@@ -186,7 +186,12 @@ The UI is organized as a multi-column workspace:
 
 ## Screenshots
 
+**Default scene**
+
 ![Default scene](./docs/screenshot1.png)
+
+**PBR scene**
+
 ![A PBR scene](./docs/screenshot2.png)
 
 ---
