@@ -1,127 +1,218 @@
 # lazyTool
 
-**lazyTool** es un editor experimental de render graph 3D hecho en C++17, Win32, DirectX 11 e ImGui. Está pensado como una herramienta rápida para montar escenas, probar shaders HLSL, depurar recursos GPU y experimentar con pipelines de render en tiempo real sin tener que recompilar el motor por cada cambio visual.
+![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
+![Windows](https://img.shields.io/badge/platform-Windows-0078D4)
+![DirectX 11](https://img.shields.io/badge/graphics-DirectX%2011-lightgrey)
+![Dear ImGui](https://img.shields.io/badge/UI-Dear%20ImGui-ff69b4)
+![HLSL](https://img.shields.io/badge/shaders-HLSL%20SM5.0-orange)
 
-> Este README se centra en lo que el editor puede hacer ahora mismo. La parte de gestión/catálogo de proyectos queda fuera por ahora.
+**lazyTool** is an experimental 3D render-graph editor for building, inspecting, and iterating on real-time rendering pipelines with C++17, Win32, DirectX 11, HLSL, and Dear ImGui.
 
----
+It is meant for fast shader iteration, GPU resource debugging, post-processing experiments, compute workflows, and visual prototyping without recompiling the engine for every rendering change.
 
-## Qué es
+> [!NOTE]
+> This project was developed as a **vibe-coded, Codex-assisted** tool: the goal is rapid exploration, practical iteration, and turning rendering ideas into usable editor features quickly. The codebase is intentionally experimental, but the editor aims to stay transparent, inspectable, and useful for real graphics programming work.
 
-lazyTool es un entorno de edición y ejecución donde combinas:
-
-- **Recursos GPU**: texturas, render targets, buffers, meshes, shaders y valores.
-- **Commands**: operaciones ordenadas que limpian targets, dibujan meshes, lanzan compute shaders o agrupan pasos.
-- **Viewport en tiempo real**: una superficie de escena que se renderiza cada frame y se puede pausar, reiniciar o ver a pantalla completa.
-- **Inspector editable**: panel para modificar recursos, estados de render, bindings, parámetros de shader, transforms y configuración de cámara/luz.
-- **HLSL dinámico**: shaders VS/PS y CS compilados en runtime, con fallback si algo falla.
-
-La idea principal es construir pipelines de render paso a paso: primero declaras o creas recursos, luego añades commands que los leen/escriben, y finalmente inspeccionas el resultado directamente en la UI.
+> [!IMPORTANT]
+> This README focuses on what the editor can do right now. Project/catalog management is intentionally left out for now.
 
 ---
 
-## Stack técnico
+## At a glance
 
-- **Lenguaje:** C++17
-- **Plataforma:** Windows
-- **API gráfica:** DirectX 11
-- **UI:** Dear ImGui
-- **Shaders:** HLSL, Shader Model 5.0
-- **Carga de imágenes:** stb_image
-- **Carga de meshes:** cgltf
-- **Build:** `build.bat` usando MSVC / Visual Studio Developer Command Prompt
-
----
-
-## Requisitos
-
-Para compilar y ejecutar desde código fuente necesitas:
-
-- Windows.
-- GPU compatible con DirectX 11.
-- Visual Studio o Build Tools con `cl.exe`, `rc.exe` y librerías de Windows/DX11 disponibles.
-- Ejecutar el build desde una **Developer Command Prompt for Visual Studio** o una consola equivalente con MSVC en el `PATH`.
+| Area | Current capability |
+|---|---|
+| Rendering API | DirectX 11 |
+| UI | Dear ImGui desktop editor |
+| Shader workflow | Runtime HLSL compilation, reflection, and hot recompilation |
+| Pipeline model | Command-based render graph / render pipeline list |
+| Resources | Textures, render targets, 3D textures, buffers, meshes, shaders, values |
+| Mesh import | Built-in primitives and glTF/GLB loading |
+| Compute | Dispatch, repeat loops, UAV/SRV bindings, indirect dispatch |
+| Draw commands | Mesh draw, instancing, MRTs, pixel UAV outputs, indirect draw |
+| Lighting | Directional light and shadow map workflow |
+| Debugging | Logs, resource previews, shader errors, binding inspection |
+| Profiling | DX11 timestamp-based GPU timings per frame and per command |
+| Persistence | Simple `.lt` scene-state save/load format |
 
 ---
 
-## Build y ejecución
+## Contents
 
-Desde la raíz del repo:
+- [What it is](#what-it-is)
+- [Quick start](#quick-start)
+- [Technical stack](#technical-stack)
+- [Requirements](#requirements)
+- [Build and run](#build-and-run)
+- [Interface overview](#interface-overview)
+- [What you can do right now](#what-you-can-do-right-now)
+- [Available commands](#available-commands)
+- [DrawMesh and DrawInstanced](#drawmesh-and-drawinstanced)
+- [MRT: Multiple Render Targets](#mrt-multiple-render-targets)
+- [Pixel UAV outputs](#pixel-uav-outputs)
+- [Compute dispatch](#compute-dispatch)
+- [Repeat for compute iterations](#repeat-for-compute-iterations)
+- [Indirect draw / indirect dispatch](#indirect-draw--indirect-dispatch)
+- [Built-in resources](#built-in-resources)
+- [Directional lighting and shadows](#directional-lighting-and-shadows)
+- [Camera and navigation](#camera-and-navigation)
+- [Viewport runtime](#viewport-runtime)
+- [Profiling and status](#profiling-and-status)
+- [Integrated log](#integrated-log)
+- [Inspector](#inspector)
+- [Bindings and slot conventions](#bindings-and-slot-conventions)
+- [Included shaders](#included-shaders)
+- [Effects you can build](#effects-you-can-build)
+- [Keyboard shortcuts](#keyboard-shortcuts)
+- [Basic persistence](#basic-persistence)
+- [Important internal limits](#important-internal-limits)
+- [Current limitations](#current-limitations)
+- [Relevant repository structure](#relevant-repository-structure)
+- [Typical workflow](#typical-workflow)
+- [Tool philosophy](#tool-philosophy)
 
-```bat
-build.bat
-```
+---
 
-Build debug:
+## What it is
 
-```bat
-build.bat debug
-```
+lazyTool is an editing and runtime environment where you combine:
 
-Build release y ejecución automática:
+- **GPU resources**: textures, render targets, buffers, meshes, shaders, and values.
+- **Commands**: ordered operations that clear targets, draw meshes, launch compute shaders, or group render steps.
+- **Real-time viewport**: a scene surface rendered every frame, with controls to pause, restart, or view fullscreen.
+- **Editable inspector**: a panel for modifying resources, render states, bindings, shader parameters, transforms, and camera/light settings.
+- **Dynamic HLSL**: VS/PS and CS shaders compiled at runtime, with fallback behavior if something fails.
+
+The core idea is to build render pipelines step by step: first you declare or create resources, then you add commands that read/write them, and finally you inspect the result directly in the UI.
+
+---
+
+## Quick start
+
+From a **Developer Command Prompt for Visual Studio**:
 
 ```bat
 build.bat run
 ```
 
-Build debug y ejecución automática:
+For a debug build:
 
 ```bat
 build.bat debug run
 ```
 
-El ejecutable se genera en:
+Then open the editor and follow the usual loop:
+
+1. Create resources from the **Resources** panel.
+2. Add commands from the **Command Pipeline** panel.
+3. Bind shaders, render targets, SRVs, UAVs, and parameters in the **Inspector**.
+4. Press `F5` to recompile shaders after editing HLSL.
+5. Use the viewport, log, binding view, and GPU profiler to iterate.
+
+---
+
+## Technical stack
+
+- **Language:** C++17
+- **Platform:** Windows
+- **Graphics API:** DirectX 11
+- **UI:** Dear ImGui
+- **Shaders:** HLSL, Shader Model 5.0
+- **Image loading:** stb_image
+- **Mesh loading:** cgltf
+- **Build:** `build.bat` using MSVC / Visual Studio Developer Command Prompt
+
+---
+
+## Requirements
+
+To build and run from source, you need:
+
+- Windows.
+- A DirectX 11-compatible GPU.
+- Visual Studio or Build Tools with `cl.exe`, `rc.exe`, and the required Windows/DX11 libraries available.
+- Run the build from a **Developer Command Prompt for Visual Studio** or an equivalent shell with MSVC in the `PATH`.
+
+---
+
+## Build and run
+
+From the repository root:
+
+```bat
+build.bat
+```
+
+Debug build:
+
+```bat
+build.bat debug
+```
+
+Release build and automatic run:
+
+```bat
+build.bat run
+```
+
+Debug build and automatic run:
+
+```bat
+build.bat debug run
+```
+
+The executable is generated at:
 
 ```text
 bin/lazyTool.exe
 ```
 
-Durante el build también se copian los assets y shaders necesarios al directorio `bin/`.
+During the build, the required assets and shaders are also copied into the `bin/` directory.
 
 ---
 
-## Vista general de la interfaz
+## Interface overview
 
-La UI está organizada como un workspace de varias columnas:
+The UI is organized as a multi-column workspace:
 
-| Zona | Qué permite hacer |
+| Area | What it lets you do |
 |---|---|
-| **Top bar** | Crear una escena nueva, guardar, cargar, recompilar shaders, abrir ayuda, ver estado de frame/memoria/profiling y controlar la ventana. |
-| **Command Pipeline** | Crear, seleccionar, ordenar, agrupar, habilitar/deshabilitar y perfilar commands. |
-| **Resources** | Crear y gestionar recursos GPU y valores editables. |
-| **Viewport** | Ver la escena renderizada, pausar/reanudar, reiniciar tiempo/frame y activar pantalla completa. |
-| **Log** | Ver errores, warnings y mensajes del motor. |
-| **Inspector / General** | Editar propiedades del elemento seleccionado, revisar bindings, configurar cámara, VSync y profiler. |
+| **Top bar** | Create a new scene, save, load, recompile shaders, open help, view frame/memory/profiling status, and control the window. |
+| **Command Pipeline** | Create, select, reorder, group, enable/disable, and profile commands. |
+| **Resources** | Create and manage GPU resources and editable values. |
+| **Viewport** | View the rendered scene, pause/resume, reset time/frame, and enable fullscreen. |
+| **Log** | View errors, warnings, and engine messages. |
+| **Inspector / General** | Edit the selected item, review bindings, configure camera, VSync, and profiler settings. |
 
 ---
 
-## Qué puedes hacer ahora mismo
+## What you can do right now
 
-### 1. Crear y editar recursos GPU
+### 1. Create and edit GPU resources
 
-Puedes crear recursos desde el panel **Resources** con clic derecho.
+You can create resources from the **Resources** panel with right-click.
 
-Recursos soportados:
+Supported resources:
 
-| Recurso | Uso principal |
+| Resource | Main use |
 |---|---|
-| `int`, `int2`, `int3` | Valores enteros editables para parámetros. |
-| `float`, `float2`, `float3`, `float4` | Valores escalares/vectoriales para shaders y User CB. |
-| `Texture2D` | Texturas cargadas desde disco. |
-| `RenderTexture2D` | Render targets 2D con RTV/SRV/UAV/DSV configurables. |
-| `RenderTexture3D` | Texturas 3D con SRV/UAV para compute o efectos volumétricos. |
-| `StructuredBuffer` | Buffers estructurados para datos GPU, instancing, partículas o argumentos indirectos. |
-| `Mesh` | Primitivas internas o meshes glTF/GLB. |
-| `Shader` | Shaders VS+PS o compute shaders. |
-| Built-ins | Tiempo, color de escena, depth de escena, shadow map y luz direccional. |
+| `int`, `int2`, `int3` | Editable integer values for parameters. |
+| `float`, `float2`, `float3`, `float4` | Scalar/vector values for shaders and User CB. |
+| `Texture2D` | Textures loaded from disk. |
+| `RenderTexture2D` | 2D render targets with configurable RTV/SRV/UAV/DSV views. |
+| `RenderTexture3D` | 3D textures with SRV/UAV for compute or volumetric effects. |
+| `StructuredBuffer` | Structured buffers for GPU data, instancing, particles, or indirect arguments. |
+| `Mesh` | Built-in primitives or glTF/GLB meshes. |
+| `Shader` | VS+PS shaders or compute shaders. |
+| Built-ins | Time, scene color, scene depth, shadow map, and directional light. |
 
-También puedes renombrar y eliminar recursos de usuario desde el menú contextual.
+You can also rename and delete user-created resources from the context menu.
 
 ---
 
-### 2. Trabajar con valores editables
+### 2. Work with editable values
 
-El editor permite crear valores escalares y vectoriales:
+The editor lets you create scalar and vector values:
 
 - `int`
 - `int2`
@@ -131,24 +222,24 @@ El editor permite crear valores escalares y vectoriales:
 - `float3`
 - `float4`
 
-Estos valores se pueden usar como fuentes para parámetros de shader o para construir un cbuffer de usuario. Sirven para exponer controles rápidos sin tocar código C++.
+These values can be used as shader parameter sources or to build a user constant buffer. They are useful for exposing quick controls without touching C++ code.
 
-Ejemplos de uso:
+Example uses:
 
-- Radio de blur.
-- Intensidad de bloom.
+- Blur radius.
+- Bloom intensity.
 - Color/tint.
-- Número de iteraciones conceptual controlado por shader.
-- Escalas de material.
-- Parámetros de simulación.
+- Conceptual shader-controlled iteration count.
+- Material scales.
+- Simulation parameters.
 
 ---
 
-### 3. Cargar texturas 2D
+### 3. Load 2D textures
 
-Puedes cargar texturas desde disco y usarlas como SRV en shaders.
+You can load textures from disk and use them as SRVs in shaders.
 
-Formatos prácticos soportados por stb_image:
+Practical formats supported by stb_image:
 
 - PNG
 - JPG/JPEG
@@ -156,177 +247,177 @@ Formatos prácticos soportados por stb_image:
 - BMP
 - HDR
 
-Comportamiento importante:
+Important behavior:
 
-- Las texturas LDR se suben como `RGBA8`.
-- Las texturas HDR se suben como `RGBA32F`.
-- Las texturas cargadas se pueden recargar desde el Inspector.
-- El selector de path incluye autocompletado y filtrado por extensión en varios campos.
+- LDR textures are uploaded as `RGBA8`.
+- HDR textures are uploaded as `RGBA32F`.
+- Loaded textures can be reloaded from the Inspector.
+- The path picker includes autocomplete and extension filtering in several fields.
 
 ---
 
-### 4. Crear render textures 2D
+### 4. Create 2D render textures
 
-Puedes crear `RenderTexture2D` con:
+You can create `RenderTexture2D` resources with:
 
-- Ancho y alto.
-- Formato DXGI.
-- Flags de vista:
-  - RTV: usable como render target.
-  - SRV: legible desde shader.
-  - UAV: escribible desde compute o pixel UAV.
-  - DSV: usable como depth target.
-- Escalado dependiente de la escena.
+- Width and height.
+- DXGI format.
+- View flags:
+  - RTV: usable as a render target.
+  - SRV: readable from shaders.
+  - UAV: writable from compute or pixel UAV.
+  - DSV: usable as a depth target.
+- Scene-dependent scaling.
 
-El **scene scale divisor** permite que una render texture siga el tamaño del viewport:
+The **scene scale divisor** lets a render texture follow the viewport size:
 
-| Divisor | Comportamiento |
+| Divisor | Behavior |
 |---:|---|
-| `0` | Tamaño fijo. |
-| `1` | Tamaño completo del viewport de escena. |
-| `2` | Mitad de resolución. |
-| `4` | Cuarto de resolución. |
+| `0` | Fixed size. |
+| `1` | Full scene viewport size. |
+| `2` | Half resolution. |
+| `4` | Quarter resolution. |
 
-Esto es útil para:
+This is useful for:
 
-- Post-procesado full-res.
-- SSAO/SSGI a media resolución.
-- Bloom a baja resolución.
+- Full-resolution post-processing.
+- Half-resolution SSAO/SSGI.
+- Low-resolution bloom.
 - G-buffers.
-- Ping-pong de compute.
-- Depth buffers auxiliares.
+- Compute ping-pong workflows.
+- Auxiliary depth buffers.
 
 ---
 
-### 5. Crear render textures 3D
+### 5. Create 3D render textures
 
-También puedes crear `RenderTexture3D` con:
+You can also create `RenderTexture3D` resources with:
 
-- Ancho.
-- Alto.
-- Profundidad.
-- Formato DXGI.
+- Width.
+- Height.
+- Depth.
+- DXGI format.
 - SRV.
 - UAV.
-- RTV cuando el formato y uso lo permitan.
+- RTV when the format and usage allow it.
 
-Esto abre la puerta a efectos como:
+This enables effects such as:
 
-- Volúmenes.
-- Campos 3D.
-- Simulaciones en grid.
-- Texturas generadas por compute.
-- Datos temporales para raymarching o efectos volumétricos.
-
----
-
-### 6. Crear structured buffers
-
-Los `StructuredBuffer` se crean indicando:
-
-- Stride en bytes.
-- Número de elementos.
-- Si tendrá SRV.
-- Si tendrá UAV.
-
-Sirven para:
-
-- Datos de instancing.
-- Sistemas de partículas GPU.
-- Buffers de simulación.
-- Argumentos indirectos.
-- Datos leídos desde vertex shader, pixel shader o compute shader según binding.
-
-El editor muestra el tamaño total estimado del buffer al crearlo o recrearlo.
+- Volumes.
+- 3D fields.
+- Grid simulations.
+- Compute-generated textures.
+- Temporary data for raymarching or volumetric effects.
 
 ---
 
-### 7. Usar meshes primitivos
+### 6. Create structured buffers
 
-Puedes crear meshes internos sin importar archivos externos:
+`StructuredBuffer` resources are created by specifying:
 
-| Primitiva | Uso típico |
+- Stride in bytes.
+- Element count.
+- Whether the buffer has an SRV.
+- Whether the buffer has a UAV.
+
+They are useful for:
+
+- Instancing data.
+- GPU particle systems.
+- Simulation buffers.
+- Indirect arguments.
+- Data read from the vertex shader, pixel shader, or compute shader depending on binding.
+
+The editor displays the estimated total buffer size when creating or recreating it.
+
+---
+
+### 7. Use primitive meshes
+
+You can create built-in meshes without importing external files:
+
+| Primitive | Typical use |
 |---|---|
-| Cube | Geometría básica, debug, materiales simples. |
-| Tetrahedron | Primitiva ligera para tests. |
-| Sphere | PBR, iluminación, reflejos, materiales. |
-| Fullscreen Triangle | Post-procesado y passes a pantalla completa. |
+| Cube | Basic geometry, debug, simple materials. |
+| Tetrahedron | Lightweight primitive for tests. |
+| Sphere | PBR, lighting, reflections, materials. |
+| Fullscreen Triangle | Post-processing and fullscreen passes. |
 
-El `fullscreen_triangle` está pensado para shaders que ya trabajan en NDC y no necesitan multiplicar por matrices de cámara.
+The `fullscreen_triangle` is intended for shaders that already operate in NDC and do not need camera matrix multiplication.
 
 ---
 
-### 8. Cargar glTF / GLB
+### 8. Load glTF / GLB
 
-Puedes cargar meshes glTF/GLB mediante cgltf.
+You can load glTF/GLB meshes through cgltf.
 
-Capacidades actuales:
+Current capabilities:
 
-- Lee meshes con primitivas de triángulos.
-- Usa atributos `POSITION`, `NORMAL` y `TEXCOORD0` cuando están disponibles.
-- Importa partes de mesh como subrangos dibujables.
-- Importa materiales hasta el límite interno.
-- Carga texturas externas y texturas embebidas en buffer views.
-- Detecta materiales double-sided.
-- Detecta materiales con alpha blend.
-- Permite habilitar/deshabilitar partes del mesh desde el Inspector.
-- Muestra conteo de vértices, índices, partes y materiales.
-- Si falla la carga, crea un cubo fallback y marca el recurso con warning.
+- Reads meshes with triangle primitives.
+- Uses `POSITION`, `NORMAL`, and `TEXCOORD0` attributes when available.
+- Imports mesh parts as drawable subranges.
+- Imports materials up to the internal limit.
+- Loads external textures and embedded textures in buffer views.
+- Detects double-sided materials.
+- Detects alpha blend materials.
+- Lets you enable/disable mesh parts from the Inspector.
+- Shows vertex, index, part, and material counts.
+- If loading fails, creates a fallback cube and marks the resource with a warning.
 
-Slots de material glTF usados por convención:
+Conventional glTF material slots:
 
-| Slot PS | Uso |
+| PS Slot | Use |
 |---:|---|
 | `t0` | Base color |
-| `t1` | Metallic/Roughness o equivalente |
+| `t1` | Metallic/Roughness or equivalent |
 | `t2` | Normal map |
 | `t3` | Emissive |
 | `t4` | Occlusion |
 
-Notas:
+Notes:
 
-- Las imágenes glTF como `data:` URI no están soportadas todavía y se saltan.
-- Sólo se procesan primitivas triangulares.
-- Si faltan normales o UVs, se usan valores por defecto.
+- glTF images as `data:` URIs are not supported yet and are skipped.
+- Only triangle primitives are processed.
+- If normals or UVs are missing, default values are used.
 
 ---
 
-### 9. Compilar shaders HLSL en runtime
+### 9. Compile HLSL shaders at runtime
 
-Puedes crear dos tipos de shader:
+You can create two shader types:
 
-| Tipo | Entry points esperados |
+| Type | Expected entry points |
 |---|---|
-| VS+PS | `VSMain` y `PSMain` |
+| VS+PS | `VSMain` and `PSMain` |
 | CS | `CSMain` |
 
-Características:
+Features:
 
-- Compilación con Shader Model 5.0.
-- Recompilación individual desde el Inspector.
-- Recompilación global con botón **Compile** o `F5`.
-- Fallback automático si el archivo no existe o falla la compilación.
-- Log de errores de compilación.
-- Reflexión automática del cbuffer `b1`.
-- Sincronización de parámetros de command a partir del layout reflejado.
+- Shader Model 5.0 compilation.
+- Individual recompilation from the Inspector.
+- Global recompilation with the **Compile** button or `F5`.
+- Automatic fallback if the file is missing or compilation fails.
+- Compilation error log.
+- Automatic reflection of the `b1` cbuffer.
+- Command parameter synchronization from the reflected layout.
 
-Registros convencionales:
+Conventional registers:
 
-| Registro | Uso |
+| Register | Use |
 |---|---|
-| `b0` | `SceneCB`, inyectado por el motor. |
-| `b1` | Parámetros propios del shader, reflejados por el editor. |
-| `b2` | `ObjectCB`, matriz `World` para draws. |
-| `s0` | Sampler lineal. |
-| `s1` | Sampler de comparación para sombras. |
+| `b0` | `SceneCB`, injected by the engine. |
+| `b1` | Shader-owned parameters, reflected by the editor. |
+| `b2` | `ObjectCB`, `World` matrix for draws. |
+| `s0` | Linear sampler. |
+| `s1` | Comparison sampler for shadows. |
 
 ---
 
-### 10. Editar parámetros de shader desde la UI
+### 10. Edit shader parameters from the UI
 
-Cuando un shader declara un cbuffer en `register(b1)`, lazyTool intenta reflejar sus variables y exponerlas como parámetros editables en commands que usan ese shader.
+When a shader declares a cbuffer in `register(b1)`, lazyTool attempts to reflect its variables and expose them as editable parameters on commands that use that shader.
 
-Tipos soportados en `b1`:
+Supported `b1` types:
 
 - `float`
 - `float2`
@@ -336,391 +427,391 @@ Tipos soportados en `b1`:
 - `int2`
 - `int3`
 
-Puedes usar parámetros de dos maneras:
+You can use parameters in two ways:
 
-1. **Hardcoded:** el valor vive en el command.
-2. **Linked:** el parámetro toma su valor desde un recurso `value` compatible.
+1. **Hardcoded:** the value lives in the command.
+2. **Linked:** the parameter takes its value from a compatible `value` resource.
 
-Esto permite cambiar valores de shader sin recompilar.
+This allows shader values to change without recompiling.
 
-Limitaciones relevantes:
+Relevant limitations:
 
-- No se reflejan matrices ni arrays en `b1`.
-- Los nombres de parámetros deben coincidir exactamente con los nombres en HLSL.
-- El packing de HLSL sigue aplicando, así que conviene agrupar variables de forma ordenada.
-
----
-
-### 11. Construir un User CB global
-
-El panel **User CB (b1)** permite crear un cbuffer de usuario con variables enlazadas a recursos.
-
-Puedes:
-
-- Añadir recursos escalares/vectoriales compatibles al User CB.
-- Cambiar nombres de variables.
-- Editar valores directos.
-- Enlazar cada entrada a un recurso existente.
-- Ver un snippet HLSL generado con `packoffset(cN)`.
-
-El User CB usa slots de 16 bytes, estilo `float4`, y se bindea en `b1` para VS/PS/CS.
-
-Esto resulta útil para shaders sencillos o para prototipar parámetros globales.
+- Matrices and arrays are not reflected in `b1`.
+- Parameter names must exactly match the HLSL variable names.
+- HLSL packing still applies, so it is best to group variables cleanly.
 
 ---
 
-## Commands disponibles
+### 11. Build a global User CB
 
-Los commands son los bloques de ejecución del render graph. Se crean con clic derecho en **Command Pipeline**.
+The **User CB (b1)** panel lets you create a user constant buffer with variables linked to resources.
 
-| Command | Qué hace |
+You can:
+
+- Add compatible scalar/vector resources to the User CB.
+- Rename variables.
+- Edit direct values.
+- Link each entry to an existing resource.
+- View a generated HLSL snippet with `packoffset(cN)`.
+
+The User CB uses 16-byte slots, `float4`-style, and is bound to `b1` for VS/PS/CS.
+
+This is useful for simple shaders or for prototyping global parameters.
+
+---
+
+## Available commands
+
+Commands are the execution blocks of the render graph. They are created with right-click in **Command Pipeline**.
+
+| Command | What it does |
 |---|---|
-| `Clear` | Limpia color y/o depth. |
-| `Group` | Contenedor lógico para organizar commands. |
-| `DrawMesh` | Dibuja un mesh con shader VS+PS. |
-| `DrawInstanced` | Dibuja un mesh con instancing. |
-| `Dispatch` | Lanza un compute shader. |
-| `Repeat` | Repite hijos compute varias veces. |
-| `IndirectDraw` | Ejecuta `DrawIndexedInstancedIndirect`. |
-| `IndirectDispatch` | Ejecuta `DispatchIndirect`. |
+| `Clear` | Clears color and/or depth. |
+| `Group` | Logical container for organizing commands. |
+| `DrawMesh` | Draws a mesh with a VS+PS shader. |
+| `DrawInstanced` | Draws a mesh with instancing. |
+| `Dispatch` | Launches a compute shader. |
+| `Repeat` | Repeats child compute commands several times. |
+| `IndirectDraw` | Executes `DrawIndexedInstancedIndirect`. |
+| `IndirectDispatch` | Executes `DispatchIndirect`. |
 
-Puedes:
+You can:
 
-- Activar/desactivar commands.
-- Renombrarlos.
-- Eliminarlos.
-- Reordenarlos con drag & drop.
-- Meter commands dentro de grupos.
-- Añadir dispatches como hijos de un `Repeat`.
-- Ver warnings si faltan bindings o hay estados incompletos.
-- Ver tiempos GPU por command cuando el profiler está activo.
+- Enable/disable commands.
+- Rename them.
+- Delete them.
+- Reorder them with drag & drop.
+- Place commands inside groups.
+- Add dispatches as children of a `Repeat` command.
+- See warnings when bindings are missing or states are incomplete.
+- See per-command GPU timings when the profiler is enabled.
 
 ---
 
-## DrawMesh y DrawInstanced
+## DrawMesh and DrawInstanced
 
-Los commands de dibujo permiten configurar:
+Draw commands let you configure:
 
 - Mesh.
-- Shader VS+PS.
-- Render target principal.
+- VS+PS shader.
+- Main render target.
 - Depth buffer.
-- MRTs adicionales.
-- Estado de render.
+- Additional MRTs.
+- Render state.
 - Transform.
-- Instancias.
-- Texturas para pixel shader.
-- SRVs para vertex shader.
-- UAVs desde pixel shader vía output merger.
-- Parámetros de shader.
-- Shadow cast.
-- Shadow receive.
-- Shader opcional para shadow pass.
+- Instances.
+- Pixel shader textures.
+- Vertex shader SRVs.
+- UAVs from the pixel shader through the output merger.
+- Shader parameters.
+- Shadow casting.
+- Shadow receiving.
+- Optional shader for the shadow pass.
 
-Estados editables:
+Editable states:
 
-| Estado | Qué controla |
+| State | What it controls |
 |---|---|
-| Color Write | Si escribe color. |
-| Depth Test | Si usa depth test. |
-| Depth Write | Si escribe depth. |
-| Alpha Blend | Si usa blending alpha. |
-| Backface Cull | Si descarta caras traseras. |
-| Shadow Caster | Si participa en el shadow prepass. |
-| Shadow Receiver | Si recibe la shadow map en `t7`. |
+| Color Write | Whether color is written. |
+| Depth Test | Whether depth testing is used. |
+| Depth Write | Whether depth is written. |
+| Alpha Blend | Whether alpha blending is used. |
+| Backface Cull | Whether back-facing triangles are culled. |
+| Shadow Caster | Whether the draw participates in the shadow prepass. |
+| Shadow Receiver | Whether it receives the shadow map in `t7`. |
 
-Transform editable:
+Editable transform:
 
-- Posición XYZ.
-- Rotación XYZ.
-- Escala XYZ.
+- XYZ position.
+- XYZ rotation.
+- XYZ scale.
 
-En `DrawInstanced` también puedes cambiar el número de instancias.
+In `DrawInstanced`, you can also change the instance count.
 
 ---
 
 ## MRT: Multiple Render Targets
 
-Los draw commands soportan render target principal más MRTs adicionales hasta el límite interno.
+Draw commands support one main render target plus additional MRTs up to the internal limit.
 
-Esto permite montar pipelines como:
+This lets you build pipelines such as:
 
-- G-buffer deferred.
-- Salida simultánea de albedo, normal y world position.
-- Masks auxiliares.
-- Buffers intermedios para post-procesado.
+- Deferred G-buffer.
+- Simultaneous output of albedo, normal, and world position.
+- Auxiliary masks.
+- Intermediate buffers for post-processing.
 
-Límite interno:
+Internal limit:
 
-- Máximo de 4 render targets activos en draw: RT principal + 3 MRTs adicionales.
+- Maximum of 4 active render targets per draw: main RT + 3 additional MRTs.
 
 ---
 
 ## Pixel UAV outputs
 
-Los draw commands también pueden escribir UAVs desde pixel shader a través del Output Merger de DX11.
+Draw commands can also write UAVs from the pixel shader through the DX11 Output Merger.
 
-El editor muestra el primer slot UAV válido según cuántos RTVs están activos, porque en DX11 los slots de RTV y UAV comparten espacio en OM.
+The editor shows the first valid UAV slot depending on how many RTVs are active, because in DX11 RTV and UAV slots share OM space.
 
-Uso típico:
+Typical uses:
 
-- Efectos avanzados desde pixel shader.
-- Buffers auxiliares.
-- Debug o acumulación controlada.
+- Advanced pixel shader effects.
+- Auxiliary buffers.
+- Debug or controlled accumulation.
 
 ---
 
-## Dispatch compute
+## Compute dispatch
 
-Los `Dispatch` ejecutan compute shaders.
+`Dispatch` commands execute compute shaders.
 
-Puedes configurar:
+You can configure:
 
 - Compute shader.
-- SRVs de entrada.
-- UAVs de salida.
-- Parámetros reflejados del shader.
-- Número de grupos `x y z`.
-- Fuente opcional para calcular el tamaño de dispatch.
+- Input SRVs.
+- Output UAVs.
+- Reflected shader parameters.
+- Group count `x y z`.
+- Optional source for calculating dispatch size.
 
-### Dispatch directo
+### Direct dispatch
 
-Si defines `threads X Y Z` sin fuente de tamaño, se usan como grupos de dispatch.
+If you define `threads X Y Z` without a size source, those values are used as dispatch groups.
 
-Ejemplo conceptual:
+Conceptual example:
 
 ```text
 threads 64 64 1
 ```
 
-El trabajo total depende de `[numthreads(...)]` dentro del shader.
+The total work depends on `[numthreads(...)]` inside the shader.
 
-### Dispatch desde tamaño de recurso
+### Dispatch from resource size
 
-Si usas `dispatch_from`, los valores de `threads` pasan a actuar como divisores del tamaño del recurso.
+If you use `dispatch_from`, the `threads` values act as divisors of the source resource size.
 
-Ejemplo conceptual:
+Conceptual example:
 
 ```text
 threads 8 8 1
-source = una textura 512x512
-resultado = Dispatch(64, 64, 1)
+source = a 512x512 texture
+result = Dispatch(64, 64, 1)
 ```
 
-Esto permite que efectos de post-procesado y compute se adapten al tamaño real del render target.
+This lets post-processing and compute effects adapt to the real render target size.
 
 ---
 
-## Repeat para iteraciones compute
+## Repeat for compute iterations
 
-`Repeat` permite ejecutar hijos compute varias veces.
+`Repeat` lets you execute child compute commands multiple times.
 
-Sirve para:
+Useful for:
 
 - Jacobi iterations.
-- Blur iterativo.
-- Simulación de fluidos.
-- Ping-pong de buffers.
-- Refinamiento progresivo.
+- Iterative blur.
+- Fluid simulation.
+- Buffer ping-pong.
+- Progressive refinement.
 
-Limitación actual:
+Current limitation:
 
-- `Repeat` sólo re-ejecuta hijos `Dispatch` e `IndirectDispatch`.
+- `Repeat` only re-executes child `Dispatch` and `IndirectDispatch` commands.
 
 ---
 
 ## Indirect draw / indirect dispatch
 
-lazyTool incluye commands indirectos:
+lazyTool includes indirect commands:
 
 - `IndirectDraw`
 - `IndirectDispatch`
 
-Usan un `StructuredBuffer` como buffer de argumentos, junto con un offset.
+They use a `StructuredBuffer` as the argument buffer, together with an offset.
 
-Esto permite pipelines GPU-driven más avanzados, como:
+This enables more advanced GPU-driven pipelines, such as:
 
-- Compute que genera argumentos.
-- Draw indirect de partículas o instancias.
-- Dispatch indirect adaptativo.
+- Compute-generated arguments.
+- Indirect drawing of particles or instances.
+- Adaptive indirect dispatch.
 
-Es una feature avanzada: el layout del buffer de argumentos debe coincidir con lo que espera DX11.
+This is an advanced feature: the argument buffer layout must match what DX11 expects.
 
 ---
 
 ## Built-in resources
 
-El motor crea recursos internos que puedes usar en bindings o inspeccionar:
+The engine creates internal resources that you can use in bindings or inspect:
 
-| Built-in | Uso |
+| Built-in | Use |
 |---|---|
-| Scene Time | Tiempo, delta/frame y datos temporales para animación. |
-| Scene Color | Color final/intermedio de la escena. |
-| Scene Depth | Depth buffer de la escena. |
-| Shadow Map | Depth map generado por el shadow prepass. |
-| Directional Light | Luz direccional editable y sus parámetros de sombra. |
+| Scene Time | Time, delta/frame, and temporal data for animation. |
+| Scene Color | Final/intermediate scene color. |
+| Scene Depth | Scene depth buffer. |
+| Shadow Map | Depth map generated by the shadow prepass. |
+| Directional Light | Editable directional light and shadow parameters. |
 
-El Inspector permite ver previews de Scene Color, Scene Depth y Shadow Map cuando hay SRV disponible.
+The Inspector can show previews of Scene Color, Scene Depth, and Shadow Map when an SRV is available.
 
 ---
 
-## Iluminación direccional y sombras
+## Directional lighting and shadows
 
-lazyTool incluye una luz direccional built-in con:
+lazyTool includes a built-in directional light with:
 
-- Posición.
+- Position.
 - Target.
-- Dirección derivada.
+- Derived direction.
 - Color.
-- Intensidad.
-- Tamaño de shadow map.
-- Near/far de la luz.
-- Extents ortográficos.
+- Intensity.
+- Shadow map size.
+- Light near/far planes.
+- Orthographic extents.
 
-Puedes orbitar la luz manteniendo `L` sobre el viewport.
+You can orbit the light by holding `L` over the viewport.
 
-Sombras:
+Shadows:
 
-- Los commands con **Shadow Caster** participan en el shadow prepass.
-- Los commands con **Shadow Receiver** reciben la shadow map en `t7`.
-- Puedes usar un shader de sombra custom para el prepass.
-- Si no se define shader de sombra custom, se usa el VS de sombra interno.
+- Commands with **Shadow Caster** participate in the shadow prepass.
+- Commands with **Shadow Receiver** receive the shadow map in `t7`.
+- You can use a custom shadow shader for the prepass.
+- If no custom shadow shader is defined, the internal shadow VS is used.
 
 ---
 
-## Cámara y navegación
+## Camera and navigation
 
-El editor tiene una cámara FPS editable.
+The editor has an editable FPS camera.
 
-Controles principales:
+Main controls:
 
-| Control | Acción |
+| Control | Action |
 |---|---|
 | RMB | Mouse look. |
-| WASD | Movimiento horizontal / forward-back/right-left. |
-| Q / E | Bajar / subir. |
-| Shift | Movimiento rápido. |
-| Ctrl | Movimiento lento. |
-| L | Orbitar luz direccional. |
+| WASD | Horizontal / forward-back / right-left movement. |
+| Q / E | Move down / up. |
+| Shift | Fast movement. |
+| Ctrl | Slow movement. |
+| L | Orbit directional light. |
 
-Desde el panel **General** puedes cambiar:
+From the **General** panel, you can change:
 
-- Activar/desactivar cámara.
+- Enable/disable camera.
 - Mouse look.
-- Invertir Y.
-- Velocidad base.
-- Multiplicador rápido.
-- Multiplicador lento.
-- Sensibilidad del mouse.
-- Posición.
+- Invert Y.
+- Base speed.
+- Fast multiplier.
+- Slow multiplier.
+- Mouse sensitivity.
+- Position.
 - Yaw.
 - Pitch.
 - FOV.
 - Near plane.
 - Far plane.
-- Reset de cámara.
+- Camera reset.
 
 ---
 
 ## Viewport runtime
 
-El viewport permite:
+The viewport lets you:
 
-- Ver la escena renderizada en tiempo real.
-- Pausar/reanudar ejecución.
-- Reiniciar la escena desde frame 0.
-- Activar pantalla completa del viewport.
-- Redimensionar la surface de escena según el layout.
-- Mantener visible el último frame al pausar.
+- View the scene rendered in real time.
+- Pause/resume execution.
+- Restart the scene from frame 0.
+- Enable fullscreen viewport.
+- Resize the scene surface according to the layout.
+- Keep the last frame visible while paused.
 
-Cuando pausas:
+When paused:
 
-- No se ejecutan commands.
-- No avanza el tiempo.
-- No se limpia/reconstruye la escena.
-- La UI sigue siendo editable.
+- Commands are not executed.
+- Time does not advance.
+- The scene is not cleared/rebuilt.
+- The UI remains editable.
 
 ---
 
-## Profiling y estado
+## Profiling and status
 
-El editor incluye profiling GPU con queries de timestamp DX11.
+The editor includes GPU profiling using DX11 timestamp queries.
 
-Puedes ver:
+You can view:
 
-- Tiempo GPU total de frame.
-- Tiempo GPU del rango de commands.
-- Tiempo GPU por command en la lista.
-- Memoria de aplicación.
-- Estimación de memoria GPU.
-- Estimación de memoria usada por recursos de usuario.
+- Total frame GPU time.
+- GPU time for the command range.
+- Per-command GPU time in the list.
+- Application memory.
+- Estimated GPU memory.
+- Estimated memory used by user resources.
 - Delta time.
-- Número de commands activos.
-- Estado de VSync.
+- Number of active commands.
+- VSync state.
 
-El profiler se activa desde **General → Profiler**.
+The profiler is enabled from **General → Profiler**.
 
 ---
 
-## Log integrado
+## Integrated log
 
-El panel **Log** muestra:
+The **Log** panel shows:
 
-- Mensajes informativos.
+- Informational messages.
 - Warnings.
-- Errores.
-- Errores de compilación de shaders.
-- Problemas al cargar texturas o meshes.
-- Avisos de fallback.
-- Eventos de escena como restart o resize.
+- Errors.
+- Shader compilation errors.
+- Texture or mesh loading issues.
+- Fallback warnings.
+- Scene events such as restart or resize.
 
-También puedes limpiar el log desde el propio panel.
+You can also clear the log from the panel.
 
 ---
 
 ## Inspector
 
-El Inspector cambia según la selección.
+The Inspector changes depending on the current selection.
 
-Para recursos permite editar o ver:
+For resources, it lets you edit or inspect:
 
-- Valores escalares/vectoriales.
-- Tamaño y flags de render textures.
-- Formato DXGI.
+- Scalar/vector values.
+- Render texture size and flags.
+- DXGI format.
 - SRV/RTV/UAV/DSV.
-- Preview de texturas y targets.
-- Path de textura, mesh o shader.
-- Recarga de textura.
-- Recarga de mesh glTF.
-- Cambio de primitiva mesh.
-- Recompilación de shader.
-- Errores de shader.
-- Variables reflejadas de cbuffer.
-- Partes y materiales glTF.
-- Flags GPU del recurso.
+- Texture and target previews.
+- Texture, mesh, or shader path.
+- Texture reload.
+- glTF mesh reload.
+- Mesh primitive switching.
+- Shader recompilation.
+- Shader errors.
+- Reflected cbuffer variables.
+- glTF parts and materials.
+- GPU resource flags.
 
-Para commands permite editar:
+For commands, it lets you edit:
 
 - Enabled.
 - Mesh/shader.
-- Parámetros de shader.
+- Shader parameters.
 - Targets.
 - MRTs.
 - Render state.
 - Transform.
-- Instancias.
-- Bindings de texturas/SRVs/UAVs.
+- Instances.
+- Texture/SRV/UAV bindings.
 - Dispatch threads.
 - Dispatch source.
 - Repeat iterations.
 - Parent/group.
-- Indirect buffer y offset.
+- Indirect buffer and offset.
 
-La pestaña **Bindings** resume cómo queda conectado el command seleccionado.
+The **Bindings** tab summarizes how the selected command is connected.
 
 ---
 
-## Bindings y convenciones de slots
+## Bindings and slot conventions
 
 ### Draw commands
 
@@ -728,22 +819,22 @@ La pestaña **Bindings** resume cómo queda conectado el command seleccionado.
 |---|---|---|
 | `textures` | Pixel Shader | `t0..t7` |
 | `srvs` | Vertex Shader | `t0..t7` |
-| `uavs` | Pixel Shader / OM | `u0..u7`, con reglas de DX11 OM |
+| `uavs` | Pixel Shader / OM | `u0..u7`, with DX11 OM rules |
 
-Convención de `t#` en pixel shader:
+Pixel shader `t#` convention:
 
-| Slot | Uso habitual |
+| Slot | Common use |
 |---:|---|
-| `t0` | Base color de material glTF. |
+| `t0` | glTF material base color. |
 | `t1` | Metallic/Roughness. |
 | `t2` | Normal map. |
 | `t3` | Emissive. |
 | `t4` | Occlusion. |
-| `t5` | Environment map para PBR/HDRI. |
-| `t6` | Libre / user-defined. |
-| `t7` | Shadow map cuando Shadow Receiver está activo. |
+| `t5` | Environment map for PBR/HDRI. |
+| `t6` | Free / user-defined. |
+| `t7` | Shadow map when Shadow Receiver is enabled. |
 
-Los bindings manuales pueden sobrescribir las texturas de material en el mismo slot.
+Manual bindings can overwrite material textures in the same slot.
 
 ### Dispatch commands
 
@@ -751,222 +842,221 @@ Los bindings manuales pueden sobrescribir las texturas de material en el mismo s
 |---|---|---|
 | `srvs` | Compute Shader | `t0..t7` |
 | `uavs` | Compute Shader | `u0..u7` |
-| Parámetros `b1` | Compute Shader | `b1` |
+| `b1` parameters | Compute Shader | `b1` |
 
 ---
 
-## Shaders incluidos
+## Included shaders
 
-El repo incluye shaders que cubren varios casos de uso:
+The repository includes shaders covering several use cases:
 
-| Shader | Qué demuestra |
+| Shader | What it demonstrates |
 |---|---|
-| `normal_color.hlsl` | Render básico coloreado por normales. |
-| `lit_mat.hlsl` | Material iluminado. |
-| `lit_ground.hlsl` | Suelo iluminado. |
-| `pbr_hdri.hlsl` | PBR con entorno HDRI. |
-| `sky_hdri.hlsl` | Sky/background HDRI. |
-| `dbg_normals.hlsl` | Debug de normales. |
-| `dbg_uvs.hlsl` | Debug de UVs. |
-| `dbg_worldpos.hlsl` | Debug de posición mundo. |
-| `gbuf_fill.hlsl` | Llenado de G-buffer. |
-| `gbuf_resolve.hlsl` | Resolve deferred. |
-| `ssao_compute.hlsl` | Cálculo SSAO. |
-| `ssao_blur.hlsl` | Blur de SSAO. |
-| `ssao_apply.hlsl` | Composición SSAO. |
-| `ssgi_compute.hlsl` | Aproximación SSGI. |
-| `ssgi_blur.hlsl` | Blur SSGI. |
-| `ssgi_composite.hlsl` | Composición SSGI. |
-| `bloom_threshold.hlsl` | Extracción de brillo. |
-| `blur_h.hlsl` | Blur horizontal. |
-| `blur_v.hlsl` | Blur vertical. |
-| `bloom_composite.hlsl` | Composición de bloom. |
-| `godrays.hlsl` | God rays / efecto volumétrico screen-space. |
-| `godrays_apply.hlsl` | Aplicación de god rays. |
+| `normal_color.hlsl` | Basic normal-colored rendering. |
+| `lit_mat.hlsl` | Lit material. |
+| `lit_ground.hlsl` | Lit ground. |
+| `pbr_hdri.hlsl` | PBR with HDRI environment. |
+| `sky_hdri.hlsl` | HDRI sky/background. |
+| `dbg_normals.hlsl` | Normal debugging. |
+| `dbg_uvs.hlsl` | UV debugging. |
+| `dbg_worldpos.hlsl` | World position debugging. |
+| `gbuf_fill.hlsl` | G-buffer fill. |
+| `gbuf_resolve.hlsl` | Deferred resolve. |
+| `ssao_compute.hlsl` | SSAO calculation. |
+| `ssao_blur.hlsl` | SSAO blur. |
+| `ssao_apply.hlsl` | SSAO composition. |
+| `ssgi_compute.hlsl` | Approximate SSGI. |
+| `ssgi_blur.hlsl` | SSGI blur. |
+| `ssgi_composite.hlsl` | SSGI composition. |
+| `bloom_threshold.hlsl` | Bright-pass extraction. |
+| `blur_h.hlsl` | Horizontal blur. |
+| `blur_v.hlsl` | Vertical blur. |
+| `bloom_composite.hlsl` | Bloom composition. |
+| `godrays.hlsl` | God rays / screen-space volumetric effect. |
+| `godrays_apply.hlsl` | God rays application. |
 | `sdf_scene.hlsl` | Raymarch/SDF. |
-| `particles_update.hlsl` | Update de partículas por compute. |
-| `particles_draw.hlsl` | Dibujo de partículas. |
-| `fluid_advect.hlsl` | Advección de fluido 2D. |
-| `fluid_divergence.hlsl` | Divergencia de fluido. |
-| `fluid_jacobi.hlsl` | Jacobi para presión. |
-| `fluid_gradsub.hlsl` | Resta de gradiente. |
-| `fluid_inject.hlsl` | Inyección de fuerza/tinta. |
-| `fluid_visualize.hlsl` | Visualización del fluido. |
-| `halftone_comic.hlsl` | Look retro/halftone. |
-| `triplanar_noise.hlsl` | Material triplanar con ruido. |
+| `particles_update.hlsl` | Compute particle update. |
+| `particles_draw.hlsl` | Particle drawing. |
+| `fluid_advect.hlsl` | 2D fluid advection. |
+| `fluid_divergence.hlsl` | Fluid divergence. |
+| `fluid_jacobi.hlsl` | Jacobi pressure solve. |
+| `fluid_gradsub.hlsl` | Gradient subtraction. |
+| `fluid_inject.hlsl` | Force/dye injection. |
+| `fluid_visualize.hlsl` | Fluid visualization. |
+| `halftone_comic.hlsl` | Retro/halftone look. |
+| `triplanar_noise.hlsl` | Triplanar material with noise. |
 
 ---
 
-## Tipos de efectos que puedes montar
+## Effects you can build
 
-Con las piezas actuales puedes construir:
+With the current building blocks, you can create:
 
-- Render forward simple.
-- PBR con HDRI.
-- Sky HDRI.
-- Sombras direccionales.
-- Debug views de normales, UVs y world position.
+- Simple forward rendering.
+- PBR with HDRI.
+- HDRI sky.
+- Directional shadows.
+- Debug views for normals, UVs, and world position.
 - G-buffer.
 - Deferred resolve.
 - SSAO.
-- SSGI aproximado.
+- Approximate SSGI.
 - Bloom.
-- Blur separable.
-- God rays / volumétricos screen-space.
-- Raymarching SDF.
-- Partículas GPU.
-- Simulación de fluidos 2D.
-- Post-procesado fullscreen.
-- Materiales triplanar/noise.
+- Separable blur.
+- God rays / screen-space volumetrics.
+- SDF raymarching.
+- GPU particles.
+- 2D fluid simulation.
+- Fullscreen post-processing.
+- Triplanar/noise materials.
 - Halftone/comic shading.
-- Pipelines ping-pong entre render textures.
-- Compute sobre texturas 2D/3D.
-- Instancing con datos en buffers.
-- Workflows indirectos GPU-driven.
+- Ping-pong pipelines between render textures.
+- Compute over 2D/3D textures.
+- Instancing with buffer data.
+- GPU-driven indirect workflows.
 
 ---
 
-## Atajos de teclado
+## Keyboard shortcuts
 
-| Atajo | Acción |
+| Shortcut | Action |
 |---|---|
-| `Space` | Pausar / reanudar ejecución de escena. |
-| `F6` | Reiniciar escena desde frame 0. |
-| `F11` | Alternar fullscreen del viewport. |
-| `F5` | Recompilar shaders. |
-| `Ctrl + S` | Guardar. |
-| `F1` | Mostrar/ocultar panel de atajos. |
-| Flechas | Navegar por Resources / Commands. |
-| `Enter` | Seleccionar elemento enfocado. |
-| `F2` | Renombrar recurso o command seleccionado. |
-| `Delete` | Eliminar selección. |
-| `X` | Activar/desactivar command seleccionado. |
-| `RMB` | Mouse look en viewport. |
-| `WASD` | Mover cámara. |
-| `Q / E` | Bajar / subir cámara. |
-| `Shift` | Movimiento rápido. |
-| `Ctrl` | Movimiento lento. |
-| `L` | Orbitar luz direccional. |
+| `Space` | Pause / resume scene execution. |
+| `F6` | Restart scene from frame 0. |
+| `F11` | Toggle viewport fullscreen. |
+| `F5` | Recompile shaders. |
+| `Ctrl + S` | Save. |
+| `F1` | Show/hide shortcuts panel. |
+| Arrow keys | Navigate Resources / Commands. |
+| `Enter` | Select focused item. |
+| `F2` | Rename selected resource or command. |
+| `Delete` | Delete selection. |
+| `X` | Enable/disable selected command. |
+| `RMB` | Mouse look in viewport. |
+| `WASD` | Move camera. |
+| `Q / E` | Move camera down / up. |
+| `Shift` | Fast movement. |
+| `Ctrl` | Slow movement. |
+| `L` | Orbit directional light. |
 
 ---
 
-## Persistencia básica
+## Basic persistence
 
-La herramienta puede guardar y cargar el estado editable de la escena en archivos de texto `.lt`.
+The tool can save and load the editable scene state to/from `.lt` text files.
 
-El guardado incluye, entre otras cosas:
+Saved data includes, among other things:
 
-- Cámara.
-- Luz direccional.
-- Recursos de usuario.
-- Partes de mesh desactivadas.
+- Camera.
+- Directional light.
+- User resources.
+- Disabled mesh parts.
 - Commands.
-- Targets, bindings, render state, transforms y params.
+- Targets, bindings, render state, transforms, and params.
 
-El formato es deliberadamente simple y estricto, pensado para ser legible y fácil de generar. Aun así, este README no documenta en detalle la capa de proyectos/escenas porque queda fuera del alcance actual.
+The format is deliberately simple and strict, intended to be readable and easy to generate. Still, this README does not document the project/scene management layer in detail because it is outside the current scope.
 
 ---
 
-## Límites internos importantes
+## Important internal limits
 
-Estos límites están definidos en el motor:
+These limits are defined in the engine:
 
-| Límite | Valor |
+| Limit | Value |
 |---|---:|
-| Recursos máximos | 256 |
-| Commands máximos | 256 |
-| Longitud máxima de nombre | 64 |
-| Longitud máxima de path | 256 |
+| Maximum resources | 256 |
+| Maximum commands | 256 |
+| Maximum name length | 64 |
+| Maximum path length | 256 |
 | Texture slots | 8 |
 | SRV slots | 8 |
 | UAV slots | 8 |
-| Render targets por draw | 4 |
-| Texturas por material mesh | 5 |
-| Partes por mesh | 128 |
-| Materiales por mesh | 64 |
-| Variables User CB | 64 |
-| Variables reflejadas por shader CB | 32 |
-| Params por command | 32 |
+| Render targets per draw | 4 |
+| Textures per mesh material | 5 |
+| Parts per mesh | 128 |
+| Materials per mesh | 64 |
+| User CB variables | 64 |
+| Reflected shader CB variables | 32 |
+| Params per command | 32 |
 
 ---
 
-## Limitaciones actuales
+## Current limitations
 
-- Sólo Windows / DirectX 11.
+- Windows / DirectX 11 only.
 - Shader Model 5.0.
-- Input layout fijo: `POSITION`, `NORMAL`, `TEXCOORD0`.
-- Los shaders VS+PS esperan `VSMain` y `PSMain`.
-- Los compute shaders esperan `CSMain`.
-- El cbuffer reflejado editable es `register(b1)`.
-- `b1` sólo soporta escalares/vectores simples, no matrices ni arrays.
-- `Repeat` sólo repite dispatches compute, no draws.
-- glTF sólo soporta primitivas triangulares.
-- Algunas rutas o nombres con espacios pueden ser problemáticos en el formato de texto porque el parser usa tokens separados por espacios/tabulaciones.
-- Las texturas glTF en data URI no están soportadas todavía.
-- No hay sistema de gizmos 3D todavía; los transforms se editan numéricamente.
-- No hay editor visual de nodos; el pipeline se edita como lista/árbol de commands.
+- Fixed input layout: `POSITION`, `NORMAL`, `TEXCOORD0`.
+- VS+PS shaders expect `VSMain` and `PSMain`.
+- Compute shaders expect `CSMain`.
+- The editable reflected cbuffer is `register(b1)`.
+- `b1` only supports simple scalars/vectors, not matrices or arrays.
+- `Repeat` only repeats compute dispatches, not draws.
+- glTF only supports triangle primitives.
+- Some paths or names with spaces may be problematic in the text format because the parser uses space/tab-separated tokens.
+- glTF textures as data URIs are not supported yet.
+- There is no 3D gizmo system yet; transforms are edited numerically.
+- There is no visual node editor; the pipeline is edited as a command list/tree.
 
 ---
 
-## Estructura relevante del repo
+## Relevant repository structure
 
 ```text
 lazyTool/
 ├─ assets/
-│  ├─ hdri/          # HDRIs de ejemplo
-│  ├─ icons/         # Iconos SVG usados por la UI
-│  └─ models/        # Modelos de ejemplo
+│  ├─ hdri/          # Example HDRIs
+│  ├─ icons/         # SVG icons used by the UI
+│  └─ models/        # Example models
 ├─ external/
 │  ├─ imgui/         # Dear ImGui
 │  ├─ stb/           # stb_image
-│  ├─ cgltf/         # loader glTF
-│  └─ nanosvg/       # iconos SVG
-├─ shaders/          # Shaders HLSL
-├─ src/              # Motor/editor C++
-├─ build.bat         # Script de build MSVC
-└─ app.ico / app.rc  # Recursos de aplicación Windows
+│  ├─ cgltf/         # glTF loader
+│  └─ nanosvg/       # SVG icons
+├─ shaders/          # HLSL shaders
+├─ src/              # C++ engine/editor
+├─ build.bat         # MSVC build script
+└─ app.ico / app.rc  # Windows application resources
 ```
 
-Archivos C++ principales:
+Main C++ files:
 
-| Archivo | Responsabilidad |
+| File | Responsibility |
 |---|---|
-| `main.cpp` | Win32, loop principal, cámara, tiempo, built-ins, ejecución frame. |
-| `dx11_ctx.cpp` | Inicialización DX11, swapchain, escena, depth, shadow map, estados. |
-| `resources.cpp` | Creación/carga/liberación de recursos GPU. |
-| `commands.cpp` | Ejecución del pipeline y profiler GPU. |
-| `shader.cpp` | Compilación HLSL, fallback y reflexión de cbuffers. |
-| `project.cpp` | Serialización/carga textual del estado editable. |
-| `ui.cpp` | Interfaz ImGui, inspector, viewport, comandos y recursos. |
-| `user_cb.cpp` | Cbuffer de usuario y sincronización de params. |
-| `log.cpp` | Log interno. |
-| `app_settings.cpp` | Preferencias globales del editor. |
+| `main.cpp` | Win32, main loop, camera, time, built-ins, frame execution. |
+| `dx11_ctx.cpp` | DX11 initialization, swapchain, scene, depth, shadow map, states. |
+| `resources.cpp` | GPU resource creation/loading/release. |
+| `commands.cpp` | Pipeline execution and GPU profiler. |
+| `shader.cpp` | HLSL compilation, fallback, and cbuffer reflection. |
+| `project.cpp` | Text serialization/loading of editable state. |
+| `ui.cpp` | ImGui interface, inspector, viewport, commands, and resources. |
+| `user_cb.cpp` | User constant buffer and parameter synchronization. |
+| `log.cpp` | Internal log. |
+| `app_settings.cpp` | Global editor preferences. |
 
 ---
 
-## Flujo típico de uso
+## Typical workflow
 
-1. Abre `lazyTool.exe`.
-2. Crea o carga recursos en **Resources**.
-3. Añade commands en **Command Pipeline**.
-4. Selecciona cada command y configura sus targets, shaders, bindings y parámetros en el **Inspector**.
-5. Ajusta cámara/luz desde el viewport o el panel **General**.
-6. Recompila shaders con **Compile** o `F5` cuando cambies HLSL.
-7. Activa el profiler si necesitas medir coste por command.
-8. Usa el log para revisar warnings, errores de carga o errores de compilación.
+1. Open `lazyTool.exe`.
+2. Create or load resources in **Resources**.
+3. Add commands in **Command Pipeline**.
+4. Select each command and configure its targets, shaders, bindings, and parameters in the **Inspector**.
+5. Adjust the camera/light from the viewport or the **General** panel.
+6. Recompile shaders with **Compile** or `F5` after changing HLSL.
+7. Enable the profiler when you need to measure per-command cost.
+8. Use the log to review warnings, loading errors, or compilation errors.
 
 ---
 
-## Filosofía de la herramienta
+## Tool philosophy
 
-lazyTool prioriza:
+lazyTool prioritizes:
 
-- Iteración rápida.
-- Control explícito del pipeline.
-- Shaders fáciles de probar.
-- Recursos GPU visibles e inspeccionables.
-- Debug visual inmediato.
-- Cero magia innecesaria.
+- Fast iteration.
+- Explicit pipeline control.
+- Easy shader testing.
+- Visible and inspectable GPU resources.
+- Immediate visual debugging.
+- No unnecessary magic.
 
-No intenta ocultar cómo se conectan los recursos: el valor está en poder ver y cambiar directamente targets, SRVs, UAVs, estados de render y parámetros.
-
+It does not try to hide how resources are connected: its value comes from letting you directly see and change targets, SRVs, UAVs, render states, and parameters.
