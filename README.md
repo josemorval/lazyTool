@@ -191,7 +191,7 @@ A simple scene using a clear render target command and rendering a cube with a d
 
 **PBR Scene**  
 
-A more advanced scene loading a glTF file with multiple meshes and textures. The helmet casts shadows, while both the ground and the helmet itself receive them.!
+A more advanced scene loading a glTF file with multiple meshes and textures. The helmet casts shadows, while both the ground and the helmet itself receive them.
 
 ![PBR Scene](./docs/screenshot2.png)
 ---
