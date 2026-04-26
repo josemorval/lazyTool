@@ -183,18 +183,19 @@ The UI is organized as a multi-column workspace:
 | **Inspector / General** | Edit the selected item, review bindings, configure camera, VSync, and profiler settings. |
 
 ---
+## Screenshots**Default Scene**  
 
-## Screenshots
+A simple scene using a clear render target command and rendering a cube with a debug shader.
 
-**Default scene**
+![Default Scene](./docs/screenshot1.png)
 
-![Default scene](./docs/screenshot1.png)
+**PBR Scene**  
 
-**PBR scene**
+A more advanced scene loading a glTF file with multiple meshes and textures. The helmet casts shadows, while both the ground and the helmet itself receive them.!
 
-![A PBR scene](./docs/screenshot2.png)
-
+[PBR Scene](./docs/screenshot2.png)
 ---
+
 
 ## What you can do right now
 
