@@ -61,8 +61,6 @@ It is meant for fast shader iteration, GPU resource debugging, post-processing e
 - [Integrated log](#integrated-log)
 - [Inspector](#inspector)
 - [Bindings and slot conventions](#bindings-and-slot-conventions)
-- [Included shaders](#included-shaders)
-- [Effects you can build](#effects-you-can-build)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Basic persistence](#basic-persistence)
 - [Important internal limits](#important-internal-limits)
@@ -183,6 +181,13 @@ The UI is organized as a multi-column workspace:
 | **Viewport** | View the rendered scene, pause/resume, reset time/frame, and enable fullscreen. |
 | **Log** | View errors, warnings, and engine messages. |
 | **Inspector / General** | Edit the selected item, review bindings, configure camera, VSync, and profiler settings. |
+
+---
+
+## Screenshots
+
+[Alt text](docs/screenshot1.png)
+[Alt text](docs/screenshot2.png)
 
 ---
 
@@ -843,77 +848,6 @@ Manual bindings can overwrite material textures in the same slot.
 | `srvs` | Compute Shader | `t0..t7` |
 | `uavs` | Compute Shader | `u0..u7` |
 | `b1` parameters | Compute Shader | `b1` |
-
----
-
-## Included shaders
-
-The repository includes shaders covering several use cases:
-
-| Shader | What it demonstrates |
-|---|---|
-| `normal_color.hlsl` | Basic normal-colored rendering. |
-| `lit_mat.hlsl` | Lit material. |
-| `lit_ground.hlsl` | Lit ground. |
-| `pbr_hdri.hlsl` | PBR with HDRI environment. |
-| `sky_hdri.hlsl` | HDRI sky/background. |
-| `dbg_normals.hlsl` | Normal debugging. |
-| `dbg_uvs.hlsl` | UV debugging. |
-| `dbg_worldpos.hlsl` | World position debugging. |
-| `gbuf_fill.hlsl` | G-buffer fill. |
-| `gbuf_resolve.hlsl` | Deferred resolve. |
-| `ssao_compute.hlsl` | SSAO calculation. |
-| `ssao_blur.hlsl` | SSAO blur. |
-| `ssao_apply.hlsl` | SSAO composition. |
-| `ssgi_compute.hlsl` | Approximate SSGI. |
-| `ssgi_blur.hlsl` | SSGI blur. |
-| `ssgi_composite.hlsl` | SSGI composition. |
-| `bloom_threshold.hlsl` | Bright-pass extraction. |
-| `blur_h.hlsl` | Horizontal blur. |
-| `blur_v.hlsl` | Vertical blur. |
-| `bloom_composite.hlsl` | Bloom composition. |
-| `godrays.hlsl` | God rays / screen-space volumetric effect. |
-| `godrays_apply.hlsl` | God rays application. |
-| `sdf_scene.hlsl` | Raymarch/SDF. |
-| `particles_update.hlsl` | Compute particle update. |
-| `particles_draw.hlsl` | Particle drawing. |
-| `fluid_advect.hlsl` | 2D fluid advection. |
-| `fluid_divergence.hlsl` | Fluid divergence. |
-| `fluid_jacobi.hlsl` | Jacobi pressure solve. |
-| `fluid_gradsub.hlsl` | Gradient subtraction. |
-| `fluid_inject.hlsl` | Force/dye injection. |
-| `fluid_visualize.hlsl` | Fluid visualization. |
-| `halftone_comic.hlsl` | Retro/halftone look. |
-| `triplanar_noise.hlsl` | Triplanar material with noise. |
-
----
-
-## Effects you can build
-
-With the current building blocks, you can create:
-
-- Simple forward rendering.
-- PBR with HDRI.
-- HDRI sky.
-- Directional shadows.
-- Debug views for normals, UVs, and world position.
-- G-buffer.
-- Deferred resolve.
-- SSAO.
-- Approximate SSGI.
-- Bloom.
-- Separable blur.
-- God rays / screen-space volumetrics.
-- SDF raymarching.
-- GPU particles.
-- 2D fluid simulation.
-- Fullscreen post-processing.
-- Triplanar/noise materials.
-- Halftone/comic shading.
-- Ping-pong pipelines between render textures.
-- Compute over 2D/3D textures.
-- Instancing with buffer data.
-- GPU-driven indirect workflows.
 
 ---
 
