@@ -1,0 +1,145 @@
+lazyTool_project 1
+
+camera_fps 0 0.75 4.6 3.1415927 -0.22 0.95 0.01 80
+
+dirlight -3.5 5 1.5 0 0 0 1 0.92 0.78 3.5 2048 2048 0.1 20 6 6
+
+resources
+
+resource value int StepCount 48 0 0 0 0 0 0 0
+resource value float Density 0 0 0 0 0.09 0 0 0
+resource value float MaxDistance 0 0 0 0 18.0 0 0 0
+resource value float3 box_color 0 0 0 0 0.75 0.78 0.85 0
+resource value float box_rough 0 0 0 0 0.55 0 0 0
+resource mesh_primitive ground cube
+resource mesh_primitive box cube
+resource mesh_primitive ball sphere
+resource shader_vsps lit_mat shaders/lit_mat.hlsl
+resource shader_vsps lit_ground shaders/lit_ground.hlsl
+resource shader_cs godrays shaders/godrays.hlsl
+resource shader_cs godrays_apply shaders/godrays_apply.hlsl
+resource render_texture godray_tex 0 0 54 1 1 1 0 2
+
+commands
+
+command clear 01_clear 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader - -
+  shadow_shader -
+  render_state 1 1 1 0 1 0 0
+  transform 0 0 0 0 0 0 1 1 1
+  clear 1 0.035 0.045 0.06 1 1 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+
+command draw_mesh 02_draw_ground 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader ground lit_ground
+  shadow_shader -
+  render_state 1 1 1 0 1 0 1
+  transform 0 -1 0 0 0 0 10 0.05 10
+  clear 0 0 0 0 0 0 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+
+command draw_mesh 03_occluder_box 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader box lit_mat
+  shadow_shader -
+  render_state 1 1 1 0 1 1 1
+  transform -0.7 -0.35 0 0 0.4 0 0.75 1.25 0.75
+  clear 0 0 0 0 0 0 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 2
+  param BaseColor float3 1 box_color 0 0 0 0 0.75 0.78 0.85 0
+  param Roughness float 1 box_rough 0 0 0 0 0.55 0 0 0
+end_command
+
+command draw_mesh 04_occluder_ball 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader ball lit_mat
+  shadow_shader -
+  render_state 1 1 1 0 1 1 1
+  transform 1.1 -0.35 -0.2 0 0 0 0.65 0.65 0.65
+  clear 0 0 0 0 0 0 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 2
+  param BaseColor float3 1 box_color 0 0 0 0 0.75 0.78 0.85 0
+  param Roughness float 1 box_rough 0 0 0 0 0.55 0 0 0
+end_command
+
+command dispatch 05_godrays 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader - godrays
+  shadow_shader -
+  render_state 1 0 0 0 1 0 0
+  transform 0 0 0 0 0 0 1 1 1
+  clear 0 0 0 0 0 0 1
+  instance 1
+  threads 8 8 1
+  dispatch_from godray_tex
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 2 scene_depth 0 shadow_map 7
+  uavs 1 godray_tex 0
+  params 3
+  param StepCount int 1 StepCount 48 0 0 0 0 0 0 0
+  param Density float 1 Density 0 0 0 0 0.09 0 0 0
+  param MaxDistance float 1 MaxDistance 0 0 0 0 18 0 0 0
+end_command
+
+command dispatch 06_apply_godrays 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader - godrays_apply
+  shadow_shader -
+  render_state 1 0 0 0 1 0 0
+  transform 0 0 0 0 0 0 1 1 1
+  clear 0 0 0 0 0 0 1
+  instance 1
+  threads 8 8 1
+  dispatch_from scene_color
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 1 godray_tex 0
+  uavs 1 scene_color 0
+  params 1
+  param Density float 1 Density 0 0 0 0 0.09 0 0 0
+end_command

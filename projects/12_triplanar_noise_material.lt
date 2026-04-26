@@ -1,0 +1,131 @@
+lazyTool_project 1
+
+camera_fps 0 0.6 4.2 3.1415927 -0.18 0.95 0.01 50
+
+dirlight -3 4.5 2 0 0 0 1 0.96 0.92 2.2 2048 2048 0.1 15 4 4
+
+resources
+
+resource value float3 BaseColor 0 0 0 0 0.12 0.34 0.72 0
+resource value float3 AccentColor 0 0 0 0 1.0 0.62 0.12 0
+resource value float NoiseScale 0 0 0 0 3.0 0 0 0
+resource value float Contrast 0 0 0 0 1.4 0 0 0
+resource value float RimStrength 0 0 0 0 0.6 0 0 0
+resource mesh_primitive ground cube
+resource mesh_primitive box cube
+resource mesh_primitive ball sphere
+resource mesh_primitive tetra tetrahedron
+resource shader_vsps triplanar_noise shaders/triplanar_noise.hlsl
+resource shader_vsps lit_ground shaders/lit_ground.hlsl
+
+commands
+
+command clear 01_clear 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader - -
+  shadow_shader -
+  render_state 1 1 1 0 1 0 0
+  transform 0 0 0 0 0 0 1 1 1
+  clear 1 0.02 0.022 0.03 1 1 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+
+command draw_mesh 02_draw_ground 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader ground lit_ground
+  shadow_shader -
+  render_state 1 1 1 0 1 0 1
+  transform 0 -1 0 0 0 0 10 0.05 10
+  clear 0 0 0 0 0 0 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+
+command draw_mesh 03_proc_box 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader box triplanar_noise
+  shadow_shader -
+  render_state 1 1 1 0 1 1 1
+  transform -1.4 -0.45 0 0 0.4 0 0.65 0.65 0.65
+  clear 0 0 0 0 0 0 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 5
+  param BaseColor float3 1 BaseColor 0 0 0 0 0.12 0.34 0.72 0
+  param AccentColor float3 1 AccentColor 0 0 0 0 1 0.62 0.12 0
+  param NoiseScale float 1 NoiseScale 0 0 0 0 3 0 0 0
+  param Contrast float 1 Contrast 0 0 0 0 1.4 0 0 0
+  param RimStrength float 1 RimStrength 0 0 0 0 0.6 0 0 0
+end_command
+
+command draw_mesh 04_proc_ball 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader ball triplanar_noise
+  shadow_shader -
+  render_state 1 1 1 0 1 1 1
+  transform 0 -0.55 0 0 0 0 0.62 0.62 0.62
+  clear 0 0 0 0 0 0 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 5
+  param BaseColor float3 1 - 0 0 0 0 0.2 0.65 0.45 0
+  param AccentColor float3 1 - 0 0 0 0 0.95 0.95 0.2 0
+  param NoiseScale float 1 - 0 0 0 0 4.2 0 0 0
+  param Contrast float 1 Contrast 0 0 0 0 1.4 0 0 0
+  param RimStrength float 1 RimStrength 0 0 0 0 0.6 0 0 0
+end_command
+
+command draw_mesh 05_proc_tetra 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader tetra triplanar_noise
+  shadow_shader -
+  render_state 1 1 1 0 1 1 1
+  transform 1.4 -0.65 0 0 0.2 0 0.7 0.7 0.7
+  clear 0 0 0 0 0 0 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 5
+  param BaseColor float3 1 - 0 0 0 0 0.65 0.18 0.55 0
+  param AccentColor float3 1 - 0 0 0 0 0.2 0.75 1 0
+  param NoiseScale float 1 - 0 0 0 0 5.5 0 0 0
+  param Contrast float 1 Contrast 0 0 0 0 1.4 0 0 0
+  param RimStrength float 1 RimStrength 0 0 0 0 0.6 0 0 0
+end_command

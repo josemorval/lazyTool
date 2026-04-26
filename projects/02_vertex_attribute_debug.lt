@@ -1,0 +1,92 @@
+lazyTool_project 1
+
+camera_fps 0 0.6 4.5 3.1415927 -0.12 0.95 0.01 50
+
+dirlight -3 4 2 0 0 0 1 1 1 1 64 64 0.1 15 4 4
+
+resources
+
+resource mesh_primitive box cube
+resource mesh_primitive ball sphere
+resource mesh_gltf model assets/models/DamagedHelmet.glb
+resource shader_vsps dbg_normals shaders/dbg_normals.hlsl
+resource shader_vsps dbg_uvs shaders/dbg_uvs.hlsl
+resource shader_vsps dbg_worldpos shaders/dbg_worldpos.hlsl
+
+commands
+
+command clear 01_clear 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader - -
+  shadow_shader -
+  render_state 1 1 1 0 1 0 0
+  transform 0 0 0 0 0 0 1 1 1
+  clear 1 0.045 0.05 0.065 1 1 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+
+command draw_mesh 02_box_normals 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader box dbg_normals
+  shadow_shader -
+  render_state 1 1 1 0 1 0 0
+  transform -2.2 0 0 0 0.7 0 0.7 0.7 0.7
+  clear 0 0 0 0 0 0 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+
+command draw_mesh 03_ball_uvs 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader ball dbg_uvs
+  shadow_shader -
+  render_state 1 1 1 0 1 0 0
+  transform 0 0 0 0 0 0 0.8 0.8 0.8
+  clear 0 0 0 0 0 0 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+
+command draw_mesh 04_helmet_worldpos 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader model dbg_worldpos
+  shadow_shader -
+  render_state 1 1 1 0 1 0 0
+  transform 2.2 0 0 0 3.1415927 0 0.8 0.8 0.8
+  clear 0 0 0 0 0 0 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command

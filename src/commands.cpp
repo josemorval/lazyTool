@@ -1,0 +1,1138 @@
+#include "commands.h"
+#include "resources.h"
+#include "dx11_ctx.h"
+#include "user_cb.h"
+#include "log.h"
+#include <string.h>
+
+Command g_commands[MAX_COMMANDS] = {};
+int     g_command_count = 0;
+bool    g_profiler_enabled = false;
+
+static Command s_cmd_move_old[MAX_COMMANDS] = {};
+static Command s_cmd_move_new[MAX_COMMANDS] = {};
+static float   s_cmd_profile_ms[MAX_COMMANDS] = {};
+static float   s_frame_profile_ms = 0.0f;
+static float   s_total_frame_profile_ms = 0.0f;
+static bool    s_gpu_profile_ready = false;
+static bool    s_gpu_total_ready = false;
+static bool    s_gpu_profiler_ok = false;
+static bool    s_prev_profiler_enabled = false;
+static bool    s_gpu_overflow_warned = false;
+static uint64_t s_gpu_submit_frame = 0;
+static uint64_t s_gpu_last_ready_frame = 0;
+static bool    s_gpu_frame_capture_open = false;
+
+#define GPU_PROFILE_LATENCY 6
+#define GPU_PROFILE_MAX_EVENTS 512
+static const UINT k_shadow_map_ps_slot = 7;
+
+struct GPUProfileEvent {
+    CmdHandle    handle;
+    ID3D11Query* begin;
+    ID3D11Query* end;
+};
+
+struct GPUProfileFrameSlot {
+    ID3D11Query* disjoint;
+    ID3D11Query* total_begin;
+    ID3D11Query* total_end;
+    ID3D11Query* frame_begin;
+    ID3D11Query* frame_end;
+    GPUProfileEvent events[GPU_PROFILE_MAX_EVENTS];
+    int        event_count;
+    bool       issued;
+    bool       total_range_issued;
+    bool       command_range_issued;
+    uint64_t   frame_id;
+};
+
+static GPUProfileFrameSlot s_gpu_slots[GPU_PROFILE_LATENCY] = {};
+static GPUProfileFrameSlot* s_gpu_active_slot = nullptr;
+
+const char* cmd_type_str(CmdType t) {
+    switch (t) {
+    case CMD_CLEAR:             return "Clear";
+    case CMD_GROUP:             return "Group";
+    case CMD_DRAW_MESH:         return "DrawMesh";
+    case CMD_DRAW_INSTANCED:    return "DrawInstanced";
+    case CMD_DISPATCH:          return "Dispatch";
+    case CMD_INDIRECT_DRAW:     return "IndirectDraw";
+    case CMD_INDIRECT_DISPATCH: return "IndirectDispatch";
+    case CMD_REPEAT:            return "Repeat";
+    default:                    return "?";
+    }
+}
+
+void cmd_init() {
+    memset(g_commands, 0, sizeof(g_commands));
+    memset(s_cmd_profile_ms, 0, sizeof(s_cmd_profile_ms));
+    memset(s_gpu_slots, 0, sizeof(s_gpu_slots));
+    g_command_count = 0;
+
+    D3D11_QUERY_DESC timestamp_desc = {};
+    timestamp_desc.Query = D3D11_QUERY_TIMESTAMP;
+    D3D11_QUERY_DESC disjoint_desc = {};
+    disjoint_desc.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+
+    s_gpu_profiler_ok = g_dx.dev != nullptr;
+    for (int f = 0; f < GPU_PROFILE_LATENCY && s_gpu_profiler_ok; f++) {
+        GPUProfileFrameSlot& slot = s_gpu_slots[f];
+        if (FAILED(g_dx.dev->CreateQuery(&disjoint_desc, &slot.disjoint))) s_gpu_profiler_ok = false;
+        if (FAILED(g_dx.dev->CreateQuery(&timestamp_desc, &slot.total_begin))) s_gpu_profiler_ok = false;
+        if (FAILED(g_dx.dev->CreateQuery(&timestamp_desc, &slot.total_end))) s_gpu_profiler_ok = false;
+        if (FAILED(g_dx.dev->CreateQuery(&timestamp_desc, &slot.frame_begin))) s_gpu_profiler_ok = false;
+        if (FAILED(g_dx.dev->CreateQuery(&timestamp_desc, &slot.frame_end))) s_gpu_profiler_ok = false;
+        for (int i = 0; i < GPU_PROFILE_MAX_EVENTS && s_gpu_profiler_ok; i++) {
+            if (FAILED(g_dx.dev->CreateQuery(&timestamp_desc, &slot.events[i].begin))) s_gpu_profiler_ok = false;
+            if (FAILED(g_dx.dev->CreateQuery(&timestamp_desc, &slot.events[i].end))) s_gpu_profiler_ok = false;
+        }
+    }
+
+    if (!s_gpu_profiler_ok)
+        log_warn("GPU profiler disabled: failed to create D3D11 timestamp queries.");
+}
+
+void cmd_shutdown() {
+    s_gpu_active_slot = nullptr;
+    for (int f = 0; f < GPU_PROFILE_LATENCY; f++) {
+        GPUProfileFrameSlot& slot = s_gpu_slots[f];
+        if (slot.disjoint) { slot.disjoint->Release(); slot.disjoint = nullptr; }
+        if (slot.total_begin) { slot.total_begin->Release(); slot.total_begin = nullptr; }
+        if (slot.total_end) { slot.total_end->Release(); slot.total_end = nullptr; }
+        if (slot.frame_begin) { slot.frame_begin->Release(); slot.frame_begin = nullptr; }
+        if (slot.frame_end) { slot.frame_end->Release(); slot.frame_end = nullptr; }
+        for (int i = 0; i < GPU_PROFILE_MAX_EVENTS; i++) {
+            if (slot.events[i].begin) { slot.events[i].begin->Release(); slot.events[i].begin = nullptr; }
+            if (slot.events[i].end) { slot.events[i].end->Release(); slot.events[i].end = nullptr; }
+            slot.events[i].handle = INVALID_HANDLE;
+        }
+        slot.event_count = 0;
+        slot.issued = false;
+        slot.frame_id = 0;
+    }
+    s_gpu_profiler_ok = false;
+    s_gpu_profile_ready = false;
+    s_prev_profiler_enabled = false;
+    s_gpu_overflow_warned = false;
+    s_gpu_submit_frame = 0;
+    s_gpu_last_ready_frame = 0;
+    s_gpu_frame_capture_open = false;
+    memset(s_cmd_profile_ms, 0, sizeof(s_cmd_profile_ms));
+    s_frame_profile_ms = 0.0f;
+}
+
+float cmd_profile_ms(CmdHandle h) {
+    if (h == INVALID_HANDLE || h > MAX_COMMANDS)
+        return 0.0f;
+    return s_cmd_profile_ms[h - 1];
+}
+
+float cmd_profile_frame_ms() {
+    return s_frame_profile_ms;
+}
+
+bool cmd_profile_ready() {
+    return s_gpu_profile_ready;
+}
+
+float cmd_profile_total_frame_ms() {
+    return s_total_frame_profile_ms;
+}
+
+bool cmd_profile_total_ready() {
+    return s_gpu_total_ready;
+}
+
+static void cmd_profile_reset_results() {
+    memset(s_cmd_profile_ms, 0, sizeof(s_cmd_profile_ms));
+    s_frame_profile_ms = 0.0f;
+    s_total_frame_profile_ms = 0.0f;
+    s_gpu_profile_ready = false;
+    s_gpu_total_ready = false;
+    s_gpu_last_ready_frame = 0;
+}
+
+static void cmd_profile_reset_slots() {
+    s_gpu_active_slot = nullptr;
+    s_gpu_submit_frame = 0;
+    s_gpu_frame_capture_open = false;
+    for (int i = 0; i < GPU_PROFILE_LATENCY; i++) {
+        s_gpu_slots[i].event_count = 0;
+        s_gpu_slots[i].issued = false;
+        s_gpu_slots[i].total_range_issued = false;
+        s_gpu_slots[i].command_range_issued = false;
+        s_gpu_slots[i].frame_id = 0;
+    }
+}
+
+static bool cmd_gpu_get_data(ID3D11Query* query, void* out, UINT out_sz) {
+    if (!query || !g_dx.ctx)
+        return false;
+    return g_dx.ctx->GetData(query, out, out_sz, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+}
+
+static void cmd_gpu_collect_slot(GPUProfileFrameSlot& slot) {
+    if (!slot.issued)
+        return;
+
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint = {};
+    UINT64 total_begin = 0;
+    UINT64 total_end = 0;
+    UINT64 frame_begin = 0;
+    UINT64 frame_end = 0;
+    if (!cmd_gpu_get_data(slot.disjoint, &disjoint, sizeof(disjoint))) return;
+    if (!cmd_gpu_get_data(slot.total_begin, &total_begin, sizeof(total_begin))) return;
+    if (!cmd_gpu_get_data(slot.total_end, &total_end, sizeof(total_end))) return;
+    if (!cmd_gpu_get_data(slot.frame_begin, &frame_begin, sizeof(frame_begin))) return;
+    if (!cmd_gpu_get_data(slot.frame_end, &frame_end, sizeof(frame_end))) return;
+
+    float cmd_ms[MAX_COMMANDS] = {};
+    for (int i = 0; i < slot.event_count; i++) {
+        UINT64 ev_begin = 0;
+        UINT64 ev_end = 0;
+        if (!cmd_gpu_get_data(slot.events[i].begin, &ev_begin, sizeof(ev_begin))) return;
+        if (!cmd_gpu_get_data(slot.events[i].end, &ev_end, sizeof(ev_end))) return;
+        CmdHandle h = slot.events[i].handle;
+        if (h != INVALID_HANDLE && h <= MAX_COMMANDS && ev_end >= ev_begin && !disjoint.Disjoint && disjoint.Frequency > 0) {
+            double ms = (double)(ev_end - ev_begin) * 1000.0 / (double)disjoint.Frequency;
+            cmd_ms[h - 1] += (float)ms;
+        }
+    }
+
+    slot.issued = false;
+    if (disjoint.Disjoint || disjoint.Frequency == 0 || frame_end < frame_begin || total_end < total_begin)
+        return;
+    if (slot.frame_id < s_gpu_last_ready_frame)
+        return;
+
+    memcpy(s_cmd_profile_ms, cmd_ms, sizeof(s_cmd_profile_ms));
+    s_frame_profile_ms = (float)((double)(frame_end - frame_begin) * 1000.0 / (double)disjoint.Frequency);
+    s_total_frame_profile_ms = (float)((double)(total_end - total_begin) * 1000.0 / (double)disjoint.Frequency);
+    s_gpu_profile_ready = true;
+    s_gpu_total_ready = true;
+    s_gpu_last_ready_frame = slot.frame_id;
+}
+
+static void cmd_profile_sync_enable_state() {
+    if (g_profiler_enabled != s_prev_profiler_enabled) {
+        cmd_profile_reset_results();
+        cmd_profile_reset_slots();
+        s_prev_profiler_enabled = g_profiler_enabled;
+    }
+}
+
+static void cmd_gpu_begin_total_frame() {
+    s_gpu_active_slot = nullptr;
+    if (!s_gpu_profiler_ok || !g_dx.ctx)
+        return;
+
+    GPUProfileFrameSlot& slot = s_gpu_slots[s_gpu_submit_frame % GPU_PROFILE_LATENCY];
+    if (slot.issued) {
+        cmd_gpu_collect_slot(slot);
+        if (slot.issued)
+            return;
+    }
+
+    slot.event_count = 0;
+    slot.frame_id = ++s_gpu_submit_frame;
+    slot.issued = true;
+    slot.total_range_issued = true;
+    slot.command_range_issued = false;
+    s_gpu_overflow_warned = false;
+
+    g_dx.ctx->Begin(slot.disjoint);
+    g_dx.ctx->End(slot.total_begin);
+    s_gpu_active_slot = &slot;
+}
+
+static void cmd_gpu_end_command_frame() {
+    if (!s_gpu_active_slot || !g_dx.ctx)
+        return;
+    if (!s_gpu_active_slot->command_range_issued) {
+        g_dx.ctx->End(s_gpu_active_slot->frame_begin);
+        s_gpu_active_slot->command_range_issued = true;
+    }
+    g_dx.ctx->End(s_gpu_active_slot->frame_end);
+}
+
+static void cmd_gpu_end_total_frame() {
+    if (!s_gpu_active_slot || !g_dx.ctx)
+        return;
+    g_dx.ctx->End(s_gpu_active_slot->total_end);
+    g_dx.ctx->End(s_gpu_active_slot->disjoint);
+    s_gpu_active_slot = nullptr;
+}
+
+static int cmd_gpu_begin_command(CmdHandle h) {
+    if (!g_profiler_enabled || !s_gpu_active_slot || !g_dx.ctx || h == INVALID_HANDLE || h > MAX_COMMANDS)
+        return -1;
+    if (s_gpu_active_slot->event_count >= GPU_PROFILE_MAX_EVENTS) {
+        if (!s_gpu_overflow_warned) {
+            log_warn("GPU profiler event pool exhausted; some commands will be skipped.");
+            s_gpu_overflow_warned = true;
+        }
+        return -1;
+    }
+
+    int event_index = s_gpu_active_slot->event_count++;
+    s_gpu_active_slot->events[event_index].handle = h;
+    g_dx.ctx->End(s_gpu_active_slot->events[event_index].begin);
+    return event_index;
+}
+
+static void cmd_gpu_end_command(int event_index) {
+    if (event_index < 0 || !s_gpu_active_slot || !g_dx.ctx || event_index >= s_gpu_active_slot->event_count)
+        return;
+    g_dx.ctx->End(s_gpu_active_slot->events[event_index].end);
+}
+
+CmdHandle cmd_alloc(const char* name, CmdType type) {
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        if (!g_commands[i].active) {
+            memset(&g_commands[i], 0, sizeof(Command));
+            strncpy(g_commands[i].name, name, MAX_NAME - 1);
+            g_commands[i].type             = type;
+            g_commands[i].active           = true;
+            g_commands[i].enabled          = true;
+            g_commands[i].parent           = INVALID_HANDLE;
+            g_commands[i].repeat_count     = 1;
+            g_commands[i].repeat_expanded  = true;
+            g_commands[i].rt               = INVALID_HANDLE;
+            g_commands[i].depth            = INVALID_HANDLE;
+            g_commands[i].mrt_count        = 0;
+            g_commands[i].mesh             = INVALID_HANDLE;
+            g_commands[i].shader           = INVALID_HANDLE;
+            g_commands[i].shadow_shader    = INVALID_HANDLE;
+            g_commands[i].color_write      = true;
+            g_commands[i].depth_test       = true;
+            g_commands[i].depth_write      = true;
+            g_commands[i].alpha_blend      = false;
+            g_commands[i].cull_back        = true;
+            g_commands[i].shadow_cast      = false;
+            g_commands[i].shadow_receive   = false;
+            g_commands[i].scale[0]         = 1.0f;
+            g_commands[i].scale[1]         = 1.0f;
+            g_commands[i].scale[2]         = 1.0f;
+            g_commands[i].indirect_buf     = INVALID_HANDLE;
+            g_commands[i].clear_color[0]   = 0.05f;
+            g_commands[i].clear_color[1]   = 0.05f;
+            g_commands[i].clear_color[2]   = 0.08f;
+            g_commands[i].clear_color[3]   = 1.0f;
+            g_commands[i].clear_color_enabled = true;
+            g_commands[i].clear_depth      = true;
+            g_commands[i].depth_clear_val  = 1.0f;
+            g_commands[i].instance_count   = 1;
+            g_commands[i].thread_x         = 1;
+            g_commands[i].thread_y         = 1;
+            g_commands[i].thread_z         = 1;
+            g_commands[i].dispatch_size_source = INVALID_HANDLE;
+            for (int r = 0; r < MAX_DRAW_RENDER_TARGETS - 1; r++) g_commands[i].mrt_handles[r] = INVALID_HANDLE;
+            for (int t = 0; t < MAX_TEX_SLOTS; t++) g_commands[i].tex_handles[t] = INVALID_HANDLE;
+            for (int s = 0; s < MAX_SRV_SLOTS; s++) g_commands[i].srv_handles[s] = INVALID_HANDLE;
+            for (int u = 0; u < MAX_UAV_SLOTS; u++) g_commands[i].uav_handles[u] = INVALID_HANDLE;
+            g_command_count++;
+            return (CmdHandle)(i + 1);
+        }
+    }
+    log_error("cmd_alloc: out of command slots");
+    return INVALID_HANDLE;
+}
+
+void cmd_free(CmdHandle h) {
+    Command* c = cmd_get(h);
+    if (!c) return;
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        if (g_commands[i].active && g_commands[i].parent == h)
+            cmd_free((CmdHandle)(i + 1));
+    }
+    c->active = false;
+    c->parent = INVALID_HANDLE;
+    g_command_count--;
+}
+
+Command* cmd_get(CmdHandle h) {
+    if (h == INVALID_HANDLE || h > MAX_COMMANDS) return nullptr;
+    Command* c = &g_commands[h - 1];
+    return c->active ? c : nullptr;
+}
+
+CmdHandle cmd_find_by_name(const char* name) {
+    if (!name || !name[0] || strcmp(name, "-") == 0)
+        return INVALID_HANDLE;
+
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        if (g_commands[i].active && strcmp(g_commands[i].name, name) == 0)
+            return (CmdHandle)(i + 1);
+    }
+    return INVALID_HANDLE;
+}
+
+CmdHandle cmd_move(CmdHandle moving, CmdHandle target, bool after_target) {
+    if (moving == INVALID_HANDLE || target == INVALID_HANDLE || moving == target)
+        return moving;
+    if (!cmd_get(moving) || !cmd_get(target))
+        return moving;
+
+    int active[MAX_COMMANDS] = {};
+    int count = 0;
+    int move_pos = -1;
+    int target_pos = -1;
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        if (!g_commands[i].active) continue;
+        if ((CmdHandle)(i + 1) == moving) move_pos = count;
+        if ((CmdHandle)(i + 1) == target) target_pos = count;
+        active[count++] = i;
+    }
+
+    if (move_pos < 0 || target_pos < 0)
+        return moving;
+
+    int without[MAX_COMMANDS] = {};
+    int without_count = 0;
+    for (int i = 0; i < count; i++)
+        if (i != move_pos)
+            without[without_count++] = active[i];
+
+    int target_without_pos = target_pos;
+    if (move_pos < target_pos)
+        target_without_pos--;
+    int insert_pos = target_without_pos + (after_target ? 1 : 0);
+    if (insert_pos < 0) insert_pos = 0;
+    if (insert_pos > without_count) insert_pos = without_count;
+
+    int order[MAX_COMMANDS] = {};
+    int out_count = 0;
+    for (int i = 0; i <= without_count; i++) {
+        if (i == insert_pos)
+            order[out_count++] = active[move_pos];
+        if (i < without_count)
+            order[out_count++] = without[i];
+    }
+
+    memcpy(s_cmd_move_old, g_commands, sizeof(g_commands));
+    memset(s_cmd_move_new, 0, sizeof(s_cmd_move_new));
+
+    CmdHandle remap[MAX_COMMANDS + 1] = {};
+    CmdHandle moved_handle = moving;
+    for (int i = 0; i < count; i++) {
+        int old_index = order[i];
+        s_cmd_move_new[i] = s_cmd_move_old[old_index];
+        remap[old_index + 1] = (CmdHandle)(i + 1);
+        if ((CmdHandle)(old_index + 1) == moving)
+            moved_handle = (CmdHandle)(i + 1);
+    }
+
+    for (int i = 0; i < count; i++) {
+        CmdHandle old_parent = s_cmd_move_new[i].parent;
+        if (old_parent != INVALID_HANDLE && old_parent <= MAX_COMMANDS)
+            s_cmd_move_new[i].parent = remap[old_parent];
+        if (s_cmd_move_new[i].parent == INVALID_HANDLE)
+            s_cmd_move_new[i].parent = INVALID_HANDLE;
+    }
+
+    memcpy(g_commands, s_cmd_move_new, sizeof(g_commands));
+    return moved_handle;
+}
+
+static ID3D11RenderTargetView* get_rtv(ResHandle h) {
+    if (h == INVALID_HANDLE) return g_dx.scene_rtv;
+    Resource* r = res_get(h);
+    if (!r) return g_dx.scene_rtv;
+    if (r->type == RES_BUILTIN_SCENE_COLOR) return g_dx.scene_rtv;
+    return r->rtv ? r->rtv : g_dx.scene_rtv;
+}
+
+static ID3D11RenderTargetView* get_optional_rtv(ResHandle h) {
+    if (h == INVALID_HANDLE)
+        return nullptr;
+    Resource* r = res_get(h);
+    if (!r)
+        return nullptr;
+    if (r->type == RES_BUILTIN_SCENE_COLOR)
+        return g_dx.scene_rtv;
+    return r->rtv;
+}
+
+static ID3D11DepthStencilView* get_dsv(ResHandle h) {
+    if (h == INVALID_HANDLE) return g_dx.depth_dsv;
+    Resource* r = res_get(h);
+    if (!r) return g_dx.depth_dsv;
+    if (r->type == RES_BUILTIN_SCENE_DEPTH) return g_dx.depth_dsv;
+    return r->dsv ? r->dsv : g_dx.depth_dsv;
+}
+
+static Resource* get_output_size_resource(ResHandle h) {
+    if (h == INVALID_HANDLE)
+        return nullptr;
+    return res_get(h);
+}
+
+static void set_viewport_for_target(ResHandle color, ResHandle depth, bool prefer_color) {
+    int w = g_dx.scene_width;
+    int hgt = g_dx.scene_height;
+
+    Resource* r = res_get(prefer_color ? color : depth);
+    if (!r)
+        r = res_get(prefer_color ? depth : color);
+    if (r && (r->type == RES_RENDER_TEXTURE2D || r->type == RES_RENDER_TEXTURE3D) &&
+        r->width > 0 && r->height > 0) {
+        w = r->width;
+        hgt = r->height;
+    }
+
+    D3D11_VIEWPORT vp = { 0, 0, (float)w, (float)hgt, 0, 1 };
+    g_dx.ctx->RSSetViewports(1, &vp);
+}
+
+static void set_viewport_for_draw_outputs(const Command& c) {
+    int w = g_dx.scene_width;
+    int hgt = g_dx.scene_height;
+
+    Resource* r = nullptr;
+    if (c.color_write)
+        r = get_output_size_resource(c.rt);
+    if (!r) {
+        for (int i = 0; i < c.mrt_count; i++) {
+            r = get_output_size_resource(c.mrt_handles[i]);
+            if (r)
+                break;
+        }
+    }
+    if (!r)
+        r = get_output_size_resource(c.depth);
+    if (!r) {
+        for (int i = 0; i < c.uav_count; i++) {
+            r = get_output_size_resource(c.uav_handles[i]);
+            if (r && r->width > 0 && r->height > 0)
+                break;
+            r = nullptr;
+        }
+    }
+
+    if (r && r->width > 0 && r->height > 0) {
+        w = r->width;
+        hgt = r->height;
+    }
+
+    D3D11_VIEWPORT vp = { 0, 0, (float)w, (float)hgt, 0, 1 };
+    g_dx.ctx->RSSetViewports(1, &vp);
+}
+
+static Mat4 mat4_from_raw(const float raw[16]) {
+    Mat4 m = {};
+    if (raw)
+        memcpy(m.m, raw, sizeof(m.m));
+    return m;
+}
+
+static const MeshMaterial* mesh_material_for_part(const Resource* mesh, const MeshPart* part) {
+    if (!mesh || !part)
+        return nullptr;
+    int mi = part->material_index;
+    if (mi < 0 || mi >= mesh->mesh_material_count)
+        return nullptr;
+    return &mesh->mesh_materials[mi];
+}
+
+static ID3D11RasterizerState* rasterizer_state_for(const Command& c, const MeshMaterial* material) {
+    bool cull_back = c.cull_back;
+    if (material && material->double_sided)
+        cull_back = false;
+    return cull_back ? g_dx.rs_solid : g_dx.rs_cull_none;
+}
+
+static void apply_draw_state(const Command& c, const MeshMaterial* material) {
+    ID3D11RasterizerState* rs = rasterizer_state_for(c, material);
+    g_dx.ctx->RSSetState(rs ? rs : g_dx.rs_solid);
+
+    ID3D11DepthStencilState* dss = g_dx.dss_default;
+    if (!c.depth_test) dss = g_dx.dss_depth_off;
+    else if (!c.depth_write) dss = g_dx.dss_depth_read;
+    if (!dss) dss = g_dx.dss_default;
+    g_dx.ctx->OMSetDepthStencilState(dss, 0);
+
+    float bf[4] = {};
+    bool alpha_blend = c.alpha_blend || (material && material->alpha_blend);
+    ID3D11BlendState* bs = alpha_blend ? g_dx.bs_alpha : g_dx.bs_opaque;
+    g_dx.ctx->OMSetBlendState(bs ? bs : g_dx.bs_opaque, bf, 0xFFFFFFFF);
+}
+
+static bool is_draw_command(CmdType type) {
+    return type == CMD_DRAW_MESH || type == CMD_DRAW_INSTANCED;
+}
+
+static Mat4 command_world_matrix(const Command& c) {
+    Mat4 s = mat4_scale(v3(c.scale[0], c.scale[1], c.scale[2]));
+    Mat4 r = mat4_rotation_xyz(v3(c.rot[0], c.rot[1], c.rot[2]));
+    Mat4 t = mat4_translation(v3(c.pos[0], c.pos[1], c.pos[2]));
+    return mat4_mul(mat4_mul(s, r), t);
+}
+
+static void update_object_cb_for_command(const Command& c, const MeshPart* part) {
+    ObjectCBData cb = {};
+    Mat4 world = command_world_matrix(c);
+    if (part) {
+        Mat4 local = mat4_from_raw(part->local_transform);
+        world = mat4_mul(local, world);
+    }
+    // See main.cpp: with default column-major HLSL and mul(M, v), upload the
+    // CPU row-major matrix as-is so the shader sees the required transpose.
+    memcpy(cb.world, world.m, sizeof(world.m));
+    dx_update_object_cb(cb);
+}
+
+static void bind_mesh_geometry(Resource* mesh) {
+    if (!mesh || !mesh->vb)
+        return;
+    UINT stride = (UINT)mesh->vert_stride, offset = 0;
+    g_dx.ctx->IASetVertexBuffers(0, 1, &mesh->vb, &stride, &offset);
+    g_dx.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if (mesh->ib)
+        g_dx.ctx->IASetIndexBuffer(mesh->ib, DXGI_FORMAT_R32_UINT, 0);
+}
+
+static void draw_command_geometry(const Command& c, Resource* mesh, const MeshPart* part) {
+    int inst = (c.type == CMD_DRAW_INSTANCED) ? c.instance_count : 1;
+    if (mesh->ib) {
+        UINT index_count = (UINT)(part ? part->index_count : mesh->idx_count);
+        UINT start_index = (UINT)(part ? part->start_index : 0);
+        g_dx.ctx->DrawIndexedInstanced(index_count, (UINT)inst, start_index, 0, 0);
+    } else {
+        UINT vertex_count = (UINT)(part ? part->index_count : mesh->vert_count);
+        UINT start_vertex = (UINT)(part ? part->start_index : 0);
+        g_dx.ctx->DrawInstanced(vertex_count, (UINT)inst, start_vertex, 0);
+    }
+}
+
+static void bind_mesh_material_textures(const Resource* mesh, const MeshPart* part) {
+    const MeshMaterial* material = mesh_material_for_part(mesh, part);
+    for (int slot = 0; slot < MAX_MESH_MATERIAL_TEXTURES; slot++) {
+        ResHandle tex_h = material ? material->textures[slot] : INVALID_HANDLE;
+        Resource* tex = res_get(tex_h);
+        ID3D11ShaderResourceView* srv = tex ? tex->srv : nullptr;
+        g_dx.ctx->PSSetShaderResources((UINT)slot, 1, &srv);
+    }
+}
+
+static UINT collect_draw_rtvs(const Command& c, ID3D11RenderTargetView** out_rtvs, UINT max_rtvs) {
+    if (!out_rtvs || max_rtvs == 0)
+        return 0;
+
+    for (UINT i = 0; i < max_rtvs; i++)
+        out_rtvs[i] = nullptr;
+    if (!c.color_write)
+        return 0;
+
+    UINT rtv_count = 0;
+    out_rtvs[0] = get_optional_rtv(c.rt);
+    if (out_rtvs[0])
+        rtv_count = 1;
+
+    int extra_count = c.mrt_count;
+    if (extra_count < 0) extra_count = 0;
+    if (extra_count > (int)(max_rtvs - 1)) extra_count = (int)(max_rtvs - 1);
+    for (int i = 0; i < extra_count; i++) {
+        out_rtvs[i + 1] = get_optional_rtv(c.mrt_handles[i]);
+        if (out_rtvs[i + 1])
+            rtv_count = (UINT)(i + 2);
+    }
+
+    return rtv_count;
+}
+
+static UINT collect_draw_uavs(const Command& c, UINT rtv_count, UINT* out_start_slot,
+                              ID3D11UnorderedAccessView** out_uavs, UINT max_uavs) {
+    if (out_start_slot)
+        *out_start_slot = rtv_count;
+    if (!out_uavs || max_uavs == 0 || rtv_count >= max_uavs)
+        return 0;
+
+    ID3D11UnorderedAccessView* by_slot[MAX_UAV_SLOTS] = {};
+    UINT highest_slot = rtv_count;
+    bool has_uav = false;
+
+    for (int i = 0; i < c.uav_count; i++) {
+        UINT slot = c.uav_slots[i];
+        if (slot < rtv_count || slot >= max_uavs)
+            continue;
+        Resource* ur = res_get(c.uav_handles[i]);
+        ID3D11UnorderedAccessView* uav = ur ? ur->uav : nullptr;
+        if (!uav)
+            continue;
+
+        by_slot[slot] = uav;
+        if (!has_uav || slot > highest_slot)
+            highest_slot = slot;
+        has_uav = true;
+    }
+
+    if (!has_uav)
+        return 0;
+
+    UINT start_slot = rtv_count;
+    UINT uav_count = highest_slot - start_slot + 1;
+    if (uav_count > max_uavs)
+        uav_count = max_uavs;
+
+    for (UINT i = 0; i < uav_count; i++)
+        out_uavs[i] = by_slot[start_slot + i];
+    for (UINT i = uav_count; i < max_uavs; i++)
+        out_uavs[i] = nullptr;
+
+    if (out_start_slot)
+        *out_start_slot = start_slot;
+    return uav_count;
+}
+
+static void clear_draw_uavs(UINT start_slot, UINT uav_count) {
+    if (uav_count == 0 || start_slot >= MAX_UAV_SLOTS)
+        return;
+
+    ID3D11UnorderedAccessView* null_uavs[MAX_UAV_SLOTS] = {};
+    g_dx.ctx->OMSetRenderTargetsAndUnorderedAccessViews(
+        D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr,
+        start_slot, uav_count, null_uavs, nullptr);
+}
+
+static void execute_shadow_prepass() {
+    if (!g_dx.shadow_dsv || !g_dx.shadow_vs || !g_dx.shadow_il)
+        return;
+
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    g_dx.ctx->PSSetShaderResources(1, 1, &null_srv);
+    g_dx.ctx->OMSetRenderTargets(0, nullptr, g_dx.shadow_dsv);
+    g_dx.ctx->ClearDepthStencilView(g_dx.shadow_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+
+    D3D11_VIEWPORT vp = { 0, 0, (float)g_dx.shadow_width, (float)g_dx.shadow_height, 0, 1 };
+    g_dx.ctx->RSSetViewports(1, &vp);
+    g_dx.ctx->OMSetDepthStencilState(g_dx.dss_default, 0);
+    float bf[4] = {};
+    g_dx.ctx->OMSetBlendState(g_dx.bs_opaque, bf, 0xFFFFFFFF);
+    g_dx.ctx->PSSetShader(nullptr, nullptr, 0);
+
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        Command& c = g_commands[i];
+        if (!c.active || !c.enabled || c.parent != INVALID_HANDLE || !c.shadow_cast || !is_draw_command(c.type))
+            continue;
+
+        Resource* mesh = res_get(c.mesh);
+        if (!mesh || !mesh->vb)
+            continue;
+
+        ID3D11VertexShader* shadow_vs = g_dx.shadow_vs;
+        ID3D11InputLayout* shadow_il = g_dx.shadow_il;
+        Resource* shadow_shader = res_get(c.shadow_shader);
+        if (shadow_shader && shadow_shader->vs && shadow_shader->il) {
+            shadow_vs = shadow_shader->vs;
+            shadow_il = shadow_shader->il;
+        }
+
+        g_dx.ctx->VSSetShader(shadow_vs, nullptr, 0);
+        g_dx.ctx->IASetInputLayout(shadow_il);
+        bind_mesh_geometry(mesh);
+        for (int s = 0; s < c.srv_count; s++) {
+            Resource* sr = res_get(c.srv_handles[s]);
+            ID3D11ShaderResourceView* srv = sr ? sr->srv : nullptr;
+            g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &srv);
+        }
+
+        int part_count = mesh->mesh_part_count > 0 ? mesh->mesh_part_count : 1;
+        for (int pi = 0; pi < part_count; pi++) {
+            const MeshPart* part = mesh->mesh_part_count > 0 ? &mesh->mesh_parts[pi] : nullptr;
+            if (part && !part->enabled)
+                continue;
+
+            const MeshMaterial* material = mesh_material_for_part(mesh, part);
+            ID3D11RasterizerState* rs = rasterizer_state_for(c, material);
+            g_dx.ctx->RSSetState(rs ? rs : g_dx.rs_solid);
+            update_object_cb_for_command(c, part);
+            draw_command_geometry(c, mesh, part);
+        }
+
+        for (int s = 0; s < c.srv_count; s++) {
+            ID3D11ShaderResourceView* null_srv = nullptr;
+            g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &null_srv);
+        }
+    }
+}
+
+static void clear_compute_bindings() {
+    ID3D11ShaderResourceView* null_srvs[MAX_SRV_SLOTS] = {};
+    ID3D11UnorderedAccessView* null_uavs[MAX_UAV_SLOTS] = {};
+    g_dx.ctx->CSSetShaderResources(0, MAX_SRV_SLOTS, null_srvs);
+    g_dx.ctx->CSSetUnorderedAccessViews(0, MAX_UAV_SLOTS, null_uavs, nullptr);
+}
+
+static void bind_compute_resources(Command& c) {
+    for (int s = 0; s < c.srv_count; s++) {
+        Resource* sr = res_get(c.srv_handles[s]);
+        ID3D11ShaderResourceView* srv = sr ? sr->srv : nullptr;
+        g_dx.ctx->CSSetShaderResources(c.srv_slots[s], 1, &srv);
+    }
+    for (int u = 0; u < c.uav_count; u++) {
+        Resource* ur = res_get(c.uav_handles[u]);
+        ID3D11UnorderedAccessView* uav = ur ? ur->uav : nullptr;
+        g_dx.ctx->CSSetUnorderedAccessViews(c.uav_slots[u], 1, &uav, nullptr);
+    }
+}
+
+static void resolve_dispatch_counts(const Command& c, UINT* out_x, UINT* out_y, UINT* out_z) {
+    UINT x = c.thread_x > 0 ? (UINT)c.thread_x : 0;
+    UINT y = c.thread_y > 0 ? (UINT)c.thread_y : 0;
+    UINT z = c.thread_z > 0 ? (UINT)c.thread_z : 0;
+    Resource* explicit_src = res_get(c.dispatch_size_source);
+    if (explicit_src) {
+        // When a command is driven from a size source we interpret thread_x/y/z
+        // as divisors, so a source like 512x512 with 8x8x1 yields 64x64x1
+        // dispatch groups. This keeps projects resolution-agnostic.
+        int src_x = 1;
+        int src_y = 1;
+        int src_z = 1;
+
+        switch (explicit_src->type) {
+        case RES_INT:
+            src_x = explicit_src->ival[0];
+            break;
+        case RES_INT2:
+            src_x = explicit_src->ival[0];
+            src_y = explicit_src->ival[1];
+            break;
+        case RES_INT3:
+            src_x = explicit_src->ival[0];
+            src_y = explicit_src->ival[1];
+            src_z = explicit_src->ival[2];
+            break;
+        case RES_TEXTURE2D:
+        case RES_RENDER_TEXTURE2D:
+        case RES_BUILTIN_SCENE_COLOR:
+        case RES_BUILTIN_SCENE_DEPTH:
+        case RES_BUILTIN_SHADOW_MAP:
+            src_x = explicit_src->width;
+            src_y = explicit_src->height;
+            break;
+        case RES_RENDER_TEXTURE3D:
+            src_x = explicit_src->width;
+            src_y = explicit_src->height;
+            src_z = explicit_src->depth;
+            break;
+        case RES_STRUCTURED_BUFFER:
+            src_x = explicit_src->elem_count;
+            break;
+        default:
+            break;
+        }
+
+        if (src_x < 1) src_x = 1;
+        if (src_y < 1) src_y = 1;
+        if (src_z < 1) src_z = 1;
+        if (x < 1) x = 1;
+        if (y < 1) y = 1;
+        if (z < 1) z = 1;
+        *out_x = (UINT)((src_x + (int)x - 1) / (int)x);
+        *out_y = (UINT)((src_y + (int)y - 1) / (int)y);
+        *out_z = (UINT)((src_z + (int)z - 1) / (int)z);
+        return;
+    }
+
+    if (x > 0 && y > 0 && z > 0) {
+        *out_x = x; *out_y = y; *out_z = z;
+        return;
+    }
+
+    int w = 1;
+    int h = 1;
+    int d = 1;
+    Resource* dim_src = nullptr;
+    if (c.uav_count > 0)
+        dim_src = res_get(c.uav_handles[0]);
+    if (!dim_src && c.srv_count > 0)
+        dim_src = res_get(c.srv_handles[0]);
+
+    if (dim_src) {
+        if (dim_src->width > 0) w = dim_src->width;
+        if (dim_src->height > 0) h = dim_src->height;
+        if (dim_src->depth > 0) d = dim_src->depth;
+    }
+
+    if (x == 0) x = (UINT)((w + 7) / 8);
+    if (y == 0) y = (UINT)((h + 7) / 8);
+    if (z == 0) z = (UINT)((d > 1) ? d : 1);
+    if (x < 1) x = 1;
+    if (y < 1) y = 1;
+    if (z < 1) z = 1;
+    *out_x = x;
+    *out_y = y;
+    *out_z = z;
+}
+
+static void execute_dispatch_command(Command& c) {
+    Resource* shader = res_get(c.shader);
+    if (!shader || !shader->cs) return;
+    g_dx.ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    clear_compute_bindings();
+    g_dx.ctx->CSSetShader(shader->cs, nullptr, 0);
+    user_cb_bind_for_command(&c, shader, false, false, true);
+    bind_compute_resources(c);
+
+    UINT dispatch_x = 1, dispatch_y = 1, dispatch_z = 1;
+    resolve_dispatch_counts(c, &dispatch_x, &dispatch_y, &dispatch_z);
+    g_dx.ctx->Dispatch(dispatch_x, dispatch_y, dispatch_z);
+
+    clear_compute_bindings();
+    g_dx.ctx->CSSetShader(nullptr, nullptr, 0);
+}
+
+static void execute_indirect_dispatch_command(Command& c) {
+    Resource* ibuf   = res_get(c.indirect_buf);
+    Resource* shader = res_get(c.shader);
+    if (!ibuf || !ibuf->buf || !shader || !shader->cs) return;
+    g_dx.ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    clear_compute_bindings();
+    g_dx.ctx->CSSetShader(shader->cs, nullptr, 0);
+    user_cb_bind_for_command(&c, shader, false, false, true);
+    bind_compute_resources(c);
+    g_dx.ctx->DispatchIndirect(ibuf->buf, c.indirect_offset);
+    clear_compute_bindings();
+    g_dx.ctx->CSSetShader(nullptr, nullptr, 0);
+}
+
+static bool is_repeat_child_type(CmdType type) {
+    return type == CMD_DISPATCH || type == CMD_INDIRECT_DISPATCH;
+}
+
+static void execute_repeat_command(CmdHandle repeat_h, Command& repeat) {
+    int count = repeat.repeat_count;
+    if (count < 1) count = 1;
+
+    for (int pass = 0; pass < count; pass++) {
+        for (int i = 0; i < MAX_COMMANDS; i++) {
+            Command& child = g_commands[i];
+            if (!child.active || !child.enabled || child.parent != repeat_h)
+                continue;
+            if (!is_repeat_child_type(child.type))
+                continue;
+
+            CmdHandle child_h = (CmdHandle)(i + 1);
+            int gpu_event = cmd_gpu_begin_command(child_h);
+
+            if (child.type == CMD_DISPATCH)
+                execute_dispatch_command(child);
+            else if (child.type == CMD_INDIRECT_DISPATCH)
+                execute_indirect_dispatch_command(child);
+
+            cmd_gpu_end_command(gpu_event);
+        }
+    }
+}
+
+static void execute_command_children(CmdHandle parent_h, bool& shadow_prepass_done);
+
+static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
+    Command* cp = cmd_get(h);
+    if (!cp || !cp->enabled)
+        return;
+
+    Command& c = *cp;
+    int gpu_event = cmd_gpu_begin_command(h);
+
+    switch (c.type) {
+
+    case CMD_CLEAR: {
+        ID3D11RenderTargetView* rtv = c.clear_color_enabled ? get_rtv(c.rt) : nullptr;
+        ID3D11DepthStencilView* dsv = get_dsv(c.depth);
+        if (rtv && c.clear_color_enabled) g_dx.ctx->ClearRenderTargetView(rtv, c.clear_color);
+        if (dsv && c.clear_depth)
+            g_dx.ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, c.depth_clear_val, 0);
+        break;
+    }
+
+    case CMD_GROUP: {
+        execute_command_children(h, shadow_prepass_done);
+        break;
+    }
+
+    case CMD_DRAW_MESH:
+    case CMD_DRAW_INSTANCED: {
+        Resource* mesh   = res_get(c.mesh);
+        Resource* shader = res_get(c.shader);
+        if (!mesh || !mesh->vb)                          break;
+        if (!shader || !shader->vs || !shader->ps)        break;
+
+        if (c.shadow_receive && !shadow_prepass_done) {
+            execute_shadow_prepass();
+            shadow_prepass_done = true;
+        }
+
+        g_dx.ctx->VSSetShader(shader->vs, nullptr, 0);
+        g_dx.ctx->PSSetShader(shader->ps, nullptr, 0);
+        if (shader->il) g_dx.ctx->IASetInputLayout(shader->il);
+        user_cb_bind_for_command(&c, shader, true, true, false);
+
+        ID3D11RenderTargetView* rtvs[MAX_DRAW_RENDER_TARGETS] = {};
+        UINT rtv_count = collect_draw_rtvs(c, rtvs, MAX_DRAW_RENDER_TARGETS);
+        ID3D11DepthStencilView* dsv = get_dsv(c.depth);
+        ID3D11UnorderedAccessView* om_uavs[MAX_UAV_SLOTS] = {};
+        UINT uav_start_slot = 0;
+        UINT om_uav_count = collect_draw_uavs(c, rtv_count, &uav_start_slot, om_uavs, MAX_UAV_SLOTS);
+        if (om_uav_count > 0) {
+            g_dx.ctx->OMSetRenderTargetsAndUnorderedAccessViews(
+                rtv_count, rtv_count > 0 ? rtvs : nullptr, dsv,
+                uav_start_slot, om_uav_count, om_uavs, nullptr);
+        } else if (rtv_count > 0) {
+            g_dx.ctx->OMSetRenderTargets(rtv_count, rtvs, dsv);
+        } else {
+            g_dx.ctx->OMSetRenderTargets(0, nullptr, dsv);
+        }
+        set_viewport_for_draw_outputs(c);
+        bind_mesh_geometry(mesh);
+
+        for (int s = 0; s < c.srv_count; s++) {
+            Resource* sr = res_get(c.srv_handles[s]);
+            ID3D11ShaderResourceView* srv = sr ? sr->srv : nullptr;
+            g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &srv);
+        }
+
+        int part_count = mesh->mesh_part_count > 0 ? mesh->mesh_part_count : 1;
+        for (int pi = 0; pi < part_count; pi++) {
+            const MeshPart* part = mesh->mesh_part_count > 0 ? &mesh->mesh_parts[pi] : nullptr;
+            if (part && !part->enabled)
+                continue;
+
+            const MeshMaterial* material = mesh_material_for_part(mesh, part);
+            apply_draw_state(c, material);
+            update_object_cb_for_command(c, part);
+            bind_mesh_material_textures(mesh, part);
+
+            for (int t = 0; t < c.tex_count; t++) {
+                Resource* tr = res_get(c.tex_handles[t]);
+                ID3D11ShaderResourceView* srv = tr ? tr->srv : nullptr;
+                g_dx.ctx->PSSetShaderResources(c.tex_slots[t], 1, &srv);
+            }
+            if (c.shadow_receive) {
+                ID3D11ShaderResourceView* srv = g_dx.shadow_srv;
+                g_dx.ctx->PSSetShaderResources(k_shadow_map_ps_slot, 1, &srv);
+            }
+
+            draw_command_geometry(c, mesh, part);
+        }
+
+        ID3D11ShaderResourceView* null_ps_srvs[MAX_TEX_SLOTS] = {};
+        g_dx.ctx->PSSetShaderResources(0, MAX_TEX_SLOTS, null_ps_srvs);
+        for (int s = 0; s < c.srv_count; s++) {
+            ID3D11ShaderResourceView* null_srv = nullptr;
+            g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &null_srv);
+        }
+        clear_draw_uavs(uav_start_slot, om_uav_count);
+        break;
+    }
+
+    case CMD_DISPATCH: {
+        execute_dispatch_command(c);
+        break;
+    }
+
+    case CMD_INDIRECT_DRAW: {
+        Resource* ibuf   = res_get(c.indirect_buf);
+        Resource* mesh   = res_get(c.mesh);
+        Resource* shader = res_get(c.shader);
+        if (!ibuf || !ibuf->buf || !mesh || !mesh->vb || !shader || !shader->vs || !shader->ps) break;
+        g_dx.ctx->VSSetShader(shader->vs, nullptr, 0);
+        g_dx.ctx->PSSetShader(shader->ps, nullptr, 0);
+        if (shader->il) g_dx.ctx->IASetInputLayout(shader->il);
+        user_cb_bind_for_command(&c, shader, true, true, false);
+        UINT stride = (UINT)mesh->vert_stride, offset = 0;
+        g_dx.ctx->IASetVertexBuffers(0, 1, &mesh->vb, &stride, &offset);
+        g_dx.ctx->IASetIndexBuffer(mesh->ib, DXGI_FORMAT_R32_UINT, 0);
+        g_dx.ctx->DrawIndexedInstancedIndirect(ibuf->buf, c.indirect_offset);
+        break;
+    }
+
+    case CMD_INDIRECT_DISPATCH: {
+        execute_indirect_dispatch_command(c);
+        break;
+    }
+
+    case CMD_REPEAT: {
+        execute_repeat_command(h, c);
+        break;
+    }
+
+    default: break;
+    }
+
+    cmd_gpu_end_command(gpu_event);
+}
+
+static void execute_command_children(CmdHandle parent_h, bool& shadow_prepass_done) {
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        Command& c = g_commands[i];
+        if (!c.active || !c.enabled || c.parent != parent_h)
+            continue;
+        execute_command_handle((CmdHandle)(i + 1), shadow_prepass_done);
+    }
+}
+
+void cmd_execute_all() {
+    bool shadow_prepass_done = false;
+    cmd_profile_sync_enable_state();
+
+    if (g_profiler_enabled && !s_gpu_active_slot)
+        cmd_profile_begin_frame_capture();
+    else if (!g_profiler_enabled)
+        s_gpu_active_slot = nullptr;
+
+    if (g_profiler_enabled && s_gpu_active_slot && !s_gpu_active_slot->command_range_issued) {
+        g_dx.ctx->End(s_gpu_active_slot->frame_begin);
+        s_gpu_active_slot->command_range_issued = true;
+    }
+
+    execute_command_children(INVALID_HANDLE, shadow_prepass_done);
+
+    if (g_profiler_enabled)
+        cmd_gpu_end_command_frame();
+}
+
+void cmd_make_unique_name(const char* base, char* out, int out_sz) {
+    bool found = false;
+    for (int i = 0; i < MAX_COMMANDS && !found; i++)
+        if (g_commands[i].active && strcmp(g_commands[i].name, base) == 0) found = true;
+    if (!found) { strncpy(out, base, out_sz - 1); out[out_sz-1] = '\0'; return; }
+    for (int i = 1; i < 1000; i++) {
+        snprintf(out, out_sz, "%s_%d", base, i);
+        bool dup = false;
+        for (int j = 0; j < MAX_COMMANDS; j++)
+            if (g_commands[j].active && strcmp(g_commands[j].name, out) == 0) { dup = true; break; }
+        if (!dup) return;
+    }
+}
+
+void cmd_profile_begin_frame_capture() {
+    cmd_profile_sync_enable_state();
+    if (!g_profiler_enabled) {
+        s_gpu_active_slot = nullptr;
+        s_gpu_frame_capture_open = false;
+        return;
+    }
+
+    cmd_gpu_begin_total_frame();
+    s_gpu_frame_capture_open = s_gpu_active_slot != nullptr;
+}
+
+void cmd_profile_end_frame_capture() {
+    if (!s_gpu_frame_capture_open)
+        return;
+
+    if (!s_gpu_active_slot) {
+        s_gpu_frame_capture_open = false;
+        return;
+    }
+
+    if (!s_gpu_active_slot->command_range_issued) {
+        g_dx.ctx->End(s_gpu_active_slot->frame_begin);
+        g_dx.ctx->End(s_gpu_active_slot->frame_end);
+        s_gpu_active_slot->command_range_issued = true;
+    }
+    cmd_gpu_end_total_frame();
+    s_gpu_frame_capture_open = false;
+}

@@ -1,0 +1,108 @@
+lazyTool_project 1
+
+camera_fps 0 0.35 3.2 3.1415927 -0.05 0.95 0.01 50
+
+dirlight -3 4.5 2 0 0.75 0 1 0.96 0.92 2.2 2048 2048 0.1 15 8 8
+
+resources
+
+resource value float SkyExposure 0 0 0 0 1.0 0 0 0
+resource value float SkyIntensity 0 0 0 0 1.0 0 0 0
+resource value float Exposure 0 0 0 0 1.0 0 0 0
+resource value float EnvIntensity 0 0 0 0 1.0 0 0 0
+resource value float RoughnessScale 0 0 0 0 1.0 0 0 0
+resource value float MetallicScale 0 0 0 0 1.0 0 0 0
+resource mesh_primitive sky_fs fullscreen_triangle
+resource mesh_primitive ground_cube cube
+resource mesh_gltf DamagedHelmet assets/models/DamagedHelmet.glb
+resource texture2d venice_hdri assets/hdri/venice_sunset_1k.hdr
+resource shader_vsps sky_hdri shaders/sky_hdri.hlsl
+resource shader_vsps helmet_pbr_hdri shaders/pbr_hdri.hlsl
+resource shader_vsps ground_shadow_lit shaders/lit_ground.hlsl
+
+commands
+
+command clear 01_clear_scene 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader - -
+  shadow_shader -
+  render_state 1 1 1 0 1 0 0
+  transform 0 0 0 0 0 0 1 1 1
+  clear 1 0.015 0.018 0.025 1 1 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+
+command draw_mesh 02_draw_sky_hdri 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader sky_fs sky_hdri
+  shadow_shader -
+  render_state 1 0 0 0 1 0 0
+  transform 0 0 0 0 0 0 1 1 1
+  clear 0 0 0 0 0 0 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 1 venice_hdri 0
+  srvs 0
+  uavs 0
+  params 3
+  param Exposure float 1 SkyExposure 0 0 0 0 1 0 0 0
+  param Intensity float 1 SkyIntensity 0 0 0 0 1 0 0 0
+  param Saturation float 1 - 0 0 0 0 1 0 0 0
+end_command
+
+command draw_mesh 03_draw_ground_shadow 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader ground_cube ground_shadow_lit
+  shadow_shader -
+  render_state 1 1 1 0 1 0 1
+  transform 0 -1.05 0 0 0 0 10 0.15 10
+  clear 0 0 0 0 0 0 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+
+command draw_mesh 04_draw_damagedhelmet_pbr 1
+  targets scene_color scene_depth
+  mrts 0
+  mesh_shader DamagedHelmet helmet_pbr_hdri
+  shadow_shader -
+  render_state 1 1 1 0 1 1 1
+  transform 0 -0.08 0 0 3.1415927 0 2.2 2.2 2.2
+  clear 0 0 0 0 0 0 1
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  repeat 1 1
+  parent -
+  textures 6 DamagedHelmet.texture0 0 DamagedHelmet.texture1 1 DamagedHelmet.texture2 2 DamagedHelmet.texture3 3 DamagedHelmet.texture4 4 venice_hdri 5
+  srvs 0
+  uavs 0
+  params 6
+  param MetallicScale float 1 MetallicScale 0 0 0 0 1 0 0 0
+  param RoughnessScale float 1 RoughnessScale 0 0 0 0 1 0 0 0
+  param EnvIntensity float 1 EnvIntensity 0 0 0 0 1 0 0 0
+  param Exposure float 1 Exposure 0 0 0 0 1 0 0 0
+  param NormalStrength float 1 - 0 0 0 0 1 0 0 0
+  param EmissiveStrength float 1 - 0 0 0 0 1 0 0 0
+end_command
