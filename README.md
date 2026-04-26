@@ -186,8 +186,8 @@ The UI is organized as a multi-column workspace:
 
 ## Screenshots
 
-[Alt text](docs/screenshot1.png)
-[Alt text](docs/screenshot2.png)
+[Default scene](./docs/screenshot1.png)
+[A PBR scene](./docs/screenshot2.png)
 
 ---
 
