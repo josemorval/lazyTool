@@ -1,6 +1,9 @@
 #pragma once
 #include "types.h"
 
+// The resource API creates and tracks every asset-like object visible to the
+// editor: shaders, textures, meshes, buffers, and built-in engine resources.
+
 extern Resource  g_resources[MAX_RESOURCES];
 extern int       g_resource_count;
 

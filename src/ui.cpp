@@ -14,6 +14,9 @@
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
 
+// The UI module is the editor shell. It presents resources, commands,
+// inspectors, logs, and the live scene view on top of the runtime state.
+
 ResHandle g_sel_res = INVALID_HANDLE;
 CmdHandle g_sel_cmd = INVALID_HANDLE;
 bool g_scene_view_hovered = false;
@@ -40,6 +43,48 @@ static bool s_scene_surface_resize_armed = true;
 static int s_scene_surface_host_w = 0;
 static int s_scene_surface_host_h = 0;
 static bool s_scene_surface_fullscreen = false;
+
+enum UiViewportGizmoMode {
+    UI_GIZMO_NONE = 0,
+    UI_GIZMO_TRANSLATE,
+    UI_GIZMO_ROTATE,
+    UI_GIZMO_SCALE
+};
+
+struct UiViewportGizmoDrag {
+    bool                 active;
+    UiViewportGizmoMode  mode;
+    CmdHandle            cmd;
+    int                  axis;
+    float                initial_pos[3];
+    float                initial_rot[3];
+    float                initial_scale[3];
+    float                axis_world_len;
+    float                axis_screen_len;
+    ImVec2               mouse_start;
+    ImVec2               origin_screen;
+    ImVec2               axis_end_screen;
+    Mat4                 initial_rot_matrix;
+    ImVec2               ring_basis_u_screen;
+    ImVec2               ring_basis_v_screen;
+    float                ring_start_angle;
+};
+
+static UiViewportGizmoMode s_viewport_gizmo_mode = UI_GIZMO_NONE;
+static UiViewportGizmoDrag s_viewport_gizmo_drag = {};
+
+struct UiCommandClipboardEntry {
+    Command cmd;
+    int     parent_index;
+};
+
+static UiCommandClipboardEntry s_cmd_clipboard[MAX_COMMANDS] = {};
+static int s_cmd_clipboard_count = 0;
+
+static bool ui_begin_shortcut_section(const char* id, const char* title, ImGuiTableFlags table_flags);
+static void ui_draw_shortcut_row(const char* key, const char* desc);
+static void ui_align_frame_row(float row_y);
+static void ui_align_text_row(float row_y);
 
 struct PathCandidate {
     char display[MAX_PATH_LEN];
@@ -414,6 +459,14 @@ static const char* ui_draw_texture_slot_usage(int slot) {
     }
 }
 
+static void ui_draw_texture_slot_row(const char* slot, const char* usage) {
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::TextDisabled("%s", slot);
+    ImGui::TableSetColumnIndex(1);
+    ImGui::TextUnformatted(usage);
+}
+
 static void ui_draw_texture_slot_reference(const char* table_id) {
     if (!ImGui::BeginTable(table_id, 2,
             ImGuiTableFlags_SizingStretchProp |
@@ -424,22 +477,14 @@ static void ui_draw_texture_slot_reference(const char* table_id) {
     ImGui::TableSetupColumn("Slot", ImGuiTableColumnFlags_WidthFixed, 116.0f);
     ImGui::TableSetupColumn("Usage", ImGuiTableColumnFlags_WidthStretch);
 
-    auto slot_row = [](const char* slot, const char* usage) {
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0);
-        ImGui::TextDisabled("%s", slot);
-        ImGui::TableSetColumnIndex(1);
-        ImGui::TextUnformatted(usage);
-    };
-
-    slot_row("t0", ui_draw_texture_slot_usage(0));
-    slot_row("t1", ui_draw_texture_slot_usage(1));
-    slot_row("t2", ui_draw_texture_slot_usage(2));
-    slot_row("t3", ui_draw_texture_slot_usage(3));
-    slot_row("t4", ui_draw_texture_slot_usage(4));
-    slot_row("t5", ui_draw_texture_slot_usage(5));
-    slot_row("t6", ui_draw_texture_slot_usage(6));
-    slot_row("t7", ui_draw_texture_slot_usage(7));
+    ui_draw_texture_slot_row("t0", ui_draw_texture_slot_usage(0));
+    ui_draw_texture_slot_row("t1", ui_draw_texture_slot_usage(1));
+    ui_draw_texture_slot_row("t2", ui_draw_texture_slot_usage(2));
+    ui_draw_texture_slot_row("t3", ui_draw_texture_slot_usage(3));
+    ui_draw_texture_slot_row("t4", ui_draw_texture_slot_usage(4));
+    ui_draw_texture_slot_row("t5", ui_draw_texture_slot_usage(5));
+    ui_draw_texture_slot_row("t6", ui_draw_texture_slot_usage(6));
+    ui_draw_texture_slot_row("t7", ui_draw_texture_slot_usage(7));
     ImGui::EndTable();
 }
 
@@ -510,7 +555,30 @@ static void ui_project_file_bar() {
 
 // ── resource combo helper ─────────────────────────────────────────────────
 
-static const char* ui_resource_display_name(const Resource& r) {
+static bool ui_resource_has_implicit_size_source(const Resource& r) {
+    switch (r.type) {
+    case RES_TEXTURE2D:
+    case RES_RENDER_TEXTURE2D:
+    case RES_RENDER_TEXTURE3D:
+    case RES_STRUCTURED_BUFFER:
+    case RES_BUILTIN_SCENE_COLOR:
+    case RES_BUILTIN_SCENE_DEPTH:
+    case RES_BUILTIN_SHADOW_MAP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static ResHandle ui_resource_handle_from_ptr(const Resource* r) {
+    if (!r) return INVALID_HANDLE;
+    int idx = (int)(r - g_resources);
+    if (idx < 0 || idx >= MAX_RESOURCES)
+        return INVALID_HANDLE;
+    return (ResHandle)(idx + 1);
+}
+
+static const char* ui_resource_base_display_name(const Resource& r) {
     switch (r.type) {
     case RES_BUILTIN_TIME:        return "Scene Time";
     case RES_BUILTIN_SCENE_COLOR: return "Scene Color";
@@ -519,6 +587,47 @@ static const char* ui_resource_display_name(const Resource& r) {
     case RES_BUILTIN_DIRLIGHT:    return "Directional Light";
     default:                      return r.name;
     }
+}
+
+static bool ui_resource_is_implicit_size_resource(const Resource& r, Resource** owner_out = nullptr) {
+    if (!r.is_generated || r.generated_from == INVALID_HANDLE)
+        return false;
+    Resource* owner = res_get(r.generated_from);
+    if (!owner || !ui_resource_has_implicit_size_source(*owner))
+        return false;
+    if (owner->size_handle != ui_resource_handle_from_ptr(&r))
+        return false;
+    if (owner_out)
+        *owner_out = owner;
+    return true;
+}
+
+static void ui_resource_display_name_buf(const Resource& r, char* out, int out_sz) {
+    if (!out || out_sz <= 0)
+        return;
+
+    Resource* owner = nullptr;
+    if (ui_resource_is_implicit_size_resource(r, &owner)) {
+        const char* owner_name = ui_resource_base_display_name(*owner);
+        if (owner->type == RES_STRUCTURED_BUFFER)
+            snprintf(out, out_sz, "%s Count", owner_name);
+        else
+            snprintf(out, out_sz, "%s Size", owner_name);
+        out[out_sz - 1] = '\0';
+        return;
+    }
+
+    snprintf(out, out_sz, "%s", ui_resource_base_display_name(r));
+    out[out_sz - 1] = '\0';
+}
+
+static const char* ui_resource_display_name(const Resource& r) {
+    static char s_labels[8][MAX_NAME + 24] = {};
+    static int s_label_index = 0;
+    char* out = s_labels[s_label_index];
+    s_label_index = (s_label_index + 1) % 8;
+    ui_resource_display_name_buf(r, out, MAX_NAME + 24);
+    return out;
 }
 
 static const char* ui_resource_display_type(const Resource& r) {
@@ -566,7 +675,32 @@ static void res_combo_depth_target(const char* label, ResHandle* h) {
     res_combo(label, h, RES_RENDER_TEXTURE2D, true, RES_BUILTIN_SCENE_DEPTH);
 }
 
+static bool ui_resource_is_dispatch_source_candidate(const Resource& r) {
+    if (r.type != RES_INT && r.type != RES_INT2 && r.type != RES_INT3)
+        return false;
+    if (!r.is_generated)
+        return true;
+    return ui_resource_is_implicit_size_resource(r);
+}
+
+static ResHandle ui_dispatch_source_normalize(ResHandle h) {
+    Resource* r = res_get(h);
+    if (!r)
+        return INVALID_HANDLE;
+    if (ui_resource_is_dispatch_source_candidate(*r))
+        return h;
+    if (r->size_handle == INVALID_HANDLE)
+        return h;
+    Resource* implicit = res_get(r->size_handle);
+    if (!implicit || !ui_resource_is_dispatch_source_candidate(*implicit))
+        return h;
+    return r->size_handle;
+}
+
 static void res_combo_dispatch_source(const char* label, ResHandle* h) {
+    ResHandle normalized = ui_dispatch_source_normalize(*h);
+    if (normalized != *h)
+        *h = normalized;
     Resource* cur = res_get(*h);
     const char* prev = cur ? ui_resource_display_name(*cur) : "(none)";
     if (ImGui::BeginCombo(label, prev)) {
@@ -576,12 +710,7 @@ static void res_combo_dispatch_source(const char* label, ResHandle* h) {
             Resource& r = g_resources[i];
             if (!r.active)
                 continue;
-            bool match =
-                r.type == RES_INT || r.type == RES_INT2 || r.type == RES_INT3 ||
-                r.type == RES_TEXTURE2D || r.type == RES_RENDER_TEXTURE2D || r.type == RES_RENDER_TEXTURE3D ||
-                r.type == RES_STRUCTURED_BUFFER ||
-                r.type == RES_BUILTIN_SCENE_COLOR || r.type == RES_BUILTIN_SCENE_DEPTH || r.type == RES_BUILTIN_SHADOW_MAP;
-            if (!match)
+            if (!ui_resource_is_dispatch_source_candidate(r))
                 continue;
             bool sel = (*h == (ResHandle)(i + 1));
             ImGui::PushID(i);
@@ -684,7 +813,7 @@ static void command_param_copy_from_resource(CommandParam* p, const Resource* r)
 
 static void ui_command_param_source_combo(CommandParam* p) {
     Resource* src = res_get(p->source);
-    if (ImGui::BeginCombo("##source", src ? src->name : "(hardcoded)")) {
+    if (ImGui::BeginCombo("##source", src ? ui_resource_display_name(*src) : "(hardcoded)")) {
         if (ImGui::Selectable("(hardcoded)", p->source == INVALID_HANDLE))
             p->source = INVALID_HANDLE;
         for (int i = 0; i < MAX_RESOURCES; i++) {
@@ -693,7 +822,7 @@ static void ui_command_param_source_combo(CommandParam* p) {
             ResHandle h = (ResHandle)(i + 1);
             bool sel = p->source == h;
             ImGui::PushID(i);
-            if (ImGui::Selectable(r.name, sel)) {
+            if (ImGui::Selectable(ui_resource_display_name(r), sel)) {
                 p->source = h;
                 command_param_copy_from_resource(p, &r);
             }
@@ -709,6 +838,32 @@ static void ui_inspector_section(const char* title) {
     ImGui::TextUnformatted(title);
     ImGui::PopStyleColor();
     ImGui::Separator();
+}
+
+static bool ui_tinted_transform_row(const char* label, float* v, float speed,
+                                    ImVec4 row_bg, ImVec4 frame_bg) {
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    float h = ImGui::GetFrameHeight();
+    float w = ImGui::GetContentRegionAvail().x;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(
+        ImVec2(pos.x - 4.0f, pos.y - 2.0f),
+        ImVec2(pos.x + w,     pos.y + h + 2.0f),
+        ImGui::GetColorU32(row_bg),
+        4.0f
+    );
+
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, frame_bg);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
+        ImVec4(frame_bg.x * 1.25f, frame_bg.y * 1.25f, frame_bg.z * 1.25f, frame_bg.w));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,
+        ImVec4(frame_bg.x * 1.55f, frame_bg.y * 1.35f, frame_bg.z * 1.25f, frame_bg.w));
+
+    bool changed = ImGui::DragFloat3(label, v, speed);
+
+    ImGui::PopStyleColor(3);
+    return changed;
 }
 
 static void ui_key_value(const char* key, const char* value) {
@@ -1088,6 +1243,47 @@ static void ui_draw_list_row_bg(ImVec2 min, ImVec2 max, bool selected, bool hove
     }
 }
 
+static bool ui_command_is_inside_group(CmdHandle h) {
+    CmdHandle cur = h;
+    for (int depth = 0; depth < MAX_COMMANDS && cur != INVALID_HANDLE; depth++) {
+        Command* c = cmd_get(cur);
+        if (!c)
+            return false;
+        cur = c->parent;
+        if (cur == INVALID_HANDLE)
+            return false;
+        Command* parent = cmd_get(cur);
+        if (!parent)
+            return false;
+        if (parent->type == CMD_GROUP)
+            return true;
+    }
+    return false;
+}
+
+static void ui_draw_command_row_bg(ImVec2 min, ImVec2 max, bool selected, bool hovered,
+                                   bool nav_target, int index, bool inside_group)
+{
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (selected) {
+        dl->AddRectFilled(min, max, ImGui::GetColorU32(ImVec4(0.190f, 0.172f, 0.168f, 0.98f)), 3.0f);
+        dl->AddRectFilled(min, ImVec2(min.x + 3.0f, max.y), ImGui::GetColorU32(ImVec4(0.78f, 0.42f, 0.32f, 0.78f)), 2.0f);
+        return;
+    }
+
+    if (inside_group) {
+        if (nav_target) {
+            dl->AddRectFilled(min, max, ImGui::GetColorU32(ImVec4(0.21f, 0.19f, 0.17f, 0.34f)), 3.0f);
+            dl->AddRect(min, max, ImGui::GetColorU32(ImVec4(0.60f, 0.36f, 0.30f, 0.52f)), 3.0f, 0, 1.0f);
+        } else if (hovered) {
+            dl->AddRectFilled(min, max, ImGui::GetColorU32(ImVec4(0.22f, 0.20f, 0.18f, 0.20f)), 3.0f);
+        }
+        return;
+    }
+
+    ui_draw_list_row_bg(min, max, selected, hovered, nav_target, index);
+}
+
 static bool ui_command_is_descendant(CmdHandle child_h, CmdHandle possible_ancestor) {
     CmdHandle cur = child_h;
     for (int depth = 0; depth < MAX_COMMANDS && cur != INVALID_HANDLE; depth++) {
@@ -1181,6 +1377,109 @@ static bool ui_resource_row(int index, Resource& r) {
     return deleted;
 }
 
+static bool ui_command_is_container(const Command* c) {
+    return c && (c->type == CMD_GROUP || c->type == CMD_REPEAT);
+}
+
+static bool ui_can_paste_command_clipboard() {
+    return s_cmd_clipboard_count > 0;
+}
+
+static void ui_copy_command_subtree_recursive(CmdHandle h, int parent_index) {
+    Command* c = cmd_get(h);
+    if (!c || s_cmd_clipboard_count >= MAX_COMMANDS)
+        return;
+
+    int index = s_cmd_clipboard_count++;
+    s_cmd_clipboard[index].cmd = *c;
+    s_cmd_clipboard[index].parent_index = parent_index;
+
+    for (int i = 0; i < MAX_COMMANDS && s_cmd_clipboard_count < MAX_COMMANDS; i++) {
+        Command& child = g_commands[i];
+        if (!child.active || child.parent != h)
+            continue;
+        ui_copy_command_subtree_recursive((CmdHandle)(i + 1), index);
+    }
+}
+
+static bool ui_copy_command_to_clipboard(CmdHandle h) {
+    s_cmd_clipboard_count = 0;
+    if (!cmd_get(h))
+        return false;
+    ui_copy_command_subtree_recursive(h, -1);
+    return s_cmd_clipboard_count > 0;
+}
+
+static CmdHandle ui_find_last_command_child(CmdHandle parent) {
+    CmdHandle last = INVALID_HANDLE;
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        if (!g_commands[i].active || g_commands[i].parent != parent)
+            continue;
+        last = (CmdHandle)(i + 1);
+    }
+    return last;
+}
+
+static CmdHandle ui_paste_command_clipboard(CmdHandle target_h) {
+    CmdHandle mapped[MAX_COMMANDS] = {};
+    CmdHandle allocated[MAX_COMMANDS] = {};
+    int allocated_count = 0;
+    CmdHandle paste_parent = INVALID_HANDLE;
+    CmdHandle anchor = INVALID_HANDLE;
+    CmdHandle new_root = INVALID_HANDLE;
+    Command* target = cmd_get(target_h);
+
+    if (!ui_can_paste_command_clipboard())
+        return INVALID_HANDLE;
+
+    if (target) {
+        if (ui_command_is_container(target)) {
+            paste_parent = target_h;
+            anchor = ui_find_last_command_child(paste_parent);
+        } else {
+            paste_parent = target->parent;
+            anchor = target_h;
+        }
+    } else {
+        anchor = ui_find_last_command_child(INVALID_HANDLE);
+    }
+
+    for (int i = 0; i < s_cmd_clipboard_count; i++) {
+        Command src = s_cmd_clipboard[i].cmd;
+        int parent_index = s_cmd_clipboard[i].parent_index;
+        char unique_name[MAX_NAME] = {};
+
+        cmd_make_unique_name(src.name, unique_name, MAX_NAME);
+        CmdHandle new_h = cmd_alloc(unique_name, src.type);
+        Command* dst = cmd_get(new_h);
+        if (new_h == INVALID_HANDLE || !dst)
+            goto fail;
+
+        allocated[allocated_count++] = new_h;
+        *dst = src;
+        strncpy(dst->name, unique_name, MAX_NAME - 1);
+        dst->name[MAX_NAME - 1] = '\0';
+        dst->active = true;
+        dst->parent = parent_index >= 0 ? mapped[parent_index] : paste_parent;
+        mapped[i] = new_h;
+        if (i == 0)
+            new_root = new_h;
+    }
+
+    if (target && ui_command_is_container(target))
+        target->repeat_expanded = true;
+    if (anchor != INVALID_HANDLE)
+        new_root = cmd_move(new_root, anchor, true);
+    return new_root;
+
+fail:
+    for (int i = allocated_count - 1; i >= 0; i--) {
+        if (cmd_get(allocated[i]))
+            cmd_free(allocated[i]);
+    }
+    return INVALID_HANDLE;
+}
+
 static bool ui_command_row(int index, Command& c, int depth = 0) {
     CmdHandle h = (CmdHandle)(index + 1);
     bool selected = (g_sel_cmd == h);
@@ -1188,6 +1487,7 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
     bool warning = ui_command_has_warning(c);
     bool deleted = false;
     float indent = (float)depth * 18.0f;
+    bool inside_group = ui_command_is_inside_group(h);
 
     ImGui::PushID(index);
     if (s_rename_active && selected && s_rename_is_cmd) {
@@ -1203,7 +1503,7 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
         return false;
     }
 
-    const float row_h = c.type == CMD_GROUP ? (ImGui::GetTextLineHeight() + 6.0f) : (ImGui::GetTextLineHeight() + 12.0f);
+    const float row_h = c.type == CMD_GROUP ? (ImGui::GetTextLineHeight() + 8.0f) : (ImGui::GetTextLineHeight() + 12.0f);
     float width = ImGui::GetContentRegionAvail().x;
     ImGui::InvisibleButton("##cmd_row", ImVec2(width, row_h));
     bool hovered = ImGui::IsItemHovered();
@@ -1213,6 +1513,11 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
         if ((c.type == CMD_REPEAT || c.type == CMD_GROUP) &&
             mp.x >= item_min.x + indent && mp.x <= item_min.x + indent + 24.0f)
             c.repeat_expanded = !c.repeat_expanded;
+        if (selected && s_viewport_gizmo_mode != UI_GIZMO_NONE &&
+            (c.type == CMD_DRAW_MESH || c.type == CMD_DRAW_INSTANCED)) {
+            s_viewport_gizmo_mode = UI_GIZMO_NONE;
+            memset(&s_viewport_gizmo_drag, 0, sizeof(s_viewport_gizmo_drag));
+        }
         g_sel_cmd = h;
         g_sel_res = INVALID_HANDLE;
         s_cmd_nav = h;
@@ -1221,7 +1526,7 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
     ImVec2 min = ImGui::GetItemRectMin();
     ImVec2 max = ImGui::GetItemRectMax();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ui_draw_list_row_bg(min, max, selected, hovered, nav_target, index);
+    ui_draw_command_row_bg(min, max, selected, hovered, nav_target, index, inside_group);
 
     float cy = (min.y + max.y) * 0.5f;
     float row_x = min.x + indent;
@@ -1256,7 +1561,10 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
     }
     ImVec2 badge_ts = ImGui::CalcTextSize(type);
     float badge_w = badge_ts.x + 12.0f;
+    float badge_h = badge_ts.y + 6.0f;
+    float text_y = floorf(cy - ImGui::GetTextLineHeight() * 0.5f);
     float right_x = max.x - (warning ? 24.0f : 6.0f);
+    bool show_type_badge = c.type != CMD_GROUP;
     char profile_buf[32] = {};
     if (g_profiler_enabled) {
         if (cmd_profile_ready())
@@ -1264,23 +1572,24 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
         else
             snprintf(profile_buf, sizeof(profile_buf), "...");
         ImVec2 ts = ImGui::CalcTextSize(profile_buf);
-        dl->AddText(ImVec2(right_x - ts.x, min.y + 6.0f),
+        dl->AddText(ImVec2(right_x - ts.x, floorf(cy - ts.y * 0.5f)),
             ImGui::GetColorU32(ImVec4(0.54f, 0.56f, 0.60f, 1.0f)), profile_buf);
         right_x -= ts.x + 10.0f;
     }
-    ImVec2 badge_min = ImVec2(right_x - badge_w, min.y + 5.0f);
-    if (badge_min.x > row_x + 96.0f)
+    ImVec2 badge_min = ImVec2(right_x - badge_w, floorf(cy - badge_h * 0.5f));
+    if (show_type_badge && badge_min.x > row_x + 96.0f)
         ui_draw_badge(dl, badge_min, type, ImVec4(0.60f, 0.62f, 0.66f, 1.0f));
 
     ImU32 name_col = ImGui::GetColorU32(c.enabled ? ImVec4(0.92f, 0.93f, 0.94f, 1.0f) :
         ImVec4(0.48f, 0.49f, 0.51f, 1.0f));
-    ImVec2 name_pos = ImVec2(row_x + 28.0f, min.y + 6.0f);
-    dl->PushClipRect(name_pos, ImVec2(badge_min.x - 6.0f, max.y), true);
+    ImVec2 name_pos = ImVec2(row_x + 28.0f, text_y);
+    float clip_right = show_type_badge ? (badge_min.x - 6.0f) : (right_x - 6.0f);
+    dl->PushClipRect(name_pos, ImVec2(clip_right, max.y), true);
     dl->AddText(name_pos, name_col, c.name);
     dl->PopClipRect();
 
     if (warning)
-        dl->AddText(ImVec2(max.x - 18.0f, min.y + 6.0f), ImGui::GetColorU32(ImVec4(1.0f, 0.78f, 0.28f, 1.0f)), "!");
+        dl->AddText(ImVec2(max.x - 18.0f, text_y), ImGui::GetColorU32(ImVec4(1.0f, 0.78f, 0.28f, 1.0f)), "!");
 
     bool moved = false;
     if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoDisableHover)) {
@@ -1330,6 +1639,24 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
     }
 
     if (ImGui::BeginPopupContextItem()) {
+        if (c.parent != INVALID_HANDLE) {
+            if (ImGui::MenuItem("Detach from Container"))
+                c.parent = INVALID_HANDLE;
+            ImGui::Separator();
+        }
+        if (ImGui::MenuItem("Copy", "Ctrl+C"))
+            ui_copy_command_to_clipboard(h);
+        if (ImGui::MenuItem(ui_command_is_container(&c) ? "Paste Inside" : "Paste After",
+                            "Ctrl+V", false, ui_can_paste_command_clipboard())) {
+            CmdHandle pasted_h = ui_paste_command_clipboard(h);
+            if (pasted_h != INVALID_HANDLE) {
+                g_sel_cmd = pasted_h;
+                g_sel_res = INVALID_HANDLE;
+                s_cmd_nav = pasted_h;
+                moved = true;
+            }
+        }
+        ImGui::Separator();
         ImGui::MenuItem("Enabled", nullptr, &c.enabled);
         if (c.type == CMD_REPEAT) {
             if (ImGui::MenuItem("Add Dispatch Child")) {
@@ -1354,8 +1681,6 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
             }
             ImGui::Separator();
         }
-        if (c.parent != INVALID_HANDLE && ImGui::MenuItem("Detach from Container"))
-            c.parent = INVALID_HANDLE;
         if (ImGui::MenuItem("Rename")) {
             g_sel_cmd = h;
             strncpy(s_rename_buf, c.name, MAX_NAME - 1);
@@ -1367,6 +1692,11 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
             deleted = true;
         }
         ImGui::EndPopup();
+    }
+
+    if (moved) {
+        ImGui::PopID();
+        return true;
     }
 
     ImGui::PopID();
@@ -1772,6 +2102,33 @@ static void ui_panel_resources(bool embedded = false) {
 
 // ── commands panel ────────────────────────────────────────────────────────
 
+static float ui_command_tree_row_height(const Command& c) {
+    return c.type == CMD_GROUP ? (ImGui::GetTextLineHeight() + 8.0f) : (ImGui::GetTextLineHeight() + 12.0f);
+}
+
+static void ui_accumulate_command_subtree_height(CmdHandle parent, int depth, float* total, bool* first) {
+    if (depth > 8)
+        return;
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        Command& c = g_commands[i];
+        if (!c.active || c.parent != parent)
+            continue;
+        if (!*first)
+            *total += ImGui::GetStyle().ItemSpacing.y;
+        *total += ui_command_tree_row_height(c);
+        *first = false;
+        if ((c.type == CMD_REPEAT || c.type == CMD_GROUP) && c.repeat_expanded)
+            ui_accumulate_command_subtree_height((CmdHandle)(i + 1), depth + (c.type == CMD_GROUP ? 0 : 1), total, first);
+    }
+}
+
+static float ui_command_subtree_height(CmdHandle parent, int depth) {
+    float total = 0.0f;
+    bool first = true;
+    ui_accumulate_command_subtree_height(parent, depth, &total, &first);
+    return total;
+}
+
 static void ui_draw_command_tree(CmdHandle parent, int depth) {
     if (depth > 8) return;
     for (int i = 0; i < MAX_COMMANDS; i++) {
@@ -1781,6 +2138,21 @@ static void ui_draw_command_tree(CmdHandle parent, int depth) {
             continue;
 
         CmdHandle h = (CmdHandle)(i + 1);
+        if (c.type == CMD_GROUP && c.repeat_expanded) {
+            float child_h = ui_command_subtree_height(h, depth);
+            if (child_h > 1.0f) {
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                ImVec2 child_min = ImGui::GetCursorScreenPos();
+                float inset_l = 3.0f + (float)depth * 18.0f;
+                float inset_r = 2.0f;
+                ImVec2 block_min = ImVec2(child_min.x + inset_l, child_min.y + 1.0f);
+                ImVec2 block_max = ImVec2(
+                    ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x - inset_r,
+                    child_min.y + child_h - 1.0f);
+                dl->AddRectFilled(block_min, block_max,
+                    ImGui::GetColorU32(ImVec4(0.245f, 0.188f, 0.118f, 0.58f)), 5.0f);
+            }
+        }
         if ((c.type == CMD_REPEAT || c.type == CMD_GROUP) && c.repeat_expanded)
             ui_draw_command_tree(h, depth + (c.type == CMD_GROUP ? 0 : 1));
     }
@@ -1793,14 +2165,30 @@ static void ui_panel_commands(bool embedded = false) {
         ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems))
     {
         char uname[MAX_NAME];
-        if (ImGui::MenuItem("Clear")) {
-            cmd_make_unique_name("clear_0", uname, MAX_NAME);
-            g_sel_cmd = cmd_alloc(uname, CMD_CLEAR); g_sel_res = INVALID_HANDLE;
-            s_cmd_nav = g_sel_cmd;
+        if (ImGui::MenuItem("Paste", "Ctrl+V", false, ui_can_paste_command_clipboard())) {
+            CmdHandle pasted_h = ui_paste_command_clipboard(INVALID_HANDLE);
+            if (pasted_h != INVALID_HANDLE) {
+                g_sel_cmd = pasted_h;
+                g_sel_res = INVALID_HANDLE;
+                s_cmd_nav = pasted_h;
+            }
         }
+        if (ui_can_paste_command_clipboard())
+            ImGui::Separator();
         if (ImGui::MenuItem("Group")) {
             cmd_make_unique_name("group_0", uname, MAX_NAME);
             g_sel_cmd = cmd_alloc(uname, CMD_GROUP); g_sel_res = INVALID_HANDLE;
+            s_cmd_nav = g_sel_cmd;
+        }
+        if (ImGui::MenuItem("Repeat")) {
+            cmd_make_unique_name("repeat_0", uname, MAX_NAME);
+            g_sel_cmd = cmd_alloc(uname, CMD_REPEAT); g_sel_res = INVALID_HANDLE;
+            s_cmd_nav = g_sel_cmd;
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Clear")) {
+            cmd_make_unique_name("clear_0", uname, MAX_NAME);
+            g_sel_cmd = cmd_alloc(uname, CMD_CLEAR); g_sel_res = INVALID_HANDLE;
             s_cmd_nav = g_sel_cmd;
         }
         if (ImGui::MenuItem("DrawMesh")) {
@@ -1816,11 +2204,6 @@ static void ui_panel_commands(bool embedded = false) {
         if (ImGui::MenuItem("Dispatch")) {
             cmd_make_unique_name("dispatch_0", uname, MAX_NAME);
             g_sel_cmd = cmd_alloc(uname, CMD_DISPATCH); g_sel_res = INVALID_HANDLE;
-            s_cmd_nav = g_sel_cmd;
-        }
-        if (ImGui::MenuItem("Repeat")) {
-            cmd_make_unique_name("repeat_0", uname, MAX_NAME);
-            g_sel_cmd = cmd_alloc(uname, CMD_REPEAT); g_sel_res = INVALID_HANDLE;
             s_cmd_nav = g_sel_cmd;
         }
         if (ImGui::MenuItem("IndirectDraw")) {
@@ -1839,7 +2222,18 @@ static void ui_panel_commands(bool embedded = false) {
     CmdHandle visible_items[MAX_COMMANDS] = {};
     int visible = ui_collect_visible_commands_recursive(INVALID_HANDLE, visible_items, MAX_COMMANDS);
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_None) && !ImGui::IsAnyItemActive()) {
+        ImGuiIO& io = ImGui::GetIO();
         ImGui::SetNextFrameWantCaptureKeyboard(true);
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false) && g_sel_cmd != INVALID_HANDLE)
+            ui_copy_command_to_clipboard(g_sel_cmd);
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V, false) && ui_can_paste_command_clipboard()) {
+            CmdHandle pasted_h = ui_paste_command_clipboard(g_sel_cmd);
+            if (pasted_h != INVALID_HANDLE) {
+                g_sel_cmd = pasted_h;
+                g_sel_res = INVALID_HANDLE;
+                s_cmd_nav = pasted_h;
+            }
+        }
         if (visible > 0) {
             int nav_index = ui_find_visible_command_index(visible_items, visible, s_cmd_nav);
             if (nav_index < 0)
@@ -2482,9 +2876,25 @@ static void ui_inspector_command(Command* c) {
             res_combo("Shadow Shader##dm", &c->shadow_shader, RES_SHADER);
 
         ui_inspector_section("TRANSFORM");
-        ImGui::DragFloat3("Position", c->pos, 0.001f);
-        ImGui::DragFloat3("Rotation", c->rot, 0.01f);
-        ImGui::DragFloat3("Scale", c->scale, 0.001f);
+
+        ui_tinted_transform_row(
+            "Position", c->pos, 0.001f,
+            ImVec4(0.150f, 0.055f, 0.050f, 0.3f), 
+            ImVec4(0.230f, 0.080f, 0.070f, 0.5f) 
+        );
+
+        ui_tinted_transform_row(
+            "Rotation", c->rot, 0.01f,
+            ImVec4(0.055f, 0.130f, 0.070f, 0.3f),
+            ImVec4(0.080f, 0.200f, 0.105f, 0.5f)   
+        );
+
+        ui_tinted_transform_row(
+            "Scale", c->scale, 0.001f,
+            ImVec4(0.050f, 0.075f, 0.150f, 0.3f), 
+            ImVec4(0.070f, 0.105f, 0.230f, 0.5f) 
+        );
+
         if (c->type == CMD_DRAW_INSTANCED)
             ImGui::InputInt("Instance Count", &c->instance_count);
 
@@ -2876,7 +3286,7 @@ static void ui_panel_user_cb() {
             ImGui::Text("%s", res_type_str(e.type));
             ImGui::TableSetColumnIndex(4);
             ImGui::SetNextItemWidth(-1.f);
-            if (ImGui::BeginCombo("##source", src ? src->name : "(hardcoded)")) {
+            if (ImGui::BeginCombo("##source", src ? ui_resource_display_name(*src) : "(hardcoded)")) {
                 if (ImGui::Selectable("(hardcoded)", e.source == INVALID_HANDLE))
                     user_cb_set_source(i, INVALID_HANDLE);
                 for (int r_i = 0; r_i < MAX_RESOURCES; r_i++) {
@@ -2885,7 +3295,7 @@ static void ui_panel_user_cb() {
                     ResHandle h = (ResHandle)(r_i + 1);
                     bool sel = (e.source == h);
                     ImGui::PushID(r_i);
-                    if (ImGui::Selectable(r.name, sel))
+                    if (ImGui::Selectable(ui_resource_display_name(r), sel))
                         user_cb_set_source(i, h);
                     ImGui::PopID();
                 }
@@ -2941,14 +3351,14 @@ static void ui_panel_user_cb() {
     {
         Resource* cur = res_get(s_add);
         ImGui::SetNextItemWidth(-60.f);
-        if (ImGui::BeginCombo("##ucb_add", cur ? cur->name : "(select resource)")) {
+        if (ImGui::BeginCombo("##ucb_add", cur ? ui_resource_display_name(*cur) : "(select resource)")) {
             for (int i = 0; i < MAX_RESOURCES; i++) {
                 Resource& r = g_resources[i];
                 if (!r.active || r.is_builtin) continue;
                 if (!user_cb_type_supported(r.type)) continue;
                 bool sel = (s_add == (ResHandle)(i + 1));
                 ImGui::PushID(i);
-                if (ImGui::Selectable(r.name, sel)) s_add = (ResHandle)(i + 1);
+                if (ImGui::Selectable(ui_resource_display_name(r), sel)) s_add = (ResHandle)(i + 1);
                 ImGui::PopID();
             }
             ImGui::EndCombo();
@@ -3087,9 +3497,479 @@ static void ui_panel_log(bool embedded = false) {
 
 // ── scene viewport ────────────────────────────────────────────────────────
 
+static bool ui_selected_command_supports_gizmo() {
+    Command* c = cmd_get(g_sel_cmd);
+    return c && (c->type == CMD_DRAW_MESH || c->type == CMD_DRAW_INSTANCED);
+}
+
+static Command* ui_selected_gizmo_command() {
+    return ui_selected_command_supports_gizmo() ? cmd_get(g_sel_cmd) : nullptr;
+}
+
+static void ui_cancel_viewport_gizmo_drag() {
+    memset(&s_viewport_gizmo_drag, 0, sizeof(s_viewport_gizmo_drag));
+}
+
+static void ui_set_viewport_gizmo_mode(UiViewportGizmoMode mode) {
+    if (s_viewport_gizmo_mode == mode)
+        mode = UI_GIZMO_NONE;
+    s_viewport_gizmo_mode = mode;
+    ui_cancel_viewport_gizmo_drag();
+}
+
+static Mat4 ui_mat4_from_raw(const float raw[16]) {
+    Mat4 m = {};
+    if (raw)
+        memcpy(m.m, raw, sizeof(m.m));
+    return m;
+}
+
+static Vec3 ui_gizmo_axis_dir_from_rotation(const Mat4& rot, int axis) {
+    switch (axis) {
+    case 0: return v3_norm(v3(rot.m[0], rot.m[1], rot.m[2]));
+    case 1: return v3_norm(v3(rot.m[4], rot.m[5], rot.m[6]));
+    default: return v3_norm(v3(rot.m[8], rot.m[9], rot.m[10]));
+    }
+}
+
+static void ui_mul_world_point(const Mat4& m, Vec3 p, float* x, float* y, float* z, float* w) {
+    if (x) *x = p.x * m.m[0] + p.y * m.m[4] + p.z * m.m[8]  + m.m[12];
+    if (y) *y = p.x * m.m[1] + p.y * m.m[5] + p.z * m.m[9]  + m.m[13];
+    if (z) *z = p.x * m.m[2] + p.y * m.m[6] + p.z * m.m[10] + m.m[14];
+    if (w) *w = p.x * m.m[3] + p.y * m.m[7] + p.z * m.m[11] + m.m[15];
+}
+
+static bool ui_project_world_to_screen(const Mat4& view_proj, ImVec2 rect_min, ImVec2 rect_max,
+                                       Vec3 world, ImVec2* out_screen)
+{
+    float clip_x = 0.0f, clip_y = 0.0f, clip_z = 0.0f, clip_w = 0.0f;
+    float nx = 0.0f;
+    float ny = 0.0f;
+    float w = rect_max.x - rect_min.x;
+    float h = rect_max.y - rect_min.y;
+    if (!out_screen || w <= 1.0f || h <= 1.0f)
+        return false;
+
+    ui_mul_world_point(view_proj, world, &clip_x, &clip_y, &clip_z, &clip_w);
+    if (clip_w <= 0.0001f)
+        return false;
+
+    nx = clip_x / clip_w;
+    ny = clip_y / clip_w;
+    out_screen->x = rect_min.x + (nx * 0.5f + 0.5f) * w;
+    out_screen->y = rect_min.y + (1.0f - (ny * 0.5f + 0.5f)) * h;
+    return true;
+}
+
+static float ui_imvec2_dot(ImVec2 a, ImVec2 b) {
+    return a.x * b.x + a.y * b.y;
+}
+
+static ImVec2 ui_imvec2_sub(ImVec2 a, ImVec2 b) {
+    return ImVec2(a.x - b.x, a.y - b.y);
+}
+
+static ImVec2 ui_imvec2_add(ImVec2 a, ImVec2 b) {
+    return ImVec2(a.x + b.x, a.y + b.y);
+}
+
+static ImVec2 ui_imvec2_scale(ImVec2 a, float s) {
+    return ImVec2(a.x * s, a.y * s);
+}
+
+static float ui_imvec2_len(ImVec2 a) {
+    return sqrtf(a.x * a.x + a.y * a.y);
+}
+
+static ImVec2 ui_imvec2_norm(ImVec2 a) {
+    float len = ui_imvec2_len(a);
+    if (len <= 0.0001f)
+        return ImVec2(1.0f, 0.0f);
+    return ImVec2(a.x / len, a.y / len);
+}
+
+static float ui_imvec2_distance_sq(ImVec2 a, ImVec2 b) {
+    float dx = a.x - b.x;
+    float dy = a.y - b.y;
+    return dx * dx + dy * dy;
+}
+
+static float ui_distance_sq_to_segment(ImVec2 p, ImVec2 a, ImVec2 b, float* out_t) {
+    ImVec2 ab = ui_imvec2_sub(b, a);
+    ImVec2 ap = ui_imvec2_sub(p, a);
+    float ab_len_sq = ui_imvec2_dot(ab, ab);
+    float t = 0.0f;
+    ImVec2 closest = a;
+    if (ab_len_sq > 0.0001f) {
+        t = clampf(ui_imvec2_dot(ap, ab) / ab_len_sq, 0.0f, 1.0f);
+        closest = ui_imvec2_add(a, ui_imvec2_scale(ab, t));
+    }
+    if (out_t)
+        *out_t = t;
+    return ui_imvec2_distance_sq(p, closest);
+}
+
+static float ui_distance_sq_to_polyline(ImVec2 p, const ImVec2* pts, int count) {
+    float best = 1e30f;
+    if (!pts || count < 2)
+        return best;
+    for (int i = 0; i < count - 1; i++) {
+        float hit = ui_distance_sq_to_segment(p, pts[i], pts[i + 1], nullptr);
+        if (hit < best)
+            best = hit;
+    }
+    return best;
+}
+
+static ImVec4 ui_gizmo_axis_color(int axis, bool active) {
+    ImVec4 color = ImVec4(0.82f, 0.82f, 0.82f, 1.0f);
+    if (axis == 0) color = ImVec4(0.92f, 0.30f, 0.28f, 1.0f);
+    if (axis == 1) color = ImVec4(0.32f, 0.84f, 0.42f, 1.0f);
+    if (axis == 2) color = ImVec4(0.35f, 0.58f, 0.96f, 1.0f);
+    if (active) {
+        color.x = clampf(color.x + 0.12f, 0.0f, 1.0f);
+        color.y = clampf(color.y + 0.12f, 0.0f, 1.0f);
+        color.z = clampf(color.z + 0.12f, 0.0f, 1.0f);
+    }
+    return color;
+}
+
+static float ui_viewport_gizmo_world_axis_len(Vec3 origin, float viewport_h) {
+    Vec3 eye = camera_eye(g_camera);
+    Vec3 delta = v3_sub(origin, eye);
+    float dist = sqrtf(v3_dot(delta, delta));
+    float world_per_pixel = 0.0f;
+    if (dist < 0.05f) dist = 0.05f;
+    if (viewport_h < 8.0f) viewport_h = 8.0f;
+    world_per_pixel = (2.0f * dist * tanf(g_camera.fov_y * 0.5f)) / viewport_h;
+    return clampf(world_per_pixel * 78.0f, 0.05f, 1000.0f);
+}
+
+static Mat4 ui_gizmo_axis_rotation_matrix(int axis, float angle) {
+    Vec3 euler = v3(0.0f, 0.0f, 0.0f);
+    if (axis == 0) euler.x = angle;
+    if (axis == 1) euler.y = angle;
+    if (axis == 2) euler.z = angle;
+    return mat4_rotation_xyz(euler);
+}
+
+static float ui_wrap_angle_near(float angle, float target) {
+    float two_pi = 6.28318530718f;
+    while (target - angle > 3.14159265359f)
+        target -= two_pi;
+    while (target - angle < -3.14159265359f)
+        target += two_pi;
+    return target;
+}
+
+static void ui_extract_rotation_xyz(const Mat4& rot, const float reference[3], float out[3]) {
+    float sy = -clampf(rot.m[2], -1.0f, 1.0f);
+    float y = asinf(sy);
+    float cy = cosf(y);
+    float x = 0.0f;
+    float z = 0.0f;
+
+    if (fabsf(cy) > 1e-5f) {
+        x = atan2f(rot.m[6], rot.m[10]);
+        z = atan2f(rot.m[1], rot.m[0]);
+    } else {
+        y = sy >= 0.0f ? 1.57079632679f : -1.57079632679f;
+        z = 0.0f;
+        x = sy >= 0.0f ? atan2f(rot.m[4], rot.m[5]) : atan2f(-rot.m[4], rot.m[5]);
+    }
+
+    if (reference) {
+        x = ui_wrap_angle_near(reference[0], x);
+        y = ui_wrap_angle_near(reference[1], y);
+        z = ui_wrap_angle_near(reference[2], z);
+    }
+
+    out[0] = x;
+    out[1] = y;
+    out[2] = z;
+}
+
+static void ui_draw_translate_axis(ImDrawList* dl, ImVec2 origin, ImVec2 end, ImU32 col, float thickness) {
+    ImVec2 dir = ui_imvec2_norm(ui_imvec2_sub(end, origin));
+    ImVec2 tangent = ImVec2(-dir.y, dir.x);
+    ImVec2 head = ui_imvec2_scale(dir, 9.0f);
+    ImVec2 wing = ui_imvec2_scale(tangent, 4.0f);
+    dl->AddLine(origin, end, col, thickness);
+    dl->AddTriangleFilled(
+        end,
+        ui_imvec2_sub(end, ui_imvec2_add(head, wing)),
+        ui_imvec2_sub(end, ui_imvec2_sub(head, wing)),
+        col);
+}
+
+static void ui_draw_scale_axis(ImDrawList* dl, ImVec2 origin, ImVec2 end, ImU32 col, float thickness) {
+    float box_r = 5.0f;
+    dl->AddLine(origin, end, col, thickness);
+    dl->AddRectFilled(ImVec2(end.x - box_r, end.y - box_r), ImVec2(end.x + box_r, end.y + box_r), col, 2.0f);
+}
+
+static void ui_draw_rotate_axis(ImDrawList* dl, ImVec2 origin, ImVec2 end, ImU32 col, float thickness) {
+    dl->AddLine(origin, end, col, thickness);
+    dl->AddCircle(end, 6.0f, col, 24, thickness);
+}
+
+static void ui_gizmo_rotation_plane_basis(Vec3 axis_world[3], int axis, Vec3* out_u, Vec3* out_v) {
+    if (!out_u || !out_v)
+        return;
+    if (axis == 0) {
+        *out_u = axis_world[1];
+        *out_v = axis_world[2];
+    } else if (axis == 1) {
+        *out_u = axis_world[2];
+        *out_v = axis_world[0];
+    } else {
+        *out_u = axis_world[0];
+        *out_v = axis_world[1];
+    }
+}
+
+static int ui_project_rotation_ring(const Mat4& view_proj, ImVec2 rect_min, ImVec2 rect_max,
+                                    Vec3 origin, Vec3 basis_u, Vec3 basis_v, float radius,
+                                    ImVec2* out_pts, int max_pts)
+{
+    const int segments = 48;
+    int count = 0;
+    if (!out_pts || max_pts < segments + 1)
+        return 0;
+
+    for (int i = 0; i <= segments; i++) {
+        float t = (6.28318530718f * (float)i) / (float)segments;
+        Vec3 world_pt =
+            v3_add(origin,
+                   v3_add(v3_scale(basis_u, cosf(t) * radius),
+                          v3_scale(basis_v, sinf(t) * radius)));
+        if (!ui_project_world_to_screen(view_proj, rect_min, rect_max, world_pt, &out_pts[count]))
+            return 0;
+        count++;
+    }
+    return count;
+}
+
+static float ui_gizmo_ring_angle(ImVec2 mouse_vec, ImVec2 basis_u, ImVec2 basis_v) {
+    float det = basis_u.x * basis_v.y - basis_u.y * basis_v.x;
+    if (fabsf(det) < 1e-4f)
+        return atan2f(mouse_vec.y, mouse_vec.x);
+
+    float a = (mouse_vec.x * basis_v.y - mouse_vec.y * basis_v.x) / det;
+    float b = (basis_u.x * mouse_vec.y - basis_u.y * mouse_vec.x) / det;
+    return atan2f(b, a);
+}
+
+static void ui_apply_gizmo_drag(Command* c, const UiViewportGizmoDrag* drag, Vec3 axis_world, ImVec2 mouse_pos) {
+    ImVec2 axis_screen = {};
+    ImVec2 axis_dir_2d = {};
+    ImVec2 mouse_delta = {};
+    float axis_motion = 0.0f;
+    float screen_len = 1.0f;
+
+    if (!c || !drag)
+        return;
+
+    axis_screen = ui_imvec2_sub(drag->axis_end_screen, drag->origin_screen);
+    axis_dir_2d = ui_imvec2_norm(axis_screen);
+    mouse_delta = ui_imvec2_sub(mouse_pos, drag->mouse_start);
+    axis_motion = ui_imvec2_dot(mouse_delta, axis_dir_2d);
+    screen_len = drag->axis_screen_len > 1.0f ? drag->axis_screen_len : 1.0f;
+
+    if (drag->mode == UI_GIZMO_TRANSLATE) {
+        float world_delta = (axis_motion / screen_len) * drag->axis_world_len;
+        c->pos[0] = drag->initial_pos[0] + axis_world.x * world_delta;
+        c->pos[1] = drag->initial_pos[1] + axis_world.y * world_delta;
+        c->pos[2] = drag->initial_pos[2] + axis_world.z * world_delta;
+    } else if (drag->mode == UI_GIZMO_ROTATE) {
+        float current_angle = ui_gizmo_ring_angle(
+            ui_imvec2_sub(mouse_pos, drag->origin_screen),
+            drag->ring_basis_u_screen,
+            drag->ring_basis_v_screen);
+        float delta_angle = ui_wrap_angle_near(0.0f, current_angle - drag->ring_start_angle);
+        Mat4 delta_rot = ui_gizmo_axis_rotation_matrix(drag->axis, delta_angle);
+        Mat4 final_rot = mat4_mul(delta_rot, drag->initial_rot_matrix);
+        float euler[3] = {};
+        ui_extract_rotation_xyz(final_rot, drag->initial_rot, euler);
+        c->rot[0] = euler[0];
+        c->rot[1] = euler[1];
+        c->rot[2] = euler[2];
+    } else if (drag->mode == UI_GIZMO_SCALE) {
+        c->scale[drag->axis] = drag->initial_scale[drag->axis] + axis_motion / screen_len;
+        if (c->scale[drag->axis] < 0.001f)
+            c->scale[drag->axis] = 0.001f;
+    }
+}
+
+static void ui_handle_viewport_gizmo_hotkeys(bool hovered) {
+    ImGuiIO& io = ImGui::GetIO();
+    bool text_blocked = io.WantTextInput || ImGui::IsAnyItemActive();
+    if (!text_blocked && s_viewport_gizmo_mode != UI_GIZMO_NONE &&
+        ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        ui_set_viewport_gizmo_mode(UI_GIZMO_NONE);
+        return;
+    }
+    if (!hovered || text_blocked)
+        return;
+    if (ImGui::IsKeyPressed(ImGuiKey_1, false))
+        ui_set_viewport_gizmo_mode(UI_GIZMO_TRANSLATE);
+    if (ImGui::IsKeyPressed(ImGuiKey_2, false))
+        ui_set_viewport_gizmo_mode(UI_GIZMO_ROTATE);
+    if (ImGui::IsKeyPressed(ImGuiKey_3, false))
+        ui_set_viewport_gizmo_mode(UI_GIZMO_SCALE);
+}
+
+static void ui_draw_viewport_gizmo(ImVec2 rect_min, ImVec2 rect_max, bool hovered) {
+    Command* c = ui_selected_gizmo_command();
+    Mat4 view_proj = {};
+    Mat4 rot = {};
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    Vec3 origin_world = {};
+    Vec3 axis_world[3] = {};
+    ImVec2 origin_screen = {};
+    ImVec2 axis_end[3] = {};
+    float axis_screen_len[3] = {};
+    float axis_world_len = 0.0f;
+    float ring_world_radius = 0.0f;
+    int hovered_axis = -1;
+    int active_axis = -1;
+    float best_hit = 1e30f;
+    bool dragging = s_viewport_gizmo_drag.active;
+    ImVec2 ring_pts[3][49] = {};
+    int ring_count[3] = {};
+
+    if (!c || s_viewport_gizmo_mode == UI_GIZMO_NONE) {
+        ui_cancel_viewport_gizmo_drag();
+        return;
+    }
+
+    origin_world = v3(c->pos[0], c->pos[1], c->pos[2]);
+    view_proj = ui_mat4_from_raw(g_dx.scene_cb_data.view_proj);
+    rot = mat4_rotation_xyz(v3(c->rot[0], c->rot[1], c->rot[2]));
+    axis_world[0] = ui_gizmo_axis_dir_from_rotation(rot, 0);
+    axis_world[1] = ui_gizmo_axis_dir_from_rotation(rot, 1);
+    axis_world[2] = ui_gizmo_axis_dir_from_rotation(rot, 2);
+    axis_world_len = ui_viewport_gizmo_world_axis_len(origin_world, rect_max.y - rect_min.y);
+    ring_world_radius = axis_world_len * 0.82f;
+
+    if (!ui_project_world_to_screen(view_proj, rect_min, rect_max, origin_world, &origin_screen)) {
+        ui_cancel_viewport_gizmo_drag();
+        return;
+    }
+
+    for (int axis = 0; axis < 3; axis++) {
+        Vec3 axis_tip_world = v3_add(origin_world, v3_scale(axis_world[axis], axis_world_len));
+        if (!ui_project_world_to_screen(view_proj, rect_min, rect_max, axis_tip_world, &axis_end[axis]))
+            axis_end[axis] = origin_screen;
+        axis_screen_len[axis] = ui_imvec2_len(ui_imvec2_sub(axis_end[axis], origin_screen));
+        if (s_viewport_gizmo_mode == UI_GIZMO_ROTATE) {
+            Vec3 ring_u = {};
+            Vec3 ring_v = {};
+            ui_gizmo_rotation_plane_basis(axis_world, axis, &ring_u, &ring_v);
+            ring_count[axis] = ui_project_rotation_ring(
+                view_proj, rect_min, rect_max, origin_world, ring_u, ring_v,
+                ring_world_radius, ring_pts[axis],
+                (int)(sizeof(ring_pts[axis]) / sizeof(ring_pts[axis][0])));
+        }
+    }
+
+    if (dragging) {
+        if (s_viewport_gizmo_drag.cmd != g_sel_cmd || !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            ui_cancel_viewport_gizmo_drag();
+            dragging = false;
+        } else {
+            active_axis = s_viewport_gizmo_drag.axis;
+            ImGui::SetNextFrameWantCaptureMouse(true);
+            ui_apply_gizmo_drag(c, &s_viewport_gizmo_drag, axis_world[active_axis], ImGui::GetIO().MousePos);
+        }
+    }
+
+    if (!dragging && hovered) {
+        ImVec2 mouse = ImGui::GetIO().MousePos;
+        for (int axis = 0; axis < 3; axis++) {
+            float hit = 1e30f;
+            if (s_viewport_gizmo_mode == UI_GIZMO_ROTATE) {
+                hit = ui_distance_sq_to_polyline(mouse, ring_pts[axis], ring_count[axis]);
+                if (ring_count[axis] > 1 && hit <= 8.0f * 8.0f && hit < best_hit) {
+                    hovered_axis = axis;
+                    best_hit = hit;
+                }
+            } else {
+                float t = 0.0f;
+                hit = ui_distance_sq_to_segment(mouse, origin_screen, axis_end[axis], &t);
+                if ((hit <= 9.0f * 9.0f && t >= 0.12f) ||
+                    ui_imvec2_distance_sq(mouse, axis_end[axis]) <= 12.0f * 12.0f) {
+                    if (hit < best_hit) {
+                        hovered_axis = axis;
+                        best_hit = hit;
+                    }
+                }
+            }
+        }
+
+        if (hovered_axis >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            s_viewport_gizmo_drag.active = true;
+            s_viewport_gizmo_drag.mode = s_viewport_gizmo_mode;
+            s_viewport_gizmo_drag.cmd = g_sel_cmd;
+            s_viewport_gizmo_drag.axis = hovered_axis;
+            memcpy(s_viewport_gizmo_drag.initial_pos, c->pos, sizeof(c->pos));
+            memcpy(s_viewport_gizmo_drag.initial_rot, c->rot, sizeof(c->rot));
+            memcpy(s_viewport_gizmo_drag.initial_scale, c->scale, sizeof(c->scale));
+            s_viewport_gizmo_drag.axis_world_len = axis_world_len;
+            s_viewport_gizmo_drag.axis_screen_len = axis_screen_len[hovered_axis];
+            s_viewport_gizmo_drag.mouse_start = ImGui::GetIO().MousePos;
+            s_viewport_gizmo_drag.origin_screen = origin_screen;
+            s_viewport_gizmo_drag.axis_end_screen = axis_end[hovered_axis];
+            s_viewport_gizmo_drag.initial_rot_matrix = rot;
+            if (s_viewport_gizmo_mode == UI_GIZMO_ROTATE) {
+                Vec3 ring_u = {};
+                Vec3 ring_v = {};
+                ImVec2 ring_u_screen = origin_screen;
+                ImVec2 ring_v_screen = origin_screen;
+                ui_gizmo_rotation_plane_basis(axis_world, hovered_axis, &ring_u, &ring_v);
+                ui_project_world_to_screen(
+                    view_proj, rect_min, rect_max,
+                    v3_add(origin_world, v3_scale(ring_u, ring_world_radius)),
+                    &ring_u_screen);
+                ui_project_world_to_screen(
+                    view_proj, rect_min, rect_max,
+                    v3_add(origin_world, v3_scale(ring_v, ring_world_radius)),
+                    &ring_v_screen);
+                s_viewport_gizmo_drag.ring_basis_u_screen = ui_imvec2_sub(ring_u_screen, origin_screen);
+                s_viewport_gizmo_drag.ring_basis_v_screen = ui_imvec2_sub(ring_v_screen, origin_screen);
+                s_viewport_gizmo_drag.ring_start_angle = ui_gizmo_ring_angle(
+                    ui_imvec2_sub(ImGui::GetIO().MousePos, origin_screen),
+                    s_viewport_gizmo_drag.ring_basis_u_screen,
+                    s_viewport_gizmo_drag.ring_basis_v_screen);
+            }
+            active_axis = hovered_axis;
+            dragging = true;
+            ImGui::SetNextFrameWantCaptureMouse(true);
+        }
+    }
+
+    dl->AddCircleFilled(origin_screen, 4.0f, ImGui::GetColorU32(ImVec4(0.95f, 0.95f, 0.95f, 0.95f)), 16);
+    dl->AddCircle(origin_screen, 7.0f, ImGui::GetColorU32(ImVec4(0.08f, 0.08f, 0.08f, 0.90f)), 16, 2.0f);
+    for (int axis = 0; axis < 3; axis++) {
+        bool active = axis == active_axis || axis == hovered_axis;
+        ImU32 col = ImGui::GetColorU32(ui_gizmo_axis_color(axis, active));
+        float thickness = active ? 3.2f : 2.2f;
+        if (s_viewport_gizmo_mode == UI_GIZMO_TRANSLATE)
+            ui_draw_translate_axis(dl, origin_screen, axis_end[axis], col, thickness);
+        else if (s_viewport_gizmo_mode == UI_GIZMO_ROTATE) {
+            if (ring_count[axis] > 1)
+                dl->AddPolyline(ring_pts[axis], ring_count[axis], col, ImDrawFlags_None, thickness);
+        }
+        else
+            ui_draw_scale_axis(dl, origin_screen, axis_end[axis], col, thickness);
+    }
+}
+
 static void ui_panel_scene(bool embedded = false) {
     if (!embedded) ImGui::Begin("Scene");
     bool hovered = false;
+    ImVec2 image_min = {};
+    ImVec2 image_max = {};
     ImVec2 avail = ImGui::GetContentRegionAvail();
     if (avail.x > 4 && avail.y > 4) {
         int new_w = (int)avail.x;
@@ -3101,9 +3981,14 @@ static void ui_panel_scene(bool embedded = false) {
         if (g_dx.scene_srv) {
             ImGui::Image((ImTextureID)g_dx.scene_srv, avail);
             hovered = ImGui::IsItemHovered();
+            image_min = ImGui::GetItemRectMin();
+            image_max = ImGui::GetItemRectMax();
         }
     }
+    ui_handle_viewport_gizmo_hotkeys(hovered);
     g_scene_view_hovered = hovered;
+    if (g_dx.scene_srv && image_max.x > image_min.x && image_max.y > image_min.y)
+        ui_draw_viewport_gizmo(image_min, image_max, hovered);
     if (!embedded) ImGui::End();
 }
 
@@ -3222,6 +4107,9 @@ enum UiIconKind {
     UI_ICON_PAUSE,
     UI_ICON_HELP,
     UI_ICON_RESTART,
+    UI_ICON_GIZMO_MOVE,
+    UI_ICON_GIZMO_ROTATE,
+    UI_ICON_GIZMO_SCALE,
     UI_ICON_FULLSCREEN,
     UI_ICON_FULLSCREEN_EXIT,
     UI_ICON_MAXIMIZE_SQUARE,
@@ -3235,6 +4123,9 @@ static const char* ui_svg_icon_path(UiIconKind icon) {
     case UI_ICON_PAUSE:            return "assets/icons/lucide-pause.svg";
     case UI_ICON_HELP:             return "assets/icons/lucide-badge-question-mark.svg";
     case UI_ICON_RESTART:          return "assets/icons/lucide-rotate-ccw.svg";
+    case UI_ICON_GIZMO_MOVE:       return "assets/icons/lucide-move-3d.svg";
+    case UI_ICON_GIZMO_ROTATE:     return "assets/icons/lucide-rotate-3d.svg";
+    case UI_ICON_GIZMO_SCALE:      return "assets/icons/lucide-scale-3d.svg";
     case UI_ICON_FULLSCREEN:       return "assets/icons/lucide-maximize.svg";
     case UI_ICON_FULLSCREEN_EXIT:  return "assets/icons/lucide-minimize.svg";
     case UI_ICON_MAXIMIZE_SQUARE:  return "assets/icons/lucide-square.svg";
@@ -3255,6 +4146,9 @@ static NSVGimage* ui_svg_icon(UiIconKind icon) {
         { UI_ICON_PAUSE, nullptr, false },
         { UI_ICON_HELP, nullptr, false },
         { UI_ICON_RESTART, nullptr, false },
+        { UI_ICON_GIZMO_MOVE, nullptr, false },
+        { UI_ICON_GIZMO_ROTATE, nullptr, false },
+        { UI_ICON_GIZMO_SCALE, nullptr, false },
         { UI_ICON_FULLSCREEN, nullptr, false },
         { UI_ICON_FULLSCREEN_EXIT, nullptr, false },
         { UI_ICON_MAXIMIZE_SQUARE, nullptr, false },
@@ -3335,6 +4229,18 @@ static bool ui_icon_button(const char* id, UiIconKind icon, ImVec2 size, const c
 static UiIconKind ui_icon_for_action(const char* action, const char** tooltip) {
     if (tooltip) *tooltip = nullptr;
     if (!action) return UI_ICON_NONE;
+    if (strncmp(action, "GizmoMove", 9) == 0) {
+        if (tooltip) *tooltip = "Move gizmo (1)";
+        return UI_ICON_GIZMO_MOVE;
+    }
+    if (strncmp(action, "GizmoRotate", 11) == 0) {
+        if (tooltip) *tooltip = "Rotate gizmo (2)";
+        return UI_ICON_GIZMO_ROTATE;
+    }
+    if (strncmp(action, "GizmoScale", 10) == 0) {
+        if (tooltip) *tooltip = "Scale gizmo (3)";
+        return UI_ICON_GIZMO_SCALE;
+    }
     if (strncmp(action, "Pause", 5) == 0) {
         if (tooltip) *tooltip = "Pause scene";
         return UI_ICON_PAUSE;
@@ -3358,12 +4264,22 @@ static UiIconKind ui_icon_for_action(const char* action, const char** tooltip) {
     return UI_ICON_NONE;
 }
 
+static UiViewportGizmoMode ui_gizmo_mode_for_action(const char* action) {
+    if (!action) return UI_GIZMO_NONE;
+    if (strncmp(action, "GizmoMove", 9) == 0) return UI_GIZMO_TRANSLATE;
+    if (strncmp(action, "GizmoRotate", 11) == 0) return UI_GIZMO_ROTATE;
+    if (strncmp(action, "GizmoScale", 10) == 0) return UI_GIZMO_SCALE;
+    return UI_GIZMO_NONE;
+}
+
 static bool ui_header_action_button(const char* action) {
     const char* tooltip = nullptr;
     UiIconKind icon = ui_icon_for_action(action, &tooltip);
     if (icon != UI_ICON_NONE) {
         bool warm = icon == UI_ICON_PLAY;
         bool danger = icon == UI_ICON_PAUSE;
+        UiViewportGizmoMode gizmo_mode = ui_gizmo_mode_for_action(action);
+        bool gizmo_active = gizmo_mode != UI_GIZMO_NONE && s_viewport_gizmo_mode == gizmo_mode;
         if (warm) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.34f, 0.20f, 0.10f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.44f, 0.26f, 0.13f, 1.0f));
@@ -3372,10 +4288,18 @@ static bool ui_header_action_button(const char* action) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.11f, 0.12f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.40f, 0.14f, 0.15f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.48f, 0.18f, 0.18f, 1.0f));
+        } else if (gizmo_active) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.33f, 0.18f, 0.10f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.24f, 0.12f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.58f, 0.30f, 0.14f, 1.0f));
         }
         bool clicked = ui_icon_button(action, icon, ImVec2(22.0f, 22.0f), tooltip);
-        if (warm || danger)
+        if (warm || danger || gizmo_active)
             ImGui::PopStyleColor(3);
+        if (clicked && gizmo_mode != UI_GIZMO_NONE) {
+            ui_set_viewport_gizmo_mode(gizmo_mode);
+            return true;
+        }
         return clicked;
     }
     return ImGui::SmallButton(action);
@@ -3414,10 +4338,17 @@ static void ui_fit_text_ellipsis(const char* text, float max_w, char* out, int o
 static void ui_panel_header(const char* title, const char* detail = nullptr,
                             const char* action_a = nullptr, bool* clicked_a = nullptr,
                             const char* action_b = nullptr, bool* clicked_b = nullptr,
-                            const char* action_c = nullptr, bool* clicked_c = nullptr) {
-    if (clicked_a) *clicked_a = false;
-    if (clicked_b) *clicked_b = false;
-    if (clicked_c) *clicked_c = false;
+                            const char* action_c = nullptr, bool* clicked_c = nullptr,
+                            const char* action_d = nullptr, bool* clicked_d = nullptr,
+                            const char* action_e = nullptr, bool* clicked_e = nullptr,
+                            const char* action_f = nullptr, bool* clicked_f = nullptr) {
+    const char* actions[] = { action_a, action_b, action_c, action_d, action_e, action_f };
+    bool* clicks[] = { clicked_a, clicked_b, clicked_c, clicked_d, clicked_e, clicked_f };
+    const int action_count = (int)(sizeof(actions) / sizeof(actions[0]));
+    for (int i = 0; i < action_count; i++) {
+        if (clicks[i])
+            *clicks[i] = false;
+    }
 
     UiPanelTone tone = ui_current_panel_tone();
     ImVec4 accent = ui_panel_accent(tone);
@@ -3434,10 +4365,11 @@ static void ui_panel_header(const char* title, const char* detail = nullptr,
 
     float button_size = 22.0f;
     float button_spacing = 4.0f;
-    int button_count =
-        (action_a && action_a[0] ? 1 : 0) +
-        (action_b && action_b[0] ? 1 : 0) +
-        (action_c && action_c[0] ? 1 : 0);
+    int button_count = 0;
+    for (int i = 0; i < action_count; i++) {
+        if (actions[i] && actions[i][0])
+            button_count++;
+    }
     float buttons_w = button_count > 0 ? button_count * button_size + (button_count - 1) * button_spacing : 0.0f;
     float buttons_x = header_right - buttons_w;
     float buttons_y = header_pos.y + floorf((header_h - button_size) * 0.5f);
@@ -3471,22 +4403,13 @@ static void ui_panel_header(const char* title, const char* detail = nullptr,
         }
     }
 
-    if (action_a && action_a[0]) {
+    for (int i = 0; i < action_count; i++) {
+        if (!actions[i] || !actions[i][0])
+            continue;
         ImGui::SetCursorScreenPos(ImVec2(buttons_x, buttons_y));
-        if (ui_header_action_button(action_a) && clicked_a)
-            *clicked_a = true;
+        if (ui_header_action_button(actions[i]) && clicks[i])
+            *clicks[i] = true;
         buttons_x += button_size + button_spacing;
-    }
-    if (action_b && action_b[0]) {
-        ImGui::SetCursorScreenPos(ImVec2(buttons_x, buttons_y));
-        if (ui_header_action_button(action_b) && clicked_b)
-            *clicked_b = true;
-        buttons_x += button_size + button_spacing;
-    }
-    if (action_c && action_c[0]) {
-        ImGui::SetCursorScreenPos(ImVec2(buttons_x, buttons_y));
-        if (ui_header_action_button(action_c) && clicked_c)
-            *clicked_c = true;
     }
 
     ImGui::SetCursorScreenPos(ImVec2(header_pos.x, header_pos.y));
@@ -3498,14 +4421,19 @@ static bool ui_begin_tool_panel(const char* id, const char* title, const char* d
                                 UiPanelTone tone = UI_PANEL_DEFAULT,
                                 const char* action_a = nullptr, bool* clicked_a = nullptr,
                                 const char* action_b = nullptr, bool* clicked_b = nullptr,
-                                const char* action_c = nullptr, bool* clicked_c = nullptr) {
+                                const char* action_c = nullptr, bool* clicked_c = nullptr,
+                                const char* action_d = nullptr, bool* clicked_d = nullptr,
+                                const char* action_e = nullptr, bool* clicked_e = nullptr,
+                                const char* action_f = nullptr, bool* clicked_f = nullptr) {
     if (s_panel_tone_count < (int)(sizeof(s_panel_tone_stack) / sizeof(s_panel_tone_stack[0])))
         s_panel_tone_stack[s_panel_tone_count++] = tone;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 7.0f));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ui_panel_bg(tone));
     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.220f, 0.205f, 0.200f, 1.0f));
     bool open = ImGui::BeginChild(id, size, true);
-    ui_panel_header(title, detail, action_a, clicked_a, action_b, clicked_b, action_c, clicked_c);
+    ui_panel_header(title, detail,
+                    action_a, clicked_a, action_b, clicked_b, action_c, clicked_c,
+                    action_d, clicked_d, action_e, clicked_e, action_f, clicked_f);
     return open;
 }
 
@@ -3651,54 +4579,40 @@ static void ui_draw_shortcuts_popup() {
             ImGuiTableFlags_PadOuterX;
         ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(6.0f, 5.0f));
 
-        auto begin_shortcut_section = [&](const char* id, const char* title) {
-            ui_inspector_section(title);
-            if (!ImGui::BeginTable(id, 2, table_flags))
-                return false;
-            ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 108.0f);
-            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch);
-            return true;
-        };
-        auto shortcut_row = [](const char* key, const char* desc) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            char badge_id[64] = {};
-            snprintf(badge_id, sizeof(badge_id), "##shortcut_%s", key);
-            ui_inline_badge(badge_id, key, ImVec4(0.74f, 0.53f, 0.42f, 1.0f));
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(desc);
-        };
-
-        if (begin_shortcut_section("##shortcuts_execution", "EXECUTION")) {
-            shortcut_row("Space", "Pause / resume scene execution");
-            shortcut_row("F6", "Restart scene from frame 0");
-            shortcut_row("F11", "Toggle viewport fullscreen");
+        if (ui_begin_shortcut_section("##shortcuts_execution", "EXECUTION", table_flags)) {
+            ui_draw_shortcut_row("Space", "Pause / resume scene execution");
+            ui_draw_shortcut_row("F6", "Restart scene from frame 0");
+            ui_draw_shortcut_row("F11", "Toggle viewport fullscreen");
             ImGui::EndTable();
         }
 
-        if (begin_shortcut_section("##shortcuts_project", "PROJECT")) {
-            shortcut_row("F5", "Compile shaders");
-            shortcut_row("Ctrl+S", "Save project");
-            shortcut_row("F1", "Toggle this shortcuts panel");
+        if (ui_begin_shortcut_section("##shortcuts_project", "PROJECT", table_flags)) {
+            ui_draw_shortcut_row("F5", "Compile shaders");
+            ui_draw_shortcut_row("Ctrl+S", "Save project");
+            ui_draw_shortcut_row("F1", "Toggle this shortcuts panel");
             ImGui::EndTable();
         }
 
-        if (begin_shortcut_section("##shortcuts_selection", "SELECTION")) {
-            shortcut_row("Arrows", "Move in Resources / Commands");
-            shortcut_row("Enter", "Select focused item");
-            shortcut_row("F2", "Rename selected resource / command");
-            shortcut_row("Delete", "Remove selected item");
-            shortcut_row("X", "Toggle selected command enabled");
+        if (ui_begin_shortcut_section("##shortcuts_selection", "SELECTION", table_flags)) {
+            ui_draw_shortcut_row("Arrows", "Move in Resources / Commands");
+            ui_draw_shortcut_row("Enter", "Select focused item");
+            ui_draw_shortcut_row("F2", "Rename selected resource / command");
+            ui_draw_shortcut_row("Delete", "Remove selected item");
+            ui_draw_shortcut_row("X", "Toggle selected command enabled");
+            ui_draw_shortcut_row("Ctrl+C", "Copy the selected command subtree");
+            ui_draw_shortcut_row("Ctrl+V", "Paste commands after the selection or inside a selected container");
+            ui_draw_shortcut_row("1 / 2 / 3", "Toggle Move / Rotate / Scale gizmo while hovering the viewport");
+            ui_draw_shortcut_row("Esc", "Disable the active viewport gizmo");
             ImGui::EndTable();
         }
 
-        if (begin_shortcut_section("##shortcuts_camera", "CAMERA")) {
-            shortcut_row("RMB", "Mouse look");
-            shortcut_row("WASD", "Move horizontally");
-            shortcut_row("Q / E", "Move down / up");
-            shortcut_row("Shift", "Faster movement");
-            shortcut_row("Ctrl", "Slower movement");
-            shortcut_row("L", "Orbit directional light");
+        if (ui_begin_shortcut_section("##shortcuts_camera", "CAMERA", table_flags)) {
+            ui_draw_shortcut_row("RMB", "Mouse look");
+            ui_draw_shortcut_row("WASD", "Move horizontally");
+            ui_draw_shortcut_row("Q / E", "Move down / up");
+            ui_draw_shortcut_row("Shift", "Faster movement");
+            ui_draw_shortcut_row("Ctrl", "Slower movement");
+            ui_draw_shortcut_row("L", "Orbit directional light");
             ImGui::EndTable();
         }
 
@@ -3714,6 +4628,34 @@ static void ui_draw_shortcuts_popup() {
     ImGui::PopStyleColor(2);
 }
 
+static bool ui_begin_shortcut_section(const char* id, const char* title, ImGuiTableFlags table_flags) {
+    ui_inspector_section(title);
+    if (!ImGui::BeginTable(id, 2, table_flags))
+        return false;
+    ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 108.0f);
+    ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch);
+    return true;
+}
+
+static void ui_draw_shortcut_row(const char* key, const char* desc) {
+    char badge_id[64] = {};
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    snprintf(badge_id, sizeof(badge_id), "##shortcut_%s", key);
+    ui_inline_badge(badge_id, key, ImVec4(0.74f, 0.53f, 0.42f, 1.0f));
+    ImGui::TableSetColumnIndex(1);
+    ImGui::TextUnformatted(desc);
+}
+
+static void ui_align_frame_row(float row_y) {
+    ImGui::SetCursorPosY(row_y);
+}
+
+static void ui_align_text_row(float row_y) {
+    ImGui::SetCursorPosY(row_y);
+    ImGui::AlignTextToFramePadding();
+}
+
 static void ui_top_bar() {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.080f, 0.076f, 0.080f, 1.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 0.0f));
@@ -3723,45 +4665,40 @@ static void ui_top_bar() {
 
     float row_h = ImGui::GetFrameHeight();
     float row_y = floorf((toolbar_h - row_h) * 0.5f);
-    auto align_frame_row = [&]() { ImGui::SetCursorPosY(row_y); };
-    auto align_text_row = [&]() {
-        ImGui::SetCursorPosY(row_y);
-        ImGui::AlignTextToFramePadding();
-    };
-    align_text_row();
+    ui_align_text_row(row_y);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.92f, 0.91f, 1.0f));
     ImGui::TextUnformatted("lazyTool");
     ImGui::PopStyleColor();
     ImGui::SameLine(0.0f, 8.0f);
-    align_text_row();
+    ui_align_text_row(row_y);
     ImGui::TextDisabled("workspace");
     ImGui::SameLine(0.0f, 8.0f);
-    align_frame_row();
+    ui_align_frame_row(row_y);
     ui_inline_badge("##project_name_badge", project_current_name() ? project_current_name() : "untitled",
                     ImVec4(0.74f, 0.53f, 0.42f, 1.0f), row_h);
     ImGui::SameLine(0.0f, 12.0f);
-    align_frame_row();
+    ui_align_frame_row(row_y);
 
     if (ImGui::Button("New"))
         project_new_default();
     ImGui::SameLine();
-    align_frame_row();
+    ui_align_frame_row(row_y);
     if (ImGui::Button("Save")) {
         s_project_file_mode = PROJECT_FILE_SAVE;
         s_project_path_focus = true;
     }
     ImGui::SameLine();
-    align_frame_row();
+    ui_align_frame_row(row_y);
     if (ImGui::Button("Load")) {
         s_project_file_mode = PROJECT_FILE_LOAD;
         s_project_path_focus = true;
     }
     ImGui::SameLine();
-    align_frame_row();
+    ui_align_frame_row(row_y);
     if (ImGui::Button("Compile"))
         ui_recompile_all_shaders();
     ImGui::SameLine(0.0f, 6.0f);
-    align_frame_row();
+    ui_align_frame_row(row_y);
     if (ui_icon_button("##shortcuts_button", UI_ICON_HELP, ImVec2(28.0f, 0.0f), "Shortcuts"))
         s_shortcuts_popup_open = !s_shortcuts_popup_open;
 
@@ -3801,7 +4738,7 @@ static void ui_top_bar() {
     float drag_x = ImGui::GetCursorPosX();
     float drag_w = summary_x - drag_x - 8.0f;
     if (drag_w > 24.0f) {
-        align_frame_row();
+        ui_align_frame_row(row_y);
         ImGui::InvisibleButton("##title_drag", ImVec2(drag_w, row_h));
         if (ImGui::IsItemActivated()) {
             ReleaseCapture();
@@ -3813,7 +4750,7 @@ static void ui_top_bar() {
         ImGui::SameLine(summary_x);
     else
         ImGui::SameLine();
-    align_text_row();
+    ui_align_text_row(row_y);
     ImGui::TextDisabled("%s", summary);
 
     ImGui::SameLine(controls_x);
@@ -3846,6 +4783,9 @@ static void ui_workspace_layout() {
         bool pause_clicked = false;
         bool exit_clicked = false;
         if (ui_begin_tool_panel("##viewport_panel_full", "VIEWPORT", detail, avail, UI_PANEL_VIEWPORT,
+                                "GizmoMove##viewport_gizmo_move_full", nullptr,
+                                "GizmoRotate##viewport_gizmo_rotate_full", nullptr,
+                                "GizmoScale##viewport_gizmo_scale_full", nullptr,
                                 "Restart##viewport_restart_full", &restart_clicked,
                                 app_scene_paused() ? "Resume##viewport_resume_full" : "Pause##viewport_pause_full", &pause_clicked,
                                 "Exit fullscreen##viewport_fullscreen_exit", &exit_clicked)) {
@@ -3901,6 +4841,9 @@ static void ui_workspace_layout() {
     bool pause_clicked = false;
     bool fullscreen_clicked = false;
     if (ui_begin_tool_panel("##viewport_panel", "VIEWPORT", viewport_detail, ImVec2(center_w, viewport_h), UI_PANEL_VIEWPORT,
+                            "GizmoMove##viewport_gizmo_move", nullptr,
+                            "GizmoRotate##viewport_gizmo_rotate", nullptr,
+                            "GizmoScale##viewport_gizmo_scale", nullptr,
                             "Restart##viewport_restart", &restart_clicked,
                             app_scene_paused() ? "Resume##viewport_resume" : "Pause##viewport_pause", &pause_clicked,
                             "Fullscreen##viewport_fullscreen", &fullscreen_clicked)) {
@@ -4024,6 +4967,7 @@ void ui_init() {
     ImGui_ImplDX11_Init(g_dx.dev, g_dx.ctx);
 }
 
+// Draw one full editor frame on top of the already-rendered scene texture.
 void ui_draw() {
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();

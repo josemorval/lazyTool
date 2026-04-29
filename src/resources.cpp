@@ -5,9 +5,11 @@
 #include "log.h"
 #include "stb_image.h"
 #include "cgltf.h"
-#include <vector>
-#include <functional>
+#include <stddef.h>
 #include <stdlib.h>
+
+// This module owns all editor/runtime resources: textures, meshes, shaders,
+// render targets, and the built-in handles that expose engine state to users.
 
 Resource  g_resources[MAX_RESOURCES] = {};
 int       g_resource_count = 0;
@@ -19,6 +21,115 @@ ResHandle g_builtin_shadow_map  = INVALID_HANDLE;
 ResHandle g_builtin_dirlight    = INVALID_HANDLE;
 
 struct Vertex { float pos[3]; float nor[3]; float uv[2]; };
+
+struct GltfPrimitiveRange {
+    cgltf_primitive* prim;
+    int              start_index;
+    int              index_count;
+};
+
+struct VertexArray {
+    Vertex* items;
+    int     count;
+    int     capacity;
+};
+
+struct IndexArray {
+    uint32_t* items;
+    int       count;
+    int       capacity;
+};
+
+struct PrimitiveRangeArray {
+    GltfPrimitiveRange* items;
+    int                 count;
+    int                 capacity;
+};
+
+struct GltfMeshBuildContext {
+    const char*          resource_name;
+    cgltf_data*          data;
+    int                  imported_material_count;
+    MeshPart*            imported_parts;
+    int*                 imported_part_count;
+    bool*                part_overflow;
+    VertexArray*         verts;
+    IndexArray*          indices;
+    PrimitiveRangeArray* primitive_cache;
+};
+
+static bool res_push_mesh_part(MeshPart* parts, int* part_count, const char* part_name,
+                               int start_index, int index_count, int material_index,
+                               const float local_transform[16]);
+
+static bool res_grow_pod_array(void** items, int* capacity, int needed, size_t item_size) {
+    if (!items || !capacity || needed <= 0)
+        return false;
+    if (needed <= *capacity)
+        return true;
+
+    int new_capacity = *capacity > 0 ? *capacity : 16;
+    while (new_capacity < needed) {
+        if (new_capacity > 0x3fffffff) {
+            new_capacity = needed;
+            break;
+        }
+        new_capacity *= 2;
+    }
+
+    void* grown = realloc(*items, item_size * (size_t)new_capacity);
+    if (!grown)
+        return false;
+
+    *items = grown;
+    *capacity = new_capacity;
+    return true;
+}
+
+static bool res_vertex_array_reserve(VertexArray* arr, int needed) {
+    if (!arr)
+        return false;
+    return res_grow_pod_array((void**)&arr->items, &arr->capacity, needed, sizeof(Vertex));
+}
+
+static bool res_index_array_reserve(IndexArray* arr, int needed) {
+    if (!arr)
+        return false;
+    return res_grow_pod_array((void**)&arr->items, &arr->capacity, needed, sizeof(uint32_t));
+}
+
+static bool res_primitive_range_array_reserve(PrimitiveRangeArray* arr, int needed) {
+    if (!arr)
+        return false;
+    return res_grow_pod_array((void**)&arr->items, &arr->capacity, needed, sizeof(GltfPrimitiveRange));
+}
+
+static void res_vertex_array_free(VertexArray* arr) {
+    if (!arr)
+        return;
+    free(arr->items);
+    arr->items = nullptr;
+    arr->count = 0;
+    arr->capacity = 0;
+}
+
+static void res_index_array_free(IndexArray* arr) {
+    if (!arr)
+        return;
+    free(arr->items);
+    arr->items = nullptr;
+    arr->count = 0;
+    arr->capacity = 0;
+}
+
+static void res_primitive_range_array_free(PrimitiveRangeArray* arr) {
+    if (!arr)
+        return;
+    free(arr->items);
+    arr->items = nullptr;
+    arr->count = 0;
+    arr->capacity = 0;
+}
 
 static void res_mesh_identity(float out[16]) {
     memset(out, 0, sizeof(float) * 16);
@@ -60,12 +171,12 @@ static void res_set_default_mesh_layout(Resource* r) {
 
     res_reset_mesh_asset(r);
 
-    MeshPart& part = r->mesh_parts[0];
-    res_init_mesh_part(&part);
-    strncpy(part.name, r->name, MAX_NAME - 1);
-    part.name[MAX_NAME - 1] = '\0';
-    part.start_index = 0;
-    part.index_count = r->idx_count > 0 ? r->idx_count : r->vert_count;
+    MeshPart* part = &r->mesh_parts[0];
+    res_init_mesh_part(part);
+    strncpy(part->name, r->name, MAX_NAME - 1);
+    part->name[MAX_NAME - 1] = '\0';
+    part->start_index = 0;
+    part->index_count = r->idx_count > 0 ? r->idx_count : r->vert_count;
     r->mesh_part_count = 1;
 }
 
@@ -77,6 +188,22 @@ static void res_set_vertex(Vertex* v, Vec3 p, Vec3 n, float u, float vv) {
     v->pos[0] = p.x; v->pos[1] = p.y; v->pos[2] = p.z;
     v->nor[0] = n.x; v->nor[1] = n.y; v->nor[2] = n.z;
     v->uv[0]  = u;   v->uv[1]  = vv;
+}
+
+static void res_add_quad_face(Vertex* verts, uint32_t* idx, int* vert_cursor, int* index_cursor,
+                              Vec3 a, Vec3 b, Vec3 c, Vec3 d, Vec3 n)
+{
+    int base = *vert_cursor;
+    res_set_vertex(&verts[(*vert_cursor)++], a, n, 0.f, 1.f);
+    res_set_vertex(&verts[(*vert_cursor)++], b, n, 1.f, 1.f);
+    res_set_vertex(&verts[(*vert_cursor)++], c, n, 1.f, 0.f);
+    res_set_vertex(&verts[(*vert_cursor)++], d, n, 0.f, 0.f);
+    idx[(*index_cursor)++] = base + 0;
+    idx[(*index_cursor)++] = base + 1;
+    idx[(*index_cursor)++] = base + 2;
+    idx[(*index_cursor)++] = base + 0;
+    idx[(*index_cursor)++] = base + 2;
+    idx[(*index_cursor)++] = base + 3;
 }
 
 static void res_add_oriented_tri(const Vertex* verts, uint32_t* idx, int* idx_count,
@@ -139,22 +266,12 @@ static bool res_make_cube_mesh(Resource* r) {
     uint32_t idx[36] = {};
     int v = 0, ii = 0;
 
-    auto add_face = [&](Vec3 a, Vec3 b, Vec3 c, Vec3 d, Vec3 n) {
-        int base = v;
-        res_set_vertex(&verts[v++], a, n, 0.f, 1.f);
-        res_set_vertex(&verts[v++], b, n, 1.f, 1.f);
-        res_set_vertex(&verts[v++], c, n, 1.f, 0.f);
-        res_set_vertex(&verts[v++], d, n, 0.f, 0.f);
-        idx[ii++] = base + 0; idx[ii++] = base + 1; idx[ii++] = base + 2;
-        idx[ii++] = base + 0; idx[ii++] = base + 2; idx[ii++] = base + 3;
-    };
-
-    add_face({-1,-1, 1}, { 1,-1, 1}, { 1, 1, 1}, {-1, 1, 1}, { 0, 0, 1});
-    add_face({ 1,-1,-1}, {-1,-1,-1}, {-1, 1,-1}, { 1, 1,-1}, { 0, 0,-1});
-    add_face({ 1,-1, 1}, { 1,-1,-1}, { 1, 1,-1}, { 1, 1, 1}, { 1, 0, 0});
-    add_face({-1,-1,-1}, {-1,-1, 1}, {-1, 1, 1}, {-1, 1,-1}, {-1, 0, 0});
-    add_face({-1, 1, 1}, { 1, 1, 1}, { 1, 1,-1}, {-1, 1,-1}, { 0, 1, 0});
-    add_face({-1,-1,-1}, { 1,-1,-1}, { 1,-1, 1}, {-1,-1, 1}, { 0,-1, 0});
+    res_add_quad_face(verts, idx, &v, &ii, {-1,-1, 1}, { 1,-1, 1}, { 1, 1, 1}, {-1, 1, 1}, { 0, 0, 1});
+    res_add_quad_face(verts, idx, &v, &ii, { 1,-1,-1}, {-1,-1,-1}, {-1, 1,-1}, { 1, 1,-1}, { 0, 0,-1});
+    res_add_quad_face(verts, idx, &v, &ii, { 1,-1, 1}, { 1,-1,-1}, { 1, 1,-1}, { 1, 1, 1}, { 1, 0, 0});
+    res_add_quad_face(verts, idx, &v, &ii, {-1,-1,-1}, {-1,-1, 1}, {-1, 1, 1}, {-1, 1,-1}, {-1, 0, 0});
+    res_add_quad_face(verts, idx, &v, &ii, {-1, 1, 1}, { 1, 1, 1}, { 1, 1,-1}, {-1, 1,-1}, { 0, 1, 0});
+    res_add_quad_face(verts, idx, &v, &ii, {-1,-1,-1}, { 1,-1,-1}, { 1,-1, 1}, {-1,-1, 1}, { 0,-1, 0});
 
     return res_upload_mesh(r, verts, 24, idx, 36);
 }
@@ -440,6 +557,7 @@ static bool res_has_size_variable(const Resource& r) {
     case RES_TEXTURE2D:
     case RES_RENDER_TEXTURE2D:
     case RES_RENDER_TEXTURE3D:
+    case RES_STRUCTURED_BUFFER:
     case RES_BUILTIN_SCENE_COLOR:
     case RES_BUILTIN_SCENE_DEPTH:
     case RES_BUILTIN_SHADOW_MAP:
@@ -450,17 +568,24 @@ static bool res_has_size_variable(const Resource& r) {
 }
 
 static ResType res_size_type_for(const Resource& r) {
-    return r.type == RES_RENDER_TEXTURE3D ? RES_INT3 : RES_INT2;
+    if (r.type == RES_RENDER_TEXTURE3D)
+        return RES_INT3;
+    if (r.type == RES_STRUCTURED_BUFFER)
+        return RES_INT;
+    return RES_INT2;
 }
 
 static void res_size_name_for(const Resource& r, char* out, int out_sz) {
-    snprintf(out, out_sz, "%s.size", r.name);
+    if (r.type == RES_STRUCTURED_BUFFER)
+        snprintf(out, out_sz, "%s.count", r.name);
+    else
+        snprintf(out, out_sz, "%s.size", r.name);
     out[out_sz - 1] = '\0';
 }
 
-// Every texture-like resource exposes a generated "<name>.size" variable. That
-// keeps size-dependent compute dispatches and shader params data-driven instead
-// of forcing the project file to hardcode resolution-specific numbers.
+// Every size-bearing resource exposes a generated dimensions/count variable so
+// compute dispatches and shader params can stay data-driven instead of
+// hardcoding scene-dependent numbers in the project file.
 void res_sync_size_resource(ResHandle h) {
     Resource* r = res_get(h);
     if (!r || r->is_generated)
@@ -497,9 +622,15 @@ void res_sync_size_resource(ResHandle h) {
     strncpy(size_res->name, size_name, MAX_NAME - 1);
     size_res->name[MAX_NAME - 1] = '\0';
     size_res->type = size_type;
-    size_res->ival[0] = r->width > 0 ? r->width : 1;
-    size_res->ival[1] = r->height > 0 ? r->height : 1;
-    size_res->ival[2] = r->depth > 0 ? r->depth : 1;
+    if (r->type == RES_STRUCTURED_BUFFER) {
+        size_res->ival[0] = r->elem_count > 0 ? r->elem_count : 1;
+        size_res->ival[1] = 1;
+        size_res->ival[2] = 1;
+    } else {
+        size_res->ival[0] = r->width > 0 ? r->width : 1;
+        size_res->ival[1] = r->height > 0 ? r->height : 1;
+        size_res->ival[2] = r->depth > 0 ? r->depth : 1;
+    }
 }
 
 Resource* res_get(ResHandle h) {
@@ -853,6 +984,7 @@ bool res_recreate_structured_buffer(ResHandle h, int elem_size, int elem_count,
         if (FAILED(hr)) log_error("StructuredBuffer UAV create failed: %s", r->name);
     }
 
+    res_sync_size_resource(h);
     return true;
 }
 
@@ -1211,7 +1343,7 @@ static ResHandle res_load_gltf_texture_ref(const char* mesh_name, int texture_in
 
 static ResHandle res_load_gltf_texture_cached(const char* mesh_name, const char* dir,
                                               cgltf_data* data, cgltf_texture* tex,
-                                              std::vector<ResHandle>& cache)
+                                              ResHandle* cache, int cache_count)
 {
     if (!tex)
         return INVALID_HANDLE;
@@ -1223,15 +1355,25 @@ static ResHandle res_load_gltf_texture_cached(const char* mesh_name, const char*
             texture_index = (int)ti;
     }
 
-    if (texture_index >= 0 && texture_index < (int)cache.size() &&
-        cache[(size_t)texture_index] != INVALID_HANDLE)
-        return cache[(size_t)texture_index];
+    if (cache && texture_index >= 0 && texture_index < cache_count &&
+        cache[texture_index] != INVALID_HANDLE)
+        return cache[texture_index];
 
     ResHandle loaded = res_load_gltf_texture_ref(mesh_name,
         texture_index >= 0 ? texture_index : 0, dir, tex);
-    if (texture_index >= 0 && texture_index < (int)cache.size())
-        cache[(size_t)texture_index] = loaded;
+    if (cache && texture_index >= 0 && texture_index < cache_count)
+        cache[texture_index] = loaded;
     return loaded;
+}
+
+static void res_load_gltf_material_texture_slot(MeshMaterial* dst, int slot,
+                                                const char* mesh_name, const char* dir,
+                                                cgltf_data* data, cgltf_texture* tex,
+                                                ResHandle* cache, int cache_count)
+{
+    if (!dst || slot < 0 || slot >= MAX_MESH_MATERIAL_TEXTURES || !tex)
+        return;
+    dst->textures[slot] = res_load_gltf_texture_cached(mesh_name, dir, data, tex, cache, cache_count);
 }
 
 static int res_load_gltf_materials(const char* mesh_name, const char* gltf_path,
@@ -1254,63 +1396,73 @@ static int res_load_gltf_materials(const char* mesh_name, const char* gltf_path,
     char dir[MAX_PATH_LEN] = {};
     res_path_dirname(gltf_path, dir, MAX_PATH_LEN);
 
-    std::vector<ResHandle> texture_cache((size_t)data->textures_count, INVALID_HANDLE);
+    int texture_cache_count = (int)data->textures_count;
+    ResHandle* texture_cache = nullptr;
+    if (texture_cache_count > 0) {
+        texture_cache = (ResHandle*)malloc(sizeof(ResHandle) * (size_t)texture_cache_count);
+        if (texture_cache) {
+            for (int i = 0; i < texture_cache_count; i++)
+                texture_cache[i] = INVALID_HANDLE;
+        } else {
+            texture_cache_count = 0;
+        }
+    }
+
     int material_count = (int)data->materials_count;
     if (material_count > MAX_MESH_MATERIALS)
         material_count = MAX_MESH_MATERIALS;
 
     for (int mi = 0; mi < material_count; mi++) {
         cgltf_material* src = &data->materials[mi];
-        MeshMaterial& dst = out_materials[mi];
-        res_init_mesh_material(&dst);
+        MeshMaterial* dst = &out_materials[mi];
+        res_init_mesh_material(dst);
 
         const char* src_name = src->name && src->name[0] ? src->name : nullptr;
         if (src_name) {
-            strncpy(dst.name, src_name, MAX_NAME - 1);
-            dst.name[MAX_NAME - 1] = '\0';
+            strncpy(dst->name, src_name, MAX_NAME - 1);
+            dst->name[MAX_NAME - 1] = '\0';
         } else {
-            snprintf(dst.name, sizeof(dst.name), "material_%d", mi);
+            snprintf(dst->name, sizeof(dst->name), "material_%d", mi);
         }
 
-        dst.double_sided = src->double_sided != 0;
-        dst.alpha_blend = src->alpha_mode == cgltf_alpha_mode_blend;
-
-        auto load_slot = [&](int slot, cgltf_texture* tex) {
-            if (slot < 0 || slot >= MAX_MESH_MATERIAL_TEXTURES || !tex)
-                return;
-            dst.textures[slot] = res_load_gltf_texture_cached(mesh_name, dir, data, tex, texture_cache);
-        };
+        dst->double_sided = src->double_sided != 0;
+        dst->alpha_blend = src->alpha_mode == cgltf_alpha_mode_blend;
 
         if (src->has_pbr_metallic_roughness) {
-            load_slot(0, src->pbr_metallic_roughness.base_color_texture.texture);
-            load_slot(1, src->pbr_metallic_roughness.metallic_roughness_texture.texture);
+            res_load_gltf_material_texture_slot(dst, 0, mesh_name, dir, data,
+                src->pbr_metallic_roughness.base_color_texture.texture, texture_cache, texture_cache_count);
+            res_load_gltf_material_texture_slot(dst, 1, mesh_name, dir, data,
+                src->pbr_metallic_roughness.metallic_roughness_texture.texture, texture_cache, texture_cache_count);
         } else if (src->has_pbr_specular_glossiness) {
-            load_slot(0, src->pbr_specular_glossiness.diffuse_texture.texture);
-            load_slot(1, src->pbr_specular_glossiness.specular_glossiness_texture.texture);
+            res_load_gltf_material_texture_slot(dst, 0, mesh_name, dir, data,
+                src->pbr_specular_glossiness.diffuse_texture.texture, texture_cache, texture_cache_count);
+            res_load_gltf_material_texture_slot(dst, 1, mesh_name, dir, data,
+                src->pbr_specular_glossiness.specular_glossiness_texture.texture, texture_cache, texture_cache_count);
         }
-        load_slot(2, src->normal_texture.texture);
-        load_slot(3, src->emissive_texture.texture);
-        load_slot(4, src->occlusion_texture.texture);
+        res_load_gltf_material_texture_slot(dst, 2, mesh_name, dir, data,
+            src->normal_texture.texture, texture_cache, texture_cache_count);
+        res_load_gltf_material_texture_slot(dst, 3, mesh_name, dir, data,
+            src->emissive_texture.texture, texture_cache, texture_cache_count);
+        res_load_gltf_material_texture_slot(dst, 4, mesh_name, dir, data,
+            src->occlusion_texture.texture, texture_cache, texture_cache_count);
     }
 
     int loaded_textures = 0;
-    for (size_t i = 0; i < texture_cache.size(); i++)
+    for (int i = 0; i < texture_cache_count; i++)
         if (texture_cache[i] != INVALID_HANDLE)
             loaded_textures++;
     if (loaded_textures > 0)
         log_info("glTF textures loaded for %s: %d", mesh_name, loaded_textures);
 
+    free(texture_cache);
     return material_count;
 }
 
-struct GltfPrimitiveRange {
-    cgltf_primitive* prim;
-    int              start_index;
-    int              index_count;
-};
-
-static bool res_extract_gltf_primitive(std::vector<Vertex>& verts,
-                                       std::vector<uint32_t>& indices,
+// Flatten one glTF primitive into the engine's simple contiguous mesh arrays.
+// The importer keeps vertices and indices in append-only buffers so multiple
+// parts can share one uploaded mesh resource.
+static bool res_extract_gltf_primitive(VertexArray* verts,
+                                       IndexArray* indices,
                                        cgltf_primitive* prim,
                                        int* out_start_index,
                                        int* out_index_count,
@@ -1335,14 +1487,14 @@ static bool res_extract_gltf_primitive(std::vector<Vertex>& verts,
     cgltf_accessor* uv_acc = nullptr;
 
     for (cgltf_size ai = 0; ai < prim->attributes_count; ai++) {
-        cgltf_attribute& attr = prim->attributes[ai];
-        cgltf_accessor* acc = attr.data;
-        if (attr.type == cgltf_attribute_type_position) {
+        cgltf_attribute* attr = &prim->attributes[ai];
+        cgltf_accessor* acc = attr->data;
+        if (attr->type == cgltf_attribute_type_position) {
             pos_acc = acc;
             vert_count = (int)acc->count;
-        } else if (attr.type == cgltf_attribute_type_normal) {
+        } else if (attr->type == cgltf_attribute_type_normal) {
             nor_acc = acc;
-        } else if (attr.type == cgltf_attribute_type_texcoord && attr.index == 0) {
+        } else if (attr->type == cgltf_attribute_type_texcoord && attr->index == 0) {
             uv_acc = acc;
         }
     }
@@ -1353,9 +1505,13 @@ static bool res_extract_gltf_primitive(std::vector<Vertex>& verts,
         return false;
     }
 
-    uint32_t base_vertex = (uint32_t)verts.size();
-    size_t old_vert_count = verts.size();
-    verts.resize(old_vert_count + (size_t)vert_count);
+    uint32_t base_vertex = (uint32_t)verts->count;
+    int old_vert_count = verts->count;
+    if (!res_vertex_array_reserve(verts, verts->count + vert_count)) {
+        if (err && err_sz > 0)
+            snprintf(err, err_sz, "out of memory growing vertex array");
+        return false;
+    }
 
     for (int i = 0; i < vert_count; i++) {
         float p[3] = {};
@@ -1365,27 +1521,135 @@ static bool res_extract_gltf_primitive(std::vector<Vertex>& verts,
         if (nor_acc) cgltf_accessor_read_float(nor_acc, (cgltf_size)i, n, 3);
         if (uv_acc) cgltf_accessor_read_float(uv_acc, (cgltf_size)i, uv, 2);
 
-        Vertex& v = verts[old_vert_count + (size_t)i];
-        v.pos[0] = p[0];  v.pos[1] = p[1];  v.pos[2] = p[2];
-        v.nor[0] = n[0];  v.nor[1] = n[1];  v.nor[2] = n[2];
-        v.uv[0] = uv[0];  v.uv[1] = uv[1];
+        Vertex* v = &verts->items[old_vert_count + i];
+        v->pos[0] = p[0];  v->pos[1] = p[1];  v->pos[2] = p[2];
+        v->nor[0] = n[0];  v->nor[1] = n[1];  v->nor[2] = n[2];
+        v->uv[0] = uv[0];  v->uv[1] = uv[1];
     }
+    verts->count += vert_count;
 
-    int start_index = (int)indices.size();
+    int start_index = indices->count;
+    int append_count = prim->indices ? (int)prim->indices->count : vert_count;
+    if (!res_index_array_reserve(indices, indices->count + append_count)) {
+        if (err && err_sz > 0)
+            snprintf(err, err_sz, "out of memory growing index array");
+        return false;
+    }
     if (prim->indices) {
         cgltf_accessor* ia = prim->indices;
-        indices.reserve(indices.size() + (size_t)ia->count);
         for (cgltf_size ii = 0; ii < ia->count; ii++)
-            indices.push_back(base_vertex + (uint32_t)cgltf_accessor_read_index(ia, ii));
+            indices->items[indices->count++] = base_vertex + (uint32_t)cgltf_accessor_read_index(ia, ii);
     } else {
-        indices.reserve(indices.size() + (size_t)vert_count);
         for (int i = 0; i < vert_count; i++)
-            indices.push_back(base_vertex + (uint32_t)i);
+            indices->items[indices->count++] = base_vertex + (uint32_t)i;
     }
 
     *out_start_index = start_index;
-    *out_index_count = (int)indices.size() - start_index;
+    *out_index_count = indices->count - start_index;
     return true;
+}
+
+static bool res_find_cached_gltf_primitive(const PrimitiveRangeArray* cache, cgltf_primitive* prim,
+                                           int* out_start_index, int* out_index_count)
+{
+    if (!cache || !prim || !out_start_index || !out_index_count)
+        return false;
+
+    for (int i = 0; i < cache->count; i++) {
+        const GltfPrimitiveRange* entry = &cache->items[i];
+        if (entry->prim != prim)
+            continue;
+        *out_start_index = entry->start_index;
+        *out_index_count = entry->index_count;
+        return true;
+    }
+    return false;
+}
+
+static bool res_push_cached_gltf_primitive(PrimitiveRangeArray* cache, cgltf_primitive* prim,
+                                           int start_index, int index_count)
+{
+    GltfPrimitiveRange* entry = nullptr;
+    if (!cache || !prim)
+        return false;
+    if (!res_primitive_range_array_reserve(cache, cache->count + 1))
+        return false;
+    entry = &cache->items[cache->count++];
+    entry->prim = prim;
+    entry->start_index = start_index;
+    entry->index_count = index_count;
+    return true;
+}
+
+static int res_gltf_resolve_material_index(const GltfMeshBuildContext* ctx, cgltf_material* mat) {
+    ptrdiff_t material_index = 0;
+    if (!ctx || !mat || !ctx->data || !ctx->data->materials || ctx->imported_material_count <= 0)
+        return -1;
+    material_index = mat - ctx->data->materials;
+    if (material_index < 0 || material_index >= ctx->imported_material_count)
+        return -1;
+    return (int)material_index;
+}
+
+static void res_gltf_append_part(GltfMeshBuildContext* ctx, cgltf_primitive* prim,
+                                 const char* part_name, const float local_transform[16])
+{
+    int start_index = 0;
+    int index_count = 0;
+    char err[256] = {};
+    if (!ctx || !prim || !ctx->part_overflow || *ctx->part_overflow)
+        return;
+
+    if (!res_find_cached_gltf_primitive(ctx->primitive_cache, prim, &start_index, &index_count)) {
+        if (!res_extract_gltf_primitive(ctx->verts, ctx->indices, prim, &start_index, &index_count, err, sizeof(err))) {
+            log_warn("glTF primitive skipped in %s: %s",
+                ctx->resource_name, err[0] ? err : "unsupported primitive");
+            return;
+        }
+        if (!res_push_cached_gltf_primitive(ctx->primitive_cache, prim, start_index, index_count)) {
+            log_warn("glTF primitive cache disabled for %s: out of memory", ctx->resource_name);
+        }
+    }
+
+    if (!res_push_mesh_part(ctx->imported_parts, ctx->imported_part_count, part_name,
+            start_index, index_count, res_gltf_resolve_material_index(ctx, prim->material), local_transform)) {
+        if (!*ctx->part_overflow) {
+            log_warn("glTF parts truncated for %s: max %d", ctx->resource_name, MAX_MESH_PARTS);
+            *ctx->part_overflow = true;
+        }
+    }
+}
+
+static void res_gltf_append_node_mesh(GltfMeshBuildContext* ctx, cgltf_node* node) {
+    const char* node_name = nullptr;
+    const char* mesh_name = nullptr;
+    float world[16] = {};
+    if (!ctx || !node || !node->mesh)
+        return;
+
+    cgltf_node_transform_world(node, world);
+    node_name = node->name && node->name[0] ? node->name : nullptr;
+    mesh_name = node->mesh->name && node->mesh->name[0] ? node->mesh->name : nullptr;
+
+    for (cgltf_size pi = 0; pi < node->mesh->primitives_count; pi++) {
+        char part_name[MAX_NAME] = {};
+        if (node_name) {
+            snprintf(part_name, sizeof(part_name), "%s.%u", node_name, (unsigned)pi);
+        } else if (mesh_name) {
+            snprintf(part_name, sizeof(part_name), "%s.%u", mesh_name, (unsigned)pi);
+        } else {
+            snprintf(part_name, sizeof(part_name), "part_%d", *ctx->imported_part_count);
+        }
+        res_gltf_append_part(ctx, &node->mesh->primitives[pi], part_name, world);
+    }
+}
+
+static void res_gltf_visit_node(GltfMeshBuildContext* ctx, cgltf_node* node) {
+    if (!ctx || !node)
+        return;
+    res_gltf_append_node_mesh(ctx, node);
+    for (cgltf_size ci = 0; ci < node->children_count; ci++)
+        res_gltf_visit_node(ctx, node->children[ci]);
 }
 
 static bool res_push_mesh_part(MeshPart* parts, int* part_count, const char* part_name,
@@ -1395,19 +1659,19 @@ static bool res_push_mesh_part(MeshPart* parts, int* part_count, const char* par
     if (!parts || !part_count || *part_count >= MAX_MESH_PARTS)
         return false;
 
-    MeshPart& part = parts[*part_count];
-    res_init_mesh_part(&part);
+    MeshPart* part = &parts[*part_count];
+    res_init_mesh_part(part);
     if (part_name && part_name[0]) {
-        strncpy(part.name, part_name, MAX_NAME - 1);
-        part.name[MAX_NAME - 1] = '\0';
+        strncpy(part->name, part_name, MAX_NAME - 1);
+        part->name[MAX_NAME - 1] = '\0';
     } else {
-        snprintf(part.name, sizeof(part.name), "part_%d", *part_count);
+        snprintf(part->name, sizeof(part->name), "part_%d", *part_count);
     }
-    part.start_index = start_index;
-    part.index_count = index_count;
-    part.material_index = material_index;
+    part->start_index = start_index;
+    part->index_count = index_count;
+    part->material_index = material_index;
     if (local_transform)
-        memcpy(part.local_transform, local_transform, sizeof(part.local_transform));
+        memcpy(part->local_transform, local_transform, sizeof(part->local_transform));
     (*part_count)++;
     return true;
 }
@@ -1463,6 +1727,8 @@ static ResHandle res_mesh_fallback_cube(ResHandle handle, const char* msg) {
     return handle;
 }
 
+// Import a glTF mesh into the engine's internal mesh representation. The
+// importer preserves per-part transforms and material assignments when found.
 ResHandle res_load_mesh(const char* name, const char* path) {
     ResHandle handle = res_alloc(name, RES_MESH);
     if (handle == INVALID_HANDLE) return INVALID_HANDLE;
@@ -1514,94 +1780,32 @@ ResHandle res_load_mesh(const char* name, const char* path) {
     int imported_part_count = 0;
     bool part_overflow = false;
 
-    std::vector<Vertex> verts;
-    std::vector<uint32_t> indices;
-    std::vector<GltfPrimitiveRange> primitive_cache;
-
-    auto resolve_material_index = [&](cgltf_material* mat) -> int {
-        if (!mat || !data->materials || imported_material_count <= 0)
-            return -1;
-        ptrdiff_t mi = mat - data->materials;
-        if (mi < 0 || mi >= imported_material_count)
-            return -1;
-        return (int)mi;
-    };
-
-    auto append_part = [&](cgltf_primitive* prim, const char* part_name, const float local_transform[16]) {
-        if (!prim || part_overflow)
-            return;
-
-        int start_index = 0;
-        int index_count = 0;
-        bool found = false;
-        for (size_t i = 0; i < primitive_cache.size(); i++) {
-            if (primitive_cache[i].prim == prim) {
-                start_index = primitive_cache[i].start_index;
-                index_count = primitive_cache[i].index_count;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            char err[256] = {};
-            if (!res_extract_gltf_primitive(verts, indices, prim, &start_index, &index_count, err, sizeof(err))) {
-                log_warn("glTF primitive skipped in %s: %s", name, err[0] ? err : "unsupported primitive");
-                return;
-            }
-            primitive_cache.push_back({ prim, start_index, index_count });
-        }
-
-        if (!res_push_mesh_part(imported_parts, &imported_part_count, part_name,
-                start_index, index_count, resolve_material_index(prim->material), local_transform)) {
-            if (!part_overflow) {
-                log_warn("glTF parts truncated for %s: max %d", name, MAX_MESH_PARTS);
-                part_overflow = true;
-            }
-        }
-    };
-
-    auto append_node_mesh = [&](cgltf_node* node) {
-        if (!node || !node->mesh)
-            return;
-
-        float world[16] = {};
-        cgltf_node_transform_world(node, world);
-        const char* node_name = node->name && node->name[0] ? node->name : nullptr;
-        const char* mesh_name = node->mesh->name && node->mesh->name[0] ? node->mesh->name : nullptr;
-
-        for (cgltf_size pi = 0; pi < node->mesh->primitives_count; pi++) {
-            char part_name[MAX_NAME] = {};
-            if (node_name) {
-                snprintf(part_name, sizeof(part_name), "%s.%u", node_name, (unsigned)pi);
-            } else if (mesh_name) {
-                snprintf(part_name, sizeof(part_name), "%s.%u", mesh_name, (unsigned)pi);
-            } else {
-                snprintf(part_name, sizeof(part_name), "part_%d", imported_part_count);
-            }
-            append_part(&node->mesh->primitives[pi], part_name, world);
-        }
-    };
-
-    std::function<void(cgltf_node*)> visit_node = [&](cgltf_node* node) {
-        if (!node)
-            return;
-        append_node_mesh(node);
-        for (cgltf_size ci = 0; ci < node->children_count; ci++)
-            visit_node(node->children[ci]);
-    };
+    VertexArray verts = {};
+    IndexArray indices = {};
+    PrimitiveRangeArray primitive_cache = {};
+    GltfMeshBuildContext build_ctx = {};
+    build_ctx.resource_name = name;
+    build_ctx.data = data;
+    build_ctx.imported_material_count = imported_material_count;
+    build_ctx.imported_parts = imported_parts;
+    build_ctx.imported_part_count = &imported_part_count;
+    build_ctx.part_overflow = &part_overflow;
+    build_ctx.verts = &verts;
+    build_ctx.indices = &indices;
+    build_ctx.primitive_cache = &primitive_cache;
 
     bool visited_nodes = false;
     cgltf_scene* scene = data->scene ? data->scene : (data->scenes_count > 0 ? &data->scenes[0] : nullptr);
     if (scene && scene->nodes_count > 0) {
         visited_nodes = true;
         for (cgltf_size ni = 0; ni < scene->nodes_count; ni++)
-            visit_node(scene->nodes[ni]);
+            res_gltf_visit_node(&build_ctx, scene->nodes[ni]);
     } else if (data->nodes_count > 0) {
         visited_nodes = true;
         for (cgltf_size ni = 0; ni < data->nodes_count; ni++) {
             cgltf_node* node = &data->nodes[ni];
             if (!node->parent)
-                visit_node(node);
+                res_gltf_visit_node(&build_ctx, node);
         }
     }
 
@@ -1617,20 +1821,26 @@ ResHandle res_load_mesh(const char* name, const char* path) {
                     snprintf(part_name, sizeof(part_name), "%s.%u", mesh_name, (unsigned)pi);
                 else
                     snprintf(part_name, sizeof(part_name), "part_%d", imported_part_count);
-                append_part(&mesh->primitives[pi], part_name, identity);
+                res_gltf_append_part(&build_ctx, &mesh->primitives[pi], part_name, identity);
             }
         }
     }
 
-    if (verts.empty() || indices.empty() || imported_part_count == 0) {
+    if (verts.count == 0 || indices.count == 0 || imported_part_count == 0) {
         char msg[512];
         snprintf(msg, sizeof(msg), "cgltf: no supported triangle primitives in '%s'", path);
         cgltf_free(data);
+        res_vertex_array_free(&verts);
+        res_index_array_free(&indices);
+        res_primitive_range_array_free(&primitive_cache);
         return res_mesh_fallback_cube(handle, msg);
     }
 
-    if (!res_upload_mesh(r, verts.data(), (int)verts.size(), indices.data(), (int)indices.size())) {
+    if (!res_upload_mesh(r, verts.items, verts.count, indices.items, indices.count)) {
         cgltf_free(data);
+        res_vertex_array_free(&verts);
+        res_index_array_free(&indices);
+        res_primitive_range_array_free(&primitive_cache);
         return res_mesh_fallback_cube(handle, "Mesh upload failed");
     }
 
@@ -1641,6 +1851,9 @@ ResHandle res_load_mesh(const char* name, const char* path) {
     memcpy(r->mesh_parts, imported_parts, sizeof(imported_parts));
 
     cgltf_free(data);
+    res_vertex_array_free(&verts);
+    res_index_array_free(&indices);
+    res_primitive_range_array_free(&primitive_cache);
     r->compiled_ok = true;
     r->using_fallback = false;
     r->mesh_primitive_type = -1;

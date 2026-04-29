@@ -5,6 +5,9 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
+// This module wraps the shared Direct3D 11 objects used by the whole tool:
+// swap chain, scene targets, depth buffers, samplers, and shared CBs.
+
 DX11Ctx g_dx = {};
 
 static const char* s_shadow_vs_src = R"HLSL(
@@ -16,6 +19,10 @@ cbuffer SceneCB : register(b0)
     float4 LightColor;
     float4 CamPos;
     float4x4 ShadowViewProj;
+    float4x4 InvViewProj;
+    float4x4 PrevViewProj;
+    float4x4 PrevInvViewProj;
+    float4x4 PrevShadowViewProj;
 };
 cbuffer ObjectCB : register(b2)
 {
@@ -240,6 +247,7 @@ void dx_create_scene_rt(int w, int h) {
     g_dx.dev->CreateShaderResourceView(g_dx.depth_tex, &srvd, &g_dx.depth_srv);
     g_dx.scene_width  = w;
     g_dx.scene_height = h;
+    dx_invalidate_scene_history();
 }
 
 void dx_destroy_scene_rt() { safe_release_scene_rt(); }
@@ -295,8 +303,14 @@ void dx_resize(int w, int h) {
     log_info("Resize %dx%d", w, h);
 }
 
+void dx_invalidate_scene_history() {
+    memset(&g_dx.scene_cb_data, 0, sizeof(g_dx.scene_cb_data));
+    g_dx.scene_cb_history_valid = false;
+}
+
 void dx_update_scene_cb(const SceneCBData& d) {
     g_dx.scene_cb_data = d;
+    g_dx.scene_cb_history_valid = true;
     D3D11_MAPPED_SUBRESOURCE ms = {};
     g_dx.ctx->Map(g_dx.scene_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
     memcpy(ms.pData, &d, sizeof(d));
@@ -312,6 +326,8 @@ void dx_update_object_cb(const ObjectCBData& d) {
     g_dx.ctx->Unmap(g_dx.object_cb, 0);
 }
 
+// Bind the off-screen scene surface and shared render state so command
+// execution can render a complete frame for the editor viewport.
 void dx_begin_scene() {
     float clear[4] = { 0.05f, 0.05f, 0.08f, 1.0f };
     ID3D11ShaderResourceView* null_srv = nullptr;

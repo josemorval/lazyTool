@@ -5,13 +5,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-// â”€â”€ fallback HLSL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// shader.cpp compiles HLSL, builds fallback shaders for error cases, and
+// reflects constant-buffer layouts so the editor can expose shader params.
 
 static const char* s_fallback_vs = R"HLSL(
 cbuffer SceneCB : register(b0) {
     float4x4 ViewProj;
     float4 TimeVec; float4 LightDir; float4 LightColor; float4 CamPos;
     float4x4 ShadowViewProj;
+    float4x4 InvViewProj;
+    float4x4 PrevViewProj;
+    float4x4 PrevInvViewProj;
+    float4x4 PrevShadowViewProj;
 };
 cbuffer ObjectCB : register(b2) { float4x4 World; };
 struct VSIn  { float3 pos : POSITION; float3 nor : NORMAL; float2 uv : TEXCOORD0; };
@@ -31,6 +36,10 @@ cbuffer SceneCB : register(b0) {
     float4x4 ViewProj;
     float4 TimeVec; float4 LightDir; float4 LightColor; float4 CamPos;
     float4x4 ShadowViewProj;
+    float4x4 InvViewProj;
+    float4x4 PrevViewProj;
+    float4x4 PrevInvViewProj;
+    float4x4 PrevShadowViewProj;
 };
 cbuffer ObjectCB : register(b2) { float4x4 World; };
 struct PSIn { float4 pos : SV_POSITION; float3 nor : NORMAL; float2 uv : TEXCOORD0; float3 wpos : TEXCOORD1; };
@@ -50,8 +59,6 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
     Output[id.xy] = float4(0.2, 0.4, 0.8, 1.0);
 }
 )HLSL";
-
-// â”€â”€ helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 static bool compile_blob(const char* src, size_t src_len, const char* src_name,
                           const char* entry, const char* profile,
@@ -209,10 +216,10 @@ static void reflect_command_cbuffer(Resource* r, ID3DBlob* blob) {
     refl->Release();
 }
 
-// â”€â”€ public â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
+// Compile the standard VS/PS pair and reflect user-editable parameters from
+// the shader's constant-buffer layout.
 bool shader_compile_vs_ps(Resource* r, const char* path,
-                           const char* vs_entry, const char* ps_entry)
+                          const char* vs_entry, const char* ps_entry)
 {
     shader_release(r);
     strncpy(r->path, path ? path : "", MAX_PATH_LEN - 1);
@@ -305,6 +312,7 @@ bool shader_compile_vs_ps(Resource* r, const char* path,
     return true;
 }
 
+// Compute shaders use the same pipeline, but with a single entry point.
 bool shader_compile_cs(Resource* r, const char* path, const char* cs_entry) {
     shader_release(r);
     strncpy(r->path, path ? path : "", MAX_PATH_LEN - 1);

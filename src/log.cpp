@@ -1,6 +1,9 @@
 #include "log.h"
 #include <stdarg.h>
 
+// The log is a fixed-size ring buffer so the UI can display recent messages
+// without allocating during normal frame updates.
+
 AppLog g_log = {};
 
 void log_init() { memset(&g_log, 0, sizeof(g_log)); }

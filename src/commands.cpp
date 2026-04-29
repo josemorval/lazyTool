@@ -5,6 +5,9 @@
 #include "log.h"
 #include <string.h>
 
+// The command system is the runtime execution graph. Each command describes
+// one draw, dispatch, clear, or grouping step in the frame pipeline.
+
 Command g_commands[MAX_COMMANDS] = {};
 int     g_command_count = 0;
 bool    g_profiler_enabled = false;
@@ -1073,6 +1076,8 @@ static void execute_command_children(CmdHandle parent_h, bool& shadow_prepass_do
     }
 }
 
+// Execute the visible command list in editor order. Child/group commands are
+// expanded by the traversal helpers that feed this top-level entry point.
 void cmd_execute_all() {
     bool shadow_prepass_done = false;
     cmd_profile_sync_enable_state();

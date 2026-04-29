@@ -1,6 +1,9 @@
 #pragma once
 #include "types.h"
 
+// Commands are the editable execution units that build a frame: clears,
+// draws, compute dispatches, grouping, repetition, and indirect work.
+
 extern Command g_commands[MAX_COMMANDS];
 extern int     g_command_count;
 extern bool    g_profiler_enabled;

@@ -1,6 +1,8 @@
 // impl.cpp — single-file header library implementations
 // Only compiled once. Never include these defines elsewhere.
 
+// This file centralizes the one-definition implementation toggles for the
+// header-only third-party libraries used by the project.
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 

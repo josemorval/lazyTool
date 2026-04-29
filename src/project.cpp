@@ -10,6 +10,9 @@
 #include <stdlib.h>
 #include <direct.h>
 
+// project.cpp owns the text project format used to save and restore the full
+// editor state in a way that remains readable and diff-friendly.
+
 static const char* bool_str(bool v) { return v ? "1" : "0"; }
 static char s_project_current_path[MAX_PATH_LEN] = {};
 
@@ -304,9 +307,11 @@ static void project_clear_user_data() {
     }
 }
 
+// Create a minimal scene so the editor always opens with valid content.
 void project_new_default() {
     project_clear_user_data();
     project_reset_dirlight_defaults();
+    dx_invalidate_scene_history();
     project_set_current_path("");
     float target[3] = { 0.0f, 0.0f, 0.0f };
     project_apply_legacy_camera(0.5f, 0.3f, 4.0f, target);
@@ -315,7 +320,7 @@ void project_new_default() {
     g_camera.far_z = 100.0f;
 
     ResHandle cube = res_create_mesh_primitive("normal_cube", MESH_PRIM_CUBE);
-    ResHandle shader = res_create_shader("normal_color", "shaders/normal_color.hlsl", "VSMain", "PSMain");
+    ResHandle shader = res_create_shader("normal_color", "shaders/default.hlsl", "VSMain", "PSMain");
 
     CmdHandle clear_h = cmd_alloc("clear_scene", CMD_CLEAR);
     if (Command* c = cmd_get(clear_h)) {
@@ -342,6 +347,7 @@ void project_new_default() {
     log_info("New project: cube colored by normal.");
 }
 
+// Serialize the current scene/editor state into the custom text format.
 bool project_save_text(const char* path) {
     ensure_parent_dir(path);
     FILE* f = fopen(path, "wb");
@@ -544,6 +550,7 @@ static void parse_handles(char* line, ResHandle* handles, int* count, int max_co
     }
 }
 
+// Parse a saved project file and rebuild the in-memory editor state.
 bool project_load_text(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) {
@@ -770,6 +777,7 @@ bool project_load_text(const char* path) {
 
     fclose(f);
     project_set_current_path(path);
+    dx_invalidate_scene_history();
     log_info("Project loaded: %s", path);
     return true;
 }

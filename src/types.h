@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <math.h>
 
+// types.h is the shared foundation of the project: limits, handles, enums,
+// POD data structures, and lightweight math helpers used by every module.
+
 // ── limits ───────────────────────────────────────────────────────────────
 #define MAX_RESOURCES    256
 #define MAX_COMMANDS     256
@@ -248,6 +251,9 @@ struct SceneCBData {
     float cam_pos[4];
     float shadow_view_proj[16];
     float inv_view_proj[16];
+    float prev_view_proj[16];
+    float prev_inv_view_proj[16];
+    float prev_shadow_view_proj[16];
 };
 
 struct UserCBData {

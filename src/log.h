@@ -1,6 +1,8 @@
 #pragma once
 #include "types.h"
 
+// Small logging API used by runtime code and displayed inside the editor UI.
+
 #define LOG_MAX_ENTRIES 512
 #define LOG_MSG_LEN     256
 

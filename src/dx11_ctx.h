@@ -1,6 +1,9 @@
 #pragma once
 #include "types.h"
 
+// Shared Direct3D 11 device state and helper entry points used by the rest of
+// the tool. Most modules touch the GPU through this narrow surface.
+
 struct DX11Ctx {
     HWND                     hwnd;
     ID3D11Device*            dev;
@@ -31,6 +34,7 @@ struct DX11Ctx {
     ID3D11Buffer*               object_cb;
     SceneCBData                 scene_cb_data;
     ObjectCBData                object_cb_data;
+    bool                        scene_cb_history_valid;
 
     ID3D11RasterizerState*   rs_solid;
     ID3D11RasterizerState*   rs_cull_none;
@@ -50,6 +54,7 @@ void dx_resize(int w, int h);
 void dx_create_scene_rt(int w, int h);
 void dx_destroy_scene_rt();
 void dx_create_shadow_map(int w, int h);
+void dx_invalidate_scene_history();
 void dx_update_scene_cb(const SceneCBData& d);
 void dx_update_object_cb(const ObjectCBData& d);
 void dx_begin_scene();

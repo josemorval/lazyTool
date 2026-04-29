@@ -5,6 +5,9 @@
 #include "log.h"
 #include <string.h>
 
+// user_cb.cpp manages the user-defined constant buffer bound at b1. It lets
+// editor variables flow into shaders every frame without manual packing.
+
 UserCBEntry   g_user_cb_entries[MAX_USER_CB_VARS] = {};
 int           g_user_cb_count = 0;
 ID3D11Buffer* g_user_cb_buf   = nullptr;
@@ -121,6 +124,7 @@ void user_cb_shutdown() {
     if (s_command_cb_buf) { s_command_cb_buf->Release(); s_command_cb_buf = nullptr; }
 }
 
+// Pack the latest user variable values into the shared GPU buffer.
 void user_cb_update() {
     if (!g_user_cb_buf) return;
 
@@ -151,6 +155,8 @@ static int command_param_find(const Command* c, const char* name) {
     return -1;
 }
 
+// Keep per-command parameter editors aligned with the reflected user CB
+// layout while preserving matching values across shader recompiles.
 void user_cb_sync_command_params(Command* c, const Resource* shader) {
     if (!c) return;
     if (!shader || !shader->shader_cb.active) {

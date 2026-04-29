@@ -1,6 +1,9 @@
 #pragma once
 #include "types.h"
 
+// UI entry points plus shared editor state queried by runtime systems such as
+// camera controls and scene pause/restart handling.
+
 extern ResHandle g_sel_res;
 extern CmdHandle g_sel_cmd;
 extern Camera g_camera;

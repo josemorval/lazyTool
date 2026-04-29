@@ -1,6 +1,8 @@
 #pragma once
 #include "types.h"
 
+// Public API for the user-defined constant buffer bound at register b1.
+
 extern UserCBEntry   g_user_cb_entries[MAX_USER_CB_VARS];
 extern int           g_user_cb_count;
 extern ID3D11Buffer* g_user_cb_buf;

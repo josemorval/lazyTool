@@ -16,6 +16,9 @@
 #include "app_settings.h"
 #include "resource.h"
 
+// main.cpp ties the whole application together: math helpers, global runtime
+// state, per-frame updates, Win32 setup, and the editor/render main loop.
+
 // ── math impl ────────────────────────────────────────────────────────────
 
 Mat4 mat4_identity() {
@@ -531,6 +534,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 // ── frame update ──────────────────────────────────────────────────────────
 
+// Gather transient engine state and expose it through built-in resources and
+// the shared SceneCB before commands begin rendering this frame.
 static void update_builtins_and_scene_cb() {
     Resource* bt = res_get(g_builtin_time);
     if (bt) bt->fval[0] = g_time;
@@ -585,6 +590,13 @@ static void update_builtins_and_scene_cb() {
     SceneCBData cb = {};
     memcpy(cb.view_proj, vp.m, sizeof(vp.m));
     memcpy(cb.inv_view_proj, inv_vp.m, sizeof(inv_vp.m));
+    if (g_dx.scene_cb_history_valid) {
+        memcpy(cb.prev_view_proj, g_dx.scene_cb_data.view_proj, sizeof(cb.prev_view_proj));
+        memcpy(cb.prev_inv_view_proj, g_dx.scene_cb_data.inv_view_proj, sizeof(cb.prev_inv_view_proj));
+    } else {
+        memcpy(cb.prev_view_proj, vp.m, sizeof(vp.m));
+        memcpy(cb.prev_inv_view_proj, inv_vp.m, sizeof(inv_vp.m));
+    }
     cb.time_vec[0] = g_time;
     cb.time_vec[1] = g_dt;
     cb.time_vec[2] = (float)g_frame;
@@ -631,6 +643,10 @@ static void update_builtins_and_scene_cb() {
     Mat4 shadow_proj = mat4_orthographic(shadow_w, shadow_h, shadow_near, shadow_far);
     Mat4 shadow_vp = mat4_mul(shadow_view, shadow_proj);
     memcpy(cb.shadow_view_proj, shadow_vp.m, sizeof(shadow_vp.m));
+    if (g_dx.scene_cb_history_valid)
+        memcpy(cb.prev_shadow_view_proj, g_dx.scene_cb_data.shadow_view_proj, sizeof(cb.prev_shadow_view_proj));
+    else
+        memcpy(cb.prev_shadow_view_proj, shadow_vp.m, sizeof(shadow_vp.m));
 
     dx_update_scene_cb(cb);
 }

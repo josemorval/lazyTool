@@ -7,6 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+// app_settings.cpp stores editor-wide preferences that should survive across
+// projects, such as VSync, profiling, and camera interaction defaults.
+
 static const char* s_settings_path = "lazytool_general.ini";
 
 // Editor-wide defaults live outside project files so opening an old project
