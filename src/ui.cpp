@@ -43,6 +43,17 @@ static bool s_scene_surface_resize_armed = true;
 static int s_scene_surface_host_w = 0;
 static int s_scene_surface_host_h = 0;
 static bool s_scene_surface_fullscreen = false;
+static RECT s_ui_top_toolbar_screen_rect = {};
+static bool s_ui_top_toolbar_screen_rect_valid = false;
+static RECT s_ui_window_control_screen_rects[3] = {};
+static bool s_ui_window_control_screen_rects_valid[3] = {};
+static const float k_ui_scale_default = 1.06f;
+static const float k_ui_scale_min = 0.75f;
+static const float k_ui_scale_max = 1.25f;
+static float s_ui_global_scale = k_ui_scale_default;
+static bool s_ui_scale_dirty = false;
+static ImGuiStyle s_ui_base_style = {};
+static bool s_ui_base_style_valid = false;
 
 enum UiViewportGizmoMode {
     UI_GIZMO_NONE = 0,
@@ -85,6 +96,7 @@ static bool ui_begin_shortcut_section(const char* id, const char* title, ImGuiTa
 static void ui_draw_shortcut_row(const char* key, const char* desc);
 static void ui_align_frame_row(float row_y);
 static void ui_align_text_row(float row_y);
+static float ui_px(float v);
 
 struct PathCandidate {
     char display[MAX_PATH_LEN];
@@ -128,6 +140,34 @@ static bool ui_prefix_ci(const char* text, const char* prefix) {
         if (a != b) return false;
     }
     return true;
+}
+
+static float ui_clamp_global_scale(float scale) {
+    if (scale < k_ui_scale_min) return k_ui_scale_min;
+    if (scale > k_ui_scale_max) return k_ui_scale_max;
+    return scale;
+}
+
+static float ui_chrome_scale() {
+    return s_ui_global_scale < 1.0f ? 1.0f : s_ui_global_scale;
+}
+
+static float ui_px(float v) {
+    return floorf(v * s_ui_global_scale + 0.5f);
+}
+
+static float ui_margin_px(float v) {
+    return floorf(v * ui_chrome_scale() + 0.5f);
+}
+
+static void ui_apply_global_scale_now() {
+    if (!ImGui::GetCurrentContext() || !s_ui_base_style_valid)
+        return;
+
+    ImGuiStyle& style = ImGui::GetStyle();
+    style = s_ui_base_style;
+    style.ScaleAllSizes(ui_chrome_scale());
+    ImGui::GetIO().FontGlobalScale = s_ui_global_scale;
 }
 
 static bool ui_ext_allowed(const char* name, const char* filter) {
@@ -752,6 +792,31 @@ static void ui_image_fit_panel(ID3D11ShaderResourceView* srv, int width, int hei
     ImGui::PopID();
 }
 
+static void ui_image_fill_panel_width(ID3D11ShaderResourceView* srv, int width, int height) {
+    if (!srv) return;
+
+    ImGui::PushID((void*)srv);
+    ImGui::SetNextItemWidth(170.0f);
+    ImGui::SliderFloat("Preview Scale", &s_asset_preview_scale, 0.10f, 1.00f, "%.2fx");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Fit"))
+        s_asset_preview_scale = 1.0f;
+
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    float max_w = avail.x > 1.0f ? avail.x : 1.0f;
+    float src_w = width  > 0 ? (float)width  : 1.0f;
+    float src_h = height > 0 ? (float)height : 1.0f;
+    float scale = max_w / src_w;
+    if (scale <= 0.0f) scale = 1.0f;
+    scale *= s_asset_preview_scale;
+
+    ImVec2 size = { src_w * scale, src_h * scale };
+    if (size.x < 1.0f) size.x = 1.0f;
+    if (size.y < 1.0f) size.y = 1.0f;
+    ImGui::Image((ImTextureID)srv, size);
+    ImGui::PopID();
+}
+
 static const char* user_cb_default_base_name(ResType type) {
     switch (type) {
     case RES_INT:    return "int_0";
@@ -901,7 +966,7 @@ static void ui_command_shader_params(Command* c, Resource* shader) {
         ImGui::PushID(i);
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.080f, 0.077f, 0.081f, 1.0f));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 7.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_margin_px(8.0f), ui_margin_px(7.0f)));
         ImGui::BeginChild("##param_card", ImVec2(0.0f, 108.0f), true);
 
         ImGui::Checkbox("##enabled", &p.enabled);
@@ -2273,6 +2338,87 @@ static void ui_panel_commands(bool embedded = false) {
 
 // ── inspector ─────────────────────────────────────────────────────────────
 
+static void ui_compute_legacy_cascade_splits(float near_z, float far_z, int cascade_count,
+                                             float lambda, float out_splits[MAX_SHADOW_CASCADES]) {
+    if (!out_splits)
+        return;
+
+    if (near_z < 0.0001f)
+        near_z = 0.1f;
+    if (far_z <= near_z + 0.001f)
+        far_z = near_z + 0.001f;
+    if (cascade_count < 1)
+        cascade_count = 1;
+    if (cascade_count > MAX_SHADOW_CASCADES)
+        cascade_count = MAX_SHADOW_CASCADES;
+    lambda = clampf(lambda, 0.0f, 1.0f);
+
+    for (int i = 0; i < MAX_SHADOW_CASCADES; i++)
+        out_splits[i] = far_z;
+
+    for (int i = 0; i < cascade_count; i++) {
+        float t = (float)(i + 1) / (float)cascade_count;
+        float log_split = near_z * powf(far_z / near_z, t);
+        float uni_split = near_z + (far_z - near_z) * t;
+        out_splits[i] = uni_split + (log_split - uni_split) * lambda;
+    }
+}
+
+static void ui_seed_dirlight_cascade_range(Resource* r, int from_index, int cascade_count) {
+    if (!r)
+        return;
+
+    if (from_index < 0)
+        from_index = 0;
+    if (cascade_count < 1)
+        cascade_count = 1;
+    if (cascade_count > MAX_SHADOW_CASCADES)
+        cascade_count = MAX_SHADOW_CASCADES;
+    if (from_index >= cascade_count)
+        return;
+
+    float seeded_splits[MAX_SHADOW_CASCADES] = {};
+    float split_far = r->shadow_distance > 0.1f ? r->shadow_distance : g_camera.far_z;
+    ui_compute_legacy_cascade_splits(g_camera.near_z, split_far, cascade_count,
+                                     r->shadow_split_lambda, seeded_splits);
+
+    float base_extent_x = r->shadow_extent[0] > 0.01f ? r->shadow_extent[0] : 0.01f;
+    float base_extent_y = r->shadow_extent[1] > 0.01f ? r->shadow_extent[1] : 0.01f;
+    float base_near = r->shadow_near > 0.0001f ? r->shadow_near : 0.0001f;
+    float base_far = r->shadow_far > base_near + 0.001f ? r->shadow_far : base_near + 0.001f;
+    for (int i = from_index; i < cascade_count; i++) {
+        r->shadow_cascade_split[i] = seeded_splits[i];
+        r->shadow_cascade_extent[i][0] = base_extent_x;
+        r->shadow_cascade_extent[i][1] = base_extent_y;
+        r->shadow_cascade_near[i] = base_near;
+        r->shadow_cascade_far[i] = base_far;
+    }
+}
+
+static void ui_validate_dirlight_cascades(Resource* r) {
+    if (!r)
+        return;
+
+    float prev_split = g_camera.near_z > 0.0001f ? g_camera.near_z : 0.1f;
+    float max_split = g_camera.far_z > prev_split + 0.001f ? g_camera.far_z : prev_split + 0.001f;
+    for (int i = 0; i < MAX_SHADOW_CASCADES; i++) {
+        if (r->shadow_cascade_extent[i][0] < 0.01f) r->shadow_cascade_extent[i][0] = 0.01f;
+        if (r->shadow_cascade_extent[i][1] < 0.01f) r->shadow_cascade_extent[i][1] = 0.01f;
+        if (r->shadow_cascade_near[i] < 0.0001f) r->shadow_cascade_near[i] = 0.0001f;
+        if (r->shadow_cascade_far[i] <= r->shadow_cascade_near[i] + 0.001f)
+            r->shadow_cascade_far[i] = r->shadow_cascade_near[i] + 0.001f;
+
+        float min_split = prev_split + 0.001f;
+        if (min_split > max_split)
+            min_split = max_split;
+        if (r->shadow_cascade_split[i] < min_split)
+            r->shadow_cascade_split[i] = min_split;
+        if (r->shadow_cascade_split[i] > max_split)
+            r->shadow_cascade_split[i] = max_split;
+        prev_split = r->shadow_cascade_split[i];
+    }
+}
+
 static void ui_inspector_resource(Resource* r, ResHandle h) {
     if (r->is_builtin) ImGui::TextDisabled("(built-in — read only name)");
 
@@ -2661,15 +2807,43 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             r->shadow_height = shadow_size[1];
             dx_create_shadow_map(r->shadow_width, r->shadow_height);
         }
-        ImGui::DragFloat2("Shadow Ortho Size", r->shadow_extent, 0.01f, 0.01f, 100.0f);
-        ImGui::DragFloat("Shadow Near", &r->shadow_near, 0.001f, 0.0001f, 100.0f);
-        ImGui::DragFloat("Shadow Far", &r->shadow_far, 0.01f, 0.001f, 1000.0f);
-        if (r->shadow_far <= r->shadow_near + 0.001f)
-            r->shadow_far = r->shadow_near + 0.001f;
+        int cascade_count = r->shadow_cascade_count > 0 ? r->shadow_cascade_count : 1;
+        int prev_cascade_count = cascade_count;
+        if (ImGui::InputInt("Shadow Cascades", &cascade_count)) {
+            if (cascade_count < 1) cascade_count = 1;
+            if (cascade_count > MAX_SHADOW_CASCADES) cascade_count = MAX_SHADOW_CASCADES;
+            r->shadow_cascade_count = cascade_count;
+            if (cascade_count > prev_cascade_count)
+                ui_seed_dirlight_cascade_range(r, prev_cascade_count, cascade_count);
+        }
+        ui_validate_dirlight_cascades(r);
+        if (r->shadow_cascade_count > 1) {
+            for (int cascade = 0; cascade < r->shadow_cascade_count; cascade++) {
+                ImGui::PushID(cascade);
+                if (cascade > 0)
+                    ImGui::Separator();
+                ImGui::TextDisabled("Cascade %d", cascade + 1);
+                ImGui::DragFloat("Split Far", &r->shadow_cascade_split[cascade], 0.05f, 0.0f, 1000.0f);
+                ImGui::DragFloat2("Ortho Size", r->shadow_cascade_extent[cascade], 0.01f, 0.01f, 100.0f);
+                ImGui::DragFloat("Near", &r->shadow_cascade_near[cascade], 0.001f, 0.0001f, 100.0f);
+                ImGui::DragFloat("Far", &r->shadow_cascade_far[cascade], 0.01f, 0.001f, 1000.0f);
+                ImGui::PopID();
+            }
+            ui_validate_dirlight_cascades(r);
+            ImGui::TextDisabled("Each cascade uses a manual ortho box and manual split distance.");
+        } else {
+            ImGui::DragFloat2("Shadow Ortho Size", r->shadow_extent, 0.01f, 0.01f, 100.0f);
+            ImGui::DragFloat("Shadow Near", &r->shadow_near, 0.001f, 0.0001f, 100.0f);
+            ImGui::DragFloat("Shadow Far", &r->shadow_far, 0.01f, 0.001f, 1000.0f);
+            if (r->shadow_far <= r->shadow_near + 0.001f)
+                r->shadow_far = r->shadow_near + 0.001f;
+            ImGui::TextDisabled("Single-cascade mode uses the manual ortho box above.");
+        }
         ImGui::Separator();
         if (Resource* shadow_map = res_get(g_builtin_shadow_map)) {
-            ImGui::Text("Shadow Map Preview (%dx%d)", shadow_map->width, shadow_map->height);
-            ui_image_fit_panel(shadow_map->srv, shadow_map->width, shadow_map->height);
+            ImGui::Text("Shadow Atlas Preview (%dx%d, %d cascades)",
+                        shadow_map->width, shadow_map->height, r->shadow_cascade_count > 0 ? r->shadow_cascade_count : 1);
+            ui_image_fill_panel_width(shadow_map->srv, shadow_map->width, shadow_map->height);
         }
         break;
     }
@@ -2705,7 +2879,12 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             }
             dx_create_shadow_map(shadow_size[0], shadow_size[1]);
         }
-        ui_image_fit_panel(r->srv, r->width, r->height);
+        if (dl) {
+            ImGui::TextDisabled("%d cascades%s",
+                                dl->shadow_cascade_count > 0 ? dl->shadow_cascade_count : 1,
+                                dl->shadow_cascade_count > 1 ? " (atlas)" : "");
+        }
+        ui_image_fill_panel_width(r->srv, r->width, r->height);
         break;
     }
 
@@ -3040,7 +3219,7 @@ static void ui_binding_row(const char* role, const char* stage, int slot, ResHan
     ImGui::PushID(slot);
     ImGui::PushID((int)h);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.080f, 0.077f, 0.081f, 1.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 7.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_margin_px(8.0f), ui_margin_px(7.0f)));
     ImGui::BeginChild("##binding_card", ImVec2(0.0f, 62.0f), true);
 
     ImGui::TextUnformatted(role);
@@ -3149,7 +3328,7 @@ static void ui_panel_bindings(bool embedded = false) {
                 const ShaderCBVar& v = r->shader_cb.vars[i];
                 ImGui::PushID(i);
                 ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.080f, 0.077f, 0.081f, 1.0f));
-                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 7.0f));
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_margin_px(8.0f), ui_margin_px(7.0f)));
                 ImGui::BeginChild("##shader_var_card", ImVec2(0.0f, 58.0f), true);
                 ImGui::TextUnformatted(v.name);
                 ImGui::SameLine();
@@ -3398,6 +3577,20 @@ static void ui_reset_camera_view();
 static void ui_panel_general(bool embedded = false) {
     if (!embedded) ImGui::Begin("General");
     bool settings_dirty = false;
+
+    if (ImGui::CollapsingHeader("Interface", ImGuiTreeNodeFlags_DefaultOpen)) {
+        float ui_scale = ui_global_scale();
+        if (ImGui::SliderFloat("Global Scale", &ui_scale, k_ui_scale_min, k_ui_scale_max, "%.2fx")) {
+            ui_set_global_scale(ui_scale);
+            settings_dirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset##ui_scale")) {
+            ui_set_global_scale(k_ui_scale_default);
+            settings_dirty = true;
+        }
+        ImGui::TextDisabled("Scales fonts and layout globally without changing project data.");
+    }
 
     if (ImGui::CollapsingHeader("Application", ImGuiTreeNodeFlags_DefaultOpen)) {
         settings_dirty |= ImGui::Checkbox("VSync", &g_dx.vsync);
@@ -4110,6 +4303,7 @@ enum UiIconKind {
     UI_ICON_GIZMO_MOVE,
     UI_ICON_GIZMO_ROTATE,
     UI_ICON_GIZMO_SCALE,
+    UI_ICON_WIREFRAME,
     UI_ICON_FULLSCREEN,
     UI_ICON_FULLSCREEN_EXIT,
     UI_ICON_MAXIMIZE_SQUARE,
@@ -4126,6 +4320,7 @@ static const char* ui_svg_icon_path(UiIconKind icon) {
     case UI_ICON_GIZMO_MOVE:       return "assets/icons/lucide-move-3d.svg";
     case UI_ICON_GIZMO_ROTATE:     return "assets/icons/lucide-rotate-3d.svg";
     case UI_ICON_GIZMO_SCALE:      return "assets/icons/lucide-scale-3d.svg";
+    case UI_ICON_WIREFRAME:        return "assets/icons/lucide-box.svg";
     case UI_ICON_FULLSCREEN:       return "assets/icons/lucide-maximize.svg";
     case UI_ICON_FULLSCREEN_EXIT:  return "assets/icons/lucide-minimize.svg";
     case UI_ICON_MAXIMIZE_SQUARE:  return "assets/icons/lucide-square.svg";
@@ -4149,6 +4344,7 @@ static NSVGimage* ui_svg_icon(UiIconKind icon) {
         { UI_ICON_GIZMO_MOVE, nullptr, false },
         { UI_ICON_GIZMO_ROTATE, nullptr, false },
         { UI_ICON_GIZMO_SCALE, nullptr, false },
+        { UI_ICON_WIREFRAME, nullptr, false },
         { UI_ICON_FULLSCREEN, nullptr, false },
         { UI_ICON_FULLSCREEN_EXIT, nullptr, false },
         { UI_ICON_MAXIMIZE_SQUARE, nullptr, false },
@@ -4226,6 +4422,33 @@ static bool ui_icon_button(const char* id, UiIconKind icon, ImVec2 size, const c
     return clicked;
 }
 
+static bool ui_icon_button_pressed(const char* id, UiIconKind icon, ImVec2 size, const char* tooltip = nullptr) {
+    if (size.y <= 0.0f)
+        size.y = ImGui::GetFrameHeight();
+    ImGui::PushID(id);
+    ImGui::Button("##icon", size);
+    bool pressed = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    ImU32 col = ImGui::GetColorU32(ImGui::IsItemActive() ? ImVec4(0.98f, 0.98f, 1.0f, 1.0f) :
+        (ImGui::IsItemHovered() ? ImVec4(0.92f, 0.93f, 0.95f, 1.0f) : ImVec4(0.70f, 0.72f, 0.75f, 1.0f)));
+    ui_draw_icon_shape(icon, ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), col);
+    if (tooltip && tooltip[0] && ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", tooltip);
+    ImGui::PopID();
+    return pressed;
+}
+
+static void ui_store_window_control_rect(int index) {
+    if (index < 0 || index >= 3)
+        return;
+    ImVec2 min = ImGui::GetItemRectMin();
+    ImVec2 max = ImGui::GetItemRectMax();
+    s_ui_window_control_screen_rects[index].left = (LONG)floorf(min.x);
+    s_ui_window_control_screen_rects[index].top = (LONG)floorf(min.y);
+    s_ui_window_control_screen_rects[index].right = (LONG)ceilf(max.x);
+    s_ui_window_control_screen_rects[index].bottom = (LONG)ceilf(max.y);
+    s_ui_window_control_screen_rects_valid[index] = true;
+}
+
 static UiIconKind ui_icon_for_action(const char* action, const char** tooltip) {
     if (tooltip) *tooltip = nullptr;
     if (!action) return UI_ICON_NONE;
@@ -4240,6 +4463,10 @@ static UiIconKind ui_icon_for_action(const char* action, const char** tooltip) {
     if (strncmp(action, "GizmoScale", 10) == 0) {
         if (tooltip) *tooltip = "Scale gizmo (3)";
         return UI_ICON_GIZMO_SCALE;
+    }
+    if (strncmp(action, "Wireframe", 9) == 0) {
+        if (tooltip) *tooltip = g_dx.scene_wireframe ? "Disable wireframe" : "Enable wireframe";
+        return UI_ICON_WIREFRAME;
     }
     if (strncmp(action, "Pause", 5) == 0) {
         if (tooltip) *tooltip = "Pause scene";
@@ -4272,7 +4499,22 @@ static UiViewportGizmoMode ui_gizmo_mode_for_action(const char* action) {
     return UI_GIZMO_NONE;
 }
 
+static bool ui_header_action_is_separator(const char* action) {
+    return action && strncmp(action, "Separator", 9) == 0;
+}
+
+static float ui_header_action_width(const char* action, float button_size) {
+    if (!action || !action[0])
+        return 0.0f;
+    if (ui_header_action_is_separator(action))
+        return ui_margin_px(10.0f);
+    return button_size;
+}
+
 static bool ui_header_action_button(const char* action) {
+    if (ui_header_action_is_separator(action))
+        return false;
+
     const char* tooltip = nullptr;
     UiIconKind icon = ui_icon_for_action(action, &tooltip);
     if (icon != UI_ICON_NONE) {
@@ -4280,6 +4522,7 @@ static bool ui_header_action_button(const char* action) {
         bool danger = icon == UI_ICON_PAUSE;
         UiViewportGizmoMode gizmo_mode = ui_gizmo_mode_for_action(action);
         bool gizmo_active = gizmo_mode != UI_GIZMO_NONE && s_viewport_gizmo_mode == gizmo_mode;
+        bool wireframe_active = strncmp(action, "Wireframe", 9) == 0 && g_dx.scene_wireframe;
         if (warm) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.34f, 0.20f, 0.10f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.44f, 0.26f, 0.13f, 1.0f));
@@ -4288,16 +4531,21 @@ static bool ui_header_action_button(const char* action) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.11f, 0.12f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.40f, 0.14f, 0.15f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.48f, 0.18f, 0.18f, 1.0f));
-        } else if (gizmo_active) {
+        } else if (gizmo_active || wireframe_active) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.33f, 0.18f, 0.10f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.24f, 0.12f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.58f, 0.30f, 0.14f, 1.0f));
         }
-        bool clicked = ui_icon_button(action, icon, ImVec2(22.0f, 22.0f), tooltip);
-        if (warm || danger || gizmo_active)
+        float icon_size = ui_px(22.0f);
+        bool clicked = ui_icon_button(action, icon, ImVec2(icon_size, icon_size), tooltip);
+        if (warm || danger || gizmo_active || wireframe_active)
             ImGui::PopStyleColor(3);
         if (clicked && gizmo_mode != UI_GIZMO_NONE) {
             ui_set_viewport_gizmo_mode(gizmo_mode);
+            return true;
+        }
+        if (clicked && strncmp(action, "Wireframe", 9) == 0) {
+            g_dx.scene_wireframe = !g_dx.scene_wireframe;
             return true;
         }
         return clicked;
@@ -4341,9 +4589,11 @@ static void ui_panel_header(const char* title, const char* detail = nullptr,
                             const char* action_c = nullptr, bool* clicked_c = nullptr,
                             const char* action_d = nullptr, bool* clicked_d = nullptr,
                             const char* action_e = nullptr, bool* clicked_e = nullptr,
-                            const char* action_f = nullptr, bool* clicked_f = nullptr) {
-    const char* actions[] = { action_a, action_b, action_c, action_d, action_e, action_f };
-    bool* clicks[] = { clicked_a, clicked_b, clicked_c, clicked_d, clicked_e, clicked_f };
+                            const char* action_f = nullptr, bool* clicked_f = nullptr,
+                            const char* action_g = nullptr, bool* clicked_g = nullptr,
+                            const char* action_h = nullptr, bool* clicked_h = nullptr) {
+    const char* actions[] = { action_a, action_b, action_c, action_d, action_e, action_f, action_g, action_h };
+    bool* clicks[] = { clicked_a, clicked_b, clicked_c, clicked_d, clicked_e, clicked_f, clicked_g, clicked_h };
     const int action_count = (int)(sizeof(actions) / sizeof(actions[0]));
     for (int i = 0; i < action_count; i++) {
         if (clicks[i])
@@ -4353,29 +4603,34 @@ static void ui_panel_header(const char* title, const char* detail = nullptr,
     UiPanelTone tone = ui_current_panel_tone();
     ImVec4 accent = ui_panel_accent(tone);
     ImVec2 header_pos = ImGui::GetCursorScreenPos();
-    float header_h = ImGui::GetTextLineHeight() + 10.0f;
+    float header_h = ImGui::GetTextLineHeight() + ui_margin_px(10.0f);
     ImDrawList* header_dl = ImGui::GetWindowDrawList();
     float header_right = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
-    header_dl->AddRectFilled(ImVec2(header_pos.x - 3.0f, header_pos.y - 2.0f),
-        ImVec2(header_right, header_pos.y + header_h + 2.0f),
+    header_dl->AddRectFilled(ImVec2(header_pos.x - ui_margin_px(3.0f), header_pos.y - ui_margin_px(2.0f)),
+        ImVec2(header_right, header_pos.y + header_h + ui_margin_px(2.0f)),
         ImGui::GetColorU32(ui_with_alpha(accent, 0.040f)), 3.0f);
-    header_dl->AddRectFilled(ImVec2(header_pos.x - 3.0f, header_pos.y - 2.0f),
-        ImVec2(header_pos.x, header_pos.y + header_h + 2.0f),
+    header_dl->AddRectFilled(ImVec2(header_pos.x - ui_margin_px(3.0f), header_pos.y - ui_margin_px(2.0f)),
+        ImVec2(header_pos.x, header_pos.y + header_h + ui_margin_px(2.0f)),
         ImGui::GetColorU32(ui_with_alpha(accent, 0.62f)), 1.5f);
 
-    float button_size = 22.0f;
-    float button_spacing = 4.0f;
-    int button_count = 0;
+    float button_size = ui_px(22.0f);
+    float button_spacing = ui_margin_px(4.0f);
+    float buttons_w = 0.0f;
+    bool has_action = false;
     for (int i = 0; i < action_count; i++) {
         if (actions[i] && actions[i][0])
-            button_count++;
+        {
+            if (has_action)
+                buttons_w += button_spacing;
+            buttons_w += ui_header_action_width(actions[i], button_size);
+            has_action = true;
+        }
     }
-    float buttons_w = button_count > 0 ? button_count * button_size + (button_count - 1) * button_spacing : 0.0f;
     float buttons_x = header_right - buttons_w;
     float buttons_y = header_pos.y + floorf((header_h - button_size) * 0.5f);
 
-    float text_left = header_pos.x + 8.0f;
-    float text_right = buttons_w > 0.0f ? (buttons_x - 8.0f) : (header_right - 8.0f);
+    float text_left = header_pos.x + ui_margin_px(8.0f);
+    float text_right = buttons_w > 0.0f ? (buttons_x - ui_margin_px(8.0f)) : (header_right - ui_margin_px(8.0f));
     if (text_right < text_left)
         text_right = text_left;
 
@@ -4389,7 +4644,7 @@ static void ui_panel_header(const char* title, const char* detail = nullptr,
 
     float title_w = ImGui::CalcTextSize(title).x;
     if (detail && detail[0]) {
-        float detail_min_x = text_left + title_w + 12.0f;
+        float detail_min_x = text_left + title_w + ui_margin_px(12.0f);
         float detail_max_w = text_right - detail_min_x;
         if (detail_max_w > 4.0f) {
             char fitted[MAX_NAME * 2 + 32] = {};
@@ -4406,10 +4661,21 @@ static void ui_panel_header(const char* title, const char* detail = nullptr,
     for (int i = 0; i < action_count; i++) {
         if (!actions[i] || !actions[i][0])
             continue;
-        ImGui::SetCursorScreenPos(ImVec2(buttons_x, buttons_y));
-        if (ui_header_action_button(actions[i]) && clicks[i])
-            *clicks[i] = true;
-        buttons_x += button_size + button_spacing;
+        float action_w = ui_header_action_width(actions[i], button_size);
+        if (ui_header_action_is_separator(actions[i])) {
+            float line_x = buttons_x + floorf(action_w * 0.5f);
+            float line_y0 = header_pos.y + ui_margin_px(5.0f);
+            float line_y1 = header_pos.y + header_h - ui_margin_px(5.0f);
+            header_dl->AddLine(
+                ImVec2(line_x, line_y0),
+                ImVec2(line_x, line_y1),
+                ImGui::GetColorU32(ImVec4(0.28f, 0.25f, 0.24f, 0.85f)), 1.0f);
+        } else {
+            ImGui::SetCursorScreenPos(ImVec2(buttons_x, buttons_y));
+            if (ui_header_action_button(actions[i]) && clicks[i])
+                *clicks[i] = true;
+        }
+        buttons_x += action_w + button_spacing;
     }
 
     ImGui::SetCursorScreenPos(ImVec2(header_pos.x, header_pos.y));
@@ -4424,16 +4690,19 @@ static bool ui_begin_tool_panel(const char* id, const char* title, const char* d
                                 const char* action_c = nullptr, bool* clicked_c = nullptr,
                                 const char* action_d = nullptr, bool* clicked_d = nullptr,
                                 const char* action_e = nullptr, bool* clicked_e = nullptr,
-                                const char* action_f = nullptr, bool* clicked_f = nullptr) {
+                                const char* action_f = nullptr, bool* clicked_f = nullptr,
+                                const char* action_g = nullptr, bool* clicked_g = nullptr,
+                                const char* action_h = nullptr, bool* clicked_h = nullptr) {
     if (s_panel_tone_count < (int)(sizeof(s_panel_tone_stack) / sizeof(s_panel_tone_stack[0])))
         s_panel_tone_stack[s_panel_tone_count++] = tone;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 7.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_margin_px(8.0f), ui_margin_px(7.0f)));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ui_panel_bg(tone));
     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.220f, 0.205f, 0.200f, 1.0f));
     bool open = ImGui::BeginChild(id, size, true);
     ui_panel_header(title, detail,
                     action_a, clicked_a, action_b, clicked_b, action_c, clicked_c,
-                    action_d, clicked_d, action_e, clicked_e, action_f, clicked_f);
+                    action_d, clicked_d, action_e, clicked_e, action_f, clicked_f,
+                    action_g, clicked_g, action_h, clicked_h);
     return open;
 }
 
@@ -4450,7 +4719,7 @@ static bool ui_header_only_panel(const char* id, const char* title, const char* 
     bool clicked = false;
     if (s_panel_tone_count < (int)(sizeof(s_panel_tone_stack) / sizeof(s_panel_tone_stack[0])))
         s_panel_tone_stack[s_panel_tone_count++] = tone;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 7.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_margin_px(8.0f), ui_margin_px(7.0f)));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ui_panel_bg(tone));
     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.220f, 0.205f, 0.200f, 1.0f));
     if (ImGui::BeginChild(id, size, true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
@@ -4541,20 +4810,116 @@ static void ui_reset_camera_view() {
 }
 
 static void ui_draw_window_controls(float host_h) {
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 4.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ui_margin_px(8.0f), ui_margin_px(4.0f)));
     ImGui::SetCursorPosY(floorf((host_h - ImGui::GetFrameHeight()) * 0.5f));
-    if (ui_icon_button("##winmin", UI_ICON_MINIMIZE, ImVec2(26.0f, 0.0f), "Minimize"))
-        ShowWindow(g_dx.hwnd, SW_MINIMIZE);
-    ImGui::SameLine(0.0f, 3.0f);
-    if (ui_icon_button("##winmax", UI_ICON_MAXIMIZE_SQUARE, ImVec2(26.0f, 0.0f), "Maximize"))
-        ShowWindow(g_dx.hwnd, IsZoomed(g_dx.hwnd) ? SW_RESTORE : SW_MAXIMIZE);
-    ImGui::SameLine(0.0f, 3.0f);
+    if (ui_icon_button_pressed("##winmin", UI_ICON_MINIMIZE, ImVec2(ui_px(26.0f), 0.0f), "Minimize")) {
+        ShowWindowAsync(g_dx.hwnd, SW_MINIMIZE);
+    }
+    ui_store_window_control_rect(0);
+    ImGui::SameLine(0.0f, ui_margin_px(3.0f));
+    if (ui_icon_button_pressed("##winmax", UI_ICON_MAXIMIZE_SQUARE, ImVec2(ui_px(26.0f), 0.0f), "Maximize")) {
+        bool zoomed = IsZoomed(g_dx.hwnd) != FALSE;
+        ShowWindowAsync(g_dx.hwnd, zoomed ? SW_RESTORE : SW_MAXIMIZE);
+    }
+    ui_store_window_control_rect(1);
+    ImGui::SameLine(0.0f, ui_margin_px(3.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.12f, 0.12f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.70f, 0.16f, 0.16f, 1.0f));
-    if (ui_icon_button("##winclose", UI_ICON_CLOSE, ImVec2(26.0f, 0.0f), "Close"))
-        PostMessageW(g_dx.hwnd, WM_CLOSE, 0, 0);
+    if (ui_icon_button_pressed("##winclose", UI_ICON_CLOSE, ImVec2(ui_px(26.0f), 0.0f), "Close")) {
+        DestroyWindow(g_dx.hwnd);
+    }
+    ui_store_window_control_rect(2);
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar();
+}
+
+static float ui_window_controls_width() {
+    return ui_px(26.0f) * 3.0f + ui_margin_px(3.0f) * 2.0f;
+}
+
+int ui_top_toolbar_height_px() {
+    return (int)ui_px(40.0f);
+}
+
+bool ui_hit_test_client_area_screen(int x, int y) {
+    if (s_ui_top_toolbar_screen_rect_valid) {
+        if (x >= s_ui_top_toolbar_screen_rect.left && x < s_ui_top_toolbar_screen_rect.right &&
+            y >= s_ui_top_toolbar_screen_rect.top && y < s_ui_top_toolbar_screen_rect.bottom)
+            return true;
+    }
+    return false;
+}
+
+UiWindowControlHit ui_hit_test_window_control_screen(int x, int y) {
+    if (!s_ui_top_toolbar_screen_rect_valid)
+        return UI_WINDOW_CONTROL_NONE;
+
+    if (y < s_ui_top_toolbar_screen_rect.top || y >= s_ui_top_toolbar_screen_rect.bottom)
+        return UI_WINDOW_CONTROL_NONE;
+
+    float pad_right = ui_margin_px(8.0f);
+    float gap = ui_margin_px(3.0f);
+    float button_w = ui_px(26.0f);
+    float right = (float)s_ui_top_toolbar_screen_rect.right - pad_right;
+
+    RECT close_rc = {};
+    close_rc.left = (LONG)floorf(right - button_w);
+    close_rc.top = s_ui_top_toolbar_screen_rect.top;
+    close_rc.right = (LONG)ceilf(right);
+    close_rc.bottom = s_ui_top_toolbar_screen_rect.bottom;
+
+    right = (float)close_rc.left - gap;
+    RECT max_rc = {};
+    max_rc.left = (LONG)floorf(right - button_w);
+    max_rc.top = s_ui_top_toolbar_screen_rect.top;
+    max_rc.right = (LONG)ceilf(right);
+    max_rc.bottom = s_ui_top_toolbar_screen_rect.bottom;
+
+    right = (float)max_rc.left - gap;
+    RECT min_rc = {};
+    min_rc.left = (LONG)floorf(right - button_w);
+    min_rc.top = s_ui_top_toolbar_screen_rect.top;
+    min_rc.right = (LONG)ceilf(right);
+    min_rc.bottom = s_ui_top_toolbar_screen_rect.bottom;
+
+    if (x >= min_rc.left && x < min_rc.right)
+        return UI_WINDOW_CONTROL_MINIMIZE;
+    if (x >= max_rc.left && x < max_rc.right)
+        return UI_WINDOW_CONTROL_MAXIMIZE;
+    if (x >= close_rc.left && x < close_rc.right)
+        return UI_WINDOW_CONTROL_CLOSE;
+    return UI_WINDOW_CONTROL_NONE;
+}
+
+UiWindowControlHit ui_hit_test_window_control_client(int x, int y, int client_w) {
+    if (y < 0 || y >= ui_top_toolbar_height_px())
+        return UI_WINDOW_CONTROL_NONE;
+    if (client_w <= 0)
+        return UI_WINDOW_CONTROL_NONE;
+
+    float pad_right = ui_margin_px(8.0f);
+    float gap = ui_margin_px(3.0f);
+    float button_w = ui_px(26.0f);
+    float right = (float)client_w - pad_right;
+
+    int close_left = (int)floorf(right - button_w);
+    int close_right = (int)ceilf(right);
+    right = (float)close_left - gap;
+
+    int max_left = (int)floorf(right - button_w);
+    int max_right = (int)ceilf(right);
+    right = (float)max_left - gap;
+
+    int min_left = (int)floorf(right - button_w);
+    int min_right = (int)ceilf(right);
+
+    if (x >= min_left && x < min_right)
+        return UI_WINDOW_CONTROL_MINIMIZE;
+    if (x >= max_left && x < max_right)
+        return UI_WINDOW_CONTROL_MAXIMIZE;
+    if (x >= close_left && x < close_right)
+        return UI_WINDOW_CONTROL_CLOSE;
+    return UI_WINDOW_CONTROL_NONE;
 }
 
 static void ui_draw_shortcuts_popup() {
@@ -4657,11 +5022,23 @@ static void ui_align_text_row(float row_y) {
 }
 
 static void ui_top_bar() {
+    for (int i = 0; i < 3; i++)
+        s_ui_window_control_screen_rects_valid[i] = false;
+
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.080f, 0.076f, 0.080f, 1.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 0.0f));
-    float toolbar_h = 40.0f;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_margin_px(8.0f), 0.0f));
+    float toolbar_h = ui_px(40.0f);
     ImGui::BeginChild("##top_toolbar", ImVec2(0.0f, toolbar_h), true,
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    {
+        ImVec2 bar_min = ImGui::GetWindowPos();
+        ImVec2 bar_max = ImVec2(bar_min.x + ImGui::GetWindowSize().x, bar_min.y + ImGui::GetWindowSize().y);
+        s_ui_top_toolbar_screen_rect.left = (LONG)floorf(bar_min.x);
+        s_ui_top_toolbar_screen_rect.top = (LONG)floorf(bar_min.y);
+        s_ui_top_toolbar_screen_rect.right = (LONG)ceilf(bar_max.x);
+        s_ui_top_toolbar_screen_rect.bottom = (LONG)ceilf(bar_max.y);
+        s_ui_top_toolbar_screen_rect_valid = true;
+    }
 
     float row_h = ImGui::GetFrameHeight();
     float row_y = floorf((toolbar_h - row_h) * 0.5f);
@@ -4669,14 +5046,14 @@ static void ui_top_bar() {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.92f, 0.91f, 1.0f));
     ImGui::TextUnformatted("lazyTool");
     ImGui::PopStyleColor();
-    ImGui::SameLine(0.0f, 8.0f);
+    ImGui::SameLine(0.0f, ui_margin_px(8.0f));
     ui_align_text_row(row_y);
     ImGui::TextDisabled("workspace");
-    ImGui::SameLine(0.0f, 8.0f);
+    ImGui::SameLine(0.0f, ui_margin_px(8.0f));
     ui_align_frame_row(row_y);
     ui_inline_badge("##project_name_badge", project_current_name() ? project_current_name() : "untitled",
                     ImVec4(0.74f, 0.53f, 0.42f, 1.0f), row_h);
-    ImGui::SameLine(0.0f, 12.0f);
+    ImGui::SameLine(0.0f, ui_margin_px(12.0f));
     ui_align_frame_row(row_y);
 
     if (ImGui::Button("New"))
@@ -4697,9 +5074,9 @@ static void ui_top_bar() {
     ui_align_frame_row(row_y);
     if (ImGui::Button("Compile"))
         ui_recompile_all_shaders();
-    ImGui::SameLine(0.0f, 6.0f);
+    ImGui::SameLine(0.0f, ui_margin_px(6.0f));
     ui_align_frame_row(row_y);
-    if (ui_icon_button("##shortcuts_button", UI_ICON_HELP, ImVec2(28.0f, 0.0f), "Shortcuts"))
+    if (ui_icon_button("##shortcuts_button", UI_ICON_HELP, ImVec2(ui_px(28.0f), 0.0f), "Shortcuts"))
         s_shortcuts_popup_open = !s_shortcuts_popup_open;
 
     char summary[256] = {};
@@ -4728,16 +5105,25 @@ static void ui_top_bar() {
             frame_ms, ui_active_command_count(), g_dx.vsync ? "vsync" : "no-vsync");
     }
 
-    float window_w = ImGui::GetWindowWidth();
-    float controls_w = 85.0f;
-    float summary_w = ImGui::CalcTextSize(summary).x;
-    float controls_x = window_w - ImGui::GetStyle().WindowPadding.x - controls_w;
-    float summary_x = controls_x - summary_w - 14.0f;
+    float content_max_x = ImGui::GetWindowContentRegionMax().x;
+    float controls_w = ui_window_controls_width();
+    float controls_x = content_max_x - controls_w;
+    float summary_gap = ui_margin_px(12.0f);
+    float drag_gap = ui_margin_px(8.0f);
+    float left_end_x = ImGui::GetCursorPosX();
+    float summary_max_w = controls_x - left_end_x - summary_gap - drag_gap;
+    char summary_fit[256] = {};
+    float summary_w = 0.0f;
+    float summary_x = controls_x - summary_gap;
+    if (summary_max_w > ui_margin_px(32.0f)) {
+        ui_fit_text_ellipsis(summary, summary_max_w, summary_fit, sizeof(summary_fit));
+        summary_w = ImGui::CalcTextSize(summary_fit).x;
+        summary_x = controls_x - summary_gap - summary_w;
+    }
 
-    ImGui::SameLine();
-    float drag_x = ImGui::GetCursorPosX();
-    float drag_w = summary_x - drag_x - 8.0f;
-    if (drag_w > 24.0f) {
+    float drag_w = summary_x - left_end_x - drag_gap;
+    if (drag_w > ui_margin_px(24.0f)) {
+        ImGui::SameLine();
         ui_align_frame_row(row_y);
         ImGui::InvisibleButton("##title_drag", ImVec2(drag_w, row_h));
         if (ImGui::IsItemActivated()) {
@@ -4746,14 +5132,13 @@ static void ui_top_bar() {
         }
     }
 
-    if (summary_x > ImGui::GetCursorPosX())
-        ImGui::SameLine(summary_x);
-    else
-        ImGui::SameLine();
-    ui_align_text_row(row_y);
-    ImGui::TextDisabled("%s", summary);
+    if (summary_w > 0.0f) {
+        ImGui::SetCursorPosX(summary_x);
+        ui_align_text_row(row_y);
+        ImGui::TextDisabled("%s", summary_fit);
+    }
 
-    ImGui::SameLine(controls_x);
+    ImGui::SetCursorPosX(controls_x);
     ui_draw_window_controls(toolbar_h);
 
     ImGui::EndChild();
@@ -4786,6 +5171,8 @@ static void ui_workspace_layout() {
                                 "GizmoMove##viewport_gizmo_move_full", nullptr,
                                 "GizmoRotate##viewport_gizmo_rotate_full", nullptr,
                                 "GizmoScale##viewport_gizmo_scale_full", nullptr,
+                                "Separator##viewport_group_split_full", nullptr,
+                                "Wireframe##viewport_wireframe_full", nullptr,
                                 "Restart##viewport_restart_full", &restart_clicked,
                                 app_scene_paused() ? "Resume##viewport_resume_full" : "Pause##viewport_pause_full", &pause_clicked,
                                 "Exit fullscreen##viewport_fullscreen_exit", &exit_clicked)) {
@@ -4812,7 +5199,7 @@ static void ui_workspace_layout() {
         left_w = ui_clampf(avail.x * 0.22f, 270.0f, 340.0f);
         right_w = ui_clampf(avail.x * 0.30f, 380.0f, 480.0f);
     }
-    const float col_gap = 4.0f;
+    const float col_gap = ui_margin_px(4.0f);
     float center_w = avail.x - left_w - right_w - col_gap * 2.0f;
     if (center_w < 260.0f) center_w = 260.0f;
 
@@ -4844,6 +5231,8 @@ static void ui_workspace_layout() {
                             "GizmoMove##viewport_gizmo_move", nullptr,
                             "GizmoRotate##viewport_gizmo_rotate", nullptr,
                             "GizmoScale##viewport_gizmo_scale", nullptr,
+                            "Separator##viewport_group_split", nullptr,
+                            "Wireframe##viewport_wireframe", nullptr,
                             "Restart##viewport_restart", &restart_clicked,
                             app_scene_paused() ? "Resume##viewport_resume" : "Pause##viewport_pause", &pause_clicked,
                             "Fullscreen##viewport_fullscreen", &fullscreen_clicked)) {
@@ -4871,7 +5260,7 @@ static void ui_workspace_layout() {
     ImGui::SameLine(0.0f, col_gap);
     ImGui::BeginGroup();
     {
-        float collapsed_h = 38.0f;
+        float collapsed_h = ui_margin_px(38.0f);
         float expanded_h = avail.y - collapsed_h - col_gap;
         if (expanded_h < 180.0f) {
             collapsed_h = 0.0f;
@@ -4946,6 +5335,15 @@ static void ui_toggle_selected_command_enabled() {
         c->enabled = !c->enabled;
 }
 
+void ui_set_global_scale(float scale) {
+    s_ui_global_scale = ui_clamp_global_scale(scale);
+    s_ui_scale_dirty = true;
+}
+
+float ui_global_scale() {
+    return s_ui_global_scale;
+}
+
 void ui_init() {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -4959,9 +5357,12 @@ void ui_init() {
     else
         io.Fonts->AddFontDefault();
 
-    ImGuiStyle& style = ImGui::GetStyle();
     ui_apply_gray_tool_style();
-    style.ScaleAllSizes(1.06f);
+    s_ui_base_style = ImGui::GetStyle();
+    s_ui_base_style_valid = true;
+    s_ui_global_scale = k_ui_scale_default;
+    ui_apply_global_scale_now();
+    s_ui_scale_dirty = false;
 
     ImGui_ImplWin32_Init(g_dx.hwnd);
     ImGui_ImplDX11_Init(g_dx.dev, g_dx.ctx);
@@ -4969,6 +5370,11 @@ void ui_init() {
 
 // Draw one full editor frame on top of the already-rendered scene texture.
 void ui_draw() {
+    if (s_ui_scale_dirty) {
+        ui_apply_global_scale_now();
+        s_ui_scale_dirty = false;
+    }
+
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
@@ -5013,10 +5419,12 @@ void ui_draw() {
     ImVec2 workspace_size = ImGui::GetContentRegionAvail();
     if (workspace_size.x < 1.0f) workspace_size.x = 1.0f;
     if (workspace_size.y < 1.0f) workspace_size.y = 1.0f;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_margin_px(8.0f), ui_margin_px(7.0f)));
     ImGui::BeginChild("##workspace_root", workspace_size, false,
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ui_workspace_layout();
     ImGui::EndChild();
+    ImGui::PopStyleVar();
     ui_draw_shortcuts_popup();
     ImGui::End();
 
