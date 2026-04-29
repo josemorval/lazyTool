@@ -8,7 +8,7 @@
 #include <string.h>
 
 // app_settings.cpp stores editor-wide preferences that should survive across
-// projects, such as VSync, profiling, and camera interaction defaults.
+// projects, such as VSync, profiling, camera interaction defaults, and UI scale.
 
 static const char* s_settings_path = "lazytool_general.ini";
 
@@ -36,6 +36,7 @@ void app_settings_save() {
 
     fprintf(f, "vsync %d\n", g_dx.vsync ? 1 : 0);
     fprintf(f, "profiler %d\n", g_profiler_enabled ? 1 : 0);
+    fprintf(f, "ui_scale %.9g\n", ui_global_scale());
     fprintf(f, "camera_enabled %d\n", g_camera_controls.enabled ? 1 : 0);
     fprintf(f, "camera_mouse_look %d\n", g_camera_controls.mouse_look ? 1 : 0);
     fprintf(f, "camera_invert_y %d\n", g_camera_controls.invert_y ? 1 : 0);
@@ -65,6 +66,7 @@ void app_settings_load_or_create() {
 
         if (strcmp(key, "vsync") == 0) g_dx.vsync = atoi(value) != 0;
         else if (strcmp(key, "profiler") == 0) g_profiler_enabled = atoi(value) != 0;
+        else if (strcmp(key, "ui_scale") == 0) ui_set_global_scale((float)atof(value));
         else if (strcmp(key, "camera_enabled") == 0) g_camera_controls.enabled = atoi(value) != 0;
         else if (strcmp(key, "camera_mouse_look") == 0) g_camera_controls.mouse_look = atoi(value) != 0;
         else if (strcmp(key, "camera_invert_y") == 0) g_camera_controls.invert_y = atoi(value) != 0;

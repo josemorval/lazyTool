@@ -82,6 +82,79 @@ static ResType res_type_from_token(const char* name) {
     return RES_NONE;
 }
 
+static void project_compute_legacy_cascade_splits(float near_z, float far_z, int cascade_count,
+                                                  float lambda, float out_splits[MAX_SHADOW_CASCADES]) {
+    if (!out_splits)
+        return;
+
+    if (near_z < 0.0001f)
+        near_z = 0.1f;
+    if (far_z <= near_z + 0.001f)
+        far_z = near_z + 0.001f;
+    if (cascade_count < 1)
+        cascade_count = 1;
+    if (cascade_count > MAX_SHADOW_CASCADES)
+        cascade_count = MAX_SHADOW_CASCADES;
+    lambda = clampf(lambda, 0.0f, 1.0f);
+
+    for (int i = 0; i < MAX_SHADOW_CASCADES; i++)
+        out_splits[i] = far_z;
+
+    for (int i = 0; i < cascade_count; i++) {
+        float t = (float)(i + 1) / (float)cascade_count;
+        float log_split = near_z * powf(far_z / near_z, t);
+        float uni_split = near_z + (far_z - near_z) * t;
+        out_splits[i] = uni_split + (log_split - uni_split) * lambda;
+    }
+}
+
+static void project_seed_manual_shadow_cascades(Resource* dl, float camera_near_z) {
+    if (!dl)
+        return;
+
+    float seeded_splits[MAX_SHADOW_CASCADES] = {};
+    project_compute_legacy_cascade_splits(camera_near_z, dl->shadow_distance,
+                                          MAX_SHADOW_CASCADES, dl->shadow_split_lambda,
+                                          seeded_splits);
+
+    float base_extent_x = dl->shadow_extent[0] > 0.01f ? dl->shadow_extent[0] : 0.01f;
+    float base_extent_y = dl->shadow_extent[1] > 0.01f ? dl->shadow_extent[1] : 0.01f;
+    float base_near = dl->shadow_near > 0.0001f ? dl->shadow_near : 0.0001f;
+    float base_far = dl->shadow_far > base_near + 0.001f ? dl->shadow_far : base_near + 0.001f;
+
+    for (int i = 0; i < MAX_SHADOW_CASCADES; i++) {
+        dl->shadow_cascade_split[i] = seeded_splits[i];
+        dl->shadow_cascade_extent[i][0] = base_extent_x;
+        dl->shadow_cascade_extent[i][1] = base_extent_y;
+        dl->shadow_cascade_near[i] = base_near;
+        dl->shadow_cascade_far[i] = base_far;
+    }
+}
+
+static void project_validate_manual_shadow_cascades(Resource* dl, float camera_near_z, float camera_far_z) {
+    if (!dl)
+        return;
+
+    float prev_split = camera_near_z > 0.0001f ? camera_near_z : 0.1f;
+    float max_split = camera_far_z > prev_split + 0.001f ? camera_far_z : prev_split + 0.001f;
+    for (int i = 0; i < MAX_SHADOW_CASCADES; i++) {
+        if (dl->shadow_cascade_extent[i][0] < 0.01f) dl->shadow_cascade_extent[i][0] = 0.01f;
+        if (dl->shadow_cascade_extent[i][1] < 0.01f) dl->shadow_cascade_extent[i][1] = 0.01f;
+        if (dl->shadow_cascade_near[i] < 0.0001f) dl->shadow_cascade_near[i] = 0.0001f;
+        if (dl->shadow_cascade_far[i] <= dl->shadow_cascade_near[i] + 0.001f)
+            dl->shadow_cascade_far[i] = dl->shadow_cascade_near[i] + 0.001f;
+
+        float min_split = prev_split + 0.001f;
+        if (min_split > max_split)
+            min_split = max_split;
+        if (dl->shadow_cascade_split[i] < min_split)
+            dl->shadow_cascade_split[i] = min_split;
+        if (dl->shadow_cascade_split[i] > max_split)
+            dl->shadow_cascade_split[i] = max_split;
+        prev_split = dl->shadow_cascade_split[i];
+    }
+}
+
 static void project_reset_dirlight_defaults() {
     Resource* dl = res_get(g_builtin_dirlight);
     if (!dl) return;
@@ -105,6 +178,11 @@ static void project_reset_dirlight_defaults() {
     dl->shadow_far = 4.0f;
     dl->shadow_width = 1024;
     dl->shadow_height = 1024;
+    dl->shadow_cascade_count = 1;
+    dl->shadow_distance = 12.0f;
+    dl->shadow_split_lambda = 0.65f;
+    project_seed_manual_shadow_cascades(dl, 0.1f);
+    project_validate_manual_shadow_cascades(dl, 0.1f, 1000.0f);
 
     if (g_dx.dev && (g_dx.shadow_width != dl->shadow_width || g_dx.shadow_height != dl->shadow_height))
         dx_create_shadow_map(dl->shadow_width, dl->shadow_height);
@@ -340,6 +418,8 @@ void project_new_default() {
         c->shader = shader;
         c->rt = g_builtin_scene_color;
         c->depth = g_builtin_scene_depth;
+        c->shadow_cast = true;
+        c->shadow_receive = true;
     }
 
     g_sel_cmd = draw_h;
@@ -363,13 +443,21 @@ bool project_save_text(const char* path) {
         g_camera.fov_y, g_camera.near_z, g_camera.far_z);
 
     if (Resource* dl = res_get(g_builtin_dirlight)) {
-        fprintf(f, "dirlight %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d %d %.9g %.9g %.9g %.9g\n\n",
+        fprintf(f, "dirlight %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d %d %.9g %.9g %.9g %.9g %d %.9g %.9g",
             dl->light_pos[0], dl->light_pos[1], dl->light_pos[2],
             dl->light_target[0], dl->light_target[1], dl->light_target[2],
             dl->light_color[0], dl->light_color[1], dl->light_color[2],
             dl->light_intensity,
             dl->shadow_width, dl->shadow_height,
-            dl->shadow_near, dl->shadow_far, dl->shadow_extent[0], dl->shadow_extent[1]);
+            dl->shadow_near, dl->shadow_far, dl->shadow_extent[0], dl->shadow_extent[1],
+            dl->shadow_cascade_count, dl->shadow_distance, dl->shadow_split_lambda);
+        for (int i = 0; i < MAX_SHADOW_CASCADES; i++) {
+            fprintf(f, " %.9g %.9g %.9g %.9g %.9g",
+                dl->shadow_cascade_split[i],
+                dl->shadow_cascade_extent[i][0], dl->shadow_cascade_extent[i][1],
+                dl->shadow_cascade_near[i], dl->shadow_cascade_far[i]);
+        }
+        fprintf(f, "\n\n");
     }
 
     fprintf(f, "resources\n");
@@ -606,6 +694,32 @@ bool project_load_text(const char* path) {
             dl->shadow_far = (float)atof(strtok(nullptr, " \t\r\n"));
             dl->shadow_extent[0] = (float)atof(strtok(nullptr, " \t\r\n"));
             dl->shadow_extent[1] = (float)atof(strtok(nullptr, " \t\r\n"));
+            char* cascade_count_tok = strtok(nullptr, " \t\r\n");
+            char* shadow_distance_tok = strtok(nullptr, " \t\r\n");
+            char* split_lambda_tok = strtok(nullptr, " \t\r\n");
+            dl->shadow_cascade_count = cascade_count_tok ? atoi(cascade_count_tok) : 1;
+            dl->shadow_distance = shadow_distance_tok ? (float)atof(shadow_distance_tok) : 12.0f;
+            dl->shadow_split_lambda = split_lambda_tok ? (float)atof(split_lambda_tok) : 0.65f;
+            if (dl->shadow_cascade_count < 1) dl->shadow_cascade_count = 1;
+            if (dl->shadow_cascade_count > MAX_SHADOW_CASCADES) dl->shadow_cascade_count = MAX_SHADOW_CASCADES;
+            if (dl->shadow_distance < 0.1f) dl->shadow_distance = 0.1f;
+            dl->shadow_split_lambda = clampf(dl->shadow_split_lambda, 0.0f, 1.0f);
+            project_seed_manual_shadow_cascades(dl, g_camera.near_z);
+            for (int i = 0; i < MAX_SHADOW_CASCADES; i++) {
+                char* split_tok = strtok(nullptr, " \t\r\n");
+                char* extent_x_tok = strtok(nullptr, " \t\r\n");
+                char* extent_y_tok = strtok(nullptr, " \t\r\n");
+                char* near_tok = strtok(nullptr, " \t\r\n");
+                char* far_tok = strtok(nullptr, " \t\r\n");
+                if (!split_tok || !extent_x_tok || !extent_y_tok || !near_tok || !far_tok)
+                    break;
+                dl->shadow_cascade_split[i] = (float)atof(split_tok);
+                dl->shadow_cascade_extent[i][0] = (float)atof(extent_x_tok);
+                dl->shadow_cascade_extent[i][1] = (float)atof(extent_y_tok);
+                dl->shadow_cascade_near[i] = (float)atof(near_tok);
+                dl->shadow_cascade_far[i] = (float)atof(far_tok);
+            }
+            project_validate_manual_shadow_cascades(dl, g_camera.near_z, g_camera.far_z);
             if (dl->shadow_width > 0 && dl->shadow_height > 0 && g_dx.dev)
                 dx_create_shadow_map(dl->shadow_width, dl->shadow_height);
         } else if (strcmp(tag, "resource") == 0) {

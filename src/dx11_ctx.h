@@ -38,6 +38,9 @@ struct DX11Ctx {
 
     ID3D11RasterizerState*   rs_solid;
     ID3D11RasterizerState*   rs_cull_none;
+    ID3D11RasterizerState*   rs_wire_solid;
+    ID3D11RasterizerState*   rs_wire_cull_none;
+    bool                     scene_wireframe;
     ID3D11DepthStencilState* dss_default;
     ID3D11DepthStencilState* dss_depth_read;
     ID3D11DepthStencilState* dss_depth_off;

@@ -26,6 +26,7 @@
 #define MAX_USER_CB_VARS 64
 #define MAX_SHADER_CB_VARS 32
 #define MAX_COMMAND_PARAMS 32
+#define MAX_SHADOW_CASCADES 4
 #define INVALID_HANDLE   0u
 
 typedef uint32_t ResHandle;
@@ -164,6 +165,13 @@ struct Resource {
     float shadow_far;
     int   shadow_width;
     int   shadow_height;
+    int   shadow_cascade_count;
+    float shadow_distance;
+    float shadow_split_lambda;
+    float shadow_cascade_split[MAX_SHADOW_CASCADES];
+    float shadow_cascade_extent[MAX_SHADOW_CASCADES][2];
+    float shadow_cascade_near[MAX_SHADOW_CASCADES];
+    float shadow_cascade_far[MAX_SHADOW_CASCADES];
 };
 
 // ── command ──────────────────────────────────────────────────────────────
@@ -254,6 +262,11 @@ struct SceneCBData {
     float prev_view_proj[16];
     float prev_inv_view_proj[16];
     float prev_shadow_view_proj[16];
+    float cam_dir[4];
+    float shadow_cascade_splits[4];
+    float shadow_params[4];
+    float shadow_cascade_rects[MAX_SHADOW_CASCADES][4];
+    float shadow_cascade_view_proj[MAX_SHADOW_CASCADES][16];
 };
 
 struct UserCBData {

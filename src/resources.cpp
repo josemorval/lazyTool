@@ -497,6 +497,17 @@ void res_init() {
     dl->shadow_far       = 4.0f;
     dl->shadow_width     = 1024;
     dl->shadow_height    = 1024;
+    dl->shadow_cascade_count = 1;
+    dl->shadow_distance = 12.0f;
+    dl->shadow_split_lambda = 0.65f;
+    for (int i = 0; i < MAX_SHADOW_CASCADES; i++) {
+        float split_t = (float)(i + 1) / (float)MAX_SHADOW_CASCADES;
+        dl->shadow_cascade_split[i] = dl->shadow_distance * split_t;
+        dl->shadow_cascade_extent[i][0] = dl->shadow_extent[0];
+        dl->shadow_cascade_extent[i][1] = dl->shadow_extent[1];
+        dl->shadow_cascade_near[i] = dl->shadow_near;
+        dl->shadow_cascade_far[i] = dl->shadow_far;
+    }
 
     res_sync_size_resource(g_builtin_scene_color);
     res_sync_size_resource(g_builtin_scene_depth);

@@ -23,6 +23,11 @@ cbuffer SceneCB : register(b0)
     float4x4 PrevViewProj;
     float4x4 PrevInvViewProj;
     float4x4 PrevShadowViewProj;
+    float4 CamDir;
+    float4 ShadowCascadeSplits;
+    float4 ShadowParams;
+    float4 ShadowCascadeRects[4];
+    float4x4 ShadowCascadeViewProj[4];
 };
 cbuffer ObjectCB : register(b2)
 {
@@ -137,6 +142,11 @@ bool dx_init(HWND hwnd, int w, int h) {
     g_dx.dev->CreateRasterizerState(&rd, &g_dx.rs_solid);
     rd.CullMode = D3D11_CULL_NONE;
     g_dx.dev->CreateRasterizerState(&rd, &g_dx.rs_cull_none);
+    rd.FillMode = D3D11_FILL_WIREFRAME;
+    rd.CullMode = D3D11_CULL_BACK;
+    g_dx.dev->CreateRasterizerState(&rd, &g_dx.rs_wire_solid);
+    rd.CullMode = D3D11_CULL_NONE;
+    g_dx.dev->CreateRasterizerState(&rd, &g_dx.rs_wire_cull_none);
 
     D3D11_DEPTH_STENCIL_DESC dsd = {};
     dsd.DepthEnable    = TRUE;
@@ -380,6 +390,8 @@ void dx_shutdown() {
     if (g_dx.dss_depth_off)  g_dx.dss_depth_off->Release();
     if (g_dx.dss_depth_read) g_dx.dss_depth_read->Release();
     if (g_dx.dss_default) g_dx.dss_default->Release();
+    if (g_dx.rs_wire_cull_none) g_dx.rs_wire_cull_none->Release();
+    if (g_dx.rs_wire_solid) g_dx.rs_wire_solid->Release();
     if (g_dx.rs_cull_none) g_dx.rs_cull_none->Release();
     if (g_dx.rs_solid)    g_dx.rs_solid->Release();
     if (g_dx.back_rtv)    g_dx.back_rtv->Release();

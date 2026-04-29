@@ -538,15 +538,18 @@ static const MeshMaterial* mesh_material_for_part(const Resource* mesh, const Me
     return &mesh->mesh_materials[mi];
 }
 
-static ID3D11RasterizerState* rasterizer_state_for(const Command& c, const MeshMaterial* material) {
+static ID3D11RasterizerState* rasterizer_state_for(const Command& c, const MeshMaterial* material,
+                                                   bool wireframe) {
     bool cull_back = c.cull_back;
     if (material && material->double_sided)
         cull_back = false;
+    if (wireframe)
+        return cull_back ? g_dx.rs_wire_solid : g_dx.rs_wire_cull_none;
     return cull_back ? g_dx.rs_solid : g_dx.rs_cull_none;
 }
 
 static void apply_draw_state(const Command& c, const MeshMaterial* material) {
-    ID3D11RasterizerState* rs = rasterizer_state_for(c, material);
+    ID3D11RasterizerState* rs = rasterizer_state_for(c, material, g_dx.scene_wireframe);
     g_dx.ctx->RSSetState(rs ? rs : g_dx.rs_solid);
 
     ID3D11DepthStencilState* dss = g_dx.dss_default;
@@ -706,58 +709,85 @@ static void execute_shadow_prepass() {
     g_dx.ctx->PSSetShaderResources(1, 1, &null_srv);
     g_dx.ctx->OMSetRenderTargets(0, nullptr, g_dx.shadow_dsv);
     g_dx.ctx->ClearDepthStencilView(g_dx.shadow_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
-
-    D3D11_VIEWPORT vp = { 0, 0, (float)g_dx.shadow_width, (float)g_dx.shadow_height, 0, 1 };
-    g_dx.ctx->RSSetViewports(1, &vp);
     g_dx.ctx->OMSetDepthStencilState(g_dx.dss_default, 0);
     float bf[4] = {};
     g_dx.ctx->OMSetBlendState(g_dx.bs_opaque, bf, 0xFFFFFFFF);
     g_dx.ctx->PSSetShader(nullptr, nullptr, 0);
 
-    for (int i = 0; i < MAX_COMMANDS; i++) {
-        Command& c = g_commands[i];
-        if (!c.active || !c.enabled || c.parent != INVALID_HANDLE || !c.shadow_cast || !is_draw_command(c.type))
-            continue;
+    SceneCBData scene_cb_backup = g_dx.scene_cb_data;
+    int cascade_count = (int)scene_cb_backup.shadow_params[0];
+    if (cascade_count < 1) cascade_count = 1;
+    if (cascade_count > MAX_SHADOW_CASCADES) cascade_count = MAX_SHADOW_CASCADES;
 
-        Resource* mesh = res_get(c.mesh);
-        if (!mesh || !mesh->vb)
-            continue;
+    for (int cascade = 0; cascade < cascade_count; cascade++) {
+        const float* rect = scene_cb_backup.shadow_cascade_rects[cascade];
+        float scale_x = rect[0] > 0.0f ? rect[0] : 1.0f;
+        float scale_y = rect[1] > 0.0f ? rect[1] : 1.0f;
+        float offset_x = rect[2];
+        float offset_y = rect[3];
 
-        ID3D11VertexShader* shadow_vs = g_dx.shadow_vs;
-        ID3D11InputLayout* shadow_il = g_dx.shadow_il;
-        Resource* shadow_shader = res_get(c.shadow_shader);
-        if (shadow_shader && shadow_shader->vs && shadow_shader->il) {
-            shadow_vs = shadow_shader->vs;
-            shadow_il = shadow_shader->il;
-        }
+        D3D11_VIEWPORT vp = {};
+        vp.TopLeftX = offset_x * (float)g_dx.shadow_width;
+        vp.TopLeftY = offset_y * (float)g_dx.shadow_height;
+        vp.Width = scale_x * (float)g_dx.shadow_width;
+        vp.Height = scale_y * (float)g_dx.shadow_height;
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        g_dx.ctx->RSSetViewports(1, &vp);
 
-        g_dx.ctx->VSSetShader(shadow_vs, nullptr, 0);
-        g_dx.ctx->IASetInputLayout(shadow_il);
-        bind_mesh_geometry(mesh);
-        for (int s = 0; s < c.srv_count; s++) {
-            Resource* sr = res_get(c.srv_handles[s]);
-            ID3D11ShaderResourceView* srv = sr ? sr->srv : nullptr;
-            g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &srv);
-        }
+        SceneCBData shadow_cb = scene_cb_backup;
+        memcpy(shadow_cb.shadow_view_proj,
+               scene_cb_backup.shadow_cascade_view_proj[cascade],
+               sizeof(shadow_cb.shadow_view_proj));
+        dx_update_scene_cb(shadow_cb);
 
-        int part_count = mesh->mesh_part_count > 0 ? mesh->mesh_part_count : 1;
-        for (int pi = 0; pi < part_count; pi++) {
-            const MeshPart* part = mesh->mesh_part_count > 0 ? &mesh->mesh_parts[pi] : nullptr;
-            if (part && !part->enabled)
+        for (int i = 0; i < MAX_COMMANDS; i++) {
+            Command& c = g_commands[i];
+            if (!c.active || !c.enabled || c.parent != INVALID_HANDLE || !c.shadow_cast || !is_draw_command(c.type))
                 continue;
 
-            const MeshMaterial* material = mesh_material_for_part(mesh, part);
-            ID3D11RasterizerState* rs = rasterizer_state_for(c, material);
-            g_dx.ctx->RSSetState(rs ? rs : g_dx.rs_solid);
-            update_object_cb_for_command(c, part);
-            draw_command_geometry(c, mesh, part);
-        }
+            Resource* mesh = res_get(c.mesh);
+            if (!mesh || !mesh->vb)
+                continue;
 
-        for (int s = 0; s < c.srv_count; s++) {
-            ID3D11ShaderResourceView* null_srv = nullptr;
-            g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &null_srv);
+            ID3D11VertexShader* shadow_vs = g_dx.shadow_vs;
+            ID3D11InputLayout* shadow_il = g_dx.shadow_il;
+            Resource* shadow_shader = res_get(c.shadow_shader);
+            if (shadow_shader && shadow_shader->vs && shadow_shader->il) {
+                shadow_vs = shadow_shader->vs;
+                shadow_il = shadow_shader->il;
+            }
+
+            g_dx.ctx->VSSetShader(shadow_vs, nullptr, 0);
+            g_dx.ctx->IASetInputLayout(shadow_il);
+            bind_mesh_geometry(mesh);
+            for (int s = 0; s < c.srv_count; s++) {
+                Resource* sr = res_get(c.srv_handles[s]);
+                ID3D11ShaderResourceView* srv = sr ? sr->srv : nullptr;
+                g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &srv);
+            }
+
+            int part_count = mesh->mesh_part_count > 0 ? mesh->mesh_part_count : 1;
+            for (int pi = 0; pi < part_count; pi++) {
+                const MeshPart* part = mesh->mesh_part_count > 0 ? &mesh->mesh_parts[pi] : nullptr;
+                if (part && !part->enabled)
+                    continue;
+
+                const MeshMaterial* material = mesh_material_for_part(mesh, part);
+                ID3D11RasterizerState* rs = rasterizer_state_for(c, material, false);
+                g_dx.ctx->RSSetState(rs ? rs : g_dx.rs_solid);
+                update_object_cb_for_command(c, part);
+                draw_command_geometry(c, mesh, part);
+            }
+
+            for (int s = 0; s < c.srv_count; s++) {
+                ID3D11ShaderResourceView* cleared_srv = nullptr;
+                g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &cleared_srv);
+            }
         }
     }
+
+    dx_update_scene_cb(scene_cb_backup);
 }
 
 static void clear_compute_bindings() {

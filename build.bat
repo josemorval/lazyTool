@@ -1,15 +1,12 @@
 @echo off
 setlocal
 
-:: ─────────────────────────────────────────────────────────────────────────
 :: lazyTool build script
 ::
 :: Usage (run from VS Developer Command Prompt so cl.exe is in PATH):
-::   build.bat            -> release build
-::   build.bat debug      -> debug build
-::   build.bat run        -> release build + run
-::   build.bat debug run  -> debug build + run
-:: ─────────────────────────────────────────────────────────────────────────
+::   build.bat        -> release build
+::   build.bat run    -> release build + run
+::   build.bat copy   -> copy assets/projects/shaders to bin without compiling
 
 set OUTDIR=bin
 set SRCDIR=src
@@ -30,21 +27,44 @@ set DEFINES=^
  /DUNICODE /D_UNICODE ^
  /D_CRT_SECURE_NO_WARNINGS
 
-set DEBUG_BUILD=0
 set RUN_AFTER=0
+set COPY_ONLY=0
 
 :parse_args
-if "%1"=="debug"  set DEBUG_BUILD=1 & shift & goto parse_args
-if "%1"=="run"    set RUN_AFTER=1   & shift & goto parse_args
-if not "%1"==""   shift & goto parse_args
-
-if "%DEBUG_BUILD%"=="1" (
-    set CFLAGS=/W3 /Od /MTd /EHsc /nologo /Zi /std:c++17 /D_DEBUG
-    echo [BUILD] debug
-) else (
-    set CFLAGS=/W3 /O2 /MT /EHsc /nologo /std:c++17 /DNDEBUG
-    echo [BUILD] release
+if /I "%1"=="run" (
+    set RUN_AFTER=1
+    shift
+    goto parse_args
 )
+if /I "%1"=="copy" (
+    set COPY_ONLY=1
+    shift
+    goto parse_args
+)
+if not "%1"=="" (
+    echo [WARN] Unknown argument: %1
+    shift
+    goto parse_args
+)
+
+if "%COPY_ONLY%"=="1" (
+    call :copy_folders
+    if %ERRORLEVEL% neq 0 (
+        echo.
+        echo [FAILED]
+        exit /b 1
+    )
+    echo.
+    echo [OK] copied folders to %OUTDIR%
+    if "%RUN_AFTER%"=="1" if exist %OUTDIR%\lazyTool.exe (
+        echo [RUN] %OUTDIR%\lazyTool.exe
+        start "" %OUTDIR%\lazyTool.exe
+    )
+    exit /b 0
+)
+
+set CFLAGS=/W3 /O2 /MT /EHsc /nologo /std:c++17 /DNDEBUG
+echo [BUILD] release
 
 set SRCS=^
  %SRCDIR%\main.cpp ^
@@ -97,9 +117,12 @@ if %ERRORLEVEL% neq 0 (
 echo.
 echo [OK] %OUTDIR%\lazyTool.exe
 
-xcopy assets %OUTDIR%\assets /E /I /Y >nul
-xcopy projects %OUTDIR%\projects /E /I /Y >nul
-xcopy shaders %OUTDIR%\shaders /E /I /Y >nul
+call :copy_folders
+if %ERRORLEVEL% neq 0 (
+    echo.
+    echo [FAILED]
+    exit /b 1
+)
 
 if "%RUN_AFTER%"=="1" (
     echo [RUN] %OUTDIR%\lazyTool.exe
@@ -107,3 +130,13 @@ if "%RUN_AFTER%"=="1" (
 )
 
 endlocal
+exit /b 0
+
+:copy_folders
+xcopy assets %OUTDIR%\assets /E /I /Y >nul
+if %ERRORLEVEL% geq 4 exit /b %ERRORLEVEL%
+xcopy projects %OUTDIR%\projects /E /I /Y >nul
+if %ERRORLEVEL% geq 4 exit /b %ERRORLEVEL%
+xcopy shaders %OUTDIR%\shaders /E /I /Y >nul
+if %ERRORLEVEL% geq 4 exit /b %ERRORLEVEL%
+exit /b 0

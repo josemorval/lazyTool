@@ -188,6 +188,134 @@ static Vec3 camera_right(const Camera& c) {
     return right;
 }
 
+static Vec3 camera_up(const Camera& c) {
+    return v3_norm(v3_cross(camera_forward(c), camera_right(c)));
+}
+
+static Vec3 v3_lerp(Vec3 a, Vec3 b, float t) {
+    return v3_add(v3_scale(a, 1.0f - t), v3_scale(b, t));
+}
+
+static Vec3 mat4_transform_point(const Mat4& m, Vec3 p) {
+    float x = p.x * m.m[0] + p.y * m.m[4] + p.z * m.m[8]  + m.m[12];
+    float y = p.x * m.m[1] + p.y * m.m[5] + p.z * m.m[9]  + m.m[13];
+    float z = p.x * m.m[2] + p.y * m.m[6] + p.z * m.m[10] + m.m[14];
+    float w = p.x * m.m[3] + p.y * m.m[7] + p.z * m.m[11] + m.m[15];
+    if (fabsf(w) > 1e-6f) {
+        float inv_w = 1.0f / w;
+        x *= inv_w;
+        y *= inv_w;
+        z *= inv_w;
+    }
+    return v3(x, y, z);
+}
+
+static void shadow_atlas_rect_for_cascade(int cascade_index, int cascade_count, float out_rect[4]) {
+    if (!out_rect)
+        return;
+
+    if (cascade_count <= 1) {
+        out_rect[0] = 1.0f;
+        out_rect[1] = 1.0f;
+        out_rect[2] = 0.0f;
+        out_rect[3] = 0.0f;
+        return;
+    }
+
+    int clamped = cascade_index;
+    if (clamped < 0) clamped = 0;
+    if (clamped > MAX_SHADOW_CASCADES - 1) clamped = MAX_SHADOW_CASCADES - 1;
+
+    // Cascades use a hierarchical atlas allocation: each cascade takes half
+    // of the remaining area so resolution drops progressively (1/2, 1/4,
+    // 1/8, 1/16...). The split axis alternates to keep rectangles readable.
+    float rem_x = 0.0f;
+    float rem_y = 0.0f;
+    float rem_w = 1.0f;
+    float rem_h = 1.0f;
+    for (int i = 0; i <= clamped; i++) {
+        bool split_vertical = (i & 1) == 0;
+        if (split_vertical) {
+            out_rect[0] = rem_w * 0.5f;
+            out_rect[1] = rem_h;
+            out_rect[2] = rem_x;
+            out_rect[3] = rem_y;
+            rem_x += out_rect[0];
+            rem_w -= out_rect[0];
+        } else {
+            out_rect[0] = rem_w;
+            out_rect[1] = rem_h * 0.5f;
+            out_rect[2] = rem_x;
+            out_rect[3] = rem_y;
+            rem_y += out_rect[1];
+            rem_h -= out_rect[1];
+        }
+    }
+}
+
+static void shadow_compute_cascade_splits(float near_z, float far_z, int cascade_count,
+                                          float lambda, float out_splits[MAX_SHADOW_CASCADES]) {
+    if (!out_splits)
+        return;
+
+    if (far_z <= near_z + 0.001f)
+        far_z = near_z + 0.001f;
+    if (cascade_count < 1)
+        cascade_count = 1;
+    if (cascade_count > MAX_SHADOW_CASCADES)
+        cascade_count = MAX_SHADOW_CASCADES;
+    lambda = clampf(lambda, 0.0f, 1.0f);
+
+    for (int i = 0; i < MAX_SHADOW_CASCADES; i++)
+        out_splits[i] = far_z;
+
+    for (int i = 0; i < cascade_count; i++) {
+        float t = (float)(i + 1) / (float)cascade_count;
+        float log_split = near_z * powf(far_z / near_z, t);
+        float uni_split = near_z + (far_z - near_z) * t;
+        out_splits[i] = uni_split + (log_split - uni_split) * lambda;
+    }
+}
+
+static void shadow_build_frustum_slice(Vec3 eye, Vec3 forward, Vec3 right, Vec3 up,
+                                       float aspect, float fov_y, float near_z, float far_z,
+                                       Vec3 out_corners[8]) {
+    float tan_half = tanf(fov_y * 0.5f);
+    float near_h = tan_half * near_z;
+    float near_w = near_h * aspect;
+    float far_h = tan_half * far_z;
+    float far_w = far_h * aspect;
+
+    Vec3 nc = v3_add(eye, v3_scale(forward, near_z));
+    Vec3 fc = v3_add(eye, v3_scale(forward, far_z));
+    Vec3 nr = v3_scale(right, near_w);
+    Vec3 nu = v3_scale(up, near_h);
+    Vec3 fr = v3_scale(right, far_w);
+    Vec3 fu = v3_scale(up, far_h);
+
+    out_corners[0] = v3_add(v3_add(nc, nu), nr);
+    out_corners[1] = v3_add(v3_sub(nc, nu), nr);
+    out_corners[2] = v3_sub(v3_add(nc, nu), nr);
+    out_corners[3] = v3_sub(v3_sub(nc, nu), nr);
+    out_corners[4] = v3_add(v3_add(fc, fu), fr);
+    out_corners[5] = v3_add(v3_sub(fc, fu), fr);
+    out_corners[6] = v3_sub(v3_add(fc, fu), fr);
+    out_corners[7] = v3_sub(v3_sub(fc, fu), fr);
+}
+
+static Mat4 shadow_build_manual_cascade_matrix(const Mat4& light_view,
+                                               float ortho_width, float ortho_height,
+                                               float ortho_near, float ortho_far) {
+    if (ortho_width < 0.01f) ortho_width = 0.01f;
+    if (ortho_height < 0.01f) ortho_height = 0.01f;
+    if (ortho_near < 0.0001f) ortho_near = 0.0001f;
+    if (ortho_far <= ortho_near + 0.001f)
+        ortho_far = ortho_near + 0.001f;
+
+    Mat4 shadow_proj = mat4_orthographic(ortho_width, ortho_height, ortho_near, ortho_far);
+    return mat4_mul(light_view, shadow_proj);
+}
+
 // ── globals ───────────────────────────────────────────────────────────────
 
 static bool     g_running        = true;
@@ -489,13 +617,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_NCHITTEST: {
+        POINT p = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        POINT client = p;
+        ScreenToClient(hwnd, &client);
+        RECT client_rc = {};
+        GetClientRect(hwnd, &client_rc);
+        if (client.x >= 0 && client.x < client_rc.right &&
+            client.y >= 0 && client.y < ui_top_toolbar_height_px())
+            return HTCLIENT;
+
         LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
         if (hit != HTCLIENT)
             return hit;
 
         RECT rc = {};
         GetWindowRect(hwnd, &rc);
-        POINT p = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         int border = GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
         if (border < 8) border = 8;
 
@@ -513,6 +649,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (top) return HTTOP;
         if (bottom) return HTBOTTOM;
         return HTCLIENT;
+    }
+    case WM_LBUTTONDOWN: {
+        int client_x = GET_X_LPARAM(lp);
+        int client_y = GET_Y_LPARAM(lp);
+        RECT client_rc = {};
+        GetClientRect(hwnd, &client_rc);
+        UiWindowControlHit control_hit = ui_hit_test_window_control_client(client_x, client_y, client_rc.right);
+        if (control_hit == UI_WINDOW_CONTROL_MINIMIZE) {
+            ShowWindowAsync(hwnd, SW_MINIMIZE);
+            return 0;
+        }
+        if (control_hit == UI_WINDOW_CONTROL_MAXIMIZE) {
+            ShowWindowAsync(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+            return 0;
+        }
+        if (control_hit == UI_WINDOW_CONTROL_CLOSE) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
     }
     }
 
@@ -601,6 +757,10 @@ static void update_builtins_and_scene_cb() {
     cb.time_vec[1] = g_dt;
     cb.time_vec[2] = (float)g_frame;
     cb.cam_pos[0]  = eye.x; cb.cam_pos[1] = eye.y; cb.cam_pos[2] = eye.z;
+    Vec3 cam_dir = camera_forward(g_camera);
+    cb.cam_dir[0] = cam_dir.x;
+    cb.cam_dir[1] = cam_dir.y;
+    cb.cam_dir[2] = cam_dir.z;
 
     Resource* dl = res_get(g_builtin_dirlight);
     Vec3 light_dir = v3(-0.577f, -0.577f, -0.577f);
@@ -642,11 +802,63 @@ static void update_builtins_and_scene_cb() {
     Mat4 shadow_view = mat4_lookat(light_pos, light_target, shadow_up);
     Mat4 shadow_proj = mat4_orthographic(shadow_w, shadow_h, shadow_near, shadow_far);
     Mat4 shadow_vp = mat4_mul(shadow_view, shadow_proj);
-    memcpy(cb.shadow_view_proj, shadow_vp.m, sizeof(shadow_vp.m));
+
+    for (int i = 0; i < MAX_SHADOW_CASCADES; i++) {
+        cb.shadow_cascade_splits[i] = g_camera.far_z;
+        cb.shadow_cascade_rects[i][0] = 0.0f;
+        cb.shadow_cascade_rects[i][1] = 0.0f;
+        cb.shadow_cascade_rects[i][2] = 0.0f;
+        cb.shadow_cascade_rects[i][3] = 0.0f;
+        memcpy(cb.shadow_cascade_view_proj[i], shadow_vp.m, sizeof(shadow_vp.m));
+    }
+
+    int cascade_count = dl ? dl->shadow_cascade_count : 1;
+    if (cascade_count < 1) cascade_count = 1;
+    if (cascade_count > MAX_SHADOW_CASCADES) cascade_count = MAX_SHADOW_CASCADES;
+    cb.shadow_params[0] = (float)cascade_count;
+    cb.shadow_params[1] = g_camera.near_z;
+    cb.shadow_params[2] = g_camera.far_z;
+
+    if (cascade_count > 1) {
+        float prev_split = g_camera.near_z;
+        for (int cascade = 0; cascade < cascade_count; cascade++) {
+            float slice_near = prev_split;
+            float slice_far = dl ? dl->shadow_cascade_split[cascade] : g_camera.far_z;
+            float min_split = slice_near + 0.001f;
+            if (min_split > g_camera.far_z)
+                min_split = g_camera.far_z;
+            if (slice_far < min_split)
+                slice_far = min_split;
+            if (slice_far > g_camera.far_z)
+                slice_far = g_camera.far_z;
+
+            float cascade_extent_x = dl ? dl->shadow_cascade_extent[cascade][0] : shadow_w;
+            float cascade_extent_y = dl ? dl->shadow_cascade_extent[cascade][1] : shadow_h;
+            float cascade_near = dl ? dl->shadow_cascade_near[cascade] : shadow_near;
+            float cascade_far = dl ? dl->shadow_cascade_far[cascade] : shadow_far;
+            Mat4 cascade_vp = shadow_build_manual_cascade_matrix(
+                shadow_view,
+                cascade_extent_x, cascade_extent_y,
+                cascade_near, cascade_far);
+            shadow_atlas_rect_for_cascade(cascade, cascade_count, cb.shadow_cascade_rects[cascade]);
+            memcpy(cb.shadow_cascade_view_proj[cascade], cascade_vp.m, sizeof(cascade_vp.m));
+            cb.shadow_cascade_splits[cascade] = slice_far;
+            prev_split = slice_far;
+            if (cascade == 0)
+                memcpy(cb.shadow_view_proj, cascade_vp.m, sizeof(cascade_vp.m));
+        }
+        cb.shadow_params[2] = cb.shadow_cascade_splits[cascade_count - 1];
+    } else {
+        shadow_atlas_rect_for_cascade(0, 1, cb.shadow_cascade_rects[0]);
+        memcpy(cb.shadow_view_proj, shadow_vp.m, sizeof(shadow_vp.m));
+        memcpy(cb.shadow_cascade_view_proj[0], shadow_vp.m, sizeof(shadow_vp.m));
+        cb.shadow_cascade_splits[0] = shadow_far;
+    }
+
     if (g_dx.scene_cb_history_valid)
         memcpy(cb.prev_shadow_view_proj, g_dx.scene_cb_data.shadow_view_proj, sizeof(cb.prev_shadow_view_proj));
     else
-        memcpy(cb.prev_shadow_view_proj, shadow_vp.m, sizeof(shadow_vp.m));
+        memcpy(cb.prev_shadow_view_proj, cb.shadow_view_proj, sizeof(cb.prev_shadow_view_proj));
 
     dx_update_scene_cb(cb);
 }

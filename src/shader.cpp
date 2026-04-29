@@ -17,6 +17,11 @@ cbuffer SceneCB : register(b0) {
     float4x4 PrevViewProj;
     float4x4 PrevInvViewProj;
     float4x4 PrevShadowViewProj;
+    float4 CamDir;
+    float4 ShadowCascadeSplits;
+    float4 ShadowParams;
+    float4 ShadowCascadeRects[4];
+    float4x4 ShadowCascadeViewProj[4];
 };
 cbuffer ObjectCB : register(b2) { float4x4 World; };
 struct VSIn  { float3 pos : POSITION; float3 nor : NORMAL; float2 uv : TEXCOORD0; };
@@ -40,6 +45,11 @@ cbuffer SceneCB : register(b0) {
     float4x4 PrevViewProj;
     float4x4 PrevInvViewProj;
     float4x4 PrevShadowViewProj;
+    float4 CamDir;
+    float4 ShadowCascadeSplits;
+    float4 ShadowParams;
+    float4 ShadowCascadeRects[4];
+    float4x4 ShadowCascadeViewProj[4];
 };
 cbuffer ObjectCB : register(b2) { float4x4 World; };
 struct PSIn { float4 pos : SV_POSITION; float3 nor : NORMAL; float2 uv : TEXCOORD0; float3 wpos : TEXCOORD1; };
