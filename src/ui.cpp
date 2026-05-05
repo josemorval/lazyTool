@@ -7,6 +7,7 @@
 #include "dx11_ctx.h"
 #include "log.h"
 #include "shader.h"
+#include "embedded_pack.h"
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
@@ -607,6 +608,57 @@ static void ui_recompile_all_shaders() {
             fallback++;
     }
     log_info("Recompiled shaders: %d total, %d OK, %d fallback/error", total, ok, fallback);
+}
+
+static void ui_make_standalone_output_path(const char* project_path, char* out, int out_sz) {
+    if (!out || out_sz <= 0)
+        return;
+    out[0] = '\0';
+    if (!project_path || !project_path[0])
+        return;
+
+    strncpy(out, project_path, out_sz - 1);
+    out[out_sz - 1] = '\0';
+    const char* slash1 = strrchr(out, '/');
+    const char* slash2 = strrchr(out, '\\');
+    const char* slash = slash1 > slash2 ? slash1 : slash2;
+    char* base = slash ? (char*)slash + 1 : out;
+    char* dot = strrchr(base, '.');
+    if (dot)
+        *dot = '\0';
+
+    int len = (int)strlen(out);
+    snprintf(out + len, out_sz - len, "_standalone.exe");
+}
+
+static void ui_export_current_project_single_exe() {
+    const char* project_path = project_current_path();
+    if (!project_path || !project_path[0]) {
+        log_warn("Export EXE needs a saved project path first.");
+        return;
+    }
+
+    if (!project_save_text(project_path))
+        return;
+
+    char exe_path[MAX_PATH_LEN] = {};
+    GetModuleFileNameA(nullptr, exe_path, MAX_PATH_LEN);
+    exe_path[MAX_PATH_LEN - 1] = '\0';
+
+    char output_path[MAX_PATH_LEN] = {};
+    ui_make_standalone_output_path(project_path, output_path, MAX_PATH_LEN);
+    if (!output_path[0]) {
+        log_error("Export EXE failed: could not build output path.");
+        return;
+    }
+
+    char err[512] = {};
+    if (!lt_export_single_exe(exe_path, project_path, output_path, err, sizeof(err))) {
+        log_error("Export EXE failed: %s", err[0] ? err : "unknown error");
+        return;
+    }
+
+    log_info("Standalone EXE exported: %s", output_path);
 }
 
 static void ui_project_file_bar() {
@@ -5782,6 +5834,10 @@ static void ui_top_bar() {
     ui_align_frame_row(row_y);
     if (ImGui::Button("Compile"))
         ui_recompile_all_shaders();
+    ImGui::SameLine();
+    ui_align_frame_row(row_y);
+    if (ImGui::Button("Export EXE"))
+        ui_export_current_project_single_exe();
     ImGui::SameLine(0.0f, ui_margin_px(6.0f));
     ui_align_frame_row(row_y);
     if (ui_icon_button("##shortcuts_button", UI_ICON_HELP, ImVec2(ui_px(28.0f), 0.0f), "Shortcuts"))

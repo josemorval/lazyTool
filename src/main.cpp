@@ -2,9 +2,12 @@
 #define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
+#include <shellapi.h>
+#ifndef LAZYTOOL_PLAYER_ONLY
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
+#endif
 #include "types.h"
 #include "log.h"
 #include "dx11_ctx.h"
@@ -14,7 +17,14 @@
 #include "user_cb.h"
 #include "ui.h"
 #include "app_settings.h"
+#include "embedded_pack.h"
 #include "resource.h"
+
+#ifdef LAZYTOOL_PLAYER_ONLY
+ResHandle g_sel_res = INVALID_HANDLE;
+CmdHandle g_sel_cmd = INVALID_HANDLE;
+bool g_scene_view_hovered = false;
+#endif
 
 // main.cpp ties the whole application together: math helpers, global runtime
 // state, per-frame updates, Win32 setup, and the editor/render main loop.
@@ -331,6 +341,7 @@ static uint64_t g_frame          = 0;
 static bool     g_restart_scene_requested = false;
 static bool     g_scene_paused = false;
 static CmdHandle g_default_pixelize_cmd = INVALID_HANDLE;
+static bool     g_player_mode = false;
 
 void app_request_scene_restart() {
     g_restart_scene_requested = true;
@@ -407,10 +418,14 @@ static ViewportMouseGesture s_camera_mouse_gesture = {};
 static ViewportMouseGesture s_light_orbit_gesture = {};
 
 static bool imgui_keyboard_capture_requested() {
+#ifdef LAZYTOOL_PLAYER_ONLY
+    return false;
+#else
     if (!ImGui::GetCurrentContext())
         return false;
     ImGuiIO& io = ImGui::GetIO();
     return io.WantTextInput || ImGui::IsAnyItemActive();
+#endif
 }
 
 static void end_viewport_mouse_gesture(ViewportMouseGesture* gesture) {
@@ -593,9 +608,34 @@ static void update_camera_controls(float dt) {
 }
 
 // Win32
+#ifndef LAZYTOOL_PLAYER_ONLY
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+#endif
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_player_mode) {
+        switch (msg) {
+        case WM_SIZE:
+            if (wp != SIZE_MINIMIZED) {
+                g_pending_w      = LOWORD(lp);
+                g_pending_h      = HIWORD(lp);
+                g_pending_resize = true;
+            }
+            return 0;
+        case WM_KEYDOWN:
+            if (wp == VK_ESCAPE) {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            break;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+#ifndef LAZYTOOL_PLAYER_ONLY
     switch (msg) {
     case WM_NCCALCSIZE:
         if (wp) {
@@ -666,6 +706,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return true;
+#endif
     switch (msg) {
     case WM_SIZE:
         if (wp != SIZE_MINIMIZED) {
@@ -887,15 +928,82 @@ static void update_default_example_commands() {
     c->thread_z = 1;
 }
 
+static bool wide_to_utf8(const wchar_t* in, char* out, int out_sz) {
+    if (!out || out_sz <= 0)
+        return false;
+    out[0] = '\0';
+    if (!in)
+        return false;
+    int n = WideCharToMultiByte(CP_UTF8, 0, in, -1, out, out_sz, nullptr, nullptr);
+    if (n <= 0) {
+        out[0] = '\0';
+        return false;
+    }
+    out[out_sz - 1] = '\0';
+    return true;
+}
+
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
-    wchar_t exe_path[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-    wchar_t* slash = wcsrchr(exe_path, L'\\');
-    if (!slash) slash = wcsrchr(exe_path, L'/');
+    wchar_t module_path_w[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, module_path_w, MAX_PATH);
+    wchar_t exe_dir_w[MAX_PATH] = {};
+    wcsncpy(exe_dir_w, module_path_w, MAX_PATH - 1);
+    wchar_t* slash = wcsrchr(exe_dir_w, L'\\');
+    if (!slash) slash = wcsrchr(exe_dir_w, L'/');
     if (slash) {
         *slash = L'\0';
-        SetCurrentDirectoryW(exe_path);
+        SetCurrentDirectoryW(exe_dir_w);
     }
+
+    char module_path[MAX_PATH_LEN] = {};
+    wide_to_utf8(module_path_w, module_path, MAX_PATH_LEN);
+    lt_pack_init_from_exe(module_path);
+
+    char startup_project[MAX_PATH_LEN] = {};
+    bool startup_player_mode = false;
+#ifdef LAZYTOOL_PLAYER_ONLY
+    startup_player_mode = true;
+#endif
+    if (lt_pack_is_loaded() && lt_pack_project_path()) {
+        startup_player_mode = true;
+        strncpy(startup_project, lt_pack_project_path(), MAX_PATH_LEN - 1);
+    }
+
+#ifndef LAZYTOOL_PROCEDURAL_ONLY
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv) {
+        char arg1[MAX_PATH_LEN] = {};
+        if (argc > 1)
+            wide_to_utf8(argv[1], arg1, MAX_PATH_LEN);
+
+#ifndef LAZYTOOL_PLAYER_ONLY
+        if (_stricmp(arg1, "--export-single") == 0) {
+            char project_path[MAX_PATH_LEN] = {};
+            char output_path[MAX_PATH_LEN] = {};
+            if (argc > 2) wide_to_utf8(argv[2], project_path, MAX_PATH_LEN);
+            if (argc > 3) wide_to_utf8(argv[3], output_path, MAX_PATH_LEN);
+
+            char err[512] = {};
+            bool ok = lt_export_single_exe(module_path, project_path, output_path, err, sizeof(err));
+            if (!ok) {
+                LocalFree(argv);
+                return 1;
+            }
+            LocalFree(argv);
+            return 0;
+        }
+#endif
+
+        if (_stricmp(arg1, "--play") == 0 && argc > 2) {
+            startup_player_mode = true;
+            wide_to_utf8(argv[2], startup_project, MAX_PATH_LEN);
+        }
+
+        LocalFree(argv);
+    }
+#endif
+    g_player_mode = startup_player_mode;
 
     WNDCLASSEXW wc  = {};
     wc.cbSize       = sizeof(wc);
@@ -913,7 +1021,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     RegisterClassExW(&wc);
 
     HWND hwnd = CreateWindowExW(
-        0, L"lazyTool_wnd", L"lazyTool",
+        0, L"lazyTool_wnd", g_player_mode ? L"lazyTool Player" : L"lazyTool",
         WS_OVERLAPPEDWINDOW,
         100, 100, 1600, 900,
         nullptr, nullptr, hInst, nullptr);
@@ -921,24 +1029,40 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     UpdateWindow(hwnd);
 
     log_init();
+#ifndef LAZYTOOL_PLAYER_ONLY
     app_settings_load_or_create();
+#endif
 
     if (!dx_init(hwnd, 1600, 900)) {
         MessageBoxA(nullptr, "DX11 init failed.\nMake sure you have a DX11-capable GPU.", "lazyTool", MB_OK | MB_ICONERROR);
         return 1;
     }
 
-    ui_init();
+#ifndef LAZYTOOL_PLAYER_ONLY
+    if (!g_player_mode)
+        ui_init();
+#endif
     res_init();
     cmd_init();
     user_cb_init();
 
-    project_new_default();
+    if (startup_project[0]) {
+        if (!project_load_text(startup_project))
+            project_new_default();
+    } else {
+        project_new_default();
+    }
 
-    log_info("lazyTool ready.");
-    log_info("Right-click Resources panel  -> create resources.");
-    log_info("Right-click Commands panel   -> create commands.");
-    log_info("Use User CB panel to create variables; link scalar/vector resources as sources.");
+    if (g_player_mode) {
+        log_info("lazyTool player ready.");
+        if (lt_pack_is_loaded())
+            log_info("Embedded pack loaded: %d files.", lt_pack_file_count());
+    } else {
+        log_info("lazyTool ready.");
+        log_info("Right-click Resources panel  -> create resources.");
+        log_info("Right-click Commands panel   -> create commands.");
+        log_info("Use User CB panel to create variables; link scalar/vector resources as sources.");
+    }
 
     LARGE_INTEGER freq, prev_t;
     QueryPerformanceFrequency(&freq);
@@ -995,6 +1119,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         // execute commands and we do not clear/rebuild the scene RT, so the
         // last rendered frame stays visible while the editor remains responsive.
         bool light_orbit_active = false;
+        if (g_player_mode)
+            g_scene_view_hovered = true;
         if (!g_scene_paused)
             light_orbit_active = update_dirlight_orbit();
         if (!g_scene_paused && !light_orbit_active)
@@ -1015,19 +1141,34 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             dx_end_scene();
         }
 
-        // ImGui render to backbuffer
-        dx_begin_ui();
-        ui_draw();
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+#ifdef LAZYTOOL_PLAYER_ONLY
+        dx_present_scene_to_backbuffer();
         cmd_profile_end_frame_capture();
+#else
+        if (g_player_mode) {
+            dx_present_scene_to_backbuffer();
+            cmd_profile_end_frame_capture();
+        } else {
+            // ImGui render to backbuffer
+            dx_begin_ui();
+            ui_draw();
+            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+            cmd_profile_end_frame_capture();
+        }
+#endif
 
         g_dx.sc->Present(g_dx.vsync ? 1 : 0, 0);
         dx_debug_log_messages();
     }
 
+#ifndef LAZYTOOL_PLAYER_ONLY
     app_settings_save();
+#endif
     user_cb_shutdown();
-    ui_shutdown();
+#ifndef LAZYTOOL_PLAYER_ONLY
+    if (!g_player_mode)
+        ui_shutdown();
+#endif
     cmd_shutdown();
     res_shutdown();
     dx_shutdown();

@@ -70,10 +70,13 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-set CFLAGS=/W3 /O2 /MT /EHsc /nologo /std:c++17 /DNDEBUG
+set CFLAGS=/W3 /O2 /MT /EHsc /nologo /std:c++17 /DNDEBUG /Gy /Gw
+set PLAYER_CFLAGS=/W3 /O1 /MT /EHsc /nologo /std:c++17 /DNDEBUG /DLAZYTOOL_PLAYER_ONLY /Gy /Gw
+set TINY_PLAYER_CFLAGS=/W3 /O1 /MD /nologo /std:c++17 /DNDEBUG /DLAZYTOOL_PLAYER_ONLY /DLAZYTOOL_PROCEDURAL_ONLY /GS- /GR- /GL /Gy /Gw
+set NANO_PLAYER_CFLAGS=/W3 /O1 /MD /nologo /std:c++17 /DNDEBUG /DLAZYTOOL_PLAYER_ONLY /DLAZYTOOL_PROCEDURAL_ONLY /DLAZYTOOL_NO_SHADER_REFLECTION /DLAZYTOOL_NO_USER_CB /DLAZYTOOL_NO_LOG /DLAZYTOOL_NANO_PROJECT_LOADER /GS- /GR- /GL /Gy /Gw
 echo [BUILD] release
 
-set SRCS=^
+set EDITOR_SRCS=^
  %SRCDIR%\main.cpp ^
  %SRCDIR%\log.cpp ^
  %SRCDIR%\dx11_ctx.cpp ^
@@ -82,6 +85,7 @@ set SRCS=^
  %SRCDIR%\commands.cpp ^
  %SRCDIR%\project.cpp ^
  %SRCDIR%\app_settings.cpp ^
+ %SRCDIR%\embedded_pack.cpp ^
  %SRCDIR%\user_cb.cpp ^
  %SRCDIR%\ui.cpp ^
  %SRCDIR%\impl.cpp ^
@@ -91,6 +95,18 @@ set SRCS=^
  %EXTDIR%\imgui\imgui_widgets.cpp ^
  %EXTDIR%\imgui\backends\imgui_impl_win32.cpp ^
  %EXTDIR%\imgui\backends\imgui_impl_dx11.cpp
+
+set PLAYER_SRCS=^
+ %SRCDIR%\main.cpp ^
+ %SRCDIR%\log.cpp ^
+ %SRCDIR%\dx11_ctx.cpp ^
+ %SRCDIR%\shader.cpp ^
+ %SRCDIR%\resources.cpp ^
+ %SRCDIR%\commands.cpp ^
+ %SRCDIR%\project.cpp ^
+ %SRCDIR%\embedded_pack.cpp ^
+ %SRCDIR%\user_cb.cpp ^
+ %SRCDIR%\impl.cpp
 
 set LIBS=^
  d3d11.lib ^
@@ -109,11 +125,11 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-cl %CFLAGS% %DEFINES% %INCLUDES% %SRCS% %RES% ^
+cl %CFLAGS% %DEFINES% %INCLUDES% %EDITOR_SRCS% %RES% ^
    /Fe:%OUTDIR%\lazyTool.exe ^
    /Fo:%OUTDIR%\ ^
    /Fd:%OUTDIR%\lazyTool.pdb ^
-   /link %LIBS% /SUBSYSTEM:WINDOWS
+   /link %LIBS% /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF
 
 if %ERRORLEVEL% neq 0 (
     echo.
@@ -123,6 +139,51 @@ if %ERRORLEVEL% neq 0 (
 
 echo.
 echo [OK] %OUTDIR%\lazyTool.exe
+
+if not exist %OUTDIR%\player mkdir %OUTDIR%\player
+cl %PLAYER_CFLAGS% %DEFINES% %INCLUDES% %PLAYER_SRCS% %RES% ^
+   /Fe:%OUTDIR%\lazyPlayer.exe ^
+   /Fo:%OUTDIR%\player\ ^
+   /Fd:%OUTDIR%\lazyPlayer.pdb ^
+   /link %LIBS% /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF
+
+if %ERRORLEVEL% neq 0 (
+    echo.
+    echo [FAILED]
+    exit /b 1
+)
+
+echo [OK] %OUTDIR%\lazyPlayer.exe
+
+if not exist %OUTDIR%\player_nano mkdir %OUTDIR%\player_nano
+cl %NANO_PLAYER_CFLAGS% %DEFINES% %INCLUDES% %PLAYER_SRCS% ^
+   /Fe:%OUTDIR%\lazyPlayerNano.exe ^
+   /Fo:%OUTDIR%\player_nano\ ^
+   /Fd:%OUTDIR%\lazyPlayerNano.pdb ^
+   /link %LIBS% /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG /INCREMENTAL:NO /FIXED /DYNAMICBASE:NO
+
+if %ERRORLEVEL% neq 0 (
+    echo.
+    echo [FAILED]
+    exit /b 1
+)
+
+echo [OK] %OUTDIR%\lazyPlayerNano.exe
+
+if not exist %OUTDIR%\player_tiny mkdir %OUTDIR%\player_tiny
+cl %TINY_PLAYER_CFLAGS% %DEFINES% %INCLUDES% %PLAYER_SRCS% ^
+   /Fe:%OUTDIR%\lazyPlayerTiny.exe ^
+   /Fo:%OUTDIR%\player_tiny\ ^
+   /Fd:%OUTDIR%\lazyPlayerTiny.pdb ^
+   /link %LIBS% /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG /INCREMENTAL:NO /FIXED /DYNAMICBASE:NO
+
+if %ERRORLEVEL% neq 0 (
+    echo.
+    echo [FAILED]
+    exit /b 1
+)
+
+echo [OK] %OUTDIR%\lazyPlayerTiny.exe
 
 call :copy_folders
 if %ERRORLEVEL% neq 0 (

@@ -644,6 +644,28 @@ void dx_begin_ui() {
     g_dx.ctx->ClearRenderTargetView(g_dx.back_rtv, clear);
 }
 
+void dx_present_scene_to_backbuffer() {
+    if (!g_dx.sc || !g_dx.ctx || !g_dx.scene_tex)
+        return;
+
+    ID3D11RenderTargetView* null_rtv = nullptr;
+    g_dx.ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    ID3D11UnorderedAccessView* null_uav = nullptr;
+    for (int i = 0; i < 8; i++) {
+        g_dx.ctx->VSSetShaderResources(i, 1, &null_srv);
+        g_dx.ctx->PSSetShaderResources(i, 1, &null_srv);
+        g_dx.ctx->CSSetShaderResources(i, 1, &null_srv);
+        g_dx.ctx->CSSetUnorderedAccessViews(i, 1, &null_uav, nullptr);
+    }
+
+    ID3D11Texture2D* bb = nullptr;
+    if (SUCCEEDED(g_dx.sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb)) && bb) {
+        g_dx.ctx->CopyResource(bb, g_dx.scene_tex);
+        bb->Release();
+    }
+}
+
 void dx_debug_clear_messages() {
     if (g_dx.info_queue)
         g_dx.info_queue->ClearStoredMessages();

@@ -72,6 +72,7 @@ void dx_begin_scene();
 void dx_end_scene();
 void dx_render_scene_grid_overlay();
 void dx_begin_ui();
+void dx_present_scene_to_backbuffer();
 void dx_debug_log_messages();
 void dx_debug_clear_messages();
 void dx_shutdown();

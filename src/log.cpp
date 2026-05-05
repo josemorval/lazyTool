@@ -1,6 +1,7 @@
 #include "log.h"
 #include <stdarg.h>
 
+#ifndef LAZYTOOL_NO_LOG
 // The log is a fixed-size ring buffer so the UI can display recent messages
 // without allocating during normal frame updates.
 
@@ -21,3 +22,4 @@ void log_push(LogLevel lvl, const char* fmt, ...) {
     OutputDebugStringA(e.msg);
     OutputDebugStringA("\n");
 }
+#endif

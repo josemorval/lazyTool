@@ -1,6 +1,7 @@
 #include "shader.h"
 #include "dx11_ctx.h"
 #include "log.h"
+#include "embedded_pack.h"
 #include <d3d11shader.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,13 +71,76 @@ void CSMain(uint3 id : SV_DispatchThreadID) {
 }
 )HLSL";
 
+static bool shader_path_is_absolute(const char* path) {
+    if (!path || !path[0]) return false;
+    if (path[0] == '/' || path[0] == '\\') return true;
+    return path[1] == ':' && (path[2] == '\\' || path[2] == '/');
+}
+
+static void shader_path_dirname(const char* path, char* out, int out_sz) {
+    out[0] = '\0';
+    if (!path) return;
+    const char* slash1 = strrchr(path, '/');
+    const char* slash2 = strrchr(path, '\\');
+    const char* slash = slash1 > slash2 ? slash1 : slash2;
+    if (!slash) return;
+    int len = (int)(slash - path);
+    if (len >= out_sz) len = out_sz - 1;
+    memcpy(out, path, len);
+    out[len] = '\0';
+}
+
+static void shader_path_join(const char* dir, const char* file, char* out, int out_sz) {
+    if (shader_path_is_absolute(file) || !dir || !dir[0]) {
+        strncpy(out, file ? file : "", out_sz - 1);
+        out[out_sz - 1] = '\0';
+        return;
+    }
+    snprintf(out, out_sz, "%s/%s", dir, file ? file : "");
+}
+
+class LtShaderInclude : public ID3DInclude {
+public:
+    explicit LtShaderInclude(const char* root) {
+        strncpy(root_dir, root ? root : "", MAX_PATH_LEN - 1);
+        root_dir[MAX_PATH_LEN - 1] = '\0';
+    }
+
+    HRESULT STDMETHODCALLTYPE Open(D3D_INCLUDE_TYPE, LPCSTR file_name,
+                                   LPCVOID, LPCVOID* out_data, UINT* out_bytes) override {
+        if (!file_name || !out_data || !out_bytes)
+            return E_INVALIDARG;
+
+        void* data = nullptr;
+        size_t size = 0;
+        char full[MAX_PATH_LEN] = {};
+        shader_path_join(root_dir, file_name, full, MAX_PATH_LEN);
+        if (!lt_read_file(full, &data, &size) && !lt_read_file(file_name, &data, &size))
+            return E_FAIL;
+
+        *out_data = data;
+        *out_bytes = (UINT)size;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Close(LPCVOID data) override {
+        lt_free_file((void*)data);
+        return S_OK;
+    }
+
+private:
+    char root_dir[MAX_PATH_LEN] = {};
+};
+
 static bool compile_blob(const char* src, size_t src_len, const char* src_name,
+                          const char* include_root,
                           const char* entry, const char* profile,
                           ID3DBlob** out_blob, char* err_buf, int err_buf_sz)
 {
     ID3DBlob* err_blob = nullptr;
+    LtShaderInclude include_handler(include_root);
     HRESULT hr = D3DCompile(
-        src, src_len, src_name, nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+        src, src_len, src_name, nullptr, &include_handler,
         entry, profile, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
         out_blob, &err_blob);
     if (FAILED(hr)) {
@@ -92,18 +156,16 @@ static bool compile_blob(const char* src, size_t src_len, const char* src_name,
 }
 
 static bool read_file(const char* path, char** out, size_t* out_sz) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return false;
-    fseek(f, 0, SEEK_END);
-    *out_sz = (size_t)ftell(f);
-    rewind(f);
-    *out = (char*)malloc(*out_sz + 1);
-    fread(*out, 1, *out_sz, f);
-    (*out)[*out_sz] = '\0';
-    fclose(f);
+    void* data = nullptr;
+    size_t size = 0;
+    if (!lt_read_file(path, &data, &size))
+        return false;
+    *out = (char*)data;
+    *out_sz = size;
     return true;
 }
 
+#ifndef LAZYTOOL_NO_SHADER_REFLECTION
 static ResType reflected_type_to_res_type(const D3D11_SHADER_TYPE_DESC& td) {
     if (td.Rows != 1 || td.Columns < 1 || td.Columns > 4)
         return RES_NONE;
@@ -313,6 +375,22 @@ static void reflect_shader_bindings(Resource* r, ID3DBlob* blob, uint32_t stage_
 
     refl->Release();
 }
+#else
+uint32_t shader_cb_next_layout_version() {
+    return 1;
+}
+
+static void reflect_command_cbuffer(Resource* r, ID3DBlob*) {
+    if (!r)
+        return;
+    // Nano player convention: ObjectCB is fixed at b1 and UserCB is disabled.
+    r->object_cb_active = true;
+    r->object_cb_bind_slot = 1;
+}
+
+static void reflect_shader_bindings(Resource*, ID3DBlob*, uint32_t) {
+}
+#endif
 
 // Compile the standard VS/PS pair and reflect user-editable parameters from
 // the shader's constant-buffer layout.
@@ -334,6 +412,7 @@ bool shader_compile_vs_ps(Resource* r, const char* path,
     char*  file_src = nullptr;
     size_t file_sz  = 0;
     bool   used_file = false;
+    char   include_root[MAX_PATH_LEN] = {};
 
     if (path && path[0]) {
         if (read_file(path, &file_src, &file_sz)) {
@@ -341,6 +420,7 @@ bool shader_compile_vs_ps(Resource* r, const char* path,
             vs_len = ps_len = file_sz;
             src_name = path;
             used_file = true;
+            shader_path_dirname(path, include_root, MAX_PATH_LEN);
         } else {
             log_warn("Shader: '%s' not found, using fallback", path);
             r->using_fallback = true;
@@ -354,18 +434,18 @@ bool shader_compile_vs_ps(Resource* r, const char* path,
     ID3DBlob* ps_blob = nullptr;
     char err[512] = {};
 
-    bool ok_vs = compile_blob(vs_src, vs_len, src_name,
+    bool ok_vs = compile_blob(vs_src, vs_len, src_name, include_root,
                                vs_entry ? vs_entry : "VSMain", "vs_5_0",
                                &vs_blob, err, sizeof(err));
     if (!ok_vs) {
         log_error("VS compile error [%s]: %s", src_name, err);
         r->using_fallback = true;
         snprintf(r->compile_err, sizeof(r->compile_err), "VS compile failed. Using fallback.\n%s", err);
-        if (used_file && file_src) { free(file_src); file_src = nullptr; used_file = false; }
-        compile_blob(s_fallback_vs, strlen(s_fallback_vs), "fallback_vs", "VSMain", "vs_5_0", &vs_blob, err, sizeof(err));
-        compile_blob(s_fallback_ps, strlen(s_fallback_ps), "fallback_ps", "PSMain", "ps_5_0", &ps_blob, err, sizeof(err));
+        if (used_file && file_src) { lt_free_file(file_src); file_src = nullptr; used_file = false; }
+        compile_blob(s_fallback_vs, strlen(s_fallback_vs), "fallback_vs", "", "VSMain", "vs_5_0", &vs_blob, err, sizeof(err));
+        compile_blob(s_fallback_ps, strlen(s_fallback_ps), "fallback_ps", "", "PSMain", "ps_5_0", &ps_blob, err, sizeof(err));
     } else {
-        bool ok_ps = compile_blob(ps_src, ps_len, src_name,
+        bool ok_ps = compile_blob(ps_src, ps_len, src_name, include_root,
                                    ps_entry ? ps_entry : "PSMain", "ps_5_0",
                                    &ps_blob, err, sizeof(err));
         if (!ok_ps) {
@@ -373,12 +453,12 @@ bool shader_compile_vs_ps(Resource* r, const char* path,
             r->using_fallback = true;
             snprintf(r->compile_err, sizeof(r->compile_err), "PS compile failed. Using fallback.\n%s", err);
             vs_blob->Release(); vs_blob = nullptr;
-            compile_blob(s_fallback_vs, strlen(s_fallback_vs), "fallback_vs", "VSMain", "vs_5_0", &vs_blob, err, sizeof(err));
-            compile_blob(s_fallback_ps, strlen(s_fallback_ps), "fallback_ps", "PSMain", "ps_5_0", &ps_blob, err, sizeof(err));
+            compile_blob(s_fallback_vs, strlen(s_fallback_vs), "fallback_vs", "", "VSMain", "vs_5_0", &vs_blob, err, sizeof(err));
+            compile_blob(s_fallback_ps, strlen(s_fallback_ps), "fallback_ps", "", "PSMain", "ps_5_0", &ps_blob, err, sizeof(err));
         }
     }
 
-    if (used_file && file_src) free(file_src);
+    if (used_file && file_src) lt_free_file(file_src);
 
     if (!vs_blob || !ps_blob) {
         if (vs_blob) vs_blob->Release();
@@ -427,12 +507,14 @@ bool shader_compile_cs(Resource* r, const char* path, const char* cs_entry) {
     char*  file_src  = nullptr;
     size_t file_sz   = 0;
     bool   used_file = false;
+    char   include_root[MAX_PATH_LEN] = {};
 
     if (path && path[0]) {
         if (read_file(path, &file_src, &file_sz)) {
             src = file_src; sz = file_sz;
             src_name = path;
             used_file = true;
+            shader_path_dirname(path, include_root, MAX_PATH_LEN);
         } else {
             log_warn("CS: '%s' not found, using fallback", path);
             r->using_fallback = true;
@@ -444,17 +526,17 @@ bool shader_compile_cs(Resource* r, const char* path, const char* cs_entry) {
 
     ID3DBlob* blob = nullptr;
     char err[512] = {};
-    if (!compile_blob(src, sz, src_name,
+    if (!compile_blob(src, sz, src_name, include_root,
                        cs_entry ? cs_entry : "CSMain", "cs_5_0",
                        &blob, err, sizeof(err))) {
         log_error("CS compile error [%s]: %s", src_name, err);
         r->using_fallback = true;
         snprintf(r->compile_err, sizeof(r->compile_err), "CS compile failed. Using fallback.\n%s", err);
-        if (used_file && file_src) { free(file_src); used_file = false; file_src = nullptr; }
-        compile_blob(s_fallback_cs, strlen(s_fallback_cs), "fallback_cs", "CSMain", "cs_5_0", &blob, err, sizeof(err));
+        if (used_file && file_src) { lt_free_file(file_src); used_file = false; file_src = nullptr; }
+        compile_blob(s_fallback_cs, strlen(s_fallback_cs), "fallback_cs", "", "CSMain", "cs_5_0", &blob, err, sizeof(err));
     }
 
-    if (used_file && file_src) free(file_src);
+    if (used_file && file_src) lt_free_file(file_src);
     if (!blob) return false;
 
     g_dx.dev->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &r->cs);

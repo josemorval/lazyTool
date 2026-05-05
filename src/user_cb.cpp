@@ -11,6 +11,26 @@
 UserCBEntry   g_user_cb_entries[MAX_USER_CB_VARS] = {};
 int           g_user_cb_count = 0;
 ID3D11Buffer* g_user_cb_buf   = nullptr;
+
+#ifdef LAZYTOOL_NO_USER_CB
+void user_cb_init() {}
+void user_cb_shutdown() {}
+void user_cb_update() {}
+void user_cb_bind() {}
+void user_cb_sync_command_params(Command* c, const Resource*) {
+    if (c)
+        c->param_count = 0;
+}
+void user_cb_bind_for_command(Command*, const Resource*, bool, bool, bool) {}
+bool user_cb_type_supported(ResType) { return false; }
+bool user_cb_add_var(const char*, ResType) { return false; }
+bool user_cb_add_from_resource(ResHandle) { return false; }
+bool user_cb_set_source(int, ResHandle) { return false; }
+void user_cb_detach_resource(ResHandle) {}
+void user_cb_remove(int) {}
+void user_cb_move(int, int) {}
+int user_cb_slot_offset(int idx) { return idx * 16; }
+#else
 static ID3D11Buffer* s_command_cb_buf = nullptr;
 
 static bool user_cb_name_exists(const char* name) {
@@ -446,3 +466,4 @@ void user_cb_move(int from, int to) {
 }
 
 int user_cb_slot_offset(int idx) { return idx * 16; }
+#endif

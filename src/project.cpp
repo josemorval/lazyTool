@@ -5,6 +5,7 @@
 #include "log.h"
 #include "ui.h"
 #include "user_cb.h"
+#include "embedded_pack.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -757,10 +758,117 @@ static void parse_handles(char* line, ResHandle* handles, int* count, int max_co
     }
 }
 
+static bool project_read_line(const char*& cursor, const char* end, char* out, int out_sz) {
+    if (!cursor || !end || cursor >= end || !out || out_sz <= 0)
+        return false;
+
+    int n = 0;
+    while (cursor < end && *cursor != '\n' && *cursor != '\r') {
+        if (n < out_sz - 1)
+            out[n++] = *cursor;
+        cursor++;
+    }
+    while (cursor < end && (*cursor == '\n' || *cursor == '\r'))
+        cursor++;
+    out[n] = '\0';
+    return true;
+}
+
 // Parse a saved project file and rebuild the in-memory editor state.
+#ifdef LAZYTOOL_NANO_PROJECT_LOADER
 bool project_load_text(const char* path) {
-    FILE* f = fopen(path, "rb");
-    if (!f) {
+    void* project_bytes = nullptr;
+    size_t project_size = 0;
+    if (!lt_read_file(path, &project_bytes, &project_size)) {
+        log_error("Project load failed: %s", path);
+        return false;
+    }
+
+    project_clear_user_data();
+    project_reset_view_defaults();
+
+    char line[1024] = {};
+    Command* cur = nullptr;
+    const char* cursor = (const char*)project_bytes;
+    const char* end = cursor + project_size;
+    while (project_read_line(cursor, end, line, sizeof(line))) {
+        char tmp[1024] = {};
+        strncpy(tmp, line, sizeof(tmp) - 1);
+        char* tag = strtok(tmp, " \t\r\n");
+        if (!tag || tag[0] == '#')
+            continue;
+
+        if (strcmp(tag, "camera_fps") == 0) {
+            g_camera.position[0] = (float)atof(strtok(nullptr, " \t\r\n"));
+            g_camera.position[1] = (float)atof(strtok(nullptr, " \t\r\n"));
+            g_camera.position[2] = (float)atof(strtok(nullptr, " \t\r\n"));
+            g_camera.yaw = (float)atof(strtok(nullptr, " \t\r\n"));
+            g_camera.pitch = (float)atof(strtok(nullptr, " \t\r\n"));
+            g_camera.fov_y = (float)atof(strtok(nullptr, " \t\r\n"));
+            g_camera.near_z = (float)atof(strtok(nullptr, " \t\r\n"));
+            g_camera.far_z = (float)atof(strtok(nullptr, " \t\r\n"));
+        } else if (strcmp(tag, "resource") == 0) {
+            char* kind = strtok(nullptr, " \t\r\n");
+            char* name = strtok(nullptr, " \t\r\n");
+            if (!kind || !name)
+                continue;
+            if (strcmp(kind, "mesh_primitive") == 0) {
+                char* prim = strtok(nullptr, " \t\r\n");
+                res_create_mesh_primitive(name, mesh_prim_from_name(prim ? prim : "cube"));
+            } else if (strcmp(kind, "shader_vsps") == 0) {
+                char* p = strtok(nullptr, " \t\r\n");
+                res_create_shader(name, p && strcmp(p, "-") != 0 ? p : "", "VSMain", "PSMain");
+            }
+        } else if (strcmp(tag, "command") == 0) {
+            char* kind = strtok(nullptr, " \t\r\n");
+            char* name = strtok(nullptr, " \t\r\n");
+            char* enabled = strtok(nullptr, " \t\r\n");
+            CmdHandle h = cmd_alloc(name ? name : "cmd", cmd_type_from_name(kind ? kind : "draw_mesh"));
+            cur = cmd_get(h);
+            if (cur && enabled)
+                cur->enabled = atoi(enabled) != 0;
+        } else if (strcmp(tag, "end_command") == 0) {
+            cur = nullptr;
+        } else if (cur) {
+            if (strcmp(tag, "targets") == 0) {
+                cur->rt = res_by_ref(strtok(nullptr, " \t\r\n"),
+                    res_lookup_types(RES_RENDER_TEXTURE2D, RES_RENDER_TEXTURE3D, RES_BUILTIN_SCENE_COLOR));
+                cur->depth = res_by_ref(strtok(nullptr, " \t\r\n"),
+                    res_lookup_types(RES_RENDER_TEXTURE2D, RES_BUILTIN_SCENE_DEPTH));
+            } else if (strcmp(tag, "mesh_shader") == 0) {
+                cur->mesh = res_by_ref(strtok(nullptr, " \t\r\n"), res_lookup_types(RES_MESH));
+                cur->shader = res_by_ref(strtok(nullptr, " \t\r\n"), res_lookup_types(RES_SHADER));
+            } else if (strcmp(tag, "render_state") == 0) {
+                cur->color_write = atoi(strtok(nullptr, " \t\r\n")) != 0;
+                cur->depth_test = atoi(strtok(nullptr, " \t\r\n")) != 0;
+                cur->depth_write = atoi(strtok(nullptr, " \t\r\n")) != 0;
+                cur->alpha_blend = atoi(strtok(nullptr, " \t\r\n")) != 0;
+                cur->cull_back = atoi(strtok(nullptr, " \t\r\n")) != 0;
+                cur->shadow_cast = atoi(strtok(nullptr, " \t\r\n")) != 0;
+                cur->shadow_receive = atoi(strtok(nullptr, " \t\r\n")) != 0;
+            } else if (strcmp(tag, "transform") == 0) {
+                for (int i = 0; i < 3; i++) cur->pos[i] = (float)atof(strtok(nullptr, " \t\r\n"));
+                for (int i = 0; i < 3; i++) cur->rot[i] = (float)atof(strtok(nullptr, " \t\r\n"));
+                for (int i = 0; i < 3; i++) cur->scale[i] = (float)atof(strtok(nullptr, " \t\r\n"));
+            } else if (strcmp(tag, "clear") == 0) {
+                cur->clear_color_enabled = atoi(strtok(nullptr, " \t\r\n")) != 0;
+                for (int i = 0; i < 4; i++) cur->clear_color[i] = (float)atof(strtok(nullptr, " \t\r\n"));
+                cur->clear_depth = atoi(strtok(nullptr, " \t\r\n")) != 0;
+                cur->depth_clear_val = (float)atof(strtok(nullptr, " \t\r\n"));
+            }
+        }
+    }
+
+    lt_free_file(project_bytes);
+    project_set_current_path(path);
+    dx_invalidate_scene_history();
+    return true;
+}
+#else
+bool project_load_text(const char* path) {
+    void* project_bytes = nullptr;
+    size_t project_size = 0;
+    if (!lt_read_file(path, &project_bytes, &project_size)) {
         log_error("Project load failed: %s", path);
         return false;
     }
@@ -774,7 +882,9 @@ bool project_load_text(const char* path) {
     CmdHandle pending_parent_cmds[MAX_COMMANDS] = {};
     char pending_parent_names[MAX_COMMANDS][MAX_NAME] = {};
     int pending_parent_count = 0;
-    while (fgets(line, sizeof(line), f)) {
+    const char* cursor = (const char*)project_bytes;
+    const char* end = cursor + project_size;
+    while (project_read_line(cursor, end, line, sizeof(line))) {
         char tmp[1024];
         strncpy(tmp, line, sizeof(tmp) - 1);
         tmp[sizeof(tmp) - 1] = '\0';
@@ -891,7 +1001,12 @@ bool project_load_text(const char* path) {
                 res_create_mesh_primitive(name, mesh_prim_from_name(prim ? prim : "cube"));
             } else if (strcmp(kind, "mesh_gltf") == 0) {
                 char* p = strtok(nullptr, " \t\r\n");
+#ifdef LAZYTOOL_PROCEDURAL_ONLY
+                log_warn("mesh_gltf skipped in procedural-only player: %s", p ? p : "");
+                res_create_mesh_primitive(name, MESH_PRIM_CUBE);
+#else
                 res_load_mesh(name, p ? p : "");
+#endif
             } else if (strcmp(kind, "shader_vsps") == 0) {
                 char* p = strtok(nullptr, " \t\r\n");
                 res_create_shader(name, p && strcmp(p, "-") != 0 ? p : "", "VSMain", "PSMain");
@@ -900,7 +1015,11 @@ bool project_load_text(const char* path) {
                 res_create_compute_shader(name, p && strcmp(p, "-") != 0 ? p : "", "CSMain");
             } else if (strcmp(kind, "texture2d") == 0) {
                 char* p = strtok(nullptr, " \t\r\n");
+#ifdef LAZYTOOL_PROCEDURAL_ONLY
+                log_warn("texture2d skipped in procedural-only player: %s", p ? p : "");
+#else
                 if (p && strcmp(p, "-") != 0) res_load_texture(name, p);
+#endif
             }
         } else if (strcmp(tag, "mesh_part_disabled") == 0) {
             char* mesh_ref = strtok(nullptr, " \t\r\n");
@@ -1020,9 +1139,10 @@ bool project_load_text(const char* path) {
             child->parent = parent;
     }
 
-    fclose(f);
+    lt_free_file(project_bytes);
     project_set_current_path(path);
     dx_invalidate_scene_history();
     log_info("Project loaded: %s", path);
     return true;
 }
+#endif

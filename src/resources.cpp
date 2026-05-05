@@ -4,10 +4,12 @@
 #include "dx11_ctx.h"
 #include "log.h"
 #include "project.h"
+#include "embedded_pack.h"
 #include "stb_image.h"
 #include "cgltf.h"
 #include <stddef.h>
 #include <stdlib.h>
+#include <limits.h>
 
 // This module owns all editor/runtime resources: textures, meshes, shaders,
 // render targets, and the built-in handles that expose engine state to users.
@@ -1180,31 +1182,50 @@ static bool res_upload_texture_rgba32f(Resource* r, const char* source_label,
                                  DXGI_FORMAT_R32G32B32A32_FLOAT, (UINT)(w * sizeof(float) * 4));
 }
 
+#ifndef LAZYTOOL_PROCEDURAL_ONLY
 static bool res_load_texture_file_into(Resource* r, const char* path) {
-    if (stbi_is_hdr(path)) {
+    void* bytes = nullptr;
+    size_t byte_count = 0;
+    if (!lt_read_file(path, &bytes, &byte_count)) {
+        log_error("Texture load failed: %s", path ? path : "");
+        return false;
+    }
+    if (byte_count > (size_t)INT_MAX) {
+        lt_free_file(bytes);
+        log_error("Texture too large: %s", path ? path : "");
+        return false;
+    }
+
+    const stbi_uc* mem = (const stbi_uc*)bytes;
+    int mem_size = (int)byte_count;
+    if (stbi_is_hdr_from_memory(mem, mem_size)) {
         int w = 0, h = 0, ch = 0;
-        float* data = stbi_loadf(path, &w, &h, &ch, 4);
+        float* data = stbi_loadf_from_memory(mem, mem_size, &w, &h, &ch, 4);
         if (!data) {
             log_error("HDR texture load failed: %s", path);
+            lt_free_file(bytes);
             return false;
         }
 
         bool ok = res_upload_texture_rgba32f(r, path, data, w, h);
         stbi_image_free(data);
+        lt_free_file(bytes);
         if (ok)
             log_info("HDR texture loaded: %s (%dx%d)", r->name, w, h);
         return ok;
     }
 
     int w = 0, h = 0, ch = 0;
-    unsigned char* data = stbi_load(path, &w, &h, &ch, 4);
+    unsigned char* data = stbi_load_from_memory(mem, mem_size, &w, &h, &ch, 4);
     if (!data) {
         log_error("Texture load failed: %s", path);
+        lt_free_file(bytes);
         return false;
     }
 
     bool ok = res_upload_texture_rgba8(r, path, data, w, h);
     stbi_image_free(data);
+    lt_free_file(bytes);
     if (ok)
         log_info("Texture loaded: %s (%dx%d)", r->name, w, h);
     return ok;
@@ -1301,7 +1322,20 @@ ResHandle res_load_texture(const char* name, const char* path) {
     }
     return handle;
 }
+#else
+bool res_reload_texture(Resource*, const char*) {
+    log_warn("Texture reload unavailable in procedural-only player.");
+    return false;
+}
 
+ResHandle res_load_texture(const char* name, const char* path) {
+    log_warn("Texture skipped in procedural-only player: %s (%s)",
+        name ? name : "", path ? path : "");
+    return INVALID_HANDLE;
+}
+#endif
+
+#ifndef LAZYTOOL_PROCEDURAL_ONLY
 static cgltf_image* res_gltf_texture_image(cgltf_texture* tex) {
     if (!tex) return nullptr;
     cgltf_image* img = tex->image ? tex->image : tex->basisu_image;
@@ -1678,6 +1712,7 @@ static bool res_push_mesh_part(MeshPart* parts, int* part_count, const char* par
     (*part_count)++;
     return true;
 }
+#endif
 
 bool res_set_mesh_primitive(Resource* r, MeshPrimitiveType type) {
     if (!r) return false;
@@ -1734,6 +1769,31 @@ static ResHandle res_mesh_fallback_cube(ResHandle handle, const char* msg) {
 
 // Import a glTF mesh into the engine's internal mesh representation. The
 // importer preserves per-part transforms and material assignments when found.
+static cgltf_result res_cgltf_file_read(const cgltf_memory_options*,
+                                        const cgltf_file_options*,
+                                        const char* path,
+                                        cgltf_size* size,
+                                        void** data)
+{
+    void* bytes = nullptr;
+    size_t byte_count = 0;
+    if (!lt_read_file(path, &bytes, &byte_count))
+        return cgltf_result_file_not_found;
+    *data = bytes;
+    if (size)
+        *size = (cgltf_size)byte_count;
+    return cgltf_result_success;
+}
+
+static void res_cgltf_file_release(const cgltf_memory_options*,
+                                   const cgltf_file_options*,
+                                   void* data,
+                                   cgltf_size)
+{
+    lt_free_file(data);
+}
+
+#ifndef LAZYTOOL_PROCEDURAL_ONLY
 ResHandle res_load_mesh(const char* name, const char* path) {
     ResHandle handle = res_alloc(name, RES_MESH);
     if (handle == INVALID_HANDLE) return INVALID_HANDLE;
@@ -1745,6 +1805,8 @@ ResHandle res_load_mesh(const char* name, const char* path) {
     r->compile_err[0] = '\0';
 
     cgltf_options opts = {};
+    opts.file.read = res_cgltf_file_read;
+    opts.file.release = res_cgltf_file_release;
     cgltf_data*   data = nullptr;
     if (cgltf_parse_file(&opts, path, &data) != cgltf_result_success) {
         char msg[512];
@@ -1867,6 +1929,16 @@ ResHandle res_load_mesh(const char* name, const char* path) {
              name, r->vert_count, r->idx_count, r->mesh_part_count, r->mesh_material_count);
     return handle;
 }
+#else
+ResHandle res_load_mesh(const char* name, const char* path) {
+    ResHandle handle = res_alloc(name ? name : "mesh", RES_MESH);
+    if (handle == INVALID_HANDLE)
+        return INVALID_HANDLE;
+    char msg[512] = {};
+    snprintf(msg, sizeof(msg), "Mesh skipped in procedural-only player: '%s'", path ? path : "");
+    return res_mesh_fallback_cube(handle, msg);
+}
+#endif
 
 void res_rename(ResHandle h, const char* new_name) {
     Resource* r = res_get(h);

@@ -22,9 +22,16 @@ struct AppLog {
 
 extern AppLog g_log;
 
+#ifdef LAZYTOOL_NO_LOG
+inline void log_init() {}
+#define log_info(...)  ((void)0)
+#define log_warn(...)  ((void)0)
+#define log_error(...) ((void)0)
+#else
 void log_init();
 void log_push(LogLevel lvl, const char* fmt, ...);
 
 #define log_info(...)  log_push(LOG_INFO,  __VA_ARGS__)
 #define log_warn(...)  log_push(LOG_WARN,  __VA_ARGS__)
 #define log_error(...) log_push(LOG_ERROR, __VA_ARGS__)
+#endif
