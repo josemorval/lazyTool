@@ -3,6 +3,7 @@
 #include "dx11_ctx.h"
 #include "user_cb.h"
 #include "log.h"
+#include <stdarg.h>
 #include <string.h>
 
 // The command system is the runtime execution graph. Each command describes
@@ -29,6 +30,59 @@ static bool    s_gpu_frame_capture_open = false;
 #define GPU_PROFILE_LATENCY 6
 #define GPU_PROFILE_MAX_EVENTS 512
 static const UINT k_shadow_map_ps_slot = 7;
+
+static uint32_t validation_hash_text(const char* text) {
+    uint32_t hash = 2166136261u;
+    if (!text)
+        return 0;
+    while (*text) {
+        hash ^= (unsigned char)*text++;
+        hash *= 16777619u;
+    }
+    return hash ? hash : 1u;
+}
+
+static void validation_issue_append(char* out, int out_sz, const char* fmt, ...) {
+    if (!out || out_sz <= 0 || !fmt)
+        return;
+
+    int len = (int)strlen(out);
+    if (len >= out_sz - 1)
+        return;
+
+    if (len > 0) {
+        int sep = snprintf(out + len, out_sz - len, "; ");
+        if (sep < 0)
+            return;
+        len += sep;
+        if (len >= out_sz - 1)
+            return;
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(out + len, out_sz - len, fmt, ap);
+    va_end(ap);
+}
+
+static void validation_finish(Command& c, const char* issues) {
+    if (!g_dx.shader_validation_warnings) {
+        c.validation_warning_hash = 0;
+        return;
+    }
+
+    if (!issues || !issues[0]) {
+        c.validation_warning_hash = 0;
+        return;
+    }
+
+    uint32_t hash = validation_hash_text(issues);
+    if (c.validation_warning_hash == hash)
+        return;
+
+    c.validation_warning_hash = hash;
+    log_warn("Command '%s': %s", c.name, issues);
+}
 
 struct GPUProfileEvent {
     CmdHandle    handle;
@@ -307,6 +361,8 @@ CmdHandle cmd_alloc(const char* name, CmdType type) {
             g_commands[i].mesh             = INVALID_HANDLE;
             g_commands[i].shader           = INVALID_HANDLE;
             g_commands[i].shadow_shader    = INVALID_HANDLE;
+            g_commands[i].draw_source      = DRAW_SOURCE_MESH;
+            g_commands[i].draw_topology    = DRAW_TOPOLOGY_TRIANGLE_LIST;
             g_commands[i].color_write      = true;
             g_commands[i].depth_test       = true;
             g_commands[i].depth_write      = true;
@@ -325,6 +381,7 @@ CmdHandle cmd_alloc(const char* name, CmdType type) {
             g_commands[i].clear_color_enabled = true;
             g_commands[i].clear_depth      = true;
             g_commands[i].depth_clear_val  = 1.0f;
+            g_commands[i].vertex_count     = 3;
             g_commands[i].instance_count   = 1;
             g_commands[i].thread_x         = 1;
             g_commands[i].thread_y         = 1;
@@ -522,6 +579,12 @@ static void set_viewport_for_draw_outputs(const Command& c) {
     g_dx.ctx->RSSetViewports(1, &vp);
 }
 
+static ID3D11DepthStencilView* get_draw_dsv(const Command& c) {
+    if (!c.depth_test && !c.depth_write)
+        return nullptr;
+    return get_dsv(c.depth);
+}
+
 static Mat4 mat4_from_raw(const float raw[16]) {
     Mat4 m = {};
     if (raw)
@@ -565,7 +628,74 @@ static void apply_draw_state(const Command& c, const MeshMaterial* material) {
 }
 
 static bool is_draw_command(CmdType type) {
-    return type == CMD_DRAW_MESH || type == CMD_DRAW_INSTANCED;
+    return type == CMD_DRAW_MESH || type == CMD_DRAW_INSTANCED || type == CMD_INDIRECT_DRAW;
+}
+
+static bool command_uses_procedural_draw(const Command& c) {
+    return c.draw_source == DRAW_SOURCE_PROCEDURAL;
+}
+
+static int mesh_enabled_part_count(const Resource* mesh) {
+    if (!mesh)
+        return 0;
+    if (mesh->mesh_part_count <= 0)
+        return 1;
+
+    int count = 0;
+    for (int i = 0; i < mesh->mesh_part_count; i++) {
+        if (mesh->mesh_parts[i].enabled)
+            count++;
+    }
+    return count;
+}
+
+static const MeshPart* indirect_draw_part_context(const Resource* mesh) {
+    if (!mesh || mesh->mesh_part_count <= 0)
+        return nullptr;
+
+    const MeshPart* selected = nullptr;
+    for (int i = 0; i < mesh->mesh_part_count; i++) {
+        const MeshPart* part = &mesh->mesh_parts[i];
+        if (!part->enabled)
+            continue;
+        if (selected)
+            return nullptr;
+        selected = part;
+    }
+    return selected;
+}
+
+static bool command_uses_indexed_mesh_draw(const Command& c, const Resource* mesh) {
+    return !command_uses_procedural_draw(c) && mesh && mesh->ib;
+}
+
+static UINT indirect_draw_args_required_bytes(const Command& c, const Resource* mesh) {
+    return command_uses_indexed_mesh_draw(c, mesh)
+        ? (UINT)sizeof(D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS)
+        : (UINT)sizeof(D3D11_DRAW_INSTANCED_INDIRECT_ARGS);
+}
+
+static UINT indirect_dispatch_args_required_bytes() {
+    return (UINT)(sizeof(UINT) * 3);
+}
+
+static bool indirect_args_buffer_has_range(const Resource* buf, uint32_t offset, UINT required_bytes) {
+    if (!buf || buf->elem_size < 1 || buf->elem_count < 1)
+        return false;
+    if ((offset & 3u) != 0u)
+        return false;
+
+    uint64_t total_bytes = (uint64_t)buf->elem_size * (uint64_t)buf->elem_count;
+    uint64_t end = (uint64_t)offset + (uint64_t)required_bytes;
+    return end <= total_bytes;
+}
+
+static D3D11_PRIMITIVE_TOPOLOGY command_draw_topology(const Command& c) {
+    switch ((DrawTopologyType)c.draw_topology) {
+    case DRAW_TOPOLOGY_POINT_LIST:    return D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
+    case DRAW_TOPOLOGY_TRIANGLE_LIST:
+    default:                          return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    }
 }
 
 static Mat4 command_world_matrix(const Command& c) {
@@ -573,6 +703,18 @@ static Mat4 command_world_matrix(const Command& c) {
     Mat4 r = mat4_rotation_xyz(v3(c.rot[0], c.rot[1], c.rot[2]));
     Mat4 t = mat4_translation(v3(c.pos[0], c.pos[1], c.pos[2]));
     return mat4_mul(mat4_mul(s, r), t);
+}
+
+static void bind_object_cb_for_shader(const Resource* shader, bool bind_vs, bool bind_ps) {
+    if (!g_dx.object_cb)
+        return;
+
+    UINT slot = 1;
+    if (shader && shader->object_cb_active)
+        slot = shader->object_cb_bind_slot;
+
+    if (bind_vs) g_dx.ctx->VSSetConstantBuffers(slot, 1, &g_dx.object_cb);
+    if (bind_ps) g_dx.ctx->PSSetConstantBuffers(slot, 1, &g_dx.object_cb);
 }
 
 static void update_object_cb_for_command(const Command& c, const MeshPart* part) {
@@ -594,12 +736,28 @@ static void bind_mesh_geometry(Resource* mesh) {
     UINT stride = (UINT)mesh->vert_stride, offset = 0;
     g_dx.ctx->IASetVertexBuffers(0, 1, &mesh->vb, &stride, &offset);
     g_dx.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    if (mesh->ib)
-        g_dx.ctx->IASetIndexBuffer(mesh->ib, DXGI_FORMAT_R32_UINT, 0);
+    g_dx.ctx->IASetIndexBuffer(mesh->ib, DXGI_FORMAT_R32_UINT, 0);
+}
+
+static void bind_command_geometry(const Command& c, Resource* mesh) {
+    if (command_uses_procedural_draw(c)) {
+        g_dx.ctx->IASetInputLayout(nullptr);
+        g_dx.ctx->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
+        g_dx.ctx->IASetIndexBuffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
+        g_dx.ctx->IASetPrimitiveTopology(command_draw_topology(c));
+        return;
+    }
+
+    bind_mesh_geometry(mesh);
 }
 
 static void draw_command_geometry(const Command& c, Resource* mesh, const MeshPart* part) {
     int inst = (c.type == CMD_DRAW_INSTANCED) ? c.instance_count : 1;
+    if (command_uses_procedural_draw(c)) {
+        if (c.vertex_count > 0)
+            g_dx.ctx->DrawInstanced((UINT)c.vertex_count, (UINT)inst, 0, 0);
+        return;
+    }
     if (mesh->ib) {
         UINT index_count = (UINT)(part ? part->index_count : mesh->idx_count);
         UINT start_index = (UINT)(part ? part->start_index : 0);
@@ -619,6 +777,181 @@ static void bind_mesh_material_textures(const Resource* mesh, const MeshPart* pa
         ID3D11ShaderResourceView* srv = tex ? tex->srv : nullptr;
         g_dx.ctx->PSSetShaderResources((UINT)slot, 1, &srv);
     }
+}
+
+static bool command_has_bound_srv(const ResHandle* handles, const uint32_t* slots, int count, uint32_t slot) {
+    if (!handles || !slots || count <= 0)
+        return false;
+
+    for (int i = 0; i < count; i++) {
+        if (slots[i] != slot)
+            continue;
+        Resource* r = res_get(handles[i]);
+        if (r && r->srv)
+            return true;
+    }
+    return false;
+}
+
+static bool command_has_bound_uav(const ResHandle* handles, const uint32_t* slots, int count, uint32_t slot) {
+    if (!handles || !slots || count <= 0)
+        return false;
+
+    for (int i = 0; i < count; i++) {
+        if (slots[i] != slot)
+            continue;
+        Resource* r = res_get(handles[i]);
+        if (r && r->uav)
+            return true;
+    }
+    return false;
+}
+
+static bool mesh_has_material_srv_binding(const Resource* mesh, uint32_t slot) {
+    if (!mesh || slot >= MAX_MESH_MATERIAL_TEXTURES)
+        return false;
+
+    for (int i = 0; i < mesh->mesh_material_count; i++) {
+        Resource* tex = res_get(mesh->mesh_materials[i].textures[slot]);
+        if (tex && tex->srv)
+            return true;
+    }
+    return false;
+}
+
+static bool is_valid_indirect_args_buffer(const Resource* r) {
+    return r && r->buf && r->indirect_args;
+}
+
+static bool is_valid_indirect_draw_call(const Command& c, const Resource* mesh, const Resource* indirect_buf) {
+    return is_valid_indirect_args_buffer(indirect_buf) &&
+           indirect_args_buffer_has_range(indirect_buf, c.indirect_offset,
+                                          indirect_draw_args_required_bytes(c, mesh));
+}
+
+static bool is_valid_indirect_dispatch_call(const Command& c, const Resource* indirect_buf) {
+    return is_valid_indirect_args_buffer(indirect_buf) &&
+           indirect_args_buffer_has_range(indirect_buf, c.indirect_offset,
+                                          indirect_dispatch_args_required_bytes());
+}
+
+static bool draw_command_has_ps_srv_binding(const Command& c, const Resource* mesh, uint32_t slot) {
+    if (slot == k_shadow_map_ps_slot && c.shadow_receive && g_dx.shadow_srv)
+        return true;
+    if (command_has_bound_srv(c.tex_handles, c.tex_slots, c.tex_count, slot))
+        return true;
+    if (mesh_has_material_srv_binding(mesh, slot))
+        return true;
+    return false;
+}
+
+static void validate_draw_command(Command& c, const Resource* mesh, const Resource* shader,
+                                  bool procedural, bool indirect, const Resource* indirect_buf) {
+    char issues[768] = {};
+
+    if (!shader || !shader->vs || !shader->ps)
+        validation_issue_append(issues, sizeof(issues), "shader missing or not compiled");
+    if (!procedural && (!mesh || !mesh->vb))
+        validation_issue_append(issues, sizeof(issues), "mesh missing or not uploaded");
+    if (indirect && !is_valid_indirect_args_buffer(indirect_buf))
+        validation_issue_append(issues, sizeof(issues),
+            "indirect args buffer missing, invalid, or not flagged");
+    if (indirect && indirect_buf) {
+        if ((c.indirect_offset & 3u) != 0u) {
+            validation_issue_append(issues, sizeof(issues),
+                "indirect offset %u is not DWORD-aligned", c.indirect_offset);
+        } else if (!indirect_args_buffer_has_range(indirect_buf, c.indirect_offset,
+                                                   indirect_draw_args_required_bytes(c, mesh))) {
+            validation_issue_append(issues, sizeof(issues),
+                "indirect args buffer too small for offset %u", c.indirect_offset);
+        }
+    }
+    if (procedural && !indirect && c.vertex_count <= 0)
+        validation_issue_append(issues, sizeof(issues), "procedural draw has vertex_count <= 0");
+    if (procedural && c.shadow_cast) {
+        Resource* shadow_shader = res_get(c.shadow_shader);
+        if (!shadow_shader || !shadow_shader->vs)
+            validation_issue_append(issues, sizeof(issues),
+                "procedural shadow caster needs shadow_shader with a valid VS");
+    }
+    if (indirect && !procedural && mesh && mesh->mesh_material_count > 0 &&
+        mesh_enabled_part_count(mesh) != 1) {
+        validation_issue_append(issues, sizeof(issues),
+            "multi-part indirect mesh draw cannot infer a single mesh material/part");
+    }
+
+    if (shader) {
+        if (shader->shader_cb.active && shader->object_cb_active &&
+            shader->shader_cb.bind_slot == shader->object_cb_bind_slot) {
+            validation_issue_append(issues, sizeof(issues),
+                "UserCB and ObjectCB share b%u", shader->shader_cb.bind_slot);
+        }
+        for (int i = 0; i < shader->shader_binding_count; i++) {
+            const ShaderBinding& bind = shader->shader_bindings[i];
+            for (uint32_t offset = 0; offset < bind.bind_count; offset++) {
+                uint32_t slot = bind.bind_slot + offset;
+
+                if (bind.kind == SHADER_BIND_SRV) {
+                    if ((bind.stage_mask & SHADER_STAGE_VERTEX) &&
+                        !command_has_bound_srv(c.srv_handles, c.srv_slots, c.srv_count, slot)) {
+                        validation_issue_append(issues, sizeof(issues), "missing VS t%u '%s'", slot, bind.name);
+                    }
+                    if ((bind.stage_mask & SHADER_STAGE_PIXEL) &&
+                        !draw_command_has_ps_srv_binding(c, mesh, slot)) {
+                        validation_issue_append(issues, sizeof(issues), "missing PS t%u '%s'", slot, bind.name);
+                    }
+                } else if (bind.kind == SHADER_BIND_UAV) {
+                    if ((bind.stage_mask & SHADER_STAGE_PIXEL) &&
+                        !command_has_bound_uav(c.uav_handles, c.uav_slots, c.uav_count, slot)) {
+                        validation_issue_append(issues, sizeof(issues), "missing PS u%u '%s'", slot, bind.name);
+                    }
+                }
+            }
+        }
+    }
+
+    validation_finish(c, issues);
+}
+
+static void validate_dispatch_command(Command& c, const Resource* shader, bool indirect, const Resource* indirect_buf) {
+    char issues[768] = {};
+
+    if (!shader || !shader->cs)
+        validation_issue_append(issues, sizeof(issues), "compute shader missing or not compiled");
+    if (indirect && !is_valid_indirect_args_buffer(indirect_buf))
+        validation_issue_append(issues, sizeof(issues),
+            "indirect args buffer missing, invalid, or not flagged");
+    if (indirect && indirect_buf) {
+        if ((c.indirect_offset & 3u) != 0u) {
+            validation_issue_append(issues, sizeof(issues),
+                "indirect offset %u is not DWORD-aligned", c.indirect_offset);
+        } else if (!indirect_args_buffer_has_range(indirect_buf, c.indirect_offset,
+                                                   indirect_dispatch_args_required_bytes())) {
+            validation_issue_append(issues, sizeof(issues),
+                "indirect args buffer too small for offset %u", c.indirect_offset);
+        }
+    }
+
+    if (shader) {
+        for (int i = 0; i < shader->shader_binding_count; i++) {
+            const ShaderBinding& bind = shader->shader_bindings[i];
+            if ((bind.stage_mask & SHADER_STAGE_COMPUTE) == 0)
+                continue;
+
+            for (uint32_t offset = 0; offset < bind.bind_count; offset++) {
+                uint32_t slot = bind.bind_slot + offset;
+                if (bind.kind == SHADER_BIND_SRV &&
+                    !command_has_bound_srv(c.srv_handles, c.srv_slots, c.srv_count, slot)) {
+                    validation_issue_append(issues, sizeof(issues), "missing CS t%u '%s'", slot, bind.name);
+                } else if (bind.kind == SHADER_BIND_UAV &&
+                           !command_has_bound_uav(c.uav_handles, c.uav_slots, c.uav_count, slot)) {
+                    validation_issue_append(issues, sizeof(issues), "missing CS u%u '%s'", slot, bind.name);
+                }
+            }
+        }
+    }
+
+    validation_finish(c, issues);
 }
 
 static UINT collect_draw_rtvs(const Command& c, ID3D11RenderTargetView** out_rtvs, UINT max_rtvs) {
@@ -701,6 +1034,121 @@ static void clear_draw_uavs(UINT start_slot, UINT uav_count) {
         start_slot, uav_count, null_uavs, nullptr);
 }
 
+static bool command_is_effectively_enabled(CmdHandle h) {
+    int depth = 0;
+    while (h != INVALID_HANDLE && depth < MAX_COMMANDS) {
+        Command* c = cmd_get(h);
+        if (!c || !c->enabled)
+            return false;
+        h = c->parent;
+        depth++;
+    }
+    return depth < MAX_COMMANDS;
+}
+
+static void execute_shadow_prepass_command(CmdHandle h) {
+    Command* cp = cmd_get(h);
+    if (!cp || !command_is_effectively_enabled(h))
+        return;
+
+    Command& c = *cp;
+    if (c.type == CMD_GROUP) {
+        for (int i = 0; i < MAX_COMMANDS; i++) {
+            if (!g_commands[i].active || g_commands[i].parent != h)
+                continue;
+            execute_shadow_prepass_command((CmdHandle)(i + 1));
+        }
+        return;
+    }
+
+    if (c.type == CMD_REPEAT) {
+        int repeat_count = c.repeat_count > 0 ? c.repeat_count : 1;
+        for (int repeat_i = 0; repeat_i < repeat_count; repeat_i++) {
+            for (int i = 0; i < MAX_COMMANDS; i++) {
+                if (!g_commands[i].active || g_commands[i].parent != h)
+                    continue;
+                execute_shadow_prepass_command((CmdHandle)(i + 1));
+            }
+        }
+        return;
+    }
+
+    if (!c.shadow_cast || !is_draw_command(c.type))
+        return;
+
+    bool procedural = command_uses_procedural_draw(c);
+    Resource* mesh = res_get(c.mesh);
+    if (!procedural && (!mesh || !mesh->vb))
+        return;
+    Resource* indirect_buf = res_get(c.indirect_buf);
+    if (c.type == CMD_INDIRECT_DRAW && !is_valid_indirect_draw_call(c, mesh, indirect_buf))
+        return;
+
+    ID3D11VertexShader* shadow_vs = g_dx.shadow_vs;
+    ID3D11InputLayout* shadow_il = g_dx.shadow_il;
+    Resource* shadow_shader = res_get(c.shadow_shader);
+    if (shadow_shader && shadow_shader->vs && (procedural || shadow_shader->il)) {
+        shadow_vs = shadow_shader->vs;
+        shadow_il = shadow_shader->il;
+        user_cb_bind_for_command(&c, shadow_shader, true, false, false);
+    } else {
+        if (procedural)
+            return;
+        user_cb_bind();
+    }
+
+    g_dx.ctx->VSSetShader(shadow_vs, nullptr, 0);
+    g_dx.ctx->IASetInputLayout(procedural ? nullptr : shadow_il);
+    bind_command_geometry(c, mesh);
+    for (int s = 0; s < c.srv_count; s++) {
+        Resource* sr = res_get(c.srv_handles[s]);
+        ID3D11ShaderResourceView* srv = sr ? sr->srv : nullptr;
+        g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &srv);
+    }
+
+    if (c.type == CMD_INDIRECT_DRAW) {
+        const MeshPart* draw_part = procedural ? nullptr : indirect_draw_part_context(mesh);
+        const MeshMaterial* material = mesh_material_for_part(mesh, draw_part);
+        ID3D11RasterizerState* rs = rasterizer_state_for(c, material, false);
+        g_dx.ctx->RSSetState(rs ? rs : g_dx.rs_solid);
+        update_object_cb_for_command(c, draw_part);
+        bind_object_cb_for_shader(shadow_shader, true, false);
+        if (procedural || !mesh || !mesh->ib) {
+            g_dx.ctx->IASetPrimitiveTopology(
+                procedural ? command_draw_topology(c) : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g_dx.ctx->DrawInstancedIndirect(indirect_buf->buf, c.indirect_offset);
+        } else {
+            g_dx.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g_dx.ctx->DrawIndexedInstancedIndirect(indirect_buf->buf, c.indirect_offset);
+        }
+
+        for (int s = 0; s < c.srv_count; s++) {
+            ID3D11ShaderResourceView* cleared_srv = nullptr;
+            g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &cleared_srv);
+        }
+        return;
+    }
+
+    int part_count = procedural ? 1 : (mesh->mesh_part_count > 0 ? mesh->mesh_part_count : 1);
+    for (int pi = 0; pi < part_count; pi++) {
+        const MeshPart* part = (!procedural && mesh->mesh_part_count > 0) ? &mesh->mesh_parts[pi] : nullptr;
+        if (part && !part->enabled)
+            continue;
+
+        const MeshMaterial* material = mesh_material_for_part(mesh, part);
+        ID3D11RasterizerState* rs = rasterizer_state_for(c, material, false);
+        g_dx.ctx->RSSetState(rs ? rs : g_dx.rs_solid);
+        update_object_cb_for_command(c, part);
+        bind_object_cb_for_shader(shadow_shader, true, false);
+        draw_command_geometry(c, mesh, part);
+    }
+
+    for (int s = 0; s < c.srv_count; s++) {
+        ID3D11ShaderResourceView* cleared_srv = nullptr;
+        g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &cleared_srv);
+    }
+}
+
 static void execute_shadow_prepass() {
     if (!g_dx.shadow_dsv || !g_dx.shadow_vs || !g_dx.shadow_il)
         return;
@@ -743,47 +1191,9 @@ static void execute_shadow_prepass() {
 
         for (int i = 0; i < MAX_COMMANDS; i++) {
             Command& c = g_commands[i];
-            if (!c.active || !c.enabled || c.parent != INVALID_HANDLE || !c.shadow_cast || !is_draw_command(c.type))
+            if (!c.active || !c.enabled || c.parent != INVALID_HANDLE)
                 continue;
-
-            Resource* mesh = res_get(c.mesh);
-            if (!mesh || !mesh->vb)
-                continue;
-
-            ID3D11VertexShader* shadow_vs = g_dx.shadow_vs;
-            ID3D11InputLayout* shadow_il = g_dx.shadow_il;
-            Resource* shadow_shader = res_get(c.shadow_shader);
-            if (shadow_shader && shadow_shader->vs && shadow_shader->il) {
-                shadow_vs = shadow_shader->vs;
-                shadow_il = shadow_shader->il;
-            }
-
-            g_dx.ctx->VSSetShader(shadow_vs, nullptr, 0);
-            g_dx.ctx->IASetInputLayout(shadow_il);
-            bind_mesh_geometry(mesh);
-            for (int s = 0; s < c.srv_count; s++) {
-                Resource* sr = res_get(c.srv_handles[s]);
-                ID3D11ShaderResourceView* srv = sr ? sr->srv : nullptr;
-                g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &srv);
-            }
-
-            int part_count = mesh->mesh_part_count > 0 ? mesh->mesh_part_count : 1;
-            for (int pi = 0; pi < part_count; pi++) {
-                const MeshPart* part = mesh->mesh_part_count > 0 ? &mesh->mesh_parts[pi] : nullptr;
-                if (part && !part->enabled)
-                    continue;
-
-                const MeshMaterial* material = mesh_material_for_part(mesh, part);
-                ID3D11RasterizerState* rs = rasterizer_state_for(c, material, false);
-                g_dx.ctx->RSSetState(rs ? rs : g_dx.rs_solid);
-                update_object_cb_for_command(c, part);
-                draw_command_geometry(c, mesh, part);
-            }
-
-            for (int s = 0; s < c.srv_count; s++) {
-                ID3D11ShaderResourceView* cleared_srv = nullptr;
-                g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &cleared_srv);
-            }
+            execute_shadow_prepass_command((CmdHandle)(i + 1));
         }
     }
 
@@ -901,6 +1311,7 @@ static void resolve_dispatch_counts(const Command& c, UINT* out_x, UINT* out_y, 
 
 static void execute_dispatch_command(Command& c) {
     Resource* shader = res_get(c.shader);
+    validate_dispatch_command(c, shader, false, nullptr);
     if (!shader || !shader->cs) return;
     g_dx.ctx->OMSetRenderTargets(0, nullptr, nullptr);
     clear_compute_bindings();
@@ -919,7 +1330,8 @@ static void execute_dispatch_command(Command& c) {
 static void execute_indirect_dispatch_command(Command& c) {
     Resource* ibuf   = res_get(c.indirect_buf);
     Resource* shader = res_get(c.shader);
-    if (!ibuf || !ibuf->buf || !shader || !shader->cs) return;
+    validate_dispatch_command(c, shader, true, ibuf);
+    if (!is_valid_indirect_dispatch_call(c, ibuf) || !shader || !shader->cs) return;
     g_dx.ctx->OMSetRenderTargets(0, nullptr, nullptr);
     clear_compute_bindings();
     g_dx.ctx->CSSetShader(shader->cs, nullptr, 0);
@@ -930,40 +1342,27 @@ static void execute_indirect_dispatch_command(Command& c) {
     g_dx.ctx->CSSetShader(nullptr, nullptr, 0);
 }
 
-static bool is_repeat_child_type(CmdType type) {
-    return type == CMD_DISPATCH || type == CMD_INDIRECT_DISPATCH;
-}
-
-static void execute_repeat_command(CmdHandle repeat_h, Command& repeat) {
+static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done);
+static void execute_repeat_command(CmdHandle repeat_h, Command& repeat, bool& shadow_prepass_done) {
     int count = repeat.repeat_count;
     if (count < 1) count = 1;
 
     for (int pass = 0; pass < count; pass++) {
         for (int i = 0; i < MAX_COMMANDS; i++) {
             Command& child = g_commands[i];
-            if (!child.active || !child.enabled || child.parent != repeat_h)
-                continue;
-            if (!is_repeat_child_type(child.type))
+            if (!child.active || child.parent != repeat_h)
                 continue;
 
             CmdHandle child_h = (CmdHandle)(i + 1);
-            int gpu_event = cmd_gpu_begin_command(child_h);
-
-            if (child.type == CMD_DISPATCH)
-                execute_dispatch_command(child);
-            else if (child.type == CMD_INDIRECT_DISPATCH)
-                execute_indirect_dispatch_command(child);
-
-            cmd_gpu_end_command(gpu_event);
+            execute_command_handle(child_h, shadow_prepass_done);
         }
     }
 }
 
 static void execute_command_children(CmdHandle parent_h, bool& shadow_prepass_done);
-
 static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
     Command* cp = cmd_get(h);
-    if (!cp || !cp->enabled)
+    if (!cp || !command_is_effectively_enabled(h))
         return;
 
     Command& c = *cp;
@@ -973,7 +1372,7 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
 
     case CMD_CLEAR: {
         ID3D11RenderTargetView* rtv = c.clear_color_enabled ? get_rtv(c.rt) : nullptr;
-        ID3D11DepthStencilView* dsv = get_dsv(c.depth);
+        ID3D11DepthStencilView* dsv = get_draw_dsv(c);
         if (rtv && c.clear_color_enabled) g_dx.ctx->ClearRenderTargetView(rtv, c.clear_color);
         if (dsv && c.clear_depth)
             g_dx.ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, c.depth_clear_val, 0);
@@ -987,10 +1386,12 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
 
     case CMD_DRAW_MESH:
     case CMD_DRAW_INSTANCED: {
+        bool procedural = command_uses_procedural_draw(c);
         Resource* mesh   = res_get(c.mesh);
         Resource* shader = res_get(c.shader);
-        if (!mesh || !mesh->vb)                          break;
-        if (!shader || !shader->vs || !shader->ps)        break;
+        validate_draw_command(c, mesh, shader, procedural, false, nullptr);
+        if (!shader || !shader->vs || !shader->ps)       break;
+        if (!procedural && (!mesh || !mesh->vb))         break;
 
         if (c.shadow_receive && !shadow_prepass_done) {
             execute_shadow_prepass();
@@ -999,12 +1400,12 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
 
         g_dx.ctx->VSSetShader(shader->vs, nullptr, 0);
         g_dx.ctx->PSSetShader(shader->ps, nullptr, 0);
-        if (shader->il) g_dx.ctx->IASetInputLayout(shader->il);
+        g_dx.ctx->IASetInputLayout(procedural ? nullptr : shader->il);
         user_cb_bind_for_command(&c, shader, true, true, false);
 
         ID3D11RenderTargetView* rtvs[MAX_DRAW_RENDER_TARGETS] = {};
         UINT rtv_count = collect_draw_rtvs(c, rtvs, MAX_DRAW_RENDER_TARGETS);
-        ID3D11DepthStencilView* dsv = get_dsv(c.depth);
+        ID3D11DepthStencilView* dsv = get_draw_dsv(c);
         ID3D11UnorderedAccessView* om_uavs[MAX_UAV_SLOTS] = {};
         UINT uav_start_slot = 0;
         UINT om_uav_count = collect_draw_uavs(c, rtv_count, &uav_start_slot, om_uavs, MAX_UAV_SLOTS);
@@ -1018,7 +1419,7 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
             g_dx.ctx->OMSetRenderTargets(0, nullptr, dsv);
         }
         set_viewport_for_draw_outputs(c);
-        bind_mesh_geometry(mesh);
+        bind_command_geometry(c, mesh);
 
         for (int s = 0; s < c.srv_count; s++) {
             Resource* sr = res_get(c.srv_handles[s]);
@@ -1026,15 +1427,16 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
             g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &srv);
         }
 
-        int part_count = mesh->mesh_part_count > 0 ? mesh->mesh_part_count : 1;
+        int part_count = procedural ? 1 : (mesh->mesh_part_count > 0 ? mesh->mesh_part_count : 1);
         for (int pi = 0; pi < part_count; pi++) {
-            const MeshPart* part = mesh->mesh_part_count > 0 ? &mesh->mesh_parts[pi] : nullptr;
+            const MeshPart* part = (!procedural && mesh->mesh_part_count > 0) ? &mesh->mesh_parts[pi] : nullptr;
             if (part && !part->enabled)
                 continue;
 
             const MeshMaterial* material = mesh_material_for_part(mesh, part);
             apply_draw_state(c, material);
             update_object_cb_for_command(c, part);
+            bind_object_cb_for_shader(shader, true, true);
             bind_mesh_material_textures(mesh, part);
 
             for (int t = 0; t < c.tex_count; t++) {
@@ -1069,15 +1471,80 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         Resource* ibuf   = res_get(c.indirect_buf);
         Resource* mesh   = res_get(c.mesh);
         Resource* shader = res_get(c.shader);
-        if (!ibuf || !ibuf->buf || !mesh || !mesh->vb || !shader || !shader->vs || !shader->ps) break;
+        bool procedural = command_uses_procedural_draw(c);
+        const MeshPart* draw_part = procedural ? nullptr : indirect_draw_part_context(mesh);
+        const MeshMaterial* material = mesh_material_for_part(mesh, draw_part);
+        validate_draw_command(c, mesh, shader, procedural, true, ibuf);
+        if (!is_valid_indirect_draw_call(c, mesh, ibuf) || !shader || !shader->vs || !shader->ps) break;
+        if (!procedural && (!mesh || !mesh->vb)) break;
+        if (c.shadow_receive && !shadow_prepass_done) {
+            execute_shadow_prepass();
+            shadow_prepass_done = true;
+        }
+
         g_dx.ctx->VSSetShader(shader->vs, nullptr, 0);
         g_dx.ctx->PSSetShader(shader->ps, nullptr, 0);
-        if (shader->il) g_dx.ctx->IASetInputLayout(shader->il);
+        g_dx.ctx->IASetInputLayout(procedural ? nullptr : shader->il);
         user_cb_bind_for_command(&c, shader, true, true, false);
-        UINT stride = (UINT)mesh->vert_stride, offset = 0;
-        g_dx.ctx->IASetVertexBuffers(0, 1, &mesh->vb, &stride, &offset);
-        g_dx.ctx->IASetIndexBuffer(mesh->ib, DXGI_FORMAT_R32_UINT, 0);
-        g_dx.ctx->DrawIndexedInstancedIndirect(ibuf->buf, c.indirect_offset);
+
+        ID3D11RenderTargetView* rtvs[MAX_DRAW_RENDER_TARGETS] = {};
+        UINT rtv_count = collect_draw_rtvs(c, rtvs, MAX_DRAW_RENDER_TARGETS);
+        ID3D11DepthStencilView* dsv = get_draw_dsv(c);
+        ID3D11UnorderedAccessView* om_uavs[MAX_UAV_SLOTS] = {};
+        UINT uav_start_slot = 0;
+        UINT om_uav_count = collect_draw_uavs(c, rtv_count, &uav_start_slot, om_uavs, MAX_UAV_SLOTS);
+        if (om_uav_count > 0) {
+            g_dx.ctx->OMSetRenderTargetsAndUnorderedAccessViews(
+                rtv_count, rtv_count > 0 ? rtvs : nullptr, dsv,
+                uav_start_slot, om_uav_count, om_uavs, nullptr);
+        } else if (rtv_count > 0) {
+            g_dx.ctx->OMSetRenderTargets(rtv_count, rtvs, dsv);
+        } else {
+            g_dx.ctx->OMSetRenderTargets(0, nullptr, dsv);
+        }
+        set_viewport_for_draw_outputs(c);
+        bind_command_geometry(c, mesh);
+
+        for (int s = 0; s < c.srv_count; s++) {
+            Resource* sr = res_get(c.srv_handles[s]);
+            ID3D11ShaderResourceView* srv = sr ? sr->srv : nullptr;
+            g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &srv);
+        }
+
+        apply_draw_state(c, material);
+        update_object_cb_for_command(c, draw_part);
+        bind_object_cb_for_shader(shader, true, true);
+        bind_mesh_material_textures(mesh, draw_part);
+
+        for (int t = 0; t < c.tex_count; t++) {
+            Resource* tr = res_get(c.tex_handles[t]);
+            ID3D11ShaderResourceView* srv = tr ? tr->srv : nullptr;
+            g_dx.ctx->PSSetShaderResources(c.tex_slots[t], 1, &srv);
+        }
+        if (c.shadow_receive) {
+            ID3D11ShaderResourceView* srv = g_dx.shadow_srv;
+            g_dx.ctx->PSSetShaderResources(k_shadow_map_ps_slot, 1, &srv);
+        }
+
+        if (procedural || !mesh->ib) {
+            if (procedural) {
+                g_dx.ctx->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
+                g_dx.ctx->IASetIndexBuffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
+                g_dx.ctx->IASetPrimitiveTopology(command_draw_topology(c));
+            }
+            g_dx.ctx->DrawInstancedIndirect(ibuf->buf, c.indirect_offset);
+        } else {
+            g_dx.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g_dx.ctx->DrawIndexedInstancedIndirect(ibuf->buf, c.indirect_offset);
+        }
+
+        ID3D11ShaderResourceView* null_ps_srvs[MAX_TEX_SLOTS] = {};
+        g_dx.ctx->PSSetShaderResources(0, MAX_TEX_SLOTS, null_ps_srvs);
+        for (int s = 0; s < c.srv_count; s++) {
+            ID3D11ShaderResourceView* null_srv = nullptr;
+            g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &null_srv);
+        }
+        clear_draw_uavs(uav_start_slot, om_uav_count);
         break;
     }
 
@@ -1087,7 +1554,7 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
     }
 
     case CMD_REPEAT: {
-        execute_repeat_command(h, c);
+        execute_repeat_command(h, c, shadow_prepass_done);
         break;
     }
 
@@ -1100,7 +1567,7 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
 static void execute_command_children(CmdHandle parent_h, bool& shadow_prepass_done) {
     for (int i = 0; i < MAX_COMMANDS; i++) {
         Command& c = g_commands[i];
-        if (!c.active || !c.enabled || c.parent != parent_h)
+        if (!c.active || c.parent != parent_h)
             continue;
         execute_command_handle((CmdHandle)(i + 1), shadow_prepass_done);
     }

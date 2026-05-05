@@ -23,7 +23,7 @@ cbuffer SceneCB : register(b0) {
     float4 ShadowCascadeRects[4];
     float4x4 ShadowCascadeViewProj[4];
 };
-cbuffer ObjectCB : register(b2) { float4x4 World; };
+cbuffer ObjectCB : register(b1) { float4x4 World; };
 struct VSIn  { float3 pos : POSITION; float3 nor : NORMAL; float2 uv : TEXCOORD0; };
 struct VSOut { float4 pos : SV_POSITION; float3 nor : NORMAL; float2 uv : TEXCOORD0; float3 wpos : TEXCOORD1; };
 VSOut VSMain(VSIn v) {
@@ -51,7 +51,7 @@ cbuffer SceneCB : register(b0) {
     float4 ShadowCascadeRects[4];
     float4x4 ShadowCascadeViewProj[4];
 };
-cbuffer ObjectCB : register(b2) { float4x4 World; };
+cbuffer ObjectCB : register(b1) { float4x4 World; };
 struct PSIn { float4 pos : SV_POSITION; float3 nor : NORMAL; float2 uv : TEXCOORD0; float3 wpos : TEXCOORD1; };
 float4 PSMain(PSIn i) : SV_Target {
     float3 n   = normalize(i.nor);
@@ -138,6 +138,59 @@ static ShaderCBVar* reflected_find_var(ShaderCBLayout* cb, const char* name) {
     return nullptr;
 }
 
+static uint32_t reflected_input_bind_to_kind(D3D_SHADER_INPUT_TYPE type) {
+    switch (type) {
+    case D3D_SIT_CBUFFER:
+        return SHADER_BIND_CBUFFER;
+    case D3D_SIT_TEXTURE:
+    case D3D_SIT_TBUFFER:
+    case D3D_SIT_STRUCTURED:
+    case D3D_SIT_BYTEADDRESS:
+        return SHADER_BIND_SRV;
+    case D3D_SIT_UAV_RWTYPED:
+    case D3D_SIT_UAV_RWSTRUCTURED:
+    case D3D_SIT_UAV_RWBYTEADDRESS:
+    case D3D_SIT_UAV_APPEND_STRUCTURED:
+    case D3D_SIT_UAV_CONSUME_STRUCTURED:
+    case D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER:
+        return SHADER_BIND_UAV;
+    case D3D_SIT_SAMPLER:
+        return SHADER_BIND_SAMPLER;
+    default:
+        return SHADER_BIND_NONE;
+    }
+}
+
+static void reflected_merge_shader_binding(Resource* r, const D3D11_SHADER_INPUT_BIND_DESC& bind,
+                                           uint32_t kind, uint32_t stage_mask) {
+    if (!r || kind == SHADER_BIND_NONE || !bind.Name)
+        return;
+
+    for (int i = 0; i < r->shader_binding_count; i++) {
+        ShaderBinding& existing = r->shader_bindings[i];
+        if (existing.kind != kind)
+            continue;
+        if (existing.bind_slot != bind.BindPoint || existing.bind_count != bind.BindCount)
+            continue;
+        if (strcmp(existing.name, bind.Name) != 0)
+            continue;
+        existing.stage_mask |= stage_mask;
+        return;
+    }
+
+    if (r->shader_binding_count >= MAX_SHADER_RESOURCE_BINDINGS)
+        return;
+
+    ShaderBinding& out = r->shader_bindings[r->shader_binding_count++];
+    memset(&out, 0, sizeof(out));
+    strncpy(out.name, bind.Name, MAX_NAME - 1);
+    out.name[MAX_NAME - 1] = '\0';
+    out.kind = kind;
+    out.bind_slot = bind.BindPoint;
+    out.bind_count = bind.BindCount;
+    out.stage_mask = stage_mask;
+}
+
 static uint32_t s_shader_cb_layout_version_counter = 0;
 
 uint32_t shader_cb_next_layout_version() {
@@ -163,7 +216,7 @@ static void reflect_command_cbuffer(Resource* r, ID3DBlob* blob) {
         D3D11_SHADER_INPUT_BIND_DESC bind = {};
         if (FAILED(refl->GetResourceBindingDesc(bi, &bind)))
             continue;
-        if (bind.Type != D3D_SIT_CBUFFER || bind.BindPoint != 1)
+        if (bind.Type != D3D_SIT_CBUFFER || !bind.Name)
             continue;
 
         ID3D11ShaderReflectionConstantBuffer* src_cb = refl->GetConstantBufferByName(bind.Name);
@@ -174,10 +227,19 @@ static void reflect_command_cbuffer(Resource* r, ID3DBlob* blob) {
         if (FAILED(src_cb->GetDesc(&cbd)))
             continue;
 
+        if (strcmp(bind.Name, "ObjectCB") == 0) {
+            r->object_cb_active = true;
+            r->object_cb_bind_slot = bind.BindPoint;
+            continue;
+        }
+
+        if (strcmp(bind.Name, "UserCB") != 0)
+            continue;
+
         ShaderCBLayout* dst = &r->shader_cb;
         if (!dst->active) {
             dst->active = true;
-            strncpy(dst->name, bind.Name ? bind.Name : "UserCB", MAX_NAME - 1);
+            strncpy(dst->name, bind.Name, MAX_NAME - 1);
             dst->name[MAX_NAME - 1] = '\0';
             dst->bind_slot = bind.BindPoint;
             dst->size = cbd.Size;
@@ -222,6 +284,32 @@ static void reflect_command_cbuffer(Resource* r, ID3DBlob* blob) {
     // Mark the layout as freshly built so commands re-sync exactly once.
     if (r->shader_cb.active)
         r->shader_cb.layout_version = shader_cb_next_layout_version();
+
+    refl->Release();
+}
+
+static void reflect_shader_bindings(Resource* r, ID3DBlob* blob, uint32_t stage_mask) {
+    if (!r || !blob || stage_mask == 0)
+        return;
+
+    ID3D11ShaderReflection* refl = nullptr;
+    HRESULT hr = D3DReflect(blob->GetBufferPointer(), blob->GetBufferSize(),
+                            __uuidof(ID3D11ShaderReflection), (void**)&refl);
+    if (FAILED(hr) || !refl)
+        return;
+
+    D3D11_SHADER_DESC sd = {};
+    refl->GetDesc(&sd);
+    for (UINT bi = 0; bi < sd.BoundResources; bi++) {
+        D3D11_SHADER_INPUT_BIND_DESC bind = {};
+        if (FAILED(refl->GetResourceBindingDesc(bi, &bind)))
+            continue;
+
+        uint32_t kind = reflected_input_bind_to_kind(bind.Type);
+        if (kind == SHADER_BIND_NONE || kind == SHADER_BIND_SAMPLER || kind == SHADER_BIND_CBUFFER)
+            continue;
+        reflected_merge_shader_binding(r, bind, kind, stage_mask);
+    }
 
     refl->Release();
 }
@@ -303,6 +391,8 @@ bool shader_compile_vs_ps(Resource* r, const char* path,
     g_dx.dev->CreatePixelShader (ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), nullptr, &r->ps);
     reflect_command_cbuffer(r, vs_blob);
     reflect_command_cbuffer(r, ps_blob);
+    reflect_shader_bindings(r, vs_blob, SHADER_STAGE_VERTEX);
+    reflect_shader_bindings(r, ps_blob, SHADER_STAGE_PIXEL);
 
     D3D11_INPUT_ELEMENT_DESC ied[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
@@ -369,6 +459,7 @@ bool shader_compile_cs(Resource* r, const char* path, const char* cs_entry) {
 
     g_dx.dev->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &r->cs);
     reflect_command_cbuffer(r, blob);
+    reflect_shader_bindings(r, blob, SHADER_STAGE_COMPUTE);
     blob->Release();
     r->compiled_ok = !r->using_fallback || !(path && path[0]);
     if (r->compiled_ok)
@@ -384,6 +475,10 @@ void shader_release(Resource* r) {
     if (r->cs) { r->cs->Release(); r->cs = nullptr; }
     if (r->il) { r->il->Release(); r->il = nullptr; }
     memset(&r->shader_cb, 0, sizeof(r->shader_cb));
+    r->object_cb_active = false;
+    r->object_cb_bind_slot = 0;
+    memset(r->shader_bindings, 0, sizeof(r->shader_bindings));
+    r->shader_binding_count = 0;
     r->compiled_ok = false;
     r->using_fallback = false;
 }

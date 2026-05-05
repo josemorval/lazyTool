@@ -3,6 +3,7 @@
 #include "shader.h"
 #include "dx11_ctx.h"
 #include "log.h"
+#include "project.h"
 #include "stb_image.h"
 #include "cgltf.h"
 #include <stddef.h>
@@ -276,6 +277,17 @@ static bool res_make_cube_mesh(Resource* r) {
     return res_upload_mesh(r, verts, 24, idx, 36);
 }
 
+static bool res_make_quad_mesh(Resource* r) {
+    Vertex verts[4] = {};
+    uint32_t idx[6] = { 0, 1, 2, 0, 2, 3 };
+    Vec3 n = { 0.0f, 0.0f, 1.0f };
+    res_set_vertex(&verts[0], v3(-1.0f, -1.0f, 0.0f), n, 0.0f, 1.0f);
+    res_set_vertex(&verts[1], v3( 1.0f, -1.0f, 0.0f), n, 1.0f, 1.0f);
+    res_set_vertex(&verts[2], v3( 1.0f,  1.0f, 0.0f), n, 1.0f, 0.0f);
+    res_set_vertex(&verts[3], v3(-1.0f,  1.0f, 0.0f), n, 0.0f, 0.0f);
+    return res_upload_mesh(r, verts, 4, idx, 6);
+}
+
 static bool res_make_tetrahedron_mesh(Resource* r) {
     Vec3 p[4] = {
         { 1,  1,  1},
@@ -477,37 +489,8 @@ void res_init() {
 
     g_builtin_dirlight = res_alloc("directional_light", RES_BUILTIN_DIRLIGHT);
     Resource* dl       = res_get(g_builtin_dirlight);
-    dl->is_builtin       = true;
-    dl->light_dir[0]     = -0.577f;
-    dl->light_dir[1]     = -0.577f;
-    dl->light_dir[2]     = -0.577f;
-    dl->light_pos[0]     = -0.8f;
-    dl->light_pos[1]     = 1.2f;
-    dl->light_pos[2]     = -0.8f;
-    dl->light_target[0]  = 0.0f;
-    dl->light_target[1]  = 0.0f;
-    dl->light_target[2]  = 0.0f;
-    dl->light_color[0]   = 1.0f;
-    dl->light_color[1]   = 0.95f;
-    dl->light_color[2]   = 0.9f;
-    dl->light_intensity  = 1.0f;
-    dl->shadow_extent[0] = 2.2f;
-    dl->shadow_extent[1] = 2.2f;
-    dl->shadow_near      = 0.01f;
-    dl->shadow_far       = 4.0f;
-    dl->shadow_width     = 1024;
-    dl->shadow_height    = 1024;
-    dl->shadow_cascade_count = 1;
-    dl->shadow_distance = 12.0f;
-    dl->shadow_split_lambda = 0.65f;
-    for (int i = 0; i < MAX_SHADOW_CASCADES; i++) {
-        float split_t = (float)(i + 1) / (float)MAX_SHADOW_CASCADES;
-        dl->shadow_cascade_split[i] = dl->shadow_distance * split_t;
-        dl->shadow_cascade_extent[i][0] = dl->shadow_extent[0];
-        dl->shadow_cascade_extent[i][1] = dl->shadow_extent[1];
-        dl->shadow_cascade_near[i] = dl->shadow_near;
-        dl->shadow_cascade_far[i] = dl->shadow_far;
-    }
+    dl->is_builtin = true;
+    project_apply_default_dirlight(dl);
 
     res_sync_size_resource(g_builtin_scene_color);
     res_sync_size_resource(g_builtin_scene_depth);
@@ -944,7 +927,7 @@ ResHandle res_create_render_texture3d(const char* name, int w, int h, int d, DXG
 }
 
 bool res_recreate_structured_buffer(ResHandle h, int elem_size, int elem_count,
-                                    bool want_srv, bool want_uav)
+                                    bool want_srv, bool want_uav, bool want_indirect_args)
 {
     Resource* r = res_get(h);
     if (!r || r->type != RES_STRUCTURED_BUFFER) return false;
@@ -958,12 +941,19 @@ bool res_recreate_structured_buffer(ResHandle h, int elem_size, int elem_count,
     r->elem_count = elem_count;
     r->has_srv    = want_srv;
     r->has_uav    = want_uav;
+    r->indirect_args = want_indirect_args;
+
+    if (want_indirect_args && elem_size != 4) {
+        log_error("Indirect args buffer stride must be 4 bytes: %s (%d)", r->name, elem_size);
+        return false;
+    }
 
     D3D11_BUFFER_DESC bd = {};
     bd.ByteWidth           = (UINT)(elem_size * elem_count);
     bd.Usage               = D3D11_USAGE_DEFAULT;
-    bd.MiscFlags           = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-    bd.StructureByteStride = (UINT)elem_size;
+    bd.MiscFlags           = want_indirect_args ? D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS
+                                                : D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bd.StructureByteStride = want_indirect_args ? 0u : (UINT)elem_size;
     if (want_srv) bd.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
     if (want_uav) bd.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
 
@@ -980,17 +970,17 @@ bool res_recreate_structured_buffer(ResHandle h, int elem_size, int elem_count,
 
     if (want_srv) {
         D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-        sd.Format             = DXGI_FORMAT_UNKNOWN;
+        sd.Format             = want_indirect_args ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_UNKNOWN;
         sd.ViewDimension      = D3D11_SRV_DIMENSION_BUFFER;
-        sd.Buffer.NumElements = (UINT)elem_count;
+        sd.Buffer.NumElements = want_indirect_args ? (UINT)(bd.ByteWidth / 4) : (UINT)elem_count;
         hr = g_dx.dev->CreateShaderResourceView(r->buf, &sd, &r->srv);
         if (FAILED(hr)) log_error("StructuredBuffer SRV create failed: %s", r->name);
     }
     if (want_uav) {
         D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
-        ud.Format             = DXGI_FORMAT_UNKNOWN;
+        ud.Format             = want_indirect_args ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_UNKNOWN;
         ud.ViewDimension      = D3D11_UAV_DIMENSION_BUFFER;
-        ud.Buffer.NumElements = (UINT)elem_count;
+        ud.Buffer.NumElements = want_indirect_args ? (UINT)(bd.ByteWidth / 4) : (UINT)elem_count;
         hr = g_dx.dev->CreateUnorderedAccessView(r->buf, &ud, &r->uav);
         if (FAILED(hr)) log_error("StructuredBuffer UAV create failed: %s", r->name);
     }
@@ -1048,7 +1038,8 @@ void res_reset_transient_gpu_resources() {
             int elem_count = r.elem_count;
             bool srv = r.has_srv;
             bool uav = r.has_uav;
-            if (res_recreate_structured_buffer(h, elem_size, elem_count, srv, uav))
+            bool indirect_args = r.indirect_args;
+            if (res_recreate_structured_buffer(h, elem_size, elem_count, srv, uav, indirect_args))
                 reset_count++;
             break;
         }
@@ -1084,11 +1075,12 @@ void res_sync_scene_dependent_render_textures() {
 }
 
 ResHandle res_create_structured_buffer(const char* name, int elem_size, int elem_count,
-                                        bool want_srv, bool want_uav)
+                                        bool want_srv, bool want_uav, bool want_indirect_args)
 {
     ResHandle handle = res_alloc(name, RES_STRUCTURED_BUFFER);
     if (handle == INVALID_HANDLE) return INVALID_HANDLE;
-    if (!res_recreate_structured_buffer(handle, elem_size, elem_count, want_srv, want_uav)) {
+    if (!res_recreate_structured_buffer(handle, elem_size, elem_count,
+                                        want_srv, want_uav, want_indirect_args)) {
         res_free(handle);
         return INVALID_HANDLE;
     }
@@ -1693,6 +1685,7 @@ bool res_set_mesh_primitive(Resource* r, MeshPrimitiveType type) {
     bool ok = false;
     switch (type) {
     case MESH_PRIM_CUBE:        ok = res_make_cube_mesh(r); break;
+    case MESH_PRIM_QUAD:        ok = res_make_quad_mesh(r); break;
     case MESH_PRIM_TETRAHEDRON: ok = res_make_tetrahedron_mesh(r); break;
     case MESH_PRIM_SPHERE:      ok = res_make_sphere_mesh(r); break;
     case MESH_PRIM_FULLSCREEN_TRIANGLE: ok = res_make_fullscreen_triangle_mesh(r); break;
@@ -1720,6 +1713,7 @@ ResHandle res_create_mesh_primitive(const char* name, MeshPrimitiveType type) {
 
     const char* kind = "mesh";
     if (type == MESH_PRIM_CUBE) kind = "cube";
+    if (type == MESH_PRIM_QUAD) kind = "quad";
     if (type == MESH_PRIM_TETRAHEDRON) kind = "tetrahedron";
     if (type == MESH_PRIM_SPHERE) kind = "sphere";
     if (type == MESH_PRIM_FULLSCREEN_TRIANGLE) kind = "fullscreen_triangle";

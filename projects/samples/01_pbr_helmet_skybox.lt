@@ -1,0 +1,115 @@
+# Sample 01
+# DamagedHelmet.glb rendered with a readable metallic-roughness shader, a thin
+# cube ground plane, and an HDR equirectangular skybox.
+
+lazyTool_project 1
+
+camera_fps 4.8 2.9 5.4 -2.41495031 -0.282865358 1.047 0.01 120
+
+dirlight 4 6.5 4 0 0.5 0 1 0.97 0.92 2 2048 2048 0.05 20 7.5 7.5 1 18 0.65 18 7.5 7.5 0.05 20 18 7.5 7.5 0.05 20 18 7.5 7.5 0.05 20 18 7.5 7.5 0.05 20
+
+resources
+resource mesh_primitive sky_triangle fullscreen_triangle
+resource mesh_primitive sample_ground cube
+resource mesh_gltf damaged_helmet assets/models/DamagedHelmet.glb
+resource texture2d venice_env assets/hdri/venice_sunset_1k.hdr
+resource shader_vsps sample_skybox shaders/samples/01_pbr_helmet_skybox/skybox_equirect.hlsl
+resource shader_vsps sample_helmet_pbr shaders/samples/01_pbr_helmet_skybox/helmet_pbr.hlsl
+resource shader_vsps sample_ground_pbr shaders/samples/01_pbr_helmet_skybox/ground_pbr.hlsl
+
+commands
+command clear clear_scene 1
+  targets scene_color|builtin_scene_color scene_depth|builtin_scene_depth
+  mrts 0
+  mesh_shader - -
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 0 0
+  transform 0 0 0 0 0 0 1 1 1
+  clear 1 0 0 0 1 1 1
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+
+command draw_mesh draw_skybox 1
+  targets scene_color|builtin_scene_color scene_depth|builtin_scene_depth
+  mrts 0
+  mesh_shader sky_triangle|mesh sample_skybox|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transform 0 0 0 0 0 0 1 1 1
+  clear 1 0.05 0.05 0.08 1 1 1
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent -
+  textures 1 venice_env|texture2d 5
+  srvs 0
+  uavs 0
+  params 0
+end_command
+
+command draw_mesh draw_ground 1
+  targets scene_color|builtin_scene_color scene_depth|builtin_scene_depth
+  mrts 0
+  mesh_shader sample_ground|mesh sample_ground_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 1
+  transform 0 -0.05 0 0 0 0 4.5 0.05 4.5
+  clear 1 0.05 0.05 0.08 1 1 1
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent -
+  textures 2 venice_env|texture2d 5 shadow_map|builtin_shadow_map 7
+  srvs 0
+  uavs 0
+  params 2
+  param GroundColor float4 1 - 0 0 0 0 0.62 0.63 0.68 1
+  param GroundMaterial float4 1 - 0 0 0 0 0 0.94 0.65 0.28
+end_command
+
+command draw_mesh draw_damaged_helmet 1
+  targets scene_color|builtin_scene_color scene_depth|builtin_scene_depth
+  mrts 0
+  mesh_shader damaged_helmet|mesh sample_helmet_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 1
+  transform 0 1.18715501 0 0 0 0 1 1 1
+  clear 1 0.05 0.05 0.08 1 1 1
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent -
+  textures 2 venice_env|texture2d 5 shadow_map|builtin_shadow_map 7
+  srvs 0
+  uavs 0
+  params 2
+  param BaseColorFactor float4 1 - 0 0 0 0 1 1 1 1
+  param SurfaceControls float4 1 - 0 0 0 0 1 1 1 1
+end_command

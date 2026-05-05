@@ -15,6 +15,7 @@ extern ResHandle g_builtin_dirlight;
 
 typedef enum {
     MESH_PRIM_CUBE = 0,
+    MESH_PRIM_QUAD,
     MESH_PRIM_TETRAHEDRON,
     MESH_PRIM_SPHERE,
     MESH_PRIM_FULLSCREEN_TRIANGLE
@@ -34,14 +35,16 @@ ResHandle res_create_render_texture(const char* name, int w, int h, DXGI_FORMAT 
 ResHandle res_create_render_texture3d(const char* name, int w, int h, int d, DXGI_FORMAT fmt,
                                        bool want_rtv, bool want_srv, bool want_uav);
 ResHandle res_create_structured_buffer(const char* name, int elem_size, int elem_count,
-                                        bool want_srv, bool want_uav);
+                                        bool want_srv, bool want_uav,
+                                        bool want_indirect_args = false);
 bool      res_recreate_render_texture(ResHandle h, int w, int hgt, DXGI_FORMAT fmt,
                                        bool want_rtv, bool want_srv, bool want_uav, bool want_dsv,
                                        int scene_scale_divisor = -1);
 bool      res_recreate_render_texture3d(ResHandle h, int w, int hgt, int d, DXGI_FORMAT fmt,
                                          bool want_rtv, bool want_srv, bool want_uav);
 bool      res_recreate_structured_buffer(ResHandle h, int elem_size, int elem_count,
-                                          bool want_srv, bool want_uav);
+                                          bool want_srv, bool want_uav,
+                                          bool want_indirect_args = false);
 ResHandle res_create_shader(const char* name, const char* path,
                              const char* vs_entry, const char* ps_entry);
 ResHandle res_create_compute_shader(const char* name, const char* path, const char* cs_entry);

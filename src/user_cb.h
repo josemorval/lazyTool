@@ -1,7 +1,8 @@
 #pragma once
 #include "types.h"
 
-// Public API for the user-defined constant buffer bound at register b1.
+// Public API for the user-defined constant buffer. Preferred convention:
+// SceneCB = b0, ObjectCB = b1, UserCB = b2.
 
 extern UserCBEntry   g_user_cb_entries[MAX_USER_CB_VARS];
 extern int           g_user_cb_count;
@@ -10,7 +11,7 @@ extern ID3D11Buffer* g_user_cb_buf;
 void user_cb_init();
 void user_cb_shutdown();
 void user_cb_update();  // call each frame before render
-void user_cb_bind();    // binds to b1 on VS+PS+CS
+void user_cb_bind();    // compatibility hook; command binding is per-shader
 void user_cb_sync_command_params(Command* c, const Resource* shader);
 void user_cb_bind_for_command(Command* c, const Resource* shader, bool bind_vs, bool bind_ps, bool bind_cs);
 

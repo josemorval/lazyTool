@@ -63,6 +63,13 @@ if "%COPY_ONLY%"=="1" (
     exit /b 0
 )
 
+call :reset_outdir
+if %ERRORLEVEL% neq 0 (
+    echo.
+    echo [FAILED]
+    exit /b 1
+)
+
 set CFLAGS=/W3 /O2 /MT /EHsc /nologo /std:c++17 /DNDEBUG
 echo [BUILD] release
 
@@ -130,6 +137,21 @@ if "%RUN_AFTER%"=="1" (
 )
 
 endlocal
+exit /b 0
+
+:reset_outdir
+if exist %OUTDIR% (
+    rmdir /S /Q %OUTDIR%
+    if exist %OUTDIR% (
+        echo [ERROR] Could not clean %OUTDIR%. Check for locked files.
+        exit /b 1
+    )
+)
+mkdir %OUTDIR%
+if not exist %OUTDIR% (
+    echo [ERROR] Could not create %OUTDIR%.
+    exit /b 1
+)
 exit /b 0
 
 :copy_folders

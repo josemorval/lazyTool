@@ -350,6 +350,7 @@ You can create built-in meshes without importing external files:
 | Primitive | Typical use |
 |---|---|
 | Cube | Basic geometry, debug, simple materials. |
+| Quad | Planes, decals, sprite-like tests, simple post steps. |
 | Tetrahedron | Lightweight primitive for tests. |
 | Sphere | PBR, lighting, reflections, materials. |
 | Fullscreen Triangle | Post-processing and fullscreen passes. |
@@ -503,7 +504,7 @@ You can:
 
 Draw commands let you configure:
 
-- Mesh.
+- Mesh or procedural vertices.
 - VS+PS shader.
 - Main render target.
 - Depth buffer.
@@ -518,6 +519,8 @@ Draw commands let you configure:
 - Shadow casting.
 - Shadow receiving.
 - Optional shader for the shadow pass.
+
+When the source is set to `Procedural`, the draw skips the mesh binding and issues a non-indexed draw driven by `SV_VertexID`. The editor currently exposes `Triangle List` and `Point List` topologies plus a manual vertex count.
 
 Editable states:
 

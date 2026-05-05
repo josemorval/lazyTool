@@ -16,6 +16,15 @@ static const char* s_settings_path = "lazytool_general.ini";
 // cannot unexpectedly re-enable expensive runtime features like profiling.
 static void app_settings_apply_defaults() {
     g_dx.vsync = false;
+    g_dx.d3d11_validation = false;
+    g_dx.d3d11_validation_active = false;
+    g_dx.d3d11_validation_supported = true;
+    g_dx.shader_validation_warnings = true;
+    g_dx.scene_grid_enabled = true;
+    g_dx.scene_grid_color[0] = 1.00f;
+    g_dx.scene_grid_color[1] = 0.50f;
+    g_dx.scene_grid_color[2] = 0.01f;
+    g_dx.scene_grid_color[3] = 0.5f;
     g_profiler_enabled = false;
 
     g_camera_controls.enabled = true;
@@ -35,8 +44,15 @@ void app_settings_save() {
     }
 
     fprintf(f, "vsync %d\n", g_dx.vsync ? 1 : 0);
+    fprintf(f, "d3d11_validation %d\n", g_dx.d3d11_validation ? 1 : 0);
+    fprintf(f, "shader_validation_warnings %d\n", g_dx.shader_validation_warnings ? 1 : 0);
     fprintf(f, "profiler %d\n", g_profiler_enabled ? 1 : 0);
     fprintf(f, "ui_scale %.9g\n", ui_global_scale());
+    fprintf(f, "scene_grid_enabled %d\n", g_dx.scene_grid_enabled ? 1 : 0);
+    fprintf(f, "scene_grid_color_r %.9g\n", g_dx.scene_grid_color[0]);
+    fprintf(f, "scene_grid_color_g %.9g\n", g_dx.scene_grid_color[1]);
+    fprintf(f, "scene_grid_color_b %.9g\n", g_dx.scene_grid_color[2]);
+    fprintf(f, "scene_grid_color_a %.9g\n", g_dx.scene_grid_color[3]);
     fprintf(f, "camera_enabled %d\n", g_camera_controls.enabled ? 1 : 0);
     fprintf(f, "camera_mouse_look %d\n", g_camera_controls.mouse_look ? 1 : 0);
     fprintf(f, "camera_invert_y %d\n", g_camera_controls.invert_y ? 1 : 0);
@@ -65,8 +81,15 @@ void app_settings_load_or_create() {
             continue;
 
         if (strcmp(key, "vsync") == 0) g_dx.vsync = atoi(value) != 0;
+        else if (strcmp(key, "d3d11_validation") == 0) g_dx.d3d11_validation = atoi(value) != 0;
+        else if (strcmp(key, "shader_validation_warnings") == 0) g_dx.shader_validation_warnings = atoi(value) != 0;
         else if (strcmp(key, "profiler") == 0) g_profiler_enabled = atoi(value) != 0;
         else if (strcmp(key, "ui_scale") == 0) ui_set_global_scale((float)atof(value));
+        else if (strcmp(key, "scene_grid_enabled") == 0) g_dx.scene_grid_enabled = atoi(value) != 0;
+        else if (strcmp(key, "scene_grid_color_r") == 0) g_dx.scene_grid_color[0] = (float)atof(value);
+        else if (strcmp(key, "scene_grid_color_g") == 0) g_dx.scene_grid_color[1] = (float)atof(value);
+        else if (strcmp(key, "scene_grid_color_b") == 0) g_dx.scene_grid_color[2] = (float)atof(value);
+        else if (strcmp(key, "scene_grid_color_a") == 0) g_dx.scene_grid_color[3] = (float)atof(value);
         else if (strcmp(key, "camera_enabled") == 0) g_camera_controls.enabled = atoi(value) != 0;
         else if (strcmp(key, "camera_mouse_look") == 0) g_camera_controls.mouse_look = atoi(value) != 0;
         else if (strcmp(key, "camera_invert_y") == 0) g_camera_controls.invert_y = atoi(value) != 0;
@@ -83,4 +106,8 @@ void app_settings_load_or_create() {
     if (g_camera_controls.fast_mult < 1.0f) g_camera_controls.fast_mult = 1.0f;
     if (g_camera_controls.slow_mult < 0.01f) g_camera_controls.slow_mult = 0.01f;
     if (g_camera_controls.mouse_sensitivity < 0.0001f) g_camera_controls.mouse_sensitivity = 0.0001f;
+    g_dx.scene_grid_color[0] = clampf(g_dx.scene_grid_color[0], 0.0f, 1.0f);
+    g_dx.scene_grid_color[1] = clampf(g_dx.scene_grid_color[1], 0.0f, 1.0f);
+    g_dx.scene_grid_color[2] = clampf(g_dx.scene_grid_color[2], 0.0f, 1.0f);
+    g_dx.scene_grid_color[3] = clampf(g_dx.scene_grid_color[3], 0.0f, 1.0f);
 }

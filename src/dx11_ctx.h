@@ -1,5 +1,6 @@
 #pragma once
 #include "types.h"
+struct ID3D11InfoQueue;
 
 // Shared Direct3D 11 device state and helper entry points used by the rest of
 // the tool. Most modules touch the GPU through this narrow surface.
@@ -12,6 +13,11 @@ struct DX11Ctx {
     ID3D11RenderTargetView*  back_rtv;
     int                      width, height;
     bool                     vsync;
+    bool                     d3d11_validation;
+    bool                     d3d11_validation_active;
+    bool                     d3d11_validation_supported;
+    bool                     shader_validation_warnings;
+    ID3D11InfoQueue*         info_queue;
 
     ID3D11Texture2D*            scene_tex;
     ID3D11RenderTargetView*     scene_rtv;
@@ -41,6 +47,8 @@ struct DX11Ctx {
     ID3D11RasterizerState*   rs_wire_solid;
     ID3D11RasterizerState*   rs_wire_cull_none;
     bool                     scene_wireframe;
+    bool                     scene_grid_enabled;
+    float                    scene_grid_color[4];
     ID3D11DepthStencilState* dss_default;
     ID3D11DepthStencilState* dss_depth_read;
     ID3D11DepthStencilState* dss_depth_off;
@@ -62,5 +70,8 @@ void dx_update_scene_cb(const SceneCBData& d);
 void dx_update_object_cb(const ObjectCBData& d);
 void dx_begin_scene();
 void dx_end_scene();
+void dx_render_scene_grid_overlay();
 void dx_begin_ui();
+void dx_debug_log_messages();
+void dx_debug_clear_messages();
 void dx_shutdown();

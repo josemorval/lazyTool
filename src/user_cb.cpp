@@ -21,6 +21,18 @@ static bool user_cb_name_exists(const char* name) {
     return false;
 }
 
+static UserCBEntry* user_cb_find_global_entry(const char* name, ResType type) {
+    if (!name)
+        return nullptr;
+    for (int i = 0; i < g_user_cb_count; i++) {
+        if (g_user_cb_entries[i].type != type)
+            continue;
+        if (strcmp(g_user_cb_entries[i].name, name) == 0)
+            return &g_user_cb_entries[i];
+    }
+    return nullptr;
+}
+
 static void user_cb_make_unique_name(const char* base, char* out, int out_sz) {
     const char* src = (base && base[0]) ? base : "var";
     if (!user_cb_name_exists(src)) {
@@ -116,7 +128,7 @@ void user_cb_init() {
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     g_dx.dev->CreateBuffer(&bd, nullptr, &g_user_cb_buf);
     g_dx.dev->CreateBuffer(&bd, nullptr, &s_command_cb_buf);
-    log_info("UserCB init (global b1 + command cb, %d slots x 16 bytes)", MAX_USER_CB_VARS);
+    log_info("UserCB init (preferred UserCB = b2, %d slots x 16 bytes)", MAX_USER_CB_VARS);
 }
 
 void user_cb_shutdown() {
@@ -142,9 +154,9 @@ void user_cb_update() {
 }
 
 void user_cb_bind() {
-    g_dx.ctx->VSSetConstantBuffers(1, 1, &g_user_cb_buf);
-    g_dx.ctx->PSSetConstantBuffers(1, 1, &g_user_cb_buf);
-    g_dx.ctx->CSSetConstantBuffers(1, 1, &g_user_cb_buf);
+    // Intentionally empty. User CB binding is now resolved per shader from the
+    // reflected UserCB slot, which allows old b1 shaders and new b2 shaders to
+    // coexist during the migration.
 }
 
 static int command_param_find(const Command* c, const char* name) {
@@ -184,6 +196,12 @@ void user_cb_sync_command_params(Command* c, const Resource* shader) {
         strncpy(p->name, v.name, MAX_NAME - 1);
         p->name[MAX_NAME - 1] = '\0';
 
+        if (UserCBEntry* global = user_cb_find_global_entry(v.name, v.type)) {
+            p->source = global->source;
+            memcpy(p->ival, global->ival, sizeof(p->ival));
+            memcpy(p->fval, global->fval, sizeof(p->fval));
+        }
+
         for (int old_i = 0; old_i < old_count; old_i++) {
             if (strcmp(old[old_i].name, v.name) != 0 || old[old_i].type != v.type)
                 continue;
@@ -203,24 +221,17 @@ void user_cb_sync_command_params(Command* c, const Resource* shader) {
     c->synced_shader_handle = c->shader;
 }
 
-static void pack_command_param_bytes(const CommandParam* p, const ShaderCBVar* v, unsigned char* bytes, int byte_count) {
-    if (!p || !v || !bytes || !p->enabled) return;
+static void pack_value_bytes(ResType type, const int* ival, const float* fval,
+                             const ShaderCBVar* v, unsigned char* bytes, int byte_count) {
+    if (!v || !bytes) return;
     if ((int)v->offset >= byte_count) return;
 
     int max_copy = byte_count - (int)v->offset;
     if (max_copy <= 0) return;
 
-    const int* ival = p->ival;
-    const float* fval = p->fval;
-    Resource* src = res_get(p->source);
-    if (src && src->type == p->type) {
-        ival = src->ival;
-        fval = src->fval;
-    }
-
     int bytes_to_copy = 0;
     const void* src_data = nullptr;
-    switch (p->type) {
+    switch (type) {
     case RES_FLOAT:  bytes_to_copy = 4;  src_data = fval; break;
     case RES_FLOAT2: bytes_to_copy = 8;  src_data = fval; break;
     case RES_FLOAT3: bytes_to_copy = 12; src_data = fval; break;
@@ -237,14 +248,22 @@ static void pack_command_param_bytes(const CommandParam* p, const ShaderCBVar* v
     memcpy(bytes + v->offset, src_data, bytes_to_copy);
 }
 
-void user_cb_bind_for_command(Command* c, const Resource* shader, bool bind_vs, bool bind_ps, bool bind_cs) {
-    if (!g_user_cb_buf)
-        return;
+static void pack_command_param_bytes(const CommandParam* p, const ShaderCBVar* v, unsigned char* bytes, int byte_count) {
+    if (!p || !v || !bytes || !p->enabled) return;
 
+    const int* ival = p->ival;
+    const float* fval = p->fval;
+    Resource* src = res_get(p->source);
+    if (src && src->type == p->type) {
+        ival = src->ival;
+        fval = src->fval;
+    }
+
+    pack_value_bytes(p->type, ival, fval, v, bytes, byte_count);
+}
+
+void user_cb_bind_for_command(Command* c, const Resource* shader, bool bind_vs, bool bind_ps, bool bind_cs) {
     if (!shader || !shader->shader_cb.active) {
-        if (bind_vs) g_dx.ctx->VSSetConstantBuffers(1, 1, &g_user_cb_buf);
-        if (bind_ps) g_dx.ctx->PSSetConstantBuffers(1, 1, &g_user_cb_buf);
-        if (bind_cs) g_dx.ctx->CSSetConstantBuffers(1, 1, &g_user_cb_buf);
         return;
     }
 
@@ -275,6 +294,12 @@ void user_cb_bind_for_command(Command* c, const Resource* shader, bool bind_vs, 
 
     for (int i = 0; i < shader->shader_cb.var_count; i++) {
         const ShaderCBVar& v = shader->shader_cb.vars[i];
+        if (UserCBEntry* global = user_cb_find_global_entry(v.name, v.type)) {
+            Resource* src = res_get(global->source);
+            const int* ival = src && src->type == global->type ? src->ival : global->ival;
+            const float* fval = src && src->type == global->type ? src->fval : global->fval;
+            pack_value_bytes(global->type, ival, fval, &v, (unsigned char*)&data, cb_size);
+        }
         int p_i = command_param_find(c, v.name);
         if (p_i < 0) continue;
         pack_command_param_bytes(&c->params[p_i], &v, (unsigned char*)&data, cb_size);
@@ -323,7 +348,7 @@ bool user_cb_add_var(const char* name, ResType type) {
     e->type   = type;
     e->source = INVALID_HANDLE;
 
-    log_info("UserCB: created '%s' at slot %d (b1, offset %d bytes)",
+    log_info("UserCB: created '%s' at slot %d (preferred b2, offset %d bytes)",
              e->name, slot, slot * 16);
     return true;
 }
@@ -351,7 +376,7 @@ bool user_cb_add_from_resource(ResHandle h) {
     e->source = h;
     user_cb_copy_from_resource(e, r);
 
-    log_info("UserCB: added '%s' linked to resource '%s' at slot %d (b1, offset %d bytes)",
+    log_info("UserCB: added '%s' linked to resource '%s' at slot %d (preferred b2, offset %d bytes)",
              e->name, r->name, slot, slot * 16);
     return true;
 }

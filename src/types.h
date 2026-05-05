@@ -25,6 +25,7 @@
 #define MAX_MESH_MATERIALS 64
 #define MAX_USER_CB_VARS 64
 #define MAX_SHADER_CB_VARS 32
+#define MAX_SHADER_RESOURCE_BINDINGS 32
 #define MAX_COMMAND_PARAMS 32
 #define MAX_SHADOW_CASCADES 4
 #define INVALID_HANDLE   0u
@@ -64,11 +65,43 @@ typedef enum {
     CMD_COUNT
 } CmdType;
 
+typedef enum {
+    DRAW_SOURCE_MESH = 0,
+    DRAW_SOURCE_PROCEDURAL
+} DrawSourceType;
+
+typedef enum {
+    DRAW_TOPOLOGY_POINT_LIST = 0,
+    DRAW_TOPOLOGY_TRIANGLE_LIST
+} DrawTopologyType;
+
+typedef enum {
+    SHADER_BIND_NONE = 0,
+    SHADER_BIND_CBUFFER,
+    SHADER_BIND_SRV,
+    SHADER_BIND_UAV,
+    SHADER_BIND_SAMPLER
+} ShaderBindingKind;
+
+enum {
+    SHADER_STAGE_VERTEX  = 1 << 0,
+    SHADER_STAGE_PIXEL   = 1 << 1,
+    SHADER_STAGE_COMPUTE = 1 << 2
+};
+
 struct ShaderCBVar {
     char     name[MAX_NAME];
     ResType  type;
     uint32_t offset;
     uint32_t size;
+};
+
+struct ShaderBinding {
+    char     name[MAX_NAME];
+    uint32_t kind;
+    uint32_t bind_slot;
+    uint32_t bind_count;
+    uint32_t stage_mask;
 };
 
 struct ShaderCBLayout {
@@ -137,6 +170,7 @@ struct Resource {
     int         width, height, depth;
     DXGI_FORMAT tex_fmt;
     bool        has_rtv, has_srv, has_uav, has_dsv;
+    bool        indirect_args;
     int         scene_scale_divisor;
     ResHandle   generated_from;
     ResHandle   size_handle;
@@ -154,6 +188,10 @@ struct Resource {
     bool using_fallback;
     char compile_err[512];
     ShaderCBLayout shader_cb;
+    bool object_cb_active;
+    uint32_t object_cb_bind_slot;
+    int shader_binding_count;
+    ShaderBinding shader_bindings[MAX_SHADER_RESOURCE_BINDINGS];
 
     float light_dir[3];
     float light_pos[3];
@@ -191,6 +229,8 @@ struct Command {
     ResHandle mesh;
     ResHandle shader;
     ResHandle shadow_shader;
+    int       draw_source;
+    int       draw_topology;
     bool      color_write;
     bool      depth_test;
     bool      depth_write;
@@ -218,6 +258,7 @@ struct Command {
     bool     clear_color_enabled;
     bool     clear_depth;
     float    depth_clear_val;
+    int      vertex_count;
 
     int      instance_count;
     int      thread_x, thread_y, thread_z;
@@ -238,6 +279,7 @@ struct Command {
     // Zero means "not yet synced" (default from cmd_alloc memset).
     uint32_t     synced_shader_cb_version;
     ResHandle    synced_shader_handle;
+    uint32_t     validation_warning_hash;
 };
 
 // ── user cbuffer entry ────────────────────────────────────────────────────

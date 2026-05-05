@@ -19,7 +19,7 @@ cbuffer SceneCB : register(b0)
     float4x4 ShadowCascadeViewProj[4];
 };
 
-cbuffer ObjectCB : register(b2)
+cbuffer ObjectCB : register(b1)
 {
     float4x4 World;
 };

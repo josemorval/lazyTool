@@ -11,6 +11,7 @@
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 #include "nanosvg/nanosvg.h"
+#include <d3dcompiler.h>
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
 
@@ -528,6 +529,68 @@ static void ui_draw_texture_slot_reference(const char* table_id) {
     ImGui::EndTable();
 }
 
+static bool ui_command_uses_procedural_draw(const Command& c) {
+    return c.draw_source == DRAW_SOURCE_PROCEDURAL;
+}
+
+static const char* ui_draw_source_name(int source) {
+    switch ((DrawSourceType)source) {
+    case DRAW_SOURCE_PROCEDURAL: return "Procedural";
+    case DRAW_SOURCE_MESH:
+    default:                     return "Mesh";
+    }
+}
+
+static bool ui_draw_source_combo(const char* label, int* source) {
+    if (!source)
+        return false;
+
+    bool changed = false;
+    if (ImGui::BeginCombo(label, ui_draw_source_name(*source))) {
+        const DrawSourceType options[] = { DRAW_SOURCE_MESH, DRAW_SOURCE_PROCEDURAL };
+        for (int i = 0; i < 2; i++) {
+            bool selected = *source == (int)options[i];
+            if (ImGui::Selectable(ui_draw_source_name((int)options[i]), selected)) {
+                *source = (int)options[i];
+                changed = true;
+            }
+            if (selected)
+                ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    return changed;
+}
+
+static const char* ui_draw_topology_name(int topology) {
+    switch ((DrawTopologyType)topology) {
+    case DRAW_TOPOLOGY_POINT_LIST:    return "Point List";
+    case DRAW_TOPOLOGY_TRIANGLE_LIST:
+    default:                          return "Triangle List";
+    }
+}
+
+static bool ui_draw_topology_combo(const char* label, int* topology) {
+    if (!topology)
+        return false;
+
+    bool changed = false;
+    if (ImGui::BeginCombo(label, ui_draw_topology_name(*topology))) {
+        const DrawTopologyType options[] = { DRAW_TOPOLOGY_TRIANGLE_LIST, DRAW_TOPOLOGY_POINT_LIST };
+        for (int i = 0; i < 2; i++) {
+            bool selected = *topology == (int)options[i];
+            if (ImGui::Selectable(ui_draw_topology_name((int)options[i]), selected)) {
+                *topology = (int)options[i];
+                changed = true;
+            }
+            if (selected)
+                ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    return changed;
+}
+
 static void ui_recompile_all_shaders() {
     int total = 0;
     int ok = 0;
@@ -763,16 +826,351 @@ static void res_combo_dispatch_source(const char* label, ResHandle* h) {
 }
 
 static float s_asset_preview_scale = 1.0f;
+static bool s_asset_preview_point_filter = false;
+
+struct UiTexture3DPreviewCBData {
+    UINT slice;
+    UINT mode;
+    UINT width;
+    UINT height;
+};
+
+static ID3D11Texture2D*           s_rt3d_preview_tex = nullptr;
+static ID3D11RenderTargetView*    s_rt3d_preview_rtv = nullptr;
+static ID3D11ShaderResourceView*  s_rt3d_preview_srv = nullptr;
+static ID3D11VertexShader*        s_rt3d_preview_vs = nullptr;
+static ID3D11PixelShader*         s_rt3d_preview_ps_float = nullptr;
+static ID3D11PixelShader*         s_rt3d_preview_ps_uint = nullptr;
+static ID3D11Buffer*              s_rt3d_preview_cb = nullptr;
+static int                        s_rt3d_preview_w = 0;
+static int                        s_rt3d_preview_h = 0;
+
+static const char* s_rt3d_preview_vs_src = R"HLSL(
+struct VSOut {
+    float4 pos : SV_Position;
+};
+
+VSOut VSMain(uint vid : SV_VertexID) {
+    float2 pos;
+    if (vid == 0) pos = float2(-1.0, -1.0);
+    else if (vid == 1) pos = float2(-1.0, 3.0);
+    else pos = float2(3.0, -1.0);
+
+    VSOut o;
+    o.pos = float4(pos, 0.0, 1.0);
+    return o;
+}
+)HLSL";
+
+static const char* s_rt3d_preview_ps_float_src = R"HLSL(
+cbuffer PreviewCB : register(b0)
+{
+    uint Slice;
+    uint Mode;
+    uint Width;
+    uint Height;
+};
+
+Texture3D<float4> PreviewTex : register(t0);
+
+float4 PSMain(float4 pos : SV_Position) : SV_Target
+{
+    uint x = Width  > 0 ? min((uint)pos.x, Width  - 1) : 0;
+    uint y = Height > 0 ? min((uint)pos.y, Height - 1) : 0;
+    float4 value = PreviewTex.Load(int4((int)x, (int)y, (int)Slice, 0));
+    if (Mode != 0)
+        value = float4(value.xxx, 1.0);
+    return saturate(value);
+}
+)HLSL";
+
+static const char* s_rt3d_preview_ps_uint_src = R"HLSL(
+cbuffer PreviewCB : register(b0)
+{
+    uint Slice;
+    uint Mode;
+    uint Width;
+    uint Height;
+};
+
+Texture3D<uint> PreviewTex : register(t0);
+
+float4 PSMain(float4 pos : SV_Position) : SV_Target
+{
+    uint x = Width  > 0 ? min((uint)pos.x, Width  - 1) : 0;
+    uint y = Height > 0 ? min((uint)pos.y, Height - 1) : 0;
+    uint value = PreviewTex.Load(int4((int)x, (int)y, (int)Slice, 0));
+    float gray = saturate((float)value / 255.0);
+    return float4(gray, gray, gray, 1.0);
+}
+)HLSL";
+
+static void ui_release_rt3d_preview_surface() {
+    if (s_rt3d_preview_srv) { s_rt3d_preview_srv->Release(); s_rt3d_preview_srv = nullptr; }
+    if (s_rt3d_preview_rtv) { s_rt3d_preview_rtv->Release(); s_rt3d_preview_rtv = nullptr; }
+    if (s_rt3d_preview_tex) { s_rt3d_preview_tex->Release(); s_rt3d_preview_tex = nullptr; }
+    s_rt3d_preview_w = 0;
+    s_rt3d_preview_h = 0;
+}
+
+static void ui_release_rt3d_preview_pipeline() {
+    ui_release_rt3d_preview_surface();
+    if (s_rt3d_preview_cb) { s_rt3d_preview_cb->Release(); s_rt3d_preview_cb = nullptr; }
+    if (s_rt3d_preview_ps_uint) { s_rt3d_preview_ps_uint->Release(); s_rt3d_preview_ps_uint = nullptr; }
+    if (s_rt3d_preview_ps_float) { s_rt3d_preview_ps_float->Release(); s_rt3d_preview_ps_float = nullptr; }
+    if (s_rt3d_preview_vs) { s_rt3d_preview_vs->Release(); s_rt3d_preview_vs = nullptr; }
+}
+
+static bool ui_compile_preview_shader_blob(const char* source, const char* entry,
+                                           const char* target, ID3DBlob** out_blob)
+{
+    if (!out_blob)
+        return false;
+    *out_blob = nullptr;
+
+    ID3DBlob* blob = nullptr;
+    ID3DBlob* err = nullptr;
+    HRESULT hr = D3DCompile(source, strlen(source), "ui_rt3d_preview",
+        nullptr, nullptr, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &err);
+    if (FAILED(hr) || !blob) {
+        const char* msg = err ? (const char*)err->GetBufferPointer() : "unknown error";
+        log_error("Texture3D preview shader compile failed (%s/%s): %s", entry, target, msg);
+        if (err) err->Release();
+        if (blob) blob->Release();
+        return false;
+    }
+    if (err) err->Release();
+    *out_blob = blob;
+    return true;
+}
+
+static bool ui_init_rt3d_preview_pipeline() {
+    if (!g_dx.dev || !g_dx.ctx)
+        return false;
+    if (s_rt3d_preview_vs && s_rt3d_preview_ps_float && s_rt3d_preview_ps_uint && s_rt3d_preview_cb)
+        return true;
+
+    ui_release_rt3d_preview_pipeline();
+
+    ID3DBlob* vs_blob = nullptr;
+    ID3DBlob* ps_float_blob = nullptr;
+    ID3DBlob* ps_uint_blob = nullptr;
+    if (!ui_compile_preview_shader_blob(s_rt3d_preview_vs_src, "VSMain", "vs_5_0", &vs_blob))
+        return false;
+    if (!ui_compile_preview_shader_blob(s_rt3d_preview_ps_float_src, "PSMain", "ps_5_0", &ps_float_blob)) {
+        vs_blob->Release();
+        return false;
+    }
+    if (!ui_compile_preview_shader_blob(s_rt3d_preview_ps_uint_src, "PSMain", "ps_5_0", &ps_uint_blob)) {
+        ps_float_blob->Release();
+        vs_blob->Release();
+        return false;
+    }
+
+    HRESULT hr = g_dx.dev->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+                                              nullptr, &s_rt3d_preview_vs);
+    if (SUCCEEDED(hr))
+        hr = g_dx.dev->CreatePixelShader(ps_float_blob->GetBufferPointer(), ps_float_blob->GetBufferSize(),
+                                         nullptr, &s_rt3d_preview_ps_float);
+    if (SUCCEEDED(hr))
+        hr = g_dx.dev->CreatePixelShader(ps_uint_blob->GetBufferPointer(), ps_uint_blob->GetBufferSize(),
+                                         nullptr, &s_rt3d_preview_ps_uint);
+
+    vs_blob->Release();
+    ps_float_blob->Release();
+    ps_uint_blob->Release();
+
+    if (FAILED(hr)) {
+        log_error("Texture3D preview shader create failed: 0x%08X", hr);
+        ui_release_rt3d_preview_pipeline();
+        return false;
+    }
+
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.ByteWidth = (UINT)((sizeof(UiTexture3DPreviewCBData) + 15) & ~15);
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = g_dx.dev->CreateBuffer(&cbd, nullptr, &s_rt3d_preview_cb);
+    if (FAILED(hr) || !s_rt3d_preview_cb) {
+        log_error("Texture3D preview cbuffer create failed: 0x%08X", hr);
+        ui_release_rt3d_preview_pipeline();
+        return false;
+    }
+
+    return true;
+}
+
+static bool ui_ensure_rt3d_preview_surface(int width, int height) {
+    if (width < 1) width = 1;
+    if (height < 1) height = 1;
+    if (s_rt3d_preview_tex && s_rt3d_preview_w == width && s_rt3d_preview_h == height)
+        return true;
+
+    ui_release_rt3d_preview_surface();
+
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = (UINT)width;
+    td.Height = (UINT)height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    HRESULT hr = g_dx.dev->CreateTexture2D(&td, nullptr, &s_rt3d_preview_tex);
+    if (FAILED(hr) || !s_rt3d_preview_tex) {
+        log_error("Texture3D preview texture create failed: 0x%08X", hr);
+        ui_release_rt3d_preview_surface();
+        return false;
+    }
+
+    hr = g_dx.dev->CreateRenderTargetView(s_rt3d_preview_tex, nullptr, &s_rt3d_preview_rtv);
+    if (FAILED(hr) || !s_rt3d_preview_rtv) {
+        log_error("Texture3D preview RTV create failed: 0x%08X", hr);
+        ui_release_rt3d_preview_surface();
+        return false;
+    }
+
+    hr = g_dx.dev->CreateShaderResourceView(s_rt3d_preview_tex, nullptr, &s_rt3d_preview_srv);
+    if (FAILED(hr) || !s_rt3d_preview_srv) {
+        log_error("Texture3D preview SRV create failed: 0x%08X", hr);
+        ui_release_rt3d_preview_surface();
+        return false;
+    }
+
+    s_rt3d_preview_w = width;
+    s_rt3d_preview_h = height;
+    return true;
+}
+
+static bool ui_rt3d_preview_supported_format(DXGI_FORMAT fmt) {
+    return fmt == DXGI_FORMAT_R8G8B8A8_UNORM ||
+           fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+           fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+           fmt == DXGI_FORMAT_R32G32B32A32_FLOAT ||
+           fmt == DXGI_FORMAT_R32_FLOAT ||
+           fmt == DXGI_FORMAT_R32_UINT;
+}
+
+static UINT ui_rt3d_preview_mode(DXGI_FORMAT fmt) {
+    return fmt == DXGI_FORMAT_R32_FLOAT ? 1u : 0u;
+}
+
+static bool ui_rt3d_preview_is_uint(DXGI_FORMAT fmt) {
+    return fmt == DXGI_FORMAT_R32_UINT;
+}
+
+static ID3D11ShaderResourceView* ui_render_texture3d_preview_slice(Resource* r, int slice) {
+    if (!r || !r->tex3d || !r->srv)
+        return nullptr;
+    if (!ui_rt3d_preview_supported_format(r->tex_fmt))
+        return nullptr;
+    if (!ui_init_rt3d_preview_pipeline())
+        return nullptr;
+    if (!ui_ensure_rt3d_preview_surface(r->width, r->height))
+        return nullptr;
+
+    if (slice < 0) slice = 0;
+    if (slice >= r->depth) slice = r->depth - 1;
+    if (slice < 0) slice = 0;
+
+    D3D11_MAPPED_SUBRESOURCE ms = {};
+    HRESULT hr = g_dx.ctx->Map(s_rt3d_preview_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+    if (FAILED(hr)) {
+        log_error("Texture3D preview cbuffer map failed: 0x%08X", hr);
+        return nullptr;
+    }
+    UiTexture3DPreviewCBData* cb = (UiTexture3DPreviewCBData*)ms.pData;
+    cb->slice = (UINT)slice;
+    cb->mode = ui_rt3d_preview_mode(r->tex_fmt);
+    cb->width = (UINT)r->width;
+    cb->height = (UINT)r->height;
+    g_dx.ctx->Unmap(s_rt3d_preview_cb, 0);
+
+    ID3D11ShaderResourceView* null_srvs[MAX_SRV_SLOTS] = {};
+    ID3D11UnorderedAccessView* null_uavs[MAX_UAV_SLOTS] = {};
+    UINT null_counts[MAX_UAV_SLOTS] = {};
+    ID3D11RenderTargetView* null_rtv = nullptr;
+    g_dx.ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+    g_dx.ctx->PSSetShaderResources(0, MAX_SRV_SLOTS, null_srvs);
+    g_dx.ctx->CSSetShaderResources(0, MAX_SRV_SLOTS, null_srvs);
+    g_dx.ctx->CSSetUnorderedAccessViews(0, MAX_UAV_SLOTS, null_uavs, null_counts);
+
+    float clear[4] = {};
+    g_dx.ctx->OMSetRenderTargets(1, &s_rt3d_preview_rtv, nullptr);
+    g_dx.ctx->ClearRenderTargetView(s_rt3d_preview_rtv, clear);
+
+    D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)r->width, (float)r->height, 0.0f, 1.0f };
+    g_dx.ctx->RSSetViewports(1, &vp);
+    g_dx.ctx->RSSetState(g_dx.rs_cull_none);
+    g_dx.ctx->OMSetDepthStencilState(g_dx.dss_depth_off, 0);
+    float blend_factor[4] = {};
+    g_dx.ctx->OMSetBlendState(g_dx.bs_opaque, blend_factor, 0xFFFFFFFF);
+    g_dx.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_dx.ctx->IASetInputLayout(nullptr);
+    ID3D11Buffer* null_vb = nullptr;
+    UINT stride = 0;
+    UINT offset = 0;
+    g_dx.ctx->IASetVertexBuffers(0, 1, &null_vb, &stride, &offset);
+    g_dx.ctx->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
+    g_dx.ctx->VSSetShader(s_rt3d_preview_vs, nullptr, 0);
+    g_dx.ctx->GSSetShader(nullptr, nullptr, 0);
+    g_dx.ctx->HSSetShader(nullptr, nullptr, 0);
+    g_dx.ctx->DSSetShader(nullptr, nullptr, 0);
+    g_dx.ctx->PSSetShader(ui_rt3d_preview_is_uint(r->tex_fmt) ? s_rt3d_preview_ps_uint : s_rt3d_preview_ps_float,
+                          nullptr, 0);
+    g_dx.ctx->PSSetConstantBuffers(0, 1, &s_rt3d_preview_cb);
+    ID3D11ShaderResourceView* src_srv = r->srv;
+    g_dx.ctx->PSSetShaderResources(0, 1, &src_srv);
+    g_dx.ctx->Draw(3, 0);
+
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    g_dx.ctx->PSSetShaderResources(0, 1, &null_srv);
+    g_dx.ctx->OMSetRenderTargets(1, &g_dx.back_rtv, nullptr);
+    return s_rt3d_preview_srv;
+}
+
+static void ui_imgui_set_preview_sampler(const ImDrawList*, const ImDrawCmd* cmd) {
+    ImGui_ImplDX11_RenderState* rs = (ImGui_ImplDX11_RenderState*)ImGui::GetPlatformIO().Renderer_RenderState;
+    if (!rs || !rs->DeviceContext)
+        return;
+
+    bool point_filter = cmd && cmd->UserCallbackData != nullptr;
+    ID3D11SamplerState* sampler = point_filter ? rs->SamplerNearest : rs->SamplerLinear;
+    rs->DeviceContext->PSSetSamplers(0, 1, &sampler);
+}
+
+static void ui_preview_toolbar() {
+    ImGui::SetNextItemWidth(170.0f);
+    ImGui::SliderFloat("Preview Scale", &s_asset_preview_scale, 0.10f, 1.00f, "%.2fx");
+    ImGui::SameLine();
+    ImGui::Checkbox("Point", &s_asset_preview_point_filter);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Fit"))
+        s_asset_preview_scale = 1.0f;
+}
+
+static void ui_image_preview(ID3D11ShaderResourceView* srv, const ImVec2& size) {
+    if (!srv)
+        return;
+    if (!s_asset_preview_point_filter) {
+        ImGui::Image((ImTextureID)srv, size);
+        return;
+    }
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddCallback(ui_imgui_set_preview_sampler, (void*)1);
+    ImGui::Image((ImTextureID)srv, size);
+    dl->AddCallback(ui_imgui_set_preview_sampler, nullptr);
+}
 
 static void ui_image_fit_panel(ID3D11ShaderResourceView* srv, int width, int height) {
     if (!srv) return;
 
     ImGui::PushID((void*)srv);
-    ImGui::SetNextItemWidth(170.0f);
-    ImGui::SliderFloat("Preview Scale", &s_asset_preview_scale, 0.10f, 1.00f, "%.2fx");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Fit"))
-        s_asset_preview_scale = 1.0f;
+    ui_preview_toolbar();
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
     float max_w = avail.x > 1.0f ? avail.x : 1.0f;
@@ -788,7 +1186,7 @@ static void ui_image_fit_panel(ID3D11ShaderResourceView* srv, int width, int hei
     ImVec2 size = { src_w * scale, src_h * scale };
     if (size.x < 1.0f) size.x = 1.0f;
     if (size.y < 1.0f) size.y = 1.0f;
-    ImGui::Image((ImTextureID)srv, size);
+    ui_image_preview(srv, size);
     ImGui::PopID();
 }
 
@@ -796,11 +1194,7 @@ static void ui_image_fill_panel_width(ID3D11ShaderResourceView* srv, int width, 
     if (!srv) return;
 
     ImGui::PushID((void*)srv);
-    ImGui::SetNextItemWidth(170.0f);
-    ImGui::SliderFloat("Preview Scale", &s_asset_preview_scale, 0.10f, 1.00f, "%.2fx");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Fit"))
-        s_asset_preview_scale = 1.0f;
+    ui_preview_toolbar();
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
     float max_w = avail.x > 1.0f ? avail.x : 1.0f;
@@ -813,7 +1207,7 @@ static void ui_image_fill_panel_width(ID3D11ShaderResourceView* srv, int width, 
     ImVec2 size = { src_w * scale, src_h * scale };
     if (size.x < 1.0f) size.x = 1.0f;
     if (size.y < 1.0f) size.y = 1.0f;
-    ImGui::Image((ImTextureID)srv, size);
+    ui_image_preview(srv, size);
     ImGui::PopID();
 }
 
@@ -947,7 +1341,7 @@ static void ui_command_shader_params(Command* c, Resource* shader) {
         return;
 
     if (!shader->shader_cb.active) {
-        ImGui::TextDisabled("No cbuffer found at register(b1).");
+        ImGui::TextDisabled("No UserCB cbuffer reflected. Recommended: register(b2).");
         return;
     }
 
@@ -1206,6 +1600,96 @@ static UINT ui_draw_command_rtv_count(const Command& c) {
     return count;
 }
 
+static bool ui_command_supports_gizmo_type(CmdType type) {
+    return type == CMD_DRAW_MESH || type == CMD_DRAW_INSTANCED || type == CMD_INDIRECT_DRAW;
+}
+
+static int ui_mesh_enabled_part_count(const Resource* mesh) {
+    if (!mesh)
+        return 0;
+    if (mesh->mesh_part_count <= 0)
+        return 1;
+
+    int count = 0;
+    for (int i = 0; i < mesh->mesh_part_count; i++) {
+        if (mesh->mesh_parts[i].enabled)
+            count++;
+    }
+    return count;
+}
+
+static bool ui_command_uses_indexed_mesh_draw(const Command& c, const Resource* mesh) {
+    return !ui_command_uses_procedural_draw(c) && mesh && mesh->ib;
+}
+
+static UINT ui_indirect_draw_args_required_bytes(const Command& c, const Resource* mesh) {
+    return ui_command_uses_indexed_mesh_draw(c, mesh)
+        ? (UINT)sizeof(D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS)
+        : (UINT)sizeof(D3D11_DRAW_INSTANCED_INDIRECT_ARGS);
+}
+
+static UINT ui_indirect_dispatch_args_required_bytes() {
+    return (UINT)(sizeof(UINT) * 3);
+}
+
+static bool ui_indirect_args_buffer_has_range(const Resource* buf, uint32_t offset, UINT required_bytes) {
+    if (!buf || !buf->buf || !buf->indirect_args || buf->elem_size < 1 || buf->elem_count < 1)
+        return false;
+    if ((offset & 3u) != 0u)
+        return false;
+
+    uint64_t total_bytes = (uint64_t)buf->elem_size * (uint64_t)buf->elem_count;
+    uint64_t end = (uint64_t)offset + (uint64_t)required_bytes;
+    return end <= total_bytes;
+}
+
+static bool ui_draw_command_has_common_warning(const Command& c, bool indirect) {
+    bool procedural = ui_command_uses_procedural_draw(c);
+    Resource* mesh = res_get(c.mesh);
+    Resource* shader = res_get(c.shader);
+    if (!shader || !shader->vs || !shader->ps) return true;
+    if (!shader->compiled_ok) return true;
+
+    if (procedural) {
+        if (!indirect && c.vertex_count < 1) return true;
+        if (c.draw_topology != DRAW_TOPOLOGY_TRIANGLE_LIST &&
+            c.draw_topology != DRAW_TOPOLOGY_POINT_LIST) return true;
+    } else {
+        if (!mesh || !mesh->vb || !shader->il) return true;
+        if (mesh->using_fallback) return true;
+    }
+
+    if (indirect) {
+        Resource* ibuf = res_get(c.indirect_buf);
+        if (!ui_indirect_args_buffer_has_range(ibuf, c.indirect_offset,
+                                               ui_indirect_draw_args_required_bytes(c, mesh))) {
+            return true;
+        }
+        if (!procedural && mesh && mesh->mesh_material_count > 0 &&
+            ui_mesh_enabled_part_count(mesh) != 1) {
+            return true;
+        }
+    }
+
+    int extra_count = c.mrt_count;
+    if (extra_count < 0 || extra_count > MAX_DRAW_RENDER_TARGETS - 1) return true;
+    for (int i = 0; i < extra_count; i++) {
+        if (!res_get(c.mrt_handles[i]) || !ui_has_draw_rtv(c.mrt_handles[i]))
+            return true;
+    }
+    UINT rtv_count = ui_draw_command_rtv_count(c);
+    for (int i = 0; i < c.uav_count; i++) {
+        if (c.uav_slots[i] >= MAX_UAV_SLOTS)
+            return true;
+        Resource* ur = res_get(c.uav_handles[i]);
+        if (!ur || !ur->uav)
+            return true;
+        if (c.uav_slots[i] < rtv_count)
+            return true;
+    }
+    return false;
+}
+
 static bool ui_command_has_warning(const Command& c) {
     if (!c.enabled) return false;
 
@@ -1217,27 +1701,7 @@ static bool ui_command_has_warning(const Command& c) {
 
     case CMD_DRAW_MESH:
     case CMD_DRAW_INSTANCED: {
-        Resource* mesh = res_get(c.mesh);
-        Resource* shader = res_get(c.shader);
-        if (!mesh || !mesh->vb || !shader || !shader->vs || !shader->ps) return true;
-        if (mesh->using_fallback || !shader->compiled_ok) return true;
-        int extra_count = c.mrt_count;
-        if (extra_count < 0 || extra_count > MAX_DRAW_RENDER_TARGETS - 1) return true;
-        for (int i = 0; i < extra_count; i++) {
-            if (!res_get(c.mrt_handles[i]) || !ui_has_draw_rtv(c.mrt_handles[i]))
-                return true;
-        }
-        UINT rtv_count = ui_draw_command_rtv_count(c);
-        for (int i = 0; i < c.uav_count; i++) {
-            if (c.uav_slots[i] >= MAX_UAV_SLOTS)
-                return true;
-            Resource* ur = res_get(c.uav_handles[i]);
-            if (!ur || !ur->uav)
-                return true;
-            if (c.uav_slots[i] < rtv_count)
-                return true;
-        }
-        return false;
+        return ui_draw_command_has_common_warning(c, false);
     }
 
     case CMD_DISPATCH: {
@@ -1247,33 +1711,29 @@ static bool ui_command_has_warning(const Command& c) {
     }
 
     case CMD_INDIRECT_DRAW: {
-        Resource* ibuf = res_get(c.indirect_buf);
-        Resource* mesh = res_get(c.mesh);
-        Resource* shader = res_get(c.shader);
-        if (!ibuf || !ibuf->buf || !mesh || !mesh->vb || !shader || !shader->vs || !shader->ps) return true;
-        if (mesh->using_fallback || !shader->compiled_ok) return true;
-        return false;
+        return ui_draw_command_has_common_warning(c, true);
     }
 
     case CMD_INDIRECT_DISPATCH: {
         Resource* ibuf = res_get(c.indirect_buf);
         Resource* shader = res_get(c.shader);
-        if (!ibuf || !ibuf->buf || !shader || !shader->cs || !shader->compiled_ok) return true;
+        if (!shader || !shader->cs || !shader->compiled_ok) return true;
+        if (!ui_indirect_args_buffer_has_range(ibuf, c.indirect_offset,
+                                               ui_indirect_dispatch_args_required_bytes())) return true;
         return false;
     }
 
     case CMD_REPEAT: {
         if (c.repeat_count < 1) return true;
         CmdHandle h = (CmdHandle)(&c - g_commands + 1);
-        bool has_compute_child = false;
+        bool has_child = false;
         for (int i = 0; i < MAX_COMMANDS; i++) {
             Command& child = g_commands[i];
             if (!child.active || child.parent != h) continue;
-            if (child.type != CMD_DISPATCH && child.type != CMD_INDIRECT_DISPATCH) continue;
-            has_compute_child = true;
+            has_child = true;
             if (ui_command_has_warning(child)) return true;
         }
-        return !has_compute_child;
+        return !has_child;
     }
 
     case CMD_GROUP: {
@@ -1579,7 +2039,7 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
             mp.x >= item_min.x + indent && mp.x <= item_min.x + indent + 24.0f)
             c.repeat_expanded = !c.repeat_expanded;
         if (selected && s_viewport_gizmo_mode != UI_GIZMO_NONE &&
-            (c.type == CMD_DRAW_MESH || c.type == CMD_DRAW_INSTANCED)) {
+            ui_command_supports_gizmo_type(c.type)) {
             s_viewport_gizmo_mode = UI_GIZMO_NONE;
             memset(&s_viewport_gizmo_drag, 0, sizeof(s_viewport_gizmo_drag));
         }
@@ -1825,7 +2285,7 @@ static void ui_panel_resources(bool embedded = false) {
 
     static char s_sb_name[MAX_NAME] = {};
     static int s_sb_stride = 16, s_sb_count = 64;
-    static bool s_sb_srv = true, s_sb_uav = true;
+    static bool s_sb_srv = true, s_sb_uav = true, s_sb_indirect_args = false;
     static bool s_open_sb_create = false;
     static bool s_user_scope_active = true;
 
@@ -1887,7 +2347,7 @@ static void ui_panel_resources(bool embedded = false) {
                 strncpy(s_sb_name, uname, MAX_NAME - 1);
                 s_sb_name[MAX_NAME - 1] = '\0';
                 s_sb_stride = 16; s_sb_count = 64;
-                s_sb_srv = true; s_sb_uav = true;
+                s_sb_srv = true; s_sb_uav = true; s_sb_indirect_args = false;
                 s_open_sb_create = true;
             }
             ImGui::Separator();
@@ -1916,6 +2376,11 @@ static void ui_panel_resources(bool embedded = false) {
                 if (ImGui::MenuItem("Cube")) {
                     res_make_unique_name("cube_0", uname, MAX_NAME);
                     g_sel_res = res_create_mesh_primitive(uname, MESH_PRIM_CUBE);
+                    g_sel_cmd = INVALID_HANDLE;
+                }
+                if (ImGui::MenuItem("Quad")) {
+                    res_make_unique_name("quad_0", uname, MAX_NAME);
+                    g_sel_res = res_create_mesh_primitive(uname, MESH_PRIM_QUAD);
                     g_sel_cmd = INVALID_HANDLE;
                 }
                 if (ImGui::MenuItem("Tetrahedron")) {
@@ -2057,18 +2522,24 @@ static void ui_panel_resources(bool embedded = false) {
         ImGui::InputText("Name", s_sb_name, MAX_NAME);
         ImGui::InputInt("Stride bytes", &s_sb_stride);
         ImGui::InputInt("Elements", &s_sb_count);
+        if (s_sb_indirect_args) s_sb_stride = 4;
         if (s_sb_stride < 1) s_sb_stride = 1;
         if (s_sb_count < 1) s_sb_count = 1;
         ImGui::TextDisabled("Total: %d bytes", s_sb_stride * s_sb_count);
         ImGui::Checkbox("SRV", &s_sb_srv);
         ImGui::SameLine();
         ImGui::Checkbox("UAV", &s_sb_uav);
+        ImGui::Checkbox("Indirect Args", &s_sb_indirect_args);
+        if (s_sb_indirect_args)
+            ImGui::TextDisabled("Indirect args are DWORD arrays. Stride is forced to 4 bytes.");
+        else
+            ImGui::TextDisabled("Enable only for DrawIndirect / DispatchIndirect argument buffers.");
 
         if (ImGui::Button("Create")) {
             char uname[MAX_NAME] = {};
             res_make_unique_name(s_sb_name[0] ? s_sb_name : "sb_0", uname, MAX_NAME);
             g_sel_res = res_create_structured_buffer(uname, s_sb_stride, s_sb_count,
-                                                     s_sb_srv, s_sb_uav);
+                                                     s_sb_srv, s_sb_uav, s_sb_indirect_args);
             g_sel_cmd = INVALID_HANDLE;
             ImGui::CloseCurrentPopup();
         }
@@ -2493,10 +2964,12 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         static int s_w = 1, s_h = 1, s_d = 1;
         static DXGI_FORMAT s_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
         static bool s_rtv = false, s_srv = false, s_uav = false;
+        static int s_preview_slice = 0;
         if (s_edit_rt3 != h) {
             s_edit_rt3 = h;
             s_w = r->width; s_h = r->height; s_d = r->depth; s_fmt = r->tex_fmt;
             s_rtv = r->has_rtv; s_srv = r->has_srv; s_uav = r->has_uav;
+            s_preview_slice = 0;
         }
 
         ImGui::InputInt("Width", &s_w);
@@ -2534,7 +3007,28 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         ImGui::Text("Current: %dx%dx%d, %s", r->width, r->height, r->depth, ui_rt_format_name(r->tex_fmt));
         ImGui::Text("RTV:%s SRV:%s UAV:%s",
             r->has_rtv?"Y":"N", r->has_srv?"Y":"N", r->has_uav?"Y":"N");
-        ImGui::TextDisabled("3D texture preview is not available yet.");
+        if (!r->srv) {
+            ImGui::TextDisabled("Preview requires SRV enabled.");
+            break;
+        }
+        if (!ui_rt3d_preview_supported_format(r->tex_fmt)) {
+            ImGui::TextDisabled("Preview is not available for this format yet.");
+            break;
+        }
+        if (s_preview_slice >= r->depth) s_preview_slice = r->depth - 1;
+        if (s_preview_slice < 0) s_preview_slice = 0;
+        if (r->depth > 1) {
+            ImGui::SliderInt("Slice", &s_preview_slice, 0, r->depth - 1);
+        } else {
+            ImGui::BeginDisabled();
+            int slice = 0;
+            ImGui::SliderInt("Slice", &slice, 0, 0);
+            ImGui::EndDisabled();
+        }
+        if (ID3D11ShaderResourceView* preview_srv = ui_render_texture3d_preview_slice(r, s_preview_slice))
+            ui_image_fit_panel(preview_srv, r->width, r->height);
+        else
+            ImGui::TextDisabled("3D texture preview is unavailable.");
         break;
     }
 
@@ -2569,31 +3063,37 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
     case RES_STRUCTURED_BUFFER: {
         static ResHandle s_edit_sb = INVALID_HANDLE;
         static int s_stride = 16, s_count = 1;
-        static bool s_srv = true, s_uav = true;
+        static bool s_srv = true, s_uav = true, s_indirect_args = false;
         if (s_edit_sb != h) {
             s_edit_sb = h;
             s_stride = r->elem_size;
             s_count = r->elem_count;
             s_srv = r->has_srv;
             s_uav = r->has_uav;
+            s_indirect_args = r->indirect_args;
         }
 
         ImGui::InputInt("Stride bytes", &s_stride);
         ImGui::InputInt("Elements", &s_count);
+        if (s_indirect_args) s_stride = 4;
         if (s_stride < 1) s_stride = 1;
         if (s_count < 1) s_count = 1;
         ImGui::TextDisabled("Total: %d bytes", s_stride * s_count);
         ImGui::Checkbox("SRV", &s_srv);
         ImGui::SameLine();
         ImGui::Checkbox("UAV", &s_uav);
+        ImGui::Checkbox("Indirect Args", &s_indirect_args);
+        if (s_indirect_args)
+            ImGui::TextDisabled("Indirect args use typed uint views for D3D11 compatibility.");
         if (ImGui::Button("Recreate")) {
-            if (res_recreate_structured_buffer(h, s_stride, s_count, s_srv, s_uav))
+            if (res_recreate_structured_buffer(h, s_stride, s_count, s_srv, s_uav, s_indirect_args))
                 log_info("StructuredBuffer recreated: %s (%d x %d bytes)", r->name, s_count, s_stride);
         }
 
         ImGui::Text("Current: %d x %d bytes = %d bytes",
             r->elem_count, r->elem_size, r->elem_count * r->elem_size);
-        ImGui::Text("SRV:%s UAV:%s", r->has_srv?"Y":"N", r->has_uav?"Y":"N");
+        ImGui::Text("SRV:%s UAV:%s IndirectArgs:%s",
+            r->has_srv?"Y":"N", r->has_uav?"Y":"N", r->indirect_args?"Y":"N");
         break;
     }
 
@@ -2670,6 +3170,12 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             mesh_path[0] = '\0';
         }
         ImGui::SameLine();
+        if (ImGui::Button("Use Quad")) {
+            res_set_mesh_primitive(r, MESH_PRIM_QUAD);
+            r->path[0] = '\0';
+            mesh_path[0] = '\0';
+        }
+        ImGui::SameLine();
         if (ImGui::Button("Use Tetrahedron")) {
             res_set_mesh_primitive(r, MESH_PRIM_TETRAHEDRON);
             r->path[0] = '\0';
@@ -2681,7 +3187,6 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             r->path[0] = '\0';
             mesh_path[0] = '\0';
         }
-        ImGui::SameLine();
         if (ImGui::Button("Use Fullscreen Triangle")) {
             res_set_mesh_primitive(r, MESH_PRIM_FULLSCREEN_TRIANGLE);
             r->path[0] = '\0';
@@ -2750,8 +3255,12 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
                 const ShaderCBVar& v = r->shader_cb.vars[i];
                 ImGui::TextDisabled("%s %s @ %u", res_type_str(v.type), v.name, v.offset);
             }
+            if (r->object_cb_active)
+                ImGui::TextDisabled("ObjectCB slot: b%u", r->object_cb_bind_slot);
         } else {
-            ImGui::TextDisabled("No command cbuffer reflected at register(b1).");
+            ImGui::TextDisabled("No UserCB cbuffer reflected. Recommended: register(b2).");
+            if (r->object_cb_active)
+                ImGui::TextDisabled("ObjectCB slot: b%u", r->object_cb_bind_slot);
         }
         break;
     }
@@ -3018,9 +3527,19 @@ static void ui_inspector_command(Command* c) {
 
     case CMD_DRAW_MESH:
     case CMD_DRAW_INSTANCED: {
-        ui_inspector_section("MESH & SHADER");
-        res_combo("Mesh##dm",          &c->mesh,   RES_MESH,   false);
-        res_combo("Shader##dm",        &c->shader, RES_SHADER, false);
+        ui_inspector_section("DRAW SOURCE & SHADER");
+        bool source_changed = ui_draw_source_combo("Source##dm", &c->draw_source);
+        if (source_changed && c->draw_source == DRAW_SOURCE_PROCEDURAL && c->vertex_count < 1)
+            c->vertex_count = 3;
+        if (ui_command_uses_procedural_draw(*c)) {
+            ui_draw_topology_combo("Topology##dm", &c->draw_topology);
+            ImGui::InputInt("Vertex Count", &c->vertex_count);
+            if (c->vertex_count < 0) c->vertex_count = 0;
+            ImGui::TextDisabled("No mesh is bound. The VS should use SV_VertexID / VS SRVs.");
+        } else {
+            res_combo("Mesh##dm", &c->mesh, RES_MESH, false);
+        }
+        res_combo("Shader##dm", &c->shader, RES_SHADER, false);
 
         ui_inspector_section("SHADER PARAMETERS");
         ui_command_shader_params(c, res_get(c->shader));
@@ -3176,11 +3695,132 @@ static void ui_inspector_command(Command* c) {
         break;
     }
 
-    case CMD_INDIRECT_DRAW:
+    case CMD_INDIRECT_DRAW: {
+        ui_inspector_section("INDIRECT COMMAND");
+        bool source_changed = ui_draw_source_combo("Source##id", &c->draw_source);
+        if (source_changed && c->draw_source == DRAW_SOURCE_PROCEDURAL)
+            c->draw_topology = DRAW_TOPOLOGY_TRIANGLE_LIST;
+        Resource* mesh = res_get(c->mesh);
+        if (ui_command_uses_procedural_draw(*c)) {
+            ui_draw_topology_combo("Topology##id", &c->draw_topology);
+            ImGui::TextDisabled("Uses DrawInstancedIndirect args.");
+        } else {
+            res_combo("Mesh##id", &c->mesh, RES_MESH, false);
+            ImGui::TextDisabled("%s",
+                (mesh && mesh->ib) ? "Uses DrawIndexedInstancedIndirect args."
+                                   : "Uses DrawInstancedIndirect args.");
+        }
+        res_combo("Shader##id", &c->shader, RES_SHADER, false);
+        ui_inspector_section("SHADER PARAMETERS");
+        ui_command_shader_params(c, res_get(c->shader));
+        ui_inspector_section("TARGETS");
+        res_combo_render_target("Render Target##id", &c->rt);
+        res_combo_depth_target("Depth Buffer##id", &c->depth);
+        ImGui::Text("Additional MRTs (%d / %d):", c->mrt_count, MAX_DRAW_RENDER_TARGETS - 1);
+        for (int rt_i = 0; rt_i < c->mrt_count; rt_i++) {
+            ImGui::PushID(800 + rt_i);
+            char lbl[32]; snprintf(lbl, sizeof(lbl), "RT%d##id_mrt", rt_i + 1);
+            res_combo_render_target(lbl, &c->mrt_handles[rt_i]);
+            ImGui::PopID();
+        }
+        if (c->mrt_count < MAX_DRAW_RENDER_TARGETS - 1 && ImGui::SmallButton("+##id_mrt")) c->mrt_count++;
+        if (c->mrt_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##id_mrt")) c->mrt_count--; }
+
+        ui_inspector_section("RENDER STATE");
+        ImGui::Checkbox("Color Write", &c->color_write);
+        ImGui::SameLine(170.0f);
+        ImGui::Checkbox("Alpha Blend", &c->alpha_blend);
+        ImGui::Checkbox("Depth Test", &c->depth_test);
+        ImGui::SameLine(170.0f);
+        ImGui::Checkbox("Backface Cull", &c->cull_back);
+        if (!c->depth_test) ImGui::BeginDisabled();
+        ImGui::Checkbox("Depth Write", &c->depth_write);
+        if (!c->depth_test) ImGui::EndDisabled();
+        ImGui::SameLine(170.0f);
+        ImGui::Checkbox("Shadow Caster", &c->shadow_cast);
+        ImGui::Checkbox("Shadow Receiver", &c->shadow_receive);
+        if (c->shadow_cast)
+            res_combo("Shadow Shader##id", &c->shadow_shader, RES_SHADER);
+
+        ui_inspector_section("TRANSFORM");
+        ui_tinted_transform_row(
+            "Position", c->pos, 0.001f,
+            ImVec4(0.150f, 0.055f, 0.050f, 0.3f),
+            ImVec4(0.230f, 0.080f, 0.070f, 0.5f)
+        );
+        ui_tinted_transform_row(
+            "Rotation", c->rot, 0.01f,
+            ImVec4(0.055f, 0.130f, 0.070f, 0.3f),
+            ImVec4(0.080f, 0.200f, 0.105f, 0.5f)
+        );
+        ui_tinted_transform_row(
+            "Scale", c->scale, 0.001f,
+            ImVec4(0.050f, 0.075f, 0.150f, 0.3f),
+            ImVec4(0.070f, 0.105f, 0.230f, 0.5f)
+        );
+
+        ui_inspector_section("TEXTURE BINDINGS");
+        ImGui::TextDisabled("Reserved PS t# slots:");
+        ImGui::TextDisabled("t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion");
+        ImGui::TextDisabled("t5 env map, t7 shadow map. Manual bindings override mesh materials on the same slot.");
+        if (ImGui::TreeNodeEx("Slot Reference##indirect_draw_slots", ImGuiTreeNodeFlags_None)) {
+            ui_draw_texture_slot_reference("##indirect_draw_slot_reference");
+            ImGui::TreePop();
+        }
+        ImGui::Text("Texture Slots (%d / %d):", c->tex_count, MAX_TEX_SLOTS);
+        for (int t = 0; t < c->tex_count; t++) {
+            ImGui::PushID(900 + t);
+            char lbl[32]; snprintf(lbl, sizeof(lbl), "t%d tex", (int)c->tex_slots[t]);
+            res_combo(lbl, &c->tex_handles[t], RES_NONE);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(48.f);
+            ImGui::InputScalar("##idslot", ImGuiDataType_U32, &c->tex_slots[t]);
+            ImGui::PopID();
+        }
+        if (c->tex_count < MAX_TEX_SLOTS && ImGui::SmallButton("+##id_t")) c->tex_count++;
+        if (c->tex_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##id_t")) c->tex_count--; }
+
+        ImGui::Spacing();
+        ImGui::Text("SRV Slots (%d / %d):", c->srv_count, MAX_SRV_SLOTS);
+        for (int s = 0; s < c->srv_count; s++) {
+            ImGui::PushID(1000 + s);
+            char lbl[32]; snprintf(lbl, sizeof(lbl), "s%d srv", (int)c->srv_slots[s]);
+            res_combo(lbl, &c->srv_handles[s], RES_NONE);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(48.f);
+            ImGui::InputScalar("##idsslot", ImGuiDataType_U32, &c->srv_slots[s]);
+            ImGui::PopID();
+        }
+        if (c->srv_count < MAX_SRV_SLOTS && ImGui::SmallButton("+##id_s")) c->srv_count++;
+        if (c->srv_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##id_s")) c->srv_count--; }
+
+        ui_inspector_section("PIXEL UAV OUTPUTS");
+        UINT draw_rtv_count = ui_draw_command_rtv_count(*c);
+        ImGui::TextDisabled("DX11 output slots are shared by RTVs and PS UAVs.");
+        ImGui::TextDisabled("With %u RTV%s active, the first valid UAV slot is u%u.",
+            draw_rtv_count, draw_rtv_count == 1 ? "" : "s", draw_rtv_count);
+        ImGui::Text("UAV Slots (%d / %d):", c->uav_count, MAX_UAV_SLOTS);
+        for (int u = 0; u < c->uav_count; u++) {
+            ImGui::PushID(1100 + u);
+            char lbl[32]; snprintf(lbl, sizeof(lbl), "u%d uav", (int)c->uav_slots[u]);
+            res_combo(lbl, &c->uav_handles[u], RES_NONE);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(48.f);
+            ImGui::InputScalar("##idpuavslot", ImGuiDataType_U32, &c->uav_slots[u]);
+            ImGui::PopID();
+        }
+        if (c->uav_count < MAX_UAV_SLOTS && ImGui::SmallButton("+##id_u")) c->uav_count++;
+        if (c->uav_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##id_u")) c->uav_count--; }
+
+        ui_inspector_section("INDIRECT BUFFER");
+        res_combo("Indirect Buffer##id", &c->indirect_buf, RES_STRUCTURED_BUFFER, false);
+        ImGui::InputScalar("Byte Offset", ImGuiDataType_U32, &c->indirect_offset);
+        break;
+    }
+
     case CMD_INDIRECT_DISPATCH: {
         ui_inspector_section("INDIRECT COMMAND");
-        res_combo("Mesh##id",            &c->mesh,         RES_MESH,              false);
-        res_combo("Shader##id",          &c->shader,       RES_SHADER,            false);
+        res_combo("Shader##id", &c->shader, RES_SHADER, false);
         ui_inspector_section("SHADER PARAMETERS");
         ui_command_shader_params(c, res_get(c->shader));
         ui_inspector_section("INDIRECT BUFFER");
@@ -3266,7 +3906,10 @@ static void ui_panel_bindings(bool embedded = false) {
             case CMD_DRAW_MESH:
             case CMD_DRAW_INSTANCED:
                 ui_inspector_section("PIPELINE");
-                ui_binding_row("Mesh", "IA", -1, c->mesh);
+                if (ui_command_uses_procedural_draw(*c))
+                    ImGui::TextDisabled("Source: Procedural (%s)", ui_draw_topology_name(c->draw_topology));
+                else
+                    ui_binding_row("Mesh", "IA", -1, c->mesh);
                 ui_binding_row("Shader", "VS/PS", -1, c->shader);
                 if (c->shadow_cast)
                     ui_binding_row("Shadow Shader", "VS", -1, c->shadow_shader);
@@ -3301,8 +3944,29 @@ static void ui_panel_bindings(bool embedded = false) {
                 break;
             case CMD_INDIRECT_DRAW:
                 ui_inspector_section("PIPELINE");
-                ui_binding_row("Mesh", "IA", -1, c->mesh);
+                if (ui_command_uses_procedural_draw(*c))
+                    ImGui::TextDisabled("Source: Procedural (%s)", ui_draw_topology_name(c->draw_topology));
+                else
+                    ui_binding_row("Mesh", "IA", -1, c->mesh);
                 ui_binding_row("Shader", "VS/PS", -1, c->shader);
+                if (c->shadow_cast)
+                    ui_binding_row("Shadow Shader", "VS", -1, c->shadow_shader);
+                ui_inspector_section("OUTPUTS");
+                ui_binding_row("Render Target 0", "OM", 0, c->rt);
+                for (int i = 0; i < c->mrt_count; i++) {
+                    char role[32];
+                    snprintf(role, sizeof(role), "Render Target %d", i + 1);
+                    ui_binding_row(role, "OM", i + 1, c->mrt_handles[i]);
+                }
+                ui_binding_row("Depth Buffer", "OM", -1, c->depth);
+                for (int i = 0; i < c->uav_count; i++)
+                    ui_binding_row("UAV", "OM/PS", (int)c->uav_slots[i], c->uav_handles[i]);
+                if (c->tex_count > 0 || c->srv_count > 0)
+                    ui_inspector_section("SHADER RESOURCES");
+                for (int i = 0; i < c->tex_count; i++)
+                    ui_binding_row("Texture", "PS", (int)c->tex_slots[i], c->tex_handles[i]);
+                for (int i = 0; i < c->srv_count; i++)
+                    ui_binding_row("SRV", "VS", (int)c->srv_slots[i], c->srv_handles[i]);
                 ui_inspector_section("ARGUMENTS");
                 ui_binding_row("Indirect Buffer", "ARG", -1, c->indirect_buf);
                 break;
@@ -3384,8 +4048,14 @@ static void ui_panel_selection_state(bool embedded = false) {
             ImGui::Text("Enabled: %s", c->enabled ? "yes" : "no");
             ImGui::Text("Warning: %s", ui_command_has_warning(*c) ? "yes" : "no");
             ImGui::Text("Type: %s", cmd_type_str(c->type));
-            if (c->type == CMD_DRAW_MESH || c->type == CMD_DRAW_INSTANCED) {
+            if (c->type == CMD_DRAW_MESH || c->type == CMD_DRAW_INSTANCED || c->type == CMD_INDIRECT_DRAW) {
                 ui_inspector_section("DRAW STATE");
+                ImGui::Text("Source: %s", ui_draw_source_name(c->draw_source));
+                if (ui_command_uses_procedural_draw(*c)) {
+                    ImGui::Text("Topology: %s", ui_draw_topology_name(c->draw_topology));
+                    if (c->type != CMD_INDIRECT_DRAW)
+                        ImGui::Text("Vertex Count: %d", c->vertex_count);
+                }
                 ImGui::Text("Color Write: %s", c->color_write ? "yes" : "no");
                 ImGui::Text("Depth Test: %s", c->depth_test ? "yes" : "no");
                 ImGui::Text("Depth Write: %s", c->depth_write ? "yes" : "no");
@@ -3435,9 +4105,9 @@ static void ui_panel_selection_state(bool embedded = false) {
 }
 
 static void ui_panel_user_cb() {
-    ImGui::Begin("User CB (b1)");
+    ImGui::Begin("User CB (b2)");
 
-    ImGui::TextDisabled("Slot = 16 bytes (float4). Use register(b1) in HLSL.");
+    ImGui::TextDisabled("Slot = 16 bytes (float4). Recommended: cbuffer UserCB : register(b2).");
     ImGui::Separator();
 
     if (ImGui::BeginTable("ucb", 6,
@@ -3554,7 +4224,7 @@ static void ui_panel_user_cb() {
     ImGui::Separator();
     ImGui::TextDisabled("HLSL snippet");
     if (ImGui::BeginChild("ucb_hlsl", {0, 140}, true)) {
-        ImGui::TextDisabled("cbuffer UserCB : register(b1)");
+        ImGui::TextDisabled("cbuffer UserCB : register(b2)");
         ImGui::TextDisabled("{");
         for (int i = 0; i < g_user_cb_count; i++) {
             UserCBEntry& e = g_user_cb_entries[i];
@@ -3596,6 +4266,38 @@ static void ui_panel_general(bool embedded = false) {
         settings_dirty |= ImGui::Checkbox("VSync", &g_dx.vsync);
         ImGui::SameLine();
         ImGui::TextDisabled("%s", g_dx.vsync ? "Present interval 1" : "Present immediate");
+    }
+
+    if (ImGui::CollapsingHeader("Viewport", ImGuiTreeNodeFlags_DefaultOpen)) {
+        settings_dirty |= ImGui::Checkbox("Show Grid", &g_dx.scene_grid_enabled);
+        settings_dirty |= ImGui::ColorEdit4("Grid Color", g_dx.scene_grid_color,
+            ImGuiColorEditFlags_Float | ImGuiColorEditFlags_AlphaBar);
+        ImGui::TextDisabled("Infinite grid overlay on y=0. Alpha controls overall intensity.");
+    }
+
+    if (ImGui::CollapsingHeader("Diagnostics", ImGuiTreeNodeFlags_DefaultOpen)) {
+        settings_dirty |= ImGui::Checkbox("D3D11 Runtime Validation", &g_dx.d3d11_validation);
+        if (g_dx.d3d11_validation_active) {
+            ImGui::TextDisabled("Debug layer active in this session. Adds overhead.");
+        } else if (g_dx.d3d11_validation) {
+            if (!g_dx.d3d11_validation_supported)
+                ImGui::TextDisabled("Requested, but the D3D11 debug layer is unavailable on this system.");
+            else
+                ImGui::TextDisabled("Takes effect on next launch.");
+        } else {
+            ImGui::TextDisabled("Disabled. Enable and restart to capture D3D11 runtime warnings.");
+        }
+
+        settings_dirty |= ImGui::Checkbox("Shader Binding Warnings", &g_dx.shader_validation_warnings);
+        ImGui::TextDisabled("Warn once when a shader expects SRV/UAV bindings that a command does not provide.");
+
+        bool can_flush_d3d11 = g_dx.d3d11_validation_active && g_dx.info_queue;
+        if (!can_flush_d3d11)
+            ImGui::BeginDisabled();
+        if (ImGui::Button("Flush D3D11 Messages"))
+            dx_debug_log_messages();
+        if (!can_flush_d3d11)
+            ImGui::EndDisabled();
     }
 
     if (ImGui::CollapsingHeader("Profiler", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -3692,7 +4394,7 @@ static void ui_panel_log(bool embedded = false) {
 
 static bool ui_selected_command_supports_gizmo() {
     Command* c = cmd_get(g_sel_cmd);
-    return c && (c->type == CMD_DRAW_MESH || c->type == CMD_DRAW_INSTANCED);
+    return c && ui_command_supports_gizmo_type(c->type);
 }
 
 static Command* ui_selected_gizmo_command() {
@@ -4304,6 +5006,7 @@ enum UiIconKind {
     UI_ICON_GIZMO_ROTATE,
     UI_ICON_GIZMO_SCALE,
     UI_ICON_WIREFRAME,
+    UI_ICON_GRID,
     UI_ICON_FULLSCREEN,
     UI_ICON_FULLSCREEN_EXIT,
     UI_ICON_MAXIMIZE_SQUARE,
@@ -4321,6 +5024,7 @@ static const char* ui_svg_icon_path(UiIconKind icon) {
     case UI_ICON_GIZMO_ROTATE:     return "assets/icons/lucide-rotate-3d.svg";
     case UI_ICON_GIZMO_SCALE:      return "assets/icons/lucide-scale-3d.svg";
     case UI_ICON_WIREFRAME:        return "assets/icons/lucide-box.svg";
+    case UI_ICON_GRID:             return "assets/icons/lucide-grid-3x3.svg";
     case UI_ICON_FULLSCREEN:       return "assets/icons/lucide-maximize.svg";
     case UI_ICON_FULLSCREEN_EXIT:  return "assets/icons/lucide-minimize.svg";
     case UI_ICON_MAXIMIZE_SQUARE:  return "assets/icons/lucide-square.svg";
@@ -4345,6 +5049,7 @@ static NSVGimage* ui_svg_icon(UiIconKind icon) {
         { UI_ICON_GIZMO_ROTATE, nullptr, false },
         { UI_ICON_GIZMO_SCALE, nullptr, false },
         { UI_ICON_WIREFRAME, nullptr, false },
+        { UI_ICON_GRID, nullptr, false },
         { UI_ICON_FULLSCREEN, nullptr, false },
         { UI_ICON_FULLSCREEN_EXIT, nullptr, false },
         { UI_ICON_MAXIMIZE_SQUARE, nullptr, false },
@@ -4468,6 +5173,10 @@ static UiIconKind ui_icon_for_action(const char* action, const char** tooltip) {
         if (tooltip) *tooltip = g_dx.scene_wireframe ? "Disable wireframe" : "Enable wireframe";
         return UI_ICON_WIREFRAME;
     }
+    if (strncmp(action, "Grid", 4) == 0) {
+        if (tooltip) *tooltip = g_dx.scene_grid_enabled ? "Hide grid" : "Show grid";
+        return UI_ICON_GRID;
+    }
     if (strncmp(action, "Pause", 5) == 0) {
         if (tooltip) *tooltip = "Pause scene";
         return UI_ICON_PAUSE;
@@ -4523,6 +5232,7 @@ static bool ui_header_action_button(const char* action) {
         UiViewportGizmoMode gizmo_mode = ui_gizmo_mode_for_action(action);
         bool gizmo_active = gizmo_mode != UI_GIZMO_NONE && s_viewport_gizmo_mode == gizmo_mode;
         bool wireframe_active = strncmp(action, "Wireframe", 9) == 0 && g_dx.scene_wireframe;
+        bool grid_active = strncmp(action, "Grid", 4) == 0 && g_dx.scene_grid_enabled;
         if (warm) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.34f, 0.20f, 0.10f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.44f, 0.26f, 0.13f, 1.0f));
@@ -4531,14 +5241,14 @@ static bool ui_header_action_button(const char* action) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.11f, 0.12f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.40f, 0.14f, 0.15f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.48f, 0.18f, 0.18f, 1.0f));
-        } else if (gizmo_active || wireframe_active) {
+        } else if (gizmo_active || wireframe_active || grid_active) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.33f, 0.18f, 0.10f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.24f, 0.12f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.58f, 0.30f, 0.14f, 1.0f));
         }
         float icon_size = ui_px(22.0f);
         bool clicked = ui_icon_button(action, icon, ImVec2(icon_size, icon_size), tooltip);
-        if (warm || danger || gizmo_active || wireframe_active)
+        if (warm || danger || gizmo_active || wireframe_active || grid_active)
             ImGui::PopStyleColor(3);
         if (clicked && gizmo_mode != UI_GIZMO_NONE) {
             ui_set_viewport_gizmo_mode(gizmo_mode);
@@ -4546,6 +5256,11 @@ static bool ui_header_action_button(const char* action) {
         }
         if (clicked && strncmp(action, "Wireframe", 9) == 0) {
             g_dx.scene_wireframe = !g_dx.scene_wireframe;
+            return true;
+        }
+        if (clicked && strncmp(action, "Grid", 4) == 0) {
+            g_dx.scene_grid_enabled = !g_dx.scene_grid_enabled;
+            app_settings_save();
             return true;
         }
         return clicked;
@@ -4799,14 +5514,7 @@ static void ui_viewport_detail(char* out, int out_sz) {
 }
 
 static void ui_reset_camera_view() {
-    g_camera.position[0] = 1.838f;
-    g_camera.position[1] = 1.182f;
-    g_camera.position[2] = 3.354f;
-    g_camera.yaw = 3.6415927f;
-    g_camera.pitch = -0.3f;
-    g_camera.fov_y = 1.047f;
-    g_camera.near_z = 0.001f;
-    g_camera.far_z = 100.0f;
+    project_reset_camera_defaults();
 }
 
 static void ui_draw_window_controls(float host_h) {
@@ -5171,8 +5879,8 @@ static void ui_workspace_layout() {
                                 "GizmoMove##viewport_gizmo_move_full", nullptr,
                                 "GizmoRotate##viewport_gizmo_rotate_full", nullptr,
                                 "GizmoScale##viewport_gizmo_scale_full", nullptr,
-                                "Separator##viewport_group_split_full", nullptr,
                                 "Wireframe##viewport_wireframe_full", nullptr,
+                                "Grid##viewport_grid_full", nullptr,
                                 "Restart##viewport_restart_full", &restart_clicked,
                                 app_scene_paused() ? "Resume##viewport_resume_full" : "Pause##viewport_pause_full", &pause_clicked,
                                 "Exit fullscreen##viewport_fullscreen_exit", &exit_clicked)) {
@@ -5231,8 +5939,8 @@ static void ui_workspace_layout() {
                             "GizmoMove##viewport_gizmo_move", nullptr,
                             "GizmoRotate##viewport_gizmo_rotate", nullptr,
                             "GizmoScale##viewport_gizmo_scale", nullptr,
-                            "Separator##viewport_group_split", nullptr,
                             "Wireframe##viewport_wireframe", nullptr,
+                            "Grid##viewport_grid", nullptr,
                             "Restart##viewport_restart", &restart_clicked,
                             app_scene_paused() ? "Resume##viewport_resume" : "Pause##viewport_pause", &pause_clicked,
                             "Fullscreen##viewport_fullscreen", &fullscreen_clicked)) {
@@ -5366,6 +6074,7 @@ void ui_init() {
 
     ImGui_ImplWin32_Init(g_dx.hwnd);
     ImGui_ImplDX11_Init(g_dx.dev, g_dx.ctx);
+    ui_init_rt3d_preview_pipeline();
 }
 
 // Draw one full editor frame on top of the already-rendered scene texture.
@@ -5432,6 +6141,7 @@ void ui_draw() {
 }
 
 void ui_shutdown() {
+    ui_release_rt3d_preview_pipeline();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

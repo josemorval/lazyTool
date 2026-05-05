@@ -360,14 +360,7 @@ uint64_t app_scene_frame() {
     return g_frame;
 }
 
-Camera g_camera = {
-    /* position */ { 1.838f, 1.182f, 3.354f },
-    /* yaw      */ 3.6415927f,
-    /* pitch    */ -0.3f,
-    /* fov_y     */ 1.047f,   // ~60 deg
-    /* near_z    */ 0.001f,
-    /* far_z     */ 100.f
-};
+Camera g_camera = {};
 
 // Camera controls
 
@@ -762,14 +755,23 @@ static void update_builtins_and_scene_cb() {
     cb.cam_dir[1] = cam_dir.y;
     cb.cam_dir[2] = cam_dir.z;
 
+    Resource default_dl = {};
+    project_apply_default_dirlight(&default_dl);
     Resource* dl = res_get(g_builtin_dirlight);
-    Vec3 light_dir = v3(-0.577f, -0.577f, -0.577f);
-    Vec3 light_pos = v3(-0.8f, 1.2f, -0.8f);
-    Vec3 light_target = v3(0.0f, 0.0f, 0.0f);
-    float shadow_w = 2.2f;
-    float shadow_h = 2.2f;
-    float shadow_near = 0.01f;
-    float shadow_far = 4.0f;
+    Vec3 light_dir = v3(default_dl.light_dir[0], default_dl.light_dir[1], default_dl.light_dir[2]);
+    Vec3 light_pos = v3(default_dl.light_pos[0], default_dl.light_pos[1], default_dl.light_pos[2]);
+    Vec3 light_target = v3(default_dl.light_target[0], default_dl.light_target[1], default_dl.light_target[2]);
+    float shadow_w = default_dl.shadow_extent[0];
+    float shadow_h = default_dl.shadow_extent[1];
+    float shadow_near = default_dl.shadow_near;
+    float shadow_far = default_dl.shadow_far;
+    cb.light_dir[0] = default_dl.light_dir[0];
+    cb.light_dir[1] = default_dl.light_dir[1];
+    cb.light_dir[2] = default_dl.light_dir[2];
+    cb.light_dir[3] = default_dl.light_intensity;
+    cb.light_color[0] = default_dl.light_color[0];
+    cb.light_color[1] = default_dl.light_color[1];
+    cb.light_color[2] = default_dl.light_color[2];
     if (dl) {
         if (dl->shadow_width > 0 && dl->shadow_height > 0 &&
             (dl->shadow_width != g_dx.shadow_width || dl->shadow_height != g_dx.shadow_height)) {
@@ -919,6 +921,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     UpdateWindow(hwnd);
 
     log_init();
+    app_settings_load_or_create();
 
     if (!dx_init(hwnd, 1600, 900)) {
         MessageBoxA(nullptr, "DX11 init failed.\nMake sure you have a DX11-capable GPU.", "lazyTool", MB_OK | MB_ICONERROR);
@@ -931,7 +934,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     user_cb_init();
 
     project_new_default();
-    app_settings_load_or_create();
 
     log_info("lazyTool ready.");
     log_info("Right-click Resources panel  -> create resources.");
@@ -1001,15 +1003,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         update_default_example_commands();
 
         if (!g_scene_paused) {
-            // User cbuffer: pack + upload + bind before any draw
+            // User cbuffer: pack editor defaults before any draw/dispatch.
             user_cb_update();
 
             cmd_profile_begin_frame_capture();
 
             // Scene render
             dx_begin_scene();
-            user_cb_bind();       // b1 stays bound for all commands
             cmd_execute_all();
+            dx_render_scene_grid_overlay();
             dx_end_scene();
         }
 
@@ -1020,6 +1022,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         cmd_profile_end_frame_capture();
 
         g_dx.sc->Present(g_dx.vsync ? 1 : 0, 0);
+        dx_debug_log_messages();
     }
 
     app_settings_save();

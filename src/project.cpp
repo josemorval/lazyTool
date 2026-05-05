@@ -16,6 +16,50 @@
 static const char* bool_str(bool v) { return v ? "1" : "0"; }
 static char s_project_current_path[MAX_PATH_LEN] = {};
 
+struct ProjectViewDefaults {
+    float camera_pos[3];
+    float view_dir[3];
+    float camera_fov_y;
+    float camera_near_z;
+    float camera_far_z;
+
+    float light_pos[3];
+    float light_target_distance;
+    float light_color[3];
+    float light_intensity;
+
+    float shadow_extent[2];
+    float shadow_near;
+    float shadow_far;
+    int   shadow_width;
+    int   shadow_height;
+    int   shadow_cascade_count;
+    float shadow_distance;
+    float shadow_split_lambda;
+};
+
+static const ProjectViewDefaults k_project_view_defaults = {
+    /* camera_pos          */ { 5.0f, 5.0f, 5.0f },
+    /* view_dir            */ { -0.57735026919f, -0.57735026919f, -0.57735026919f },
+    /* camera_fov_y        */ 1.047f,
+    /* camera_near_z       */ 0.001f,
+    /* camera_far_z        */ 100.0f,
+
+    /* light_pos           */ { 5.0f, 5.0f, 5.0f },
+    /* light_target_dist   */ 8.66025403784f,
+    /* light_color         */ { 1.0f, 0.95f, 0.9f },
+    /* light_intensity     */ 1.0f,
+
+    /* shadow_extent       */ { 8.0f, 8.0f },
+    /* shadow_near         */ 0.01f,
+    /* shadow_far          */ 10.0f,
+    /* shadow_width        */ 1024,
+    /* shadow_height       */ 1204,
+    /* shadow_cascade_count*/ 1,
+    /* shadow_distance     */ 5.0f,
+    /* shadow_split_lambda */ 0.65f
+};
+
 static void project_set_current_path(const char* path) {
     if (!path) path = "";
     strncpy(s_project_current_path, path, MAX_PATH_LEN - 1);
@@ -155,37 +199,80 @@ static void project_validate_manual_shadow_cascades(Resource* dl, float camera_n
     }
 }
 
-static void project_reset_dirlight_defaults() {
-    Resource* dl = res_get(g_builtin_dirlight);
-    if (!dl) return;
+static void project_angles_from_direction(const float dir[3], float* yaw, float* pitch) {
+    Vec3 forward = v3_norm(v3(dir[0], dir[1], dir[2]));
+    float dir_y = clampf(forward.y, -1.0f, 1.0f);
+    if (yaw)
+        *yaw = atan2f(forward.x, forward.z);
+    if (pitch)
+        *pitch = asinf(dir_y);
+}
 
-    dl->light_pos[0] = -0.8f;
-    dl->light_pos[1] = 1.2f;
-    dl->light_pos[2] = -0.8f;
-    dl->light_target[0] = 0.0f;
-    dl->light_target[1] = 0.0f;
-    dl->light_target[2] = 0.0f;
-    dl->light_dir[0] = -0.577f;
-    dl->light_dir[1] = -0.577f;
-    dl->light_dir[2] = -0.577f;
-    dl->light_color[0] = 1.0f;
-    dl->light_color[1] = 0.95f;
-    dl->light_color[2] = 0.9f;
-    dl->light_intensity = 1.0f;
-    dl->shadow_extent[0] = 2.2f;
-    dl->shadow_extent[1] = 2.2f;
-    dl->shadow_near = 0.01f;
-    dl->shadow_far = 4.0f;
-    dl->shadow_width = 1024;
-    dl->shadow_height = 1024;
-    dl->shadow_cascade_count = 1;
-    dl->shadow_distance = 12.0f;
-    dl->shadow_split_lambda = 0.65f;
-    project_seed_manual_shadow_cascades(dl, 0.1f);
-    project_validate_manual_shadow_cascades(dl, 0.1f, 1000.0f);
+void project_apply_default_camera(Camera* camera) {
+    if (!camera)
+        return;
+
+    camera->position[0] = k_project_view_defaults.camera_pos[0];
+    camera->position[1] = k_project_view_defaults.camera_pos[1];
+    camera->position[2] = k_project_view_defaults.camera_pos[2];
+    project_angles_from_direction(k_project_view_defaults.view_dir, &camera->yaw, &camera->pitch);
+    camera->fov_y = k_project_view_defaults.camera_fov_y;
+    camera->near_z = k_project_view_defaults.camera_near_z;
+    camera->far_z = k_project_view_defaults.camera_far_z;
+}
+
+void project_apply_default_dirlight(Resource* dl) {
+    if (!dl)
+        return;
+
+    dl->light_pos[0] = k_project_view_defaults.light_pos[0];
+    dl->light_pos[1] = k_project_view_defaults.light_pos[1];
+    dl->light_pos[2] = k_project_view_defaults.light_pos[2];
+    dl->light_target[0] = dl->light_pos[0] + k_project_view_defaults.view_dir[0] * k_project_view_defaults.light_target_distance;
+    dl->light_target[1] = dl->light_pos[1] + k_project_view_defaults.view_dir[1] * k_project_view_defaults.light_target_distance;
+    dl->light_target[2] = dl->light_pos[2] + k_project_view_defaults.view_dir[2] * k_project_view_defaults.light_target_distance;
+    Vec3 light_dir = v3_norm(v3_sub(
+        v3(dl->light_target[0], dl->light_target[1], dl->light_target[2]),
+        v3(dl->light_pos[0], dl->light_pos[1], dl->light_pos[2])));
+    dl->light_dir[0] = light_dir.x;
+    dl->light_dir[1] = light_dir.y;
+    dl->light_dir[2] = light_dir.z;
+    dl->light_color[0] = k_project_view_defaults.light_color[0];
+    dl->light_color[1] = k_project_view_defaults.light_color[1];
+    dl->light_color[2] = k_project_view_defaults.light_color[2];
+    dl->light_intensity = k_project_view_defaults.light_intensity;
+    dl->shadow_extent[0] = k_project_view_defaults.shadow_extent[0];
+    dl->shadow_extent[1] = k_project_view_defaults.shadow_extent[1];
+    dl->shadow_near = k_project_view_defaults.shadow_near;
+    dl->shadow_far = k_project_view_defaults.shadow_far;
+    dl->shadow_width = k_project_view_defaults.shadow_width;
+    dl->shadow_height = k_project_view_defaults.shadow_height;
+    dl->shadow_cascade_count = k_project_view_defaults.shadow_cascade_count;
+    dl->shadow_distance = k_project_view_defaults.shadow_distance;
+    dl->shadow_split_lambda = k_project_view_defaults.shadow_split_lambda;
+    project_seed_manual_shadow_cascades(dl, k_project_view_defaults.camera_near_z);
+    project_validate_manual_shadow_cascades(dl, k_project_view_defaults.camera_near_z,
+                                            k_project_view_defaults.camera_far_z);
+}
+
+void project_reset_camera_defaults() {
+    project_apply_default_camera(&g_camera);
+}
+
+void project_reset_dirlight_defaults() {
+    Resource* dl = res_get(g_builtin_dirlight);
+    if (!dl)
+        return;
+
+    project_apply_default_dirlight(dl);
 
     if (g_dx.dev && (g_dx.shadow_width != dl->shadow_width || g_dx.shadow_height != dl->shadow_height))
         dx_create_shadow_map(dl->shadow_width, dl->shadow_height);
+}
+
+void project_reset_view_defaults() {
+    project_reset_camera_defaults();
+    project_reset_dirlight_defaults();
 }
 
 static void res_ref(ResHandle h, char* out, int out_sz) {
@@ -322,6 +409,7 @@ static void ensure_parent_dir(const char* path) {
 static const char* mesh_prim_name(int prim) {
     switch ((MeshPrimitiveType)prim) {
     case MESH_PRIM_CUBE:        return "cube";
+    case MESH_PRIM_QUAD:        return "quad";
     case MESH_PRIM_TETRAHEDRON: return "tetrahedron";
     case MESH_PRIM_SPHERE:      return "sphere";
     case MESH_PRIM_FULLSCREEN_TRIANGLE: return "fullscreen_triangle";
@@ -330,10 +418,37 @@ static const char* mesh_prim_name(int prim) {
 }
 
 static MeshPrimitiveType mesh_prim_from_name(const char* name) {
+    if (strcmp(name, "quad") == 0) return MESH_PRIM_QUAD;
     if (strcmp(name, "tetrahedron") == 0) return MESH_PRIM_TETRAHEDRON;
     if (strcmp(name, "sphere") == 0) return MESH_PRIM_SPHERE;
     if (strcmp(name, "fullscreen_triangle") == 0) return MESH_PRIM_FULLSCREEN_TRIANGLE;
     return MESH_PRIM_CUBE;
+}
+
+static const char* draw_source_name(int source) {
+    switch ((DrawSourceType)source) {
+    case DRAW_SOURCE_PROCEDURAL: return "procedural";
+    case DRAW_SOURCE_MESH:
+    default:                     return "mesh";
+    }
+}
+
+static DrawSourceType draw_source_from_name(const char* name) {
+    if (name && strcmp(name, "procedural") == 0) return DRAW_SOURCE_PROCEDURAL;
+    return DRAW_SOURCE_MESH;
+}
+
+static const char* draw_topology_name(int topology) {
+    switch ((DrawTopologyType)topology) {
+    case DRAW_TOPOLOGY_POINT_LIST:    return "point_list";
+    case DRAW_TOPOLOGY_TRIANGLE_LIST:
+    default:                          return "triangle_list";
+    }
+}
+
+static DrawTopologyType draw_topology_from_name(const char* name) {
+    if (name && strcmp(name, "point_list") == 0) return DRAW_TOPOLOGY_POINT_LIST;
+    return DRAW_TOPOLOGY_TRIANGLE_LIST;
 }
 
 static void project_apply_legacy_camera(float azimuth, float elevation, float distance, const float target[3]) {
@@ -388,14 +503,11 @@ static void project_clear_user_data() {
 // Create a minimal scene so the editor always opens with valid content.
 void project_new_default() {
     project_clear_user_data();
-    project_reset_dirlight_defaults();
+    project_reset_camera_defaults();
+    if (Resource* dl = res_get(g_builtin_dirlight))
+        project_apply_default_dirlight(dl);
     dx_invalidate_scene_history();
     project_set_current_path("");
-    float target[3] = { 0.0f, 0.0f, 0.0f };
-    project_apply_legacy_camera(0.5f, 0.3f, 4.0f, target);
-    g_camera.fov_y = 1.047f;
-    g_camera.near_z = 0.001f;
-    g_camera.far_z = 100.0f;
 
     ResHandle cube = res_create_mesh_primitive("normal_cube", MESH_PRIM_CUBE);
     ResHandle shader = res_create_shader("normal_color", "shaders/default.hlsl", "VSMain", "PSMain");
@@ -404,9 +516,9 @@ void project_new_default() {
     if (Command* c = cmd_get(clear_h)) {
         c->rt = g_builtin_scene_color;
         c->depth = g_builtin_scene_depth;
-        c->clear_color[0] = 0.025f;
-        c->clear_color[1] = 0.030f;
-        c->clear_color[2] = 0.040f;
+        c->clear_color[0] = 0.04f;
+        c->clear_color[1] = 0.02f;
+        c->clear_color[2] = 0.0f;
         c->clear_color[3] = 1.0f;
         c->clear_depth = true;
         c->depth_clear_val = 1.0f;
@@ -481,8 +593,9 @@ bool project_save_text(const char* path) {
                 r.name, r.width, r.height, r.depth, (int)r.tex_fmt,
                 bool_str(r.has_rtv), bool_str(r.has_srv), bool_str(r.has_uav));
         } else if (r.type == RES_STRUCTURED_BUFFER) {
-            fprintf(f, "resource structured_buffer %s %d %d %s %s\n",
-                r.name, r.elem_size, r.elem_count, bool_str(r.has_srv), bool_str(r.has_uav));
+            fprintf(f, "resource structured_buffer %s %d %d %s %s %s\n",
+                r.name, r.elem_size, r.elem_count,
+                bool_str(r.has_srv), bool_str(r.has_uav), bool_str(r.indirect_args));
         } else if (r.type == RES_MESH) {
             if (r.path[0]) {
                 fprintf(f, "resource mesh_gltf %s %s\n", r.name, r.path);
@@ -532,6 +645,8 @@ bool project_save_text(const char* path) {
         }
         fprintf(f, "\n");
         fprintf(f, "  mesh_shader %s %s\n", mesh_ref, shader_ref);
+        fprintf(f, "  draw_source %s\n", draw_source_name(c.draw_source));
+        fprintf(f, "  topology %s\n", draw_topology_name(c.draw_topology));
         fprintf(f, "  shadow_shader %s\n", shadow_shader_ref);
         fprintf(f, "  render_state %s %s %s %s %s %s %s\n",
             bool_str(c.color_write), bool_str(c.depth_test), bool_str(c.depth_write),
@@ -541,11 +656,15 @@ bool project_save_text(const char* path) {
         fprintf(f, "  clear %s %.9g %.9g %.9g %.9g %s %.9g\n",
             bool_str(c.clear_color_enabled), c.clear_color[0], c.clear_color[1], c.clear_color[2], c.clear_color[3],
             bool_str(c.clear_depth), c.depth_clear_val);
+        fprintf(f, "  vertex_count %d\n", c.vertex_count);
         fprintf(f, "  instance %d\n", c.instance_count);
         fprintf(f, "  threads %d %d %d\n", c.thread_x, c.thread_y, c.thread_z);
         char dispatch_ref[MAX_PATH_LEN] = {};
         res_ref(c.dispatch_size_source, dispatch_ref, MAX_PATH_LEN);
         fprintf(f, "  dispatch_from %s\n", dispatch_ref);
+        char indirect_ref[MAX_PATH_LEN] = {};
+        res_ref(c.indirect_buf, indirect_ref, MAX_PATH_LEN);
+        fprintf(f, "  indirect_args %s %u\n", indirect_ref, c.indirect_offset);
         fprintf(f, "  repeat %d %s\n", c.repeat_count, bool_str(c.repeat_expanded));
         Command* parent_cmd = cmd_get(c.parent);
         fprintf(f, "  parent %s\n", parent_cmd ? parent_cmd->name : "-");
@@ -647,7 +766,7 @@ bool project_load_text(const char* path) {
     }
 
     project_clear_user_data();
-    project_reset_dirlight_defaults();
+    project_reset_view_defaults();
 
     char line[1024] = {};
     Command* cur = nullptr;
@@ -698,8 +817,8 @@ bool project_load_text(const char* path) {
             char* shadow_distance_tok = strtok(nullptr, " \t\r\n");
             char* split_lambda_tok = strtok(nullptr, " \t\r\n");
             dl->shadow_cascade_count = cascade_count_tok ? atoi(cascade_count_tok) : 1;
-            dl->shadow_distance = shadow_distance_tok ? (float)atof(shadow_distance_tok) : 12.0f;
-            dl->shadow_split_lambda = split_lambda_tok ? (float)atof(split_lambda_tok) : 0.65f;
+            dl->shadow_distance = shadow_distance_tok ? (float)atof(shadow_distance_tok) : dl->shadow_distance;
+            dl->shadow_split_lambda = split_lambda_tok ? (float)atof(split_lambda_tok) : dl->shadow_split_lambda;
             if (dl->shadow_cascade_count < 1) dl->shadow_cascade_count = 1;
             if (dl->shadow_cascade_count > MAX_SHADOW_CASCADES) dl->shadow_cascade_count = MAX_SHADOW_CASCADES;
             if (dl->shadow_distance < 0.1f) dl->shadow_distance = 0.1f;
@@ -764,7 +883,9 @@ bool project_load_text(const char* path) {
                 int count = atoi(strtok(nullptr, " \t\r\n"));
                 bool srv = atoi(strtok(nullptr, " \t\r\n")) != 0;
                 bool uav = atoi(strtok(nullptr, " \t\r\n")) != 0;
-                res_create_structured_buffer(name, stride, count, srv, uav);
+                char* indirect_tok = strtok(nullptr, " \t\r\n");
+                bool indirect_args = indirect_tok ? atoi(indirect_tok) != 0 : false;
+                res_create_structured_buffer(name, stride, count, srv, uav, indirect_args);
             } else if (strcmp(kind, "mesh_primitive") == 0) {
                 char* prim = strtok(nullptr, " \t\r\n");
                 res_create_mesh_primitive(name, mesh_prim_from_name(prim ? prim : "cube"));
@@ -812,6 +933,10 @@ bool project_load_text(const char* path) {
             } else if (strcmp(tag, "mesh_shader") == 0) {
                 cur->mesh = res_by_ref(strtok(nullptr, " \t\r\n"), res_lookup_types(RES_MESH));
                 cur->shader = res_by_ref(strtok(nullptr, " \t\r\n"), res_lookup_types(RES_SHADER));
+            } else if (strcmp(tag, "draw_source") == 0) {
+                cur->draw_source = (int)draw_source_from_name(strtok(nullptr, " \t\r\n"));
+            } else if (strcmp(tag, "topology") == 0) {
+                cur->draw_topology = (int)draw_topology_from_name(strtok(nullptr, " \t\r\n"));
             } else if (strcmp(tag, "shadow_shader") == 0) {
                 cur->shadow_shader = res_by_ref(strtok(nullptr, " \t\r\n"), res_lookup_types(RES_SHADER));
             } else if (strcmp(tag, "render_state") == 0) {
@@ -831,6 +956,8 @@ bool project_load_text(const char* path) {
                 for (int i = 0; i < 4; i++) cur->clear_color[i] = (float)atof(strtok(nullptr, " \t\r\n"));
                 cur->clear_depth = atoi(strtok(nullptr, " \t\r\n")) != 0;
                 cur->depth_clear_val = (float)atof(strtok(nullptr, " \t\r\n"));
+            } else if (strcmp(tag, "vertex_count") == 0) {
+                cur->vertex_count = atoi(strtok(nullptr, " \t\r\n"));
             } else if (strcmp(tag, "instance") == 0) {
                 cur->instance_count = atoi(strtok(nullptr, " \t\r\n"));
             } else if (strcmp(tag, "threads") == 0) {
@@ -839,6 +966,10 @@ bool project_load_text(const char* path) {
                 cur->thread_z = atoi(strtok(nullptr, " \t\r\n"));
             } else if (strcmp(tag, "dispatch_from") == 0) {
                 cur->dispatch_size_source = res_by_ref(strtok(nullptr, " \t\r\n"), res_lookup_types());
+            } else if (strcmp(tag, "indirect_args") == 0) {
+                cur->indirect_buf = res_by_ref(strtok(nullptr, " \t\r\n"), res_lookup_types(RES_STRUCTURED_BUFFER));
+                char* offset_tok = strtok(nullptr, " \t\r\n");
+                cur->indirect_offset = offset_tok ? (uint32_t)strtoul(offset_tok, nullptr, 10) : 0u;
             } else if (strcmp(tag, "repeat") == 0) {
                 char* count = strtok(nullptr, " \t\r\n");
                 char* expanded = strtok(nullptr, " \t\r\n");
