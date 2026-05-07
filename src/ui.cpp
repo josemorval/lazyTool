@@ -8,6 +8,7 @@
 #include "log.h"
 #include "shader.h"
 #include "embedded_pack.h"
+#include "timeline.h"
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
@@ -41,6 +42,8 @@ static bool s_project_path_focus = false;
 static bool s_viewport_fullscreen = false;
 static bool s_right_panel_general_open = false;
 static bool s_shortcuts_popup_open = false;
+static bool s_timeline_window_open = false;
+static bool s_timeline_keyboard_focus = false;
 static bool s_scene_surface_resize_armed = true;
 static int s_scene_surface_host_w = 0;
 static int s_scene_surface_host_h = 0;
@@ -652,8 +655,8 @@ static void ui_export_current_project_single_exe() {
         return;
     }
 
-    char err[512] = {};
-    if (!lt_export_single_exe(exe_path, project_path, output_path, err, sizeof(err))) {
+    char err[8192] = {};
+    if (!lt_export_normal_exe(exe_path, project_path, output_path, err, sizeof(err))) {
         log_error("Export EXE failed: %s", err[0] ? err : "unknown error");
         return;
     }
@@ -1289,17 +1292,17 @@ static const char* user_cb_hlsl_type(ResType type) {
     }
 }
 
-static void ui_user_cb_value_editor(ResType type, int* ival, float* fval, float reserve = 78.0f) {
+static bool ui_user_cb_value_editor(ResType type, int* ival, float* fval, float reserve = 78.0f) {
     float width = reserve > 0.0f ? -reserve : -1.0f;
     switch (type) {
-    case RES_FLOAT:  ImGui::SetNextItemWidth(width); ImGui::DragFloat("##v",  &fval[0], 0.01f); break;
-    case RES_FLOAT2: ImGui::SetNextItemWidth(width); ImGui::DragFloat2("##v",  fval,    0.01f); break;
-    case RES_FLOAT3: ImGui::SetNextItemWidth(width); ImGui::ColorEdit3("##v",  fval);          break;
-    case RES_FLOAT4: ImGui::SetNextItemWidth(width); ImGui::ColorEdit4("##v",  fval);          break;
-    case RES_INT:    ImGui::SetNextItemWidth(width); ImGui::InputInt("##v",   &ival[0]);       break;
-    case RES_INT2:   ImGui::SetNextItemWidth(width); ImGui::InputInt2("##v",   ival);          break;
-    case RES_INT3:   ImGui::SetNextItemWidth(width); ImGui::InputInt3("##v",   ival);          break;
-    default:         ImGui::TextDisabled("(unsupported)"); break;
+    case RES_FLOAT:  ImGui::SetNextItemWidth(width); return ImGui::DragFloat("##v",  &fval[0], 0.01f);
+    case RES_FLOAT2: ImGui::SetNextItemWidth(width); return ImGui::DragFloat2("##v",  fval,    0.01f);
+    case RES_FLOAT3: ImGui::SetNextItemWidth(width); return ImGui::ColorEdit3("##v",  fval);
+    case RES_FLOAT4: ImGui::SetNextItemWidth(width); return ImGui::ColorEdit4("##v",  fval);
+    case RES_INT:    ImGui::SetNextItemWidth(width); return ImGui::InputInt("##v",   &ival[0]);
+    case RES_INT2:   ImGui::SetNextItemWidth(width); return ImGui::InputInt2("##v",   ival);
+    case RES_INT3:   ImGui::SetNextItemWidth(width); return ImGui::InputInt3("##v",   ival);
+    default:         ImGui::TextDisabled("(unsupported)"); return false;
     }
 }
 
@@ -3327,6 +3330,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             offset = v3(0.0f, 1.0f, 0.0f);
         }
 
+        bool light_changed = false;
         float edit_target[3] = { target.x, target.y, target.z };
         if (ImGui::DragFloat3("Target", edit_target, 0.01f)) {
             Vec3 new_target = v3(edit_target[0], edit_target[1], edit_target[2]);
@@ -3340,6 +3344,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             target = new_target;
             pos = new_pos;
             offset = v3_sub(pos, target);
+            light_changed = true;
         }
 
         if (ImGui::DragFloat("Distance", &distance, 0.01f, 0.001f, 100.0f)) {
@@ -3350,10 +3355,13 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             r->light_pos[0] = new_pos.x;
             r->light_pos[1] = new_pos.y;
             r->light_pos[2] = new_pos.z;
+            light_changed = true;
         }
 
-        ImGui::ColorEdit3("Color",     r->light_color);
-        ImGui::DragFloat("Intensity", &r->light_intensity, 0.01f, 0.f, 10.f);
+        light_changed |= ImGui::ColorEdit3("Color", r->light_color);
+        light_changed |= ImGui::DragFloat("Intensity", &r->light_intensity, 0.01f, 0.f, 10.f);
+        if (light_changed)
+            timeline_capture_if_tracked(TIMELINE_TRACK_DIRLIGHT, "dirlight", RES_NONE);
         ImGui::Separator();
         int shadow_size[2] = {
             r->shadow_width > 0 ? r->shadow_width : g_dx.shadow_width,
@@ -3496,8 +3504,45 @@ static CmdHandle ui_create_repeat_dispatch_child(CmdHandle parent, ResHandle sha
     return child_h;
 }
 
+static bool ui_command_has_transform(const Command* c) {
+    return c && (c->type == CMD_DRAW_MESH ||
+                 c->type == CMD_DRAW_INSTANCED ||
+                 c->type == CMD_INDIRECT_DRAW);
+}
+
+static void ui_command_transform_editor(Command* c) {
+    if (!c)
+        return;
+
+    ui_inspector_section("TRANSFORM");
+    bool transform_changed = false;
+    transform_changed |= ui_tinted_transform_row(
+        "Position", c->pos, 0.001f,
+        ImVec4(0.150f, 0.055f, 0.050f, 0.3f),
+        ImVec4(0.230f, 0.080f, 0.070f, 0.5f)
+    );
+
+    transform_changed |= ui_tinted_transform_row(
+        "Rotation", c->rot, 0.01f,
+        ImVec4(0.055f, 0.130f, 0.070f, 0.3f),
+        ImVec4(0.080f, 0.200f, 0.105f, 0.5f)
+    );
+
+    transform_changed |= ui_tinted_transform_row(
+        "Scale", c->scale, 0.001f,
+        ImVec4(0.050f, 0.075f, 0.150f, 0.3f),
+        ImVec4(0.070f, 0.105f, 0.230f, 0.5f)
+    );
+    if (transform_changed)
+        timeline_capture_if_tracked(TIMELINE_TRACK_COMMAND_TRANSFORM, c->name, RES_NONE);
+}
+
 static void ui_inspector_command(Command* c) {
-    ImGui::Checkbox("Enabled", &c->enabled);
+    if (ImGui::Checkbox("Enabled", &c->enabled))
+        timeline_capture_if_tracked(TIMELINE_TRACK_COMMAND_ENABLED, c->name, RES_NONE);
+
+    if (ui_command_has_transform(c))
+        ui_command_transform_editor(c);
 
     switch (c->type) {
     case CMD_GROUP: {
@@ -3624,26 +3669,6 @@ static void ui_inspector_command(Command* c) {
         ImGui::Checkbox("Shadow Receiver", &c->shadow_receive);
         if (c->shadow_cast)
             res_combo("Shadow Shader##dm", &c->shadow_shader, RES_SHADER);
-
-        ui_inspector_section("TRANSFORM");
-
-        ui_tinted_transform_row(
-            "Position", c->pos, 0.001f,
-            ImVec4(0.150f, 0.055f, 0.050f, 0.3f), 
-            ImVec4(0.230f, 0.080f, 0.070f, 0.5f) 
-        );
-
-        ui_tinted_transform_row(
-            "Rotation", c->rot, 0.01f,
-            ImVec4(0.055f, 0.130f, 0.070f, 0.3f),
-            ImVec4(0.080f, 0.200f, 0.105f, 0.5f)   
-        );
-
-        ui_tinted_transform_row(
-            "Scale", c->scale, 0.001f,
-            ImVec4(0.050f, 0.075f, 0.150f, 0.3f), 
-            ImVec4(0.070f, 0.105f, 0.230f, 0.5f) 
-        );
 
         if (c->type == CMD_DRAW_INSTANCED)
             ImGui::InputInt("Instance Count", &c->instance_count);
@@ -3793,23 +3818,6 @@ static void ui_inspector_command(Command* c) {
         ImGui::Checkbox("Shadow Receiver", &c->shadow_receive);
         if (c->shadow_cast)
             res_combo("Shadow Shader##id", &c->shadow_shader, RES_SHADER);
-
-        ui_inspector_section("TRANSFORM");
-        ui_tinted_transform_row(
-            "Position", c->pos, 0.001f,
-            ImVec4(0.150f, 0.055f, 0.050f, 0.3f),
-            ImVec4(0.230f, 0.080f, 0.070f, 0.5f)
-        );
-        ui_tinted_transform_row(
-            "Rotation", c->rot, 0.01f,
-            ImVec4(0.055f, 0.130f, 0.070f, 0.3f),
-            ImVec4(0.080f, 0.200f, 0.105f, 0.5f)
-        );
-        ui_tinted_transform_row(
-            "Scale", c->scale, 0.001f,
-            ImVec4(0.050f, 0.075f, 0.150f, 0.3f),
-            ImVec4(0.070f, 0.105f, 0.230f, 0.5f)
-        );
 
         ui_inspector_section("TEXTURE BINDINGS");
         ImGui::TextDisabled("Reserved PS t# slots:");
@@ -4187,17 +4195,22 @@ static void ui_panel_user_cb() {
             ImGui::Text("%s", res_type_str(e.type));
             ImGui::TableSetColumnIndex(4);
             ImGui::SetNextItemWidth(-1.f);
+            bool user_changed = false;
             if (ImGui::BeginCombo("##source", src ? ui_resource_display_name(*src) : "(hardcoded)")) {
-                if (ImGui::Selectable("(hardcoded)", e.source == INVALID_HANDLE))
+                if (ImGui::Selectable("(hardcoded)", e.source == INVALID_HANDLE)) {
                     user_cb_set_source(i, INVALID_HANDLE);
+                    user_changed = true;
+                }
                 for (int r_i = 0; r_i < MAX_RESOURCES; r_i++) {
                     Resource& r = g_resources[r_i];
                     if (!r.active || r.is_builtin || r.type != e.type) continue;
                     ResHandle h = (ResHandle)(r_i + 1);
                     bool sel = (e.source == h);
                     ImGui::PushID(r_i);
-                    if (ImGui::Selectable(ui_resource_display_name(r), sel))
+                    if (ImGui::Selectable(ui_resource_display_name(r), sel)) {
                         user_cb_set_source(i, h);
+                        user_changed = true;
+                    }
                     ImGui::PopID();
                 }
                 ImGui::EndCombo();
@@ -4205,9 +4218,11 @@ static void ui_panel_user_cb() {
             ImGui::TableSetColumnIndex(5);
             src = res_get(e.source);
             if (src && src->type == e.type)
-                ui_user_cb_value_editor(e.type, src->ival, src->fval);
+                user_changed |= ui_user_cb_value_editor(e.type, src->ival, src->fval);
             else
-                ui_user_cb_value_editor(e.type, e.ival, e.fval);
+                user_changed |= ui_user_cb_value_editor(e.type, e.ival, e.fval);
+            if (user_changed)
+                timeline_capture_if_tracked(TIMELINE_TRACK_USER_VAR, e.name, e.type);
             ImGui::SameLine();
             if (ImGui::SmallButton("^") && i > 0)                   user_cb_move(i, i - 1);
             ImGui::SameLine();
@@ -4387,12 +4402,13 @@ static void ui_panel_general(bool embedded = false) {
         settings_dirty |= ImGui::DragFloat("Mouse Sensitivity", &g_camera_controls.mouse_sensitivity, 0.0001f, 0.0001f, 0.05f, "%.4f");
 
         ImGui::Separator();
-        ImGui::DragFloat3("Position", g_camera.position, 0.01f);
-        ImGui::DragFloat("Yaw", &g_camera.yaw, 0.01f);
-        ImGui::DragFloat("Pitch", &g_camera.pitch, 0.01f, -1.50f, 1.50f);
-        ImGui::DragFloat("FOV", &g_camera.fov_y, 0.01f, 0.10f, 2.80f);
-        ImGui::DragFloat("Near Plane", &g_camera.near_z, 0.001f, 0.0001f, 100.0f);
-        ImGui::DragFloat("Far Plane", &g_camera.far_z, 0.05f, 0.001f, 10000.0f);
+        bool camera_changed = false;
+        camera_changed |= ImGui::DragFloat3("Position", g_camera.position, 0.01f);
+        camera_changed |= ImGui::DragFloat("Yaw", &g_camera.yaw, 0.01f);
+        camera_changed |= ImGui::DragFloat("Pitch", &g_camera.pitch, 0.01f, -1.50f, 1.50f);
+        camera_changed |= ImGui::DragFloat("FOV", &g_camera.fov_y, 0.01f, 0.10f, 2.80f);
+        camera_changed |= ImGui::DragFloat("Near Plane", &g_camera.near_z, 0.001f, 0.0001f, 100.0f);
+        camera_changed |= ImGui::DragFloat("Far Plane", &g_camera.far_z, 0.05f, 0.001f, 10000.0f);
 
         g_camera.pitch = clampf(g_camera.pitch, -1.50f, 1.50f);
         if (g_camera.fov_y < 0.10f) g_camera.fov_y = 0.10f;
@@ -4400,9 +4416,12 @@ static void ui_panel_general(bool embedded = false) {
         if (g_camera.near_z < 0.0001f) g_camera.near_z = 0.0001f;
         if (g_camera.far_z <= g_camera.near_z + 0.001f)
             g_camera.far_z = g_camera.near_z + 0.001f;
+        if (camera_changed)
+            timeline_capture_if_tracked(TIMELINE_TRACK_CAMERA, "camera", RES_NONE);
 
         if (ImGui::Button("Reset Camera")) {
             ui_reset_camera_view();
+            timeline_capture_if_tracked(TIMELINE_TRACK_CAMERA, "camera", RES_NONE);
         }
     }
 
@@ -4828,6 +4847,7 @@ static void ui_draw_viewport_gizmo(ImVec2 rect_min, ImVec2 rect_max, bool hovere
             active_axis = s_viewport_gizmo_drag.axis;
             ImGui::SetNextFrameWantCaptureMouse(true);
             ui_apply_gizmo_drag(c, &s_viewport_gizmo_drag, axis_world[active_axis], ImGui::GetIO().MousePos);
+            timeline_capture_if_tracked(TIMELINE_TRACK_COMMAND_TRANSFORM, c->name, RES_NONE);
         }
     }
 
@@ -5686,7 +5706,7 @@ static void ui_draw_shortcuts_popup() {
     if (!s_shortcuts_popup_open)
         return;
 
-    ImGui::SetNextWindowSize(ImVec2(456.0f, 360.0f), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(492.0f, 430.0f), ImGuiCond_Appearing);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ui_panel_bg(UI_PANEL_GENERAL));
     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.220f, 0.205f, 0.200f, 1.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 5.0f);
@@ -5715,6 +5735,17 @@ static void ui_draw_shortcuts_popup() {
             ui_draw_shortcut_row("F5", "Compile shaders");
             ui_draw_shortcut_row("Ctrl+S", "Save project");
             ui_draw_shortcut_row("F1", "Toggle this shortcuts panel");
+            ImGui::EndTable();
+        }
+
+        if (ui_begin_shortcut_section("##shortcuts_timeline", "TIMELINE", table_flags)) {
+            ui_draw_shortcut_row("Click", "Select slot and move current frame");
+            ui_draw_shortcut_row("Arrows", "Move selected slot / current frame");
+            ui_draw_shortcut_row("Shift+Arrows", "Move selected slot by 10 frames");
+            ui_draw_shortcut_row("I", "Insert or update key on selected slot");
+            ui_draw_shortcut_row("Delete", "Delete key on selected slot");
+            ui_draw_shortcut_row("Ctrl+C", "Copy selected key");
+            ui_draw_shortcut_row("Ctrl+V", "Paste key into compatible selected slot");
             ImGui::EndTable();
         }
 
@@ -5781,6 +5812,509 @@ static void ui_align_text_row(float row_y) {
     ImGui::AlignTextToFramePadding();
 }
 
+struct TimelineSlotSelection {
+    bool valid;
+    int  track_index;
+    int  frame;
+};
+
+struct TimelineSlotClipboard {
+    bool              valid;
+    TimelineTrackKind kind;
+    ResType           value_type;
+    TimelineKey       key;
+};
+
+static TimelineSlotSelection s_timeline_slot_selection = {};
+static TimelineSlotClipboard s_timeline_slot_clipboard = {};
+
+static bool ui_timeline_slot_selection_valid() {
+    if (!s_timeline_slot_selection.valid)
+        return false;
+    int track_index = s_timeline_slot_selection.track_index;
+    if (track_index < 0 || track_index >= g_timeline_track_count)
+        return false;
+    if (!g_timeline_tracks[track_index].active)
+        return false;
+    int frame = s_timeline_slot_selection.frame;
+    return frame >= 0 && frame < timeline_length_frames();
+}
+
+static bool ui_timeline_slot_selected(int track_index, int frame) {
+    return ui_timeline_slot_selection_valid() &&
+           s_timeline_slot_selection.track_index == track_index &&
+           s_timeline_slot_selection.frame == frame;
+}
+
+static void ui_timeline_select_slot(int track_index, int frame) {
+    if (track_index < 0 || track_index >= g_timeline_track_count)
+        return;
+    s_timeline_slot_selection.valid = true;
+    s_timeline_slot_selection.track_index = track_index;
+    s_timeline_slot_selection.frame = frame;
+}
+
+static int ui_timeline_next_active_track(int start, int dir) {
+    int i = start + dir;
+    while (i >= 0 && i < g_timeline_track_count) {
+        if (g_timeline_tracks[i].active)
+            return i;
+        i += dir;
+    }
+    return start;
+}
+
+static bool ui_timeline_clipboard_compatible(const TimelineTrack& track) {
+    if (!s_timeline_slot_clipboard.valid || !track.active)
+        return false;
+    if (track.kind != s_timeline_slot_clipboard.kind)
+        return false;
+    if (track.kind == TIMELINE_TRACK_USER_VAR)
+        return track.value_type == s_timeline_slot_clipboard.value_type;
+    return true;
+}
+
+static void ui_timeline_copy_selected_slot() {
+    if (!ui_timeline_slot_selection_valid())
+        return;
+    TimelineTrack& track = g_timeline_tracks[s_timeline_slot_selection.track_index];
+    int key_index = timeline_find_key_index(track, s_timeline_slot_selection.frame);
+    if (key_index < 0)
+        return;
+    s_timeline_slot_clipboard.valid = true;
+    s_timeline_slot_clipboard.kind = track.kind;
+    s_timeline_slot_clipboard.value_type = track.value_type;
+    s_timeline_slot_clipboard.key = track.keys[key_index];
+}
+
+static void ui_timeline_paste_selected_slot() {
+    if (!ui_timeline_slot_selection_valid())
+        return;
+    TimelineTrack& track = g_timeline_tracks[s_timeline_slot_selection.track_index];
+    if (!ui_timeline_clipboard_compatible(track))
+        return;
+    TimelineKey* key = timeline_set_key(s_timeline_slot_selection.track_index, s_timeline_slot_selection.frame);
+    if (!key)
+        return;
+    *key = s_timeline_slot_clipboard.key;
+    key->frame = s_timeline_slot_selection.frame;
+    app_request_scene_render();
+}
+
+static void ui_timeline_delete_selected_slot() {
+    if (!ui_timeline_slot_selection_valid())
+        return;
+    timeline_delete_key(s_timeline_slot_selection.track_index, s_timeline_slot_selection.frame);
+}
+
+static void ui_timeline_insert_selected_slot() {
+    if (!ui_timeline_slot_selection_valid())
+        return;
+    if (!timeline_capture_key(s_timeline_slot_selection.track_index, s_timeline_slot_selection.frame))
+        log_warn("Timeline: could not capture key.");
+}
+
+static void ui_timeline_move_selection(int frame_delta, int track_delta) {
+    if (!ui_timeline_slot_selection_valid()) {
+        if (g_timeline_track_count > 0)
+            ui_timeline_select_slot(0, timeline_current_frame());
+        return;
+    }
+    int track_index = s_timeline_slot_selection.track_index;
+    if (track_delta != 0)
+        track_index = ui_timeline_next_active_track(track_index, track_delta);
+    int frame = s_timeline_slot_selection.frame + frame_delta;
+    if (frame < 0) frame = 0;
+    if (frame >= timeline_length_frames()) frame = timeline_length_frames() - 1;
+    ui_timeline_select_slot(track_index, frame);
+    timeline_set_current_frame(frame);
+}
+
+static void ui_timeline_centered_text_disabled(const char* text) {
+    if (!text || !text[0])
+        return;
+    float avail = ImGui::GetContentRegionAvail().x;
+    float text_w = ImGui::CalcTextSize(text).x;
+    if (avail > text_w)
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + floorf((avail - text_w) * 0.5f));
+    ImGui::TextDisabled("%s", text);
+}
+
+static void ui_timeline_add_track_button(const char* label, TimelineTrackKind kind,
+                                         const char* target, ResType value_type) {
+    if (ImGui::Button(label)) {
+        int idx = timeline_add_track(kind, target ? target : "", value_type);
+        if (idx < 0)
+            log_warn("Timeline: could not add track.");
+    }
+}
+
+static int ui_timeline_user_cb_index_for_source(ResHandle h) {
+    if (h == INVALID_HANDLE)
+        return -1;
+    for (int i = 0; i < g_user_cb_count; i++) {
+        if (g_user_cb_entries[i].source == h)
+            return i;
+    }
+    return -1;
+}
+
+static void ui_timeline_add_parameter_track(ResHandle h) {
+    Resource* r = res_get(h);
+    if (!r || r->is_builtin || r->is_generated || !user_cb_type_supported(r->type))
+        return;
+
+    int entry_idx = ui_timeline_user_cb_index_for_source(h);
+    if (entry_idx < 0) {
+        if (user_cb_add_from_resource(h))
+            entry_idx = g_user_cb_count - 1;
+    }
+    if (entry_idx < 0) {
+        log_warn("Timeline: could not add parameter to User CB.");
+        return;
+    }
+
+    UserCBEntry& e = g_user_cb_entries[entry_idx];
+    int idx = timeline_add_track(TIMELINE_TRACK_USER_VAR, e.name, e.type);
+    if (idx < 0)
+        log_warn("Timeline: could not add parameter track.");
+}
+
+static void ui_timeline_add_tracks() {
+    ui_inspector_section("ADD TRACK");
+
+    ui_timeline_add_track_button("Camera", TIMELINE_TRACK_CAMERA, "camera", RES_NONE);
+    ImGui::SameLine();
+    ui_timeline_add_track_button("Dir Light", TIMELINE_TRACK_DIRLIGHT, "dirlight", RES_NONE);
+
+    Command* selected_cmd = cmd_get(g_sel_cmd);
+    if (selected_cmd) {
+        bool has_transform = selected_cmd->type == CMD_DRAW_MESH ||
+                             selected_cmd->type == CMD_DRAW_INSTANCED ||
+                             selected_cmd->type == CMD_INDIRECT_DRAW;
+        if (has_transform) {
+            ImGui::SameLine();
+            ui_timeline_add_track_button("Selected Transform", TIMELINE_TRACK_COMMAND_TRANSFORM,
+                                         selected_cmd->name, RES_NONE);
+        }
+        ImGui::SameLine();
+        ui_timeline_add_track_button("Selected Enable", TIMELINE_TRACK_COMMAND_ENABLED,
+                                     selected_cmd->name, RES_NONE);
+    }
+
+    Resource* selected_res = res_get(g_sel_res);
+    if (selected_res && !selected_res->is_builtin && !selected_res->is_generated &&
+        user_cb_type_supported(selected_res->type)) {
+        ImGui::SameLine();
+        if (ImGui::Button("Add Parameter"))
+            ui_timeline_add_parameter_track(g_sel_res);
+    }
+}
+
+static void ui_timeline_track_label(const TimelineTrack& track, char* out, int out_sz) {
+    if (!out || out_sz <= 0)
+        return;
+    out[0] = '\0';
+    switch (track.kind) {
+    case TIMELINE_TRACK_USER_VAR:
+        snprintf(out, out_sz, "User  %s", track.target);
+        break;
+    case TIMELINE_TRACK_COMMAND_TRANSFORM:
+        snprintf(out, out_sz, "Transform  %s", track.target);
+        break;
+    case TIMELINE_TRACK_COMMAND_ENABLED:
+        snprintf(out, out_sz, "Enable  %s", track.target);
+        break;
+    case TIMELINE_TRACK_CAMERA:
+        snprintf(out, out_sz, "Camera");
+        break;
+    case TIMELINE_TRACK_DIRLIGHT:
+        snprintf(out, out_sz, "Dir Light");
+        break;
+    default:
+        snprintf(out, out_sz, "Track");
+        break;
+    }
+}
+
+static void ui_timeline_draw_slot(int track_index, int frame, ImVec2 slot_size) {
+    TimelineTrack& track = g_timeline_tracks[track_index];
+    bool has_key = timeline_find_key_index(track, frame) >= 0;
+    bool selected = ui_timeline_slot_selected(track_index, frame);
+
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##slot", slot_size);
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
+        (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))) {
+        ui_timeline_select_slot(track_index, frame);
+        timeline_set_current_frame(frame);
+    }
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Right))
+        ui_timeline_select_slot(track_index, frame);
+
+    if (ImGui::BeginPopupContextItem()) {
+        if (ImGui::MenuItem(has_key ? "Update Key" : "Add Key")) {
+            if (!timeline_capture_key(track_index, frame))
+                log_warn("Timeline: could not capture key.");
+        }
+        if (has_key && ImGui::MenuItem("Copy Key"))
+            ui_timeline_copy_selected_slot();
+        bool can_paste = ui_timeline_clipboard_compatible(track);
+        if (ImGui::MenuItem("Paste Key", nullptr, false, can_paste))
+            ui_timeline_paste_selected_slot();
+        if (has_key && ImGui::MenuItem("Delete Key"))
+            timeline_delete_key(track_index, frame);
+        ImGui::EndPopup();
+    }
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 q = ImVec2(p.x + slot_size.x, p.y + slot_size.y);
+    bool hovered = ImGui::IsItemHovered();
+    if (hovered)
+        dl->AddRectFilled(p, q, ImGui::GetColorU32(ImVec4(0.31f, 0.17f, 0.08f, 0.46f)),
+            ui_px(2.0f));
+    if (selected) {
+        dl->AddRectFilled(p, q, ImGui::GetColorU32(ImVec4(0.56f, 0.25f, 0.07f, 0.70f)),
+            ui_px(2.0f));
+        dl->AddRect(p, q, ImGui::GetColorU32(ImVec4(0.95f, 0.48f, 0.13f, 1.0f)),
+            ui_px(2.0f), 0, ui_px(1.8f));
+    }
+    if (hovered && !selected) {
+        dl->AddRect(p, q, ImGui::GetColorU32(ImVec4(0.48f, 0.49f, 0.52f, 0.65f)),
+            ui_px(2.0f), 0, ui_px(1.0f));
+    }
+    if (has_key) {
+        ImVec2 c = ImVec2((p.x + q.x) * 0.5f, (p.y + q.y) * 0.5f);
+        float r = ui_px(5.0f);
+        ImVec2 pts[4] = {
+            ImVec2(c.x, c.y - r),
+            ImVec2(c.x + r, c.y),
+            ImVec2(c.x, c.y + r),
+            ImVec2(c.x - r, c.y)
+        };
+        dl->AddConvexPolyFilled(pts, 4, ImGui::GetColorU32(ImVec4(0.83f, 0.55f, 0.22f, 1.0f)));
+        dl->AddPolyline(pts, 4, ImGui::GetColorU32(ImVec4(0.18f, 0.12f, 0.06f, 1.0f)),
+            true, ui_px(1.0f));
+    }
+}
+
+static void ui_draw_timeline_window() {
+    if (!s_timeline_window_open) {
+        s_timeline_keyboard_focus = false;
+        return;
+    }
+
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowViewport(vp->ID);
+    ImGui::SetNextWindowSize(ImVec2(ui_px(920.0f), ui_px(420.0f)), ImGuiCond_FirstUseEver);
+    ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar;
+    if (!ImGui::Begin("Timeline", nullptr, window_flags)) {
+        ImGui::End();
+        return;
+    }
+
+    char detail[128] = {};
+    snprintf(detail, sizeof(detail), "%s  frame %d / %d  %.2fs",
+             timeline_enabled() ? "active" : "disabled",
+             timeline_current_frame(), timeline_length_frames() - 1, app_scene_time());
+    if (!ui_begin_tool_panel("##timeline_panel", "TIMELINE", detail,
+                             ImGui::GetContentRegionAvail(), UI_PANEL_DEFAULT)) {
+        ui_end_tool_panel();
+        ImGui::End();
+        return;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    bool track_enabled = timeline_enabled();
+    bool timeline_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    s_timeline_keyboard_focus = timeline_focused;
+    bool timeline_nav_active = track_enabled && timeline_focused &&
+                               !io.WantTextInput && !ImGui::IsAnyItemActive() &&
+                               !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+    if (timeline_nav_active) {
+        int step = io.KeyShift ? 10 : 1;
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false))
+            ui_timeline_copy_selected_slot();
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V, false))
+            ui_timeline_paste_selected_slot();
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete, false))
+            ui_timeline_delete_selected_slot();
+        if (ImGui::IsKeyPressed(ImGuiKey_I, false))
+            ui_timeline_insert_selected_slot();
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false)) {
+            if (ui_timeline_slot_selection_valid())
+                ui_timeline_move_selection(-step, 0);
+            else
+                timeline_set_current_frame(timeline_current_frame() - step);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false)) {
+            if (ui_timeline_slot_selection_valid())
+                ui_timeline_move_selection(step, 0);
+            else
+                timeline_set_current_frame(timeline_current_frame() + step);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false))
+            ui_timeline_move_selection(0, -1);
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false))
+            ui_timeline_move_selection(0, 1);
+        if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) {
+            if (ui_timeline_slot_selection_valid())
+                ui_timeline_move_selection(-timeline_length_frames(), 0);
+            timeline_set_current_frame(0);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_End, false)) {
+            if (ui_timeline_slot_selection_valid())
+                ui_timeline_move_selection(timeline_length_frames(), 0);
+            timeline_set_current_frame(timeline_length_frames() - 1);
+        }
+    }
+
+    int fps = timeline_fps();
+    int length = timeline_length_frames();
+    static float s_timeline_slot_zoom = 1.0f;
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ui_margin_px(10.0f), ui_margin_px(4.0f)));
+    if (track_enabled) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.33f, 0.18f, 0.10f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.24f, 0.12f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.58f, 0.30f, 0.14f, 1.0f));
+    }
+    if (ImGui::Button(track_enabled ? "Track" : "No Track"))
+        timeline_set_enabled(!track_enabled);
+    if (track_enabled)
+        ImGui::PopStyleColor(3);
+    ImGui::SameLine(0.0f, ui_margin_px(18.0f));
+    if (!track_enabled)
+        ImGui::BeginDisabled();
+    ImGui::SetNextItemWidth(ui_px(62.0f));
+    if (ImGui::InputInt("fps", &fps, 0, 0))
+        timeline_set_fps(fps);
+    ImGui::SameLine(0.0f, ui_margin_px(18.0f));
+    ImGui::SetNextItemWidth(ui_px(76.0f));
+    if (ImGui::InputInt("frames", &length, 0, 0))
+        timeline_set_length_frames(length);
+    ImGui::SameLine(0.0f, ui_margin_px(10.0f));
+    bool loop = timeline_loop();
+    if (loop) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.33f, 0.18f, 0.10f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.24f, 0.12f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.58f, 0.30f, 0.14f, 1.0f));
+    }
+    if (ui_icon_button("##timeline_loop", UI_ICON_RESTART, ImVec2(ui_px(26.0f), 0.0f),
+                       loop ? "Loop on" : "Loop off"))
+        timeline_set_loop(!loop);
+    if (loop)
+        ImGui::PopStyleColor(3);
+    ImGui::SameLine(0.0f, ui_margin_px(18.0f));
+    ImGui::SetNextItemWidth(ui_px(112.0f));
+    ImGui::SliderFloat("zoom", &s_timeline_slot_zoom, 0.55f, 1.60f, "%.2f");
+    ImGui::SameLine(0.0f, ui_margin_px(18.0f));
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("Current frame %d / %d  -  scene %.2fs",
+                        timeline_current_frame(), timeline_length_frames() - 1, app_scene_time());
+    ImGui::PopStyleVar();
+
+    ui_timeline_add_tracks();
+    ImGui::Separator();
+
+    int max_visible_frames = (int)(40.0f / s_timeline_slot_zoom);
+    if (max_visible_frames < 24) max_visible_frames = 24;
+    if (max_visible_frames > 80) max_visible_frames = 80;
+    int visible_count = timeline_length_frames();
+    if (visible_count > max_visible_frames)
+        visible_count = max_visible_frames;
+    int visible_first = timeline_current_frame() - visible_count / 2;
+    int max_first_frame = timeline_length_frames() - visible_count;
+    if (max_first_frame < 0) max_first_frame = 0;
+    if (visible_first < 0) visible_first = 0;
+    if (visible_first > max_first_frame) visible_first = max_first_frame;
+    int visible_last = visible_first + visible_count;
+
+    ImVec2 slot_size = ImVec2(ui_px(22.0f * s_timeline_slot_zoom), ui_px(18.0f));
+    const float col_w = slot_size.x + ui_px(2.0f);
+    ImGuiTableFlags flags = ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY |
+        ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+        ImGuiTableFlags_BordersOuterV | ImGuiTableFlags_SizingFixedFit;
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(ui_px(1.0f), ui_px(2.0f)));
+    if (ImGui::BeginTable("##timeline_table", visible_count + 1, flags, ImVec2(0.0f, 0.0f))) {
+        ImGui::TableSetupScrollFreeze(1, 1);
+        ImGui::TableSetupColumn("Track", ImGuiTableColumnFlags_WidthFixed, ui_px(210.0f));
+        for (int f = visible_first; f < visible_last; f++) {
+            char label[16] = {};
+            if (f % 5 == 0)
+                snprintf(label, sizeof(label), "%d", f);
+            ImGui::TableSetupColumn(label, ImGuiTableColumnFlags_WidthFixed, col_w);
+        }
+
+        ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextDisabled("Track");
+        for (int f = visible_first; f < visible_last; f++) {
+            ImGui::TableSetColumnIndex((f - visible_first) + 1);
+            if (f == timeline_current_frame())
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg,
+                    ImGui::GetColorU32(ImVec4(0.25f, 0.13f, 0.07f, 0.78f)));
+            if (f % 5 == 0) {
+                char label[16] = {};
+                snprintf(label, sizeof(label), "%d", f);
+                ui_timeline_centered_text_disabled(label);
+            }
+        }
+
+        for (int t = 0; t < g_timeline_track_count; t++) {
+            TimelineTrack& track = g_timeline_tracks[t];
+            if (!track.active)
+                continue;
+
+            ImGui::PushID(t);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            char label[128] = {};
+            ui_timeline_track_label(track, label, sizeof(label));
+            bool missing = !timeline_track_target_exists(track);
+            if (missing)
+                ImGui::TextDisabled("%s", label);
+            else
+                ImGui::TextUnformatted(label);
+            if (ImGui::BeginPopupContextItem("##track_menu")) {
+                if (ImGui::MenuItem("Delete Track")) {
+                    if (s_timeline_slot_selection.valid) {
+                        if (s_timeline_slot_selection.track_index == t)
+                            s_timeline_slot_selection.valid = false;
+                        else if (s_timeline_slot_selection.track_index > t)
+                            s_timeline_slot_selection.track_index--;
+                    }
+                    timeline_delete_track(t);
+                    ImGui::EndPopup();
+                    ImGui::PopID();
+                    t--;
+                    continue;
+                }
+                ImGui::EndPopup();
+            }
+
+            for (int f = visible_first; f < visible_last; f++) {
+                ImGui::TableSetColumnIndex((f - visible_first) + 1);
+                if (f == timeline_current_frame())
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg,
+                        ImGui::GetColorU32(ImVec4(0.25f, 0.13f, 0.07f, 0.58f)));
+                ImGui::PushID(f);
+                ui_timeline_draw_slot(t, f, slot_size);
+                ImGui::PopID();
+            }
+            ImGui::PopID();
+        }
+
+        ImGui::EndTable();
+    }
+    ImGui::PopStyleVar();
+
+    if (!track_enabled)
+        ImGui::EndDisabled();
+
+    ui_end_tool_panel();
+    ImGui::End();
+}
+
 static void ui_top_bar() {
     for (int i = 0; i < 3; i++)
         s_ui_window_control_screen_rects_valid[i] = false;
@@ -5838,6 +6372,18 @@ static void ui_top_bar() {
     ui_align_frame_row(row_y);
     if (ImGui::Button("Export EXE"))
         ui_export_current_project_single_exe();
+    ImGui::SameLine();
+    ui_align_frame_row(row_y);
+    bool timeline_was_open = s_timeline_window_open;
+    if (timeline_was_open) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.33f, 0.18f, 0.10f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.24f, 0.12f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.58f, 0.30f, 0.14f, 1.0f));
+    }
+    if (ImGui::Button("Timeline"))
+        s_timeline_window_open = !s_timeline_window_open;
+    if (timeline_was_open)
+        ImGui::PopStyleColor(3);
     ImGui::SameLine(0.0f, ui_margin_px(6.0f));
     ui_align_frame_row(row_y);
     if (ui_icon_button("##shortcuts_button", UI_ICON_HELP, ImVec2(ui_px(28.0f), 0.0f), "Shortcuts"))
@@ -6146,6 +6692,7 @@ void ui_draw() {
 
     ImGuiIO& io = ImGui::GetIO();
     bool hotkeys_ok = !io.WantTextInput && !ImGui::IsAnyItemActive();
+    bool editor_selection_hotkeys_ok = hotkeys_ok && !s_timeline_keyboard_focus;
     if (ImGui::IsKeyPressed(ImGuiKey_F5, false))
         ui_recompile_all_shaders();
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false))
@@ -6158,9 +6705,9 @@ void ui_draw() {
         app_request_scene_restart();
     if (hotkeys_ok && ImGui::IsKeyPressed(ImGuiKey_F11, false))
         s_viewport_fullscreen = !s_viewport_fullscreen;
-    if (hotkeys_ok && ImGui::IsKeyPressed(ImGuiKey_Delete, false))
+    if (editor_selection_hotkeys_ok && ImGui::IsKeyPressed(ImGuiKey_Delete, false))
         ui_delete_selection();
-    if (hotkeys_ok && ImGui::IsKeyPressed(ImGuiKey_X, false))
+    if (editor_selection_hotkeys_ok && ImGui::IsKeyPressed(ImGuiKey_X, false))
         ui_toggle_selected_command_enabled();
 
     ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -6192,6 +6739,8 @@ void ui_draw() {
     ImGui::PopStyleVar();
     ui_draw_shortcuts_popup();
     ImGui::End();
+
+    ui_draw_timeline_window();
 
     ImGui::Render();
 }

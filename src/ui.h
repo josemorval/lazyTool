@@ -19,7 +19,9 @@ enum UiWindowControlHit {
 
 void app_request_scene_restart();
 void app_request_scene_surface_resize(int w, int h);
+void app_request_scene_render();
 void app_set_scene_paused(bool paused);
+void app_set_scene_time(float seconds);
 bool app_scene_paused();
 float app_scene_time();
 uint64_t app_scene_frame();

@@ -942,6 +942,20 @@ These limits are defined in the engine:
 
 ---
 
+## Standalone EXE export
+
+The build produces one standalone player: `lazyPlayer.exe`. The editor's
+**Export EXE** button always uses this same packed-player path, embedding the
+current project plus referenced assets and shaders into the output executable.
+
+The CLI path is:
+
+```bat
+bin\lazyTool.exe --export projects\scene.lt bin\scene.exe
+```
+
+---
+
 ## Relevant repository structure
 
 ```text

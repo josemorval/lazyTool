@@ -18,6 +18,7 @@
 #include "ui.h"
 #include "app_settings.h"
 #include "embedded_pack.h"
+#include "timeline.h"
 #include "resource.h"
 
 #ifdef LAZYTOOL_PLAYER_ONLY
@@ -340,6 +341,7 @@ static float    g_dt             = 0.f;
 static uint64_t g_frame          = 0;
 static bool     g_restart_scene_requested = false;
 static bool     g_scene_paused = false;
+static bool     g_scene_render_requested = false;
 static CmdHandle g_default_pixelize_cmd = INVALID_HANDLE;
 static bool     g_player_mode = false;
 
@@ -355,8 +357,22 @@ void app_request_scene_surface_resize(int w, int h) {
     g_pending_scene_surface_resize = true;
 }
 
+void app_request_scene_render() {
+    g_scene_render_requested = true;
+}
+
 void app_set_scene_paused(bool paused) {
     g_scene_paused = paused;
+}
+
+void app_set_scene_time(float seconds) {
+    if (seconds < 0.0f)
+        seconds = 0.0f;
+    g_time = seconds;
+    g_dt = 0.0f;
+    g_frame = (uint64_t)floorf(seconds * 60.0f + 0.5f);
+    dx_invalidate_scene_history();
+    app_request_scene_render();
 }
 
 bool app_scene_paused() {
@@ -369,6 +385,27 @@ float app_scene_time() {
 
 uint64_t app_scene_frame() {
     return g_frame;
+}
+
+static void app_restart_scene_runtime() {
+    g_time = 0.0f;
+    g_dt = 0.0f;
+    g_frame = 0;
+    dx_create_scene_rt(g_dx.scene_width, g_dx.scene_height);
+    Resource* dl = res_get(g_builtin_dirlight);
+    if (dl && dl->shadow_width > 0 && dl->shadow_height > 0)
+        dx_create_shadow_map(dl->shadow_width, dl->shadow_height);
+    else
+        dx_create_shadow_map(g_dx.shadow_width, g_dx.shadow_height);
+    res_reset_transient_gpu_resources();
+}
+
+static bool app_timeline_has_keys() {
+    for (int i = 0; i < g_timeline_track_count; i++) {
+        if (g_timeline_tracks[i].active && g_timeline_tracks[i].key_count > 0)
+            return true;
+    }
+    return false;
 }
 
 Camera g_camera = {};
@@ -943,7 +980,40 @@ static bool wide_to_utf8(const wchar_t* in, char* out, int out_sz) {
     return true;
 }
 
+#ifndef LAZYTOOL_PLAYER_ONLY
+static void cli_attach_console() {
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        FILE* f = nullptr;
+        freopen_s(&f, "CONOUT$", "w", stdout);
+        freopen_s(&f, "CONOUT$", "w", stderr);
+    }
+}
+
+static bool cli_path_is_absolute(const char* path) {
+    if (!path || !path[0])
+        return false;
+    if (path[0] == '/' || path[0] == '\\')
+        return true;
+    return path[1] == ':' && (path[2] == '\\' || path[2] == '/');
+}
+
+static void cli_resolve_path_from_launch_dir(const char* launch_dir, char* path, int path_sz) {
+    if (!path || !path[0] || path_sz <= 0 || cli_path_is_absolute(path))
+        return;
+    char tmp[MAX_PATH_LEN] = {};
+    snprintf(tmp, sizeof(tmp), "%s\\%s", launch_dir && launch_dir[0] ? launch_dir : ".", path);
+    strncpy(path, tmp, path_sz - 1);
+    path[path_sz - 1] = '\0';
+}
+
+#endif
+
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
+    wchar_t launch_dir_w[MAX_PATH] = {};
+    GetCurrentDirectoryW(MAX_PATH, launch_dir_w);
+    char launch_dir[MAX_PATH_LEN] = {};
+    wide_to_utf8(launch_dir_w, launch_dir, MAX_PATH_LEN);
+
     wchar_t module_path_w[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, module_path_w, MAX_PATH);
     wchar_t exe_dir_w[MAX_PATH] = {};
@@ -969,7 +1039,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         strncpy(startup_project, lt_pack_project_path(), MAX_PATH_LEN - 1);
     }
 
-#ifndef LAZYTOOL_PROCEDURAL_ONLY
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv) {
@@ -978,15 +1047,19 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             wide_to_utf8(argv[1], arg1, MAX_PATH_LEN);
 
 #ifndef LAZYTOOL_PLAYER_ONLY
-        if (_stricmp(arg1, "--export-single") == 0) {
+        if (_stricmp(arg1, "--export") == 0 || _stricmp(arg1, "--export-single") == 0) {
             char project_path[MAX_PATH_LEN] = {};
             char output_path[MAX_PATH_LEN] = {};
             if (argc > 2) wide_to_utf8(argv[2], project_path, MAX_PATH_LEN);
             if (argc > 3) wide_to_utf8(argv[3], output_path, MAX_PATH_LEN);
+            cli_resolve_path_from_launch_dir(launch_dir, project_path, MAX_PATH_LEN);
+            cli_resolve_path_from_launch_dir(launch_dir, output_path, MAX_PATH_LEN);
 
             char err[512] = {};
-            bool ok = lt_export_single_exe(module_path, project_path, output_path, err, sizeof(err));
+            bool ok = lt_export_normal_exe(module_path, project_path, output_path, err, sizeof(err));
             if (!ok) {
+                cli_attach_console();
+                fprintf(stderr, "%s\n", err[0] ? err : "Export failed.");
                 LocalFree(argv);
                 return 1;
             }
@@ -1002,7 +1075,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
         LocalFree(argv);
     }
-#endif
     g_player_mode = startup_player_mode;
 
     WNDCLASSEXW wc  = {};
@@ -1077,9 +1149,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         }
         if (!g_running) break;
 
+        bool force_scene_render = g_scene_render_requested;
+        g_scene_render_requested = false;
+
         if (g_pending_resize) {
             dx_resize(g_pending_w, g_pending_h);
+            res_sync_scene_dependent_render_textures();
             g_pending_resize = false;
+            force_scene_render = true;
         }
         if (g_pending_scene_surface_resize) {
             if (g_pending_scene_surface_w != g_dx.scene_width || g_pending_scene_surface_h != g_dx.scene_height) {
@@ -1088,47 +1165,69 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
                 log_info("Scene surface resized to %dx%d", g_pending_scene_surface_w, g_pending_scene_surface_h);
             }
             g_pending_scene_surface_resize = false;
+            force_scene_render = true;
         }
 
         LARGE_INTEGER now_t;
         QueryPerformanceCounter(&now_t);
         g_dt = (float)(now_t.QuadPart - prev_t.QuadPart) / (float)freq.QuadPart;
         if (g_dt > 0.1f) g_dt = 0.1f;
+        float editor_dt = g_dt;
         prev_t  = now_t;
         if (g_restart_scene_requested) {
-            g_time = 0.0f;
-            g_dt = 0.0f;
-            g_frame = 0;
             g_restart_scene_requested = false;
-            dx_create_scene_rt(g_dx.scene_width, g_dx.scene_height);
-            Resource* dl = res_get(g_builtin_dirlight);
-            if (dl && dl->shadow_width > 0 && dl->shadow_height > 0)
-                dx_create_shadow_map(dl->shadow_width, dl->shadow_height);
-            else
-                dx_create_shadow_map(g_dx.shadow_width, g_dx.shadow_height);
-            res_reset_transient_gpu_resources();
+            force_scene_render = true;
+            app_restart_scene_runtime();
             log_info("Scene restarted from frame 0.");
         } else if (!g_scene_paused) {
             g_time += g_dt;
             g_frame++;
+            bool timeline_runtime_active = timeline_enabled();
+            if (timeline_runtime_active) {
+                float timeline_end_time = timeline_fps() > 0 ?
+                    (float)(timeline_length_frames() - 1) / (float)timeline_fps() : 0.0f;
+                if (timeline_loop() && timeline_end_time > 0.0f && g_time > timeline_end_time) {
+                    force_scene_render = true;
+                    app_restart_scene_runtime();
+                } else if (!timeline_loop() && timeline_end_time >= 0.0f && g_time >= timeline_end_time) {
+                    app_set_scene_time(timeline_end_time);
+                    g_scene_paused = true;
+                    force_scene_render = true;
+                }
+            }
         } else {
             g_dt = 0.0f;
         }
 
-        // Pause is intentionally a "freeze the scene texture" state: we do not
-        // execute commands and we do not clear/rebuild the scene RT, so the
-        // last rendered frame stays visible while the editor remains responsive.
+        // Pause freezes the scene texture by default. Explicit editor actions
+        // can still request one render so reset, scrubbing and key edits stay
+        // visible without advancing runtime time.
         bool light_orbit_active = false;
         if (g_player_mode)
             g_scene_view_hovered = true;
-        if (!g_scene_paused)
-            light_orbit_active = update_dirlight_orbit();
-        if (!g_scene_paused && !light_orbit_active)
-            update_camera_controls(g_dt);
+        if (timeline_enabled()) {
+            timeline_update(g_time);
+            if (app_timeline_has_keys())
+                timeline_apply_current();
+        }
+        Camera camera_before_controls = g_camera;
+        light_orbit_active = update_dirlight_orbit();
+        if (!light_orbit_active)
+            update_camera_controls(g_scene_paused ? editor_dt : g_dt);
+        if (memcmp(&camera_before_controls, &g_camera, sizeof(g_camera)) != 0) {
+            force_scene_render = true;
+            timeline_capture_if_tracked(TIMELINE_TRACK_CAMERA, "camera", RES_NONE);
+        }
+        if (light_orbit_active) {
+            force_scene_render = true;
+            timeline_capture_if_tracked(TIMELINE_TRACK_DIRLIGHT, "dirlight", RES_NONE);
+        }
+        if (force_scene_render)
+            g_scene_render_requested = false;
         update_builtins_and_scene_cb();
         update_default_example_commands();
 
-        if (!g_scene_paused) {
+        if (!g_scene_paused || force_scene_render) {
             // User cbuffer: pack editor defaults before any draw/dispatch.
             user_cb_update();
 

@@ -15,6 +15,7 @@ ID3D11Buffer* g_user_cb_buf   = nullptr;
 #ifdef LAZYTOOL_NO_USER_CB
 void user_cb_init() {}
 void user_cb_shutdown() {}
+void user_cb_clear() {}
 void user_cb_update() {}
 void user_cb_bind() {}
 void user_cb_sync_command_params(Command* c, const Resource*) {
@@ -154,6 +155,11 @@ void user_cb_init() {
 void user_cb_shutdown() {
     if (g_user_cb_buf) { g_user_cb_buf->Release(); g_user_cb_buf = nullptr; }
     if (s_command_cb_buf) { s_command_cb_buf->Release(); s_command_cb_buf = nullptr; }
+}
+
+void user_cb_clear() {
+    memset(g_user_cb_entries, 0, sizeof(g_user_cb_entries));
+    g_user_cb_count = 0;
 }
 
 // Pack the latest user variable values into the shared GPU buffer.

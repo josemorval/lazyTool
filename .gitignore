@@ -1,2 +1,5 @@
 bin/*
 assets/*
+debug
+imgui.ini
+*.zip

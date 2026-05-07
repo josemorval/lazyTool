@@ -6,6 +6,7 @@
 #include "ui.h"
 #include "user_cb.h"
 #include "embedded_pack.h"
+#include "timeline.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -490,6 +491,9 @@ static const char* cmd_type_name(CmdType type) {
 }
 
 static void project_clear_user_data() {
+    timeline_reset();
+    user_cb_clear();
+
     for (int i = 0; i < MAX_COMMANDS; i++) {
         if (g_commands[i].active)
             cmd_free((CmdHandle)(i + 1));
@@ -620,6 +624,18 @@ bool project_save_text(const char* path) {
         }
     }
 
+    fprintf(f, "\nuser_cb\n");
+    for (int i = 0; i < g_user_cb_count; i++) {
+        UserCBEntry& e = g_user_cb_entries[i];
+        char source_ref[MAX_PATH_LEN] = {};
+        res_ref(e.source, source_ref, MAX_PATH_LEN);
+        fprintf(f, "user_var %s %s %s %d %d %d %d %.9g %.9g %.9g %.9g\n",
+            e.name, res_type_token(e.type), source_ref,
+            e.ival[0], e.ival[1], e.ival[2], e.ival[3],
+            e.fval[0], e.fval[1], e.fval[2], e.fval[3]);
+    }
+    fprintf(f, "end_user_cb\n");
+
     fprintf(f, "\ncommands\n");
     for (int i = 0; i < MAX_COMMANDS; i++) {
         Command& c = g_commands[i];
@@ -718,6 +734,8 @@ bool project_save_text(const char* path) {
         fprintf(f, "end_command\n");
     }
 
+    timeline_write_project(f);
+
     fclose(f);
     project_set_current_path(path);
     log_info("Project saved: %s", path);
@@ -774,97 +792,9 @@ static bool project_read_line(const char*& cursor, const char* end, char* out, i
     return true;
 }
 
-// Parse a saved project file and rebuild the in-memory editor state.
-#ifdef LAZYTOOL_NANO_PROJECT_LOADER
-bool project_load_text(const char* path) {
-    void* project_bytes = nullptr;
-    size_t project_size = 0;
-    if (!lt_read_file(path, &project_bytes, &project_size)) {
-        log_error("Project load failed: %s", path);
-        return false;
-    }
-
-    project_clear_user_data();
-    project_reset_view_defaults();
-
-    char line[1024] = {};
-    Command* cur = nullptr;
-    const char* cursor = (const char*)project_bytes;
-    const char* end = cursor + project_size;
-    while (project_read_line(cursor, end, line, sizeof(line))) {
-        char tmp[1024] = {};
-        strncpy(tmp, line, sizeof(tmp) - 1);
-        char* tag = strtok(tmp, " \t\r\n");
-        if (!tag || tag[0] == '#')
-            continue;
-
-        if (strcmp(tag, "camera_fps") == 0) {
-            g_camera.position[0] = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.position[1] = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.position[2] = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.yaw = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.pitch = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.fov_y = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.near_z = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.far_z = (float)atof(strtok(nullptr, " \t\r\n"));
-        } else if (strcmp(tag, "resource") == 0) {
-            char* kind = strtok(nullptr, " \t\r\n");
-            char* name = strtok(nullptr, " \t\r\n");
-            if (!kind || !name)
-                continue;
-            if (strcmp(kind, "mesh_primitive") == 0) {
-                char* prim = strtok(nullptr, " \t\r\n");
-                res_create_mesh_primitive(name, mesh_prim_from_name(prim ? prim : "cube"));
-            } else if (strcmp(kind, "shader_vsps") == 0) {
-                char* p = strtok(nullptr, " \t\r\n");
-                res_create_shader(name, p && strcmp(p, "-") != 0 ? p : "", "VSMain", "PSMain");
-            }
-        } else if (strcmp(tag, "command") == 0) {
-            char* kind = strtok(nullptr, " \t\r\n");
-            char* name = strtok(nullptr, " \t\r\n");
-            char* enabled = strtok(nullptr, " \t\r\n");
-            CmdHandle h = cmd_alloc(name ? name : "cmd", cmd_type_from_name(kind ? kind : "draw_mesh"));
-            cur = cmd_get(h);
-            if (cur && enabled)
-                cur->enabled = atoi(enabled) != 0;
-        } else if (strcmp(tag, "end_command") == 0) {
-            cur = nullptr;
-        } else if (cur) {
-            if (strcmp(tag, "targets") == 0) {
-                cur->rt = res_by_ref(strtok(nullptr, " \t\r\n"),
-                    res_lookup_types(RES_RENDER_TEXTURE2D, RES_RENDER_TEXTURE3D, RES_BUILTIN_SCENE_COLOR));
-                cur->depth = res_by_ref(strtok(nullptr, " \t\r\n"),
-                    res_lookup_types(RES_RENDER_TEXTURE2D, RES_BUILTIN_SCENE_DEPTH));
-            } else if (strcmp(tag, "mesh_shader") == 0) {
-                cur->mesh = res_by_ref(strtok(nullptr, " \t\r\n"), res_lookup_types(RES_MESH));
-                cur->shader = res_by_ref(strtok(nullptr, " \t\r\n"), res_lookup_types(RES_SHADER));
-            } else if (strcmp(tag, "render_state") == 0) {
-                cur->color_write = atoi(strtok(nullptr, " \t\r\n")) != 0;
-                cur->depth_test = atoi(strtok(nullptr, " \t\r\n")) != 0;
-                cur->depth_write = atoi(strtok(nullptr, " \t\r\n")) != 0;
-                cur->alpha_blend = atoi(strtok(nullptr, " \t\r\n")) != 0;
-                cur->cull_back = atoi(strtok(nullptr, " \t\r\n")) != 0;
-                cur->shadow_cast = atoi(strtok(nullptr, " \t\r\n")) != 0;
-                cur->shadow_receive = atoi(strtok(nullptr, " \t\r\n")) != 0;
-            } else if (strcmp(tag, "transform") == 0) {
-                for (int i = 0; i < 3; i++) cur->pos[i] = (float)atof(strtok(nullptr, " \t\r\n"));
-                for (int i = 0; i < 3; i++) cur->rot[i] = (float)atof(strtok(nullptr, " \t\r\n"));
-                for (int i = 0; i < 3; i++) cur->scale[i] = (float)atof(strtok(nullptr, " \t\r\n"));
-            } else if (strcmp(tag, "clear") == 0) {
-                cur->clear_color_enabled = atoi(strtok(nullptr, " \t\r\n")) != 0;
-                for (int i = 0; i < 4; i++) cur->clear_color[i] = (float)atof(strtok(nullptr, " \t\r\n"));
-                cur->clear_depth = atoi(strtok(nullptr, " \t\r\n")) != 0;
-                cur->depth_clear_val = (float)atof(strtok(nullptr, " \t\r\n"));
-            }
-        }
-    }
-
-    lt_free_file(project_bytes);
-    project_set_current_path(path);
-    dx_invalidate_scene_history();
-    return true;
-}
-#else
+// Parse a saved project file and rebuild the in-memory editor state. The text
+// format is append-friendly: older files may omit newer fields, and unknown
+// lines are ignored so experimental commands can survive round-trips.
 bool project_load_text(const char* path) {
     void* project_bytes = nullptr;
     size_t project_size = 0;
@@ -882,6 +812,7 @@ bool project_load_text(const char* path) {
     CmdHandle pending_parent_cmds[MAX_COMMANDS] = {};
     char pending_parent_names[MAX_COMMANDS][MAX_NAME] = {};
     int pending_parent_count = 0;
+    int timeline_load_track = -1;
     const char* cursor = (const char*)project_bytes;
     const char* end = cursor + project_size;
     while (project_read_line(cursor, end, line, sizeof(line))) {
@@ -891,7 +822,51 @@ bool project_load_text(const char* path) {
         char* tag = strtok(tmp, " \t\r\n");
         if (!tag || tag[0] == '#') continue;
 
-        if (strcmp(tag, "camera") == 0) {
+        if (strcmp(tag, "timeline") == 0) {
+            timeline_reset();
+            timeline_load_track = -1;
+        } else if (strcmp(tag, "end_timeline") == 0) {
+            timeline_load_track = -1;
+        } else if (strcmp(tag, "timeline_settings") == 0) {
+            char* fps = strtok(nullptr, " \t\r\n");
+            char* length = strtok(nullptr, " \t\r\n");
+            char* frame = strtok(nullptr, " \t\r\n");
+            char* play_dir = strtok(nullptr, " \t\r\n");
+            char* loop = strtok(nullptr, " \t\r\n");
+            char* enabled = strtok(nullptr, " \t\r\n");
+            if (fps) timeline_set_fps(atoi(fps));
+            if (length) timeline_set_length_frames(atoi(length));
+            if (frame) timeline_set_current_frame(atoi(frame));
+            if (play_dir) timeline_set_play_dir(atoi(play_dir));
+            if (loop) timeline_set_loop(atoi(loop) != 0);
+            if (enabled) timeline_set_enabled(atoi(enabled) != 0);
+        } else if (strcmp(tag, "timeline_track") == 0) {
+            char* kind = strtok(nullptr, " \t\r\n");
+            char* target = strtok(nullptr, " \t\r\n");
+            char* type = strtok(nullptr, " \t\r\n");
+            timeline_load_track = timeline_add_track(
+                timeline_track_kind_from_token(kind),
+                target ? target : "",
+                res_type_from_token(type));
+        } else if (strcmp(tag, "timeline_key") == 0) {
+            char* frame_tok = strtok(nullptr, " \t\r\n");
+            TimelineKey* key = frame_tok ? timeline_set_key(timeline_load_track, atoi(frame_tok)) : nullptr;
+            if (key && timeline_load_track >= 0 && timeline_load_track < g_timeline_track_count) {
+                TimelineTrack& track = g_timeline_tracks[timeline_load_track];
+                int n = timeline_track_value_count(track);
+                if (timeline_track_uses_integral_values(track)) {
+                    for (int i = 0; i < n; i++) {
+                        char* v = strtok(nullptr, " \t\r\n");
+                        key->ival[i] = v ? atoi(v) : 0;
+                    }
+                } else {
+                    for (int i = 0; i < n; i++) {
+                        char* v = strtok(nullptr, " \t\r\n");
+                        key->fval[i] = v ? (float)atof(v) : 0.0f;
+                    }
+                }
+            }
+        } else if (strcmp(tag, "camera") == 0) {
             float azimuth = (float)atof(strtok(nullptr, " \t\r\n"));
             float elevation = (float)atof(strtok(nullptr, " \t\r\n"));
             float distance = (float)atof(strtok(nullptr, " \t\r\n"));
@@ -1001,12 +976,7 @@ bool project_load_text(const char* path) {
                 res_create_mesh_primitive(name, mesh_prim_from_name(prim ? prim : "cube"));
             } else if (strcmp(kind, "mesh_gltf") == 0) {
                 char* p = strtok(nullptr, " \t\r\n");
-#ifdef LAZYTOOL_PROCEDURAL_ONLY
-                log_warn("mesh_gltf skipped in procedural-only player: %s", p ? p : "");
-                res_create_mesh_primitive(name, MESH_PRIM_CUBE);
-#else
                 res_load_mesh(name, p ? p : "");
-#endif
             } else if (strcmp(kind, "shader_vsps") == 0) {
                 char* p = strtok(nullptr, " \t\r\n");
                 res_create_shader(name, p && strcmp(p, "-") != 0 ? p : "", "VSMain", "PSMain");
@@ -1015,11 +985,7 @@ bool project_load_text(const char* path) {
                 res_create_compute_shader(name, p && strcmp(p, "-") != 0 ? p : "", "CSMain");
             } else if (strcmp(kind, "texture2d") == 0) {
                 char* p = strtok(nullptr, " \t\r\n");
-#ifdef LAZYTOOL_PROCEDURAL_ONLY
-                log_warn("texture2d skipped in procedural-only player: %s", p ? p : "");
-#else
                 if (p && strcmp(p, "-") != 0) res_load_texture(name, p);
-#endif
             }
         } else if (strcmp(tag, "mesh_part_disabled") == 0) {
             char* mesh_ref = strtok(nullptr, " \t\r\n");
@@ -1029,6 +995,26 @@ bool project_load_text(const char* path) {
             int part_index = part_tok ? atoi(part_tok) : -1;
             if (mesh && part_index >= 0 && part_index < mesh->mesh_part_count)
                 mesh->mesh_parts[part_index].enabled = false;
+        } else if (strcmp(tag, "user_var") == 0) {
+            char* name = strtok(nullptr, " \t\r\n");
+            char* type_name = strtok(nullptr, " \t\r\n");
+            char* source = strtok(nullptr, " \t\r\n");
+            ResType type = res_type_from_token(type_name);
+            if (name && type != RES_NONE && user_cb_add_var(name, type)) {
+                int idx = g_user_cb_count - 1;
+                UserCBEntry& e = g_user_cb_entries[idx];
+                for (int i = 0; i < 4; i++) {
+                    char* v = strtok(nullptr, " \t\r\n");
+                    e.ival[i] = v ? atoi(v) : 0;
+                }
+                for (int i = 0; i < 4; i++) {
+                    char* v = strtok(nullptr, " \t\r\n");
+                    e.fval[i] = v ? (float)atof(v) : 0.0f;
+                }
+                ResHandle source_h = res_by_ref(source, res_lookup_types(type));
+                if (source_h != INVALID_HANDLE)
+                    user_cb_set_source(idx, source_h);
+            }
         } else if (strcmp(tag, "command") == 0) {
             char* kind = strtok(nullptr, " \t\r\n");
             char* name = strtok(nullptr, " \t\r\n");
@@ -1145,4 +1131,3 @@ bool project_load_text(const char* path) {
     log_info("Project loaded: %s", path);
     return true;
 }
-#endif

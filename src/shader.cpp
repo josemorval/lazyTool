@@ -383,7 +383,7 @@ uint32_t shader_cb_next_layout_version() {
 static void reflect_command_cbuffer(Resource* r, ID3DBlob*) {
     if (!r)
         return;
-    // Nano player convention: ObjectCB is fixed at b1 and UserCB is disabled.
+    // Ultra player convention: ObjectCB is fixed at b1 and UserCB is disabled.
     r->object_cb_active = true;
     r->object_cb_bind_slot = 1;
 }

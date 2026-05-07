@@ -3,13 +3,11 @@
 
 // This file centralizes the one-definition implementation toggles for the
 // header-only third-party libraries used by the project.
-#ifndef LAZYTOOL_PROCEDURAL_ONLY
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
 #define CGLTF_IMPLEMENTATION
 #include "cgltf.h"
-#endif
 
 #ifndef LAZYTOOL_PLAYER_ONLY
 #ifdef _MSC_VER

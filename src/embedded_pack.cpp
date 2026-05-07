@@ -1,12 +1,18 @@
 #include "embedded_pack.h"
 #include "types.h"
 #include "log.h"
-#ifndef LAZYTOOL_PROCEDURAL_ONLY
 #include "cgltf.h"
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// Normal executable packaging.
+//
+// The normal player keeps the full runtime so asset-heavy projects can load
+// textures, meshes, and shader files. Exporting copies the player executable,
+// appends a small pack at the end of the PE file, and writes a footer that lets
+// the runtime find that pack when it starts. The project text is minified before
+// it is embedded, but external assets are preserved byte-for-byte.
 
 static const unsigned char k_footer_magic[8] = { 'L','T','P','A','C','K','1','!' };
 static const unsigned char k_data_magic[8]   = { 'L','T','P','D','A','T','1','!' };
@@ -178,46 +184,18 @@ static bool disk_file_exists(const char* path) {
     return true;
 }
 
-static const char* path_basename(const char* path) {
-    if (!path)
-        return "";
-    const char* slash1 = strrchr(path, '/');
-    const char* slash2 = strrchr(path, '\\');
-    const char* slash = slash1 > slash2 ? slash1 : slash2;
-    return slash ? slash + 1 : path;
-}
-
-static void choose_export_base_exe(const char* requested, bool needs_asset_loaders,
-                                   bool nano_compatible, char* out, int out_sz) {
+// Normal exports are requested from lazyTool.exe, but the player stub has a
+// smaller link surface than the editor. Prefer a sibling lazyPlayer.exe when it
+// exists and fall back to the requested executable for development builds.
+static void choose_normal_export_base_exe(const char* requested, char* out, int out_sz) {
     if (!out || out_sz <= 0)
         return;
     strncpy(out, requested ? requested : "", out_sz - 1);
     out[out_sz - 1] = '\0';
-    if (!requested ||
-        _stricmp(path_basename(requested), "lazyPlayer.exe") == 0 ||
-        _stricmp(path_basename(requested), "lazyPlayerTiny.exe") == 0)
-        return;
 
     char dir[MAX_PATH_LEN] = {};
     path_dirname(requested, dir, MAX_PATH_LEN);
     char candidate[MAX_PATH_LEN] = {};
-    if (nano_compatible && !needs_asset_loaders) {
-        path_join(dir, "lazyPlayerNano.exe", candidate, MAX_PATH_LEN);
-        if (disk_file_exists(candidate)) {
-            strncpy(out, candidate, out_sz - 1);
-            out[out_sz - 1] = '\0';
-            return;
-        }
-    }
-    if (!needs_asset_loaders) {
-        path_join(dir, "lazyPlayerTiny.exe", candidate, MAX_PATH_LEN);
-        if (disk_file_exists(candidate)) {
-            strncpy(out, candidate, out_sz - 1);
-            out[out_sz - 1] = '\0';
-            return;
-        }
-    }
-
     path_join(dir, "lazyPlayer.exe", candidate, MAX_PATH_LEN);
     if (disk_file_exists(candidate)) {
         strncpy(out, candidate, out_sz - 1);
@@ -252,11 +230,7 @@ bool lt_read_file(const char* path, void** out_data, size_t* out_size) {
         return true;
     }
 
-#ifdef LAZYTOOL_PROCEDURAL_ONLY
-    return false;
-#else
     return read_disk_file(path, out_data, out_size);
-#endif
 }
 
 void lt_free_file(void* data) {
@@ -416,8 +390,6 @@ struct ExportFile {
 struct ExportList {
     ExportFile files[512];
     int count;
-    bool needs_asset_loaders;
-    bool nano_compatible;
 };
 
 static bool export_add_file(ExportList* list, const char* pack_path, const char* source_path) {
@@ -446,12 +418,6 @@ static bool has_ext(const char* path, const char* ext) {
         return false;
     const char* dot = strrchr(path, '.');
     return dot && _stricmp(dot, ext) == 0;
-}
-
-static bool is_default_shader_path(const char* path) {
-    char norm[MAX_PATH_LEN] = {};
-    normalize_path(path, norm, MAX_PATH_LEN);
-    return _stricmp(norm, "shaders/default.hlsl") == 0;
 }
 
 static const char* skip_ws(const char* p) {
@@ -551,6 +517,53 @@ static void project_minify_command_line(char* line) {
         snprintf(line, 1024, "command %s %s", kind, name);
 }
 
+static bool project_timeline_block_disabled(const char* cursor, const char* end, const char** out_after_block) {
+    if (out_after_block)
+        *out_after_block = cursor;
+
+    const char* scan = cursor;
+    const char* after_end = cursor;
+    bool found_end = false;
+    bool disabled = false;
+    while (scan < end) {
+        char line[1024] = {};
+        int n = 0;
+        while (scan < end && *scan != '\n' && *scan != '\r') {
+            if (n < (int)sizeof(line) - 1)
+                line[n++] = *scan;
+            scan++;
+        }
+        while (scan < end && (*scan == '\n' || *scan == '\r'))
+            scan++;
+        after_end = scan;
+        line[n] = '\0';
+        trim_line(line);
+
+        char tmp[1024] = {};
+        strncpy(tmp, line, sizeof(tmp) - 1);
+        char* tag = strtok(tmp, " \t\r\n");
+        if (!tag)
+            continue;
+        if (strcmp(tag, "timeline_settings") == 0) {
+            strtok(nullptr, " \t\r\n");
+            strtok(nullptr, " \t\r\n");
+            strtok(nullptr, " \t\r\n");
+            strtok(nullptr, " \t\r\n");
+            strtok(nullptr, " \t\r\n");
+            char* enabled = strtok(nullptr, " \t\r\n");
+            if (enabled && atoi(enabled) == 0)
+                disabled = true;
+        } else if (strcmp(tag, "end_timeline") == 0) {
+            found_end = true;
+            break;
+        }
+    }
+
+    if (disabled && found_end && out_after_block)
+        *out_after_block = after_end;
+    return disabled && found_end;
+}
+
 static bool minify_project_text(const void* data, size_t size, void** out_data, size_t* out_size) {
     if (!data || !out_data || !out_size)
         return false;
@@ -573,6 +586,13 @@ static bool minify_project_text(const void* data, size_t size, void** out_data, 
             cursor++;
         line[n] = '\0';
         trim_line(line);
+        if (strcmp(line, "timeline") == 0) {
+            const char* after_timeline = cursor;
+            if (project_timeline_block_disabled(cursor, end, &after_timeline)) {
+                cursor = after_timeline;
+                continue;
+            }
+        }
         if (project_line_is_known_default(line))
             continue;
         project_minify_command_line(line);
@@ -706,7 +726,6 @@ static bool minify_hlsl_text(const void* data, size_t size, void** out_data, siz
     return true;
 }
 
-#ifndef LAZYTOOL_PROCEDURAL_ONLY
 static cgltf_result export_cgltf_read(const cgltf_memory_options* memory_options,
                                       const cgltf_file_options*,
                                       const char* path,
@@ -772,10 +791,6 @@ static void collect_gltf_refs(ExportList* list, const char* gltf_path) {
 
     cgltf_free(data);
 }
-#else
-static void collect_gltf_refs(ExportList*, const char*) {
-}
-#endif
 
 static void collect_shader_includes(ExportList* list, const char* shader_path, int depth) {
     if (!list || !shader_path || depth > 8)
@@ -839,22 +854,11 @@ static bool collect_project_refs(ExportList* list, const char* project_path, cha
         char tmp[1024] = {};
         strncpy(tmp, line, sizeof(tmp) - 1);
         char* tag = strtok(tmp, " \t");
-        if (tag && strcmp(tag, "param") == 0)
-            list->nano_compatible = false;
-        if (tag && strcmp(tag, "command") == 0) {
-            char* kind = strtok(nullptr, " \t");
-            if (!kind || (strcmp(kind, "clear") != 0 && strcmp(kind, "draw_mesh") != 0))
-                list->nano_compatible = false;
-        }
         if (tag && strcmp(tag, "resource") == 0) {
             char* kind = strtok(nullptr, " \t");
             char* name = strtok(nullptr, " \t");
             char* path = strtok(nullptr, " \t");
             (void)name;
-            if (kind &&
-                strcmp(kind, "mesh_primitive") != 0 &&
-                strcmp(kind, "shader_vsps") != 0)
-                list->nano_compatible = false;
             bool file_resource =
                 kind &&
                 (strcmp(kind, "mesh_gltf") == 0 ||
@@ -862,17 +866,8 @@ static bool collect_project_refs(ExportList* list, const char* project_path, cha
                  strcmp(kind, "shader_vsps") == 0 ||
                  strcmp(kind, "shader_cs") == 0);
             if (file_resource && path && strcmp(path, "-") != 0) {
-                if (strcmp(kind, "mesh_gltf") == 0 || strcmp(kind, "texture2d") == 0) {
-                    list->needs_asset_loaders = true;
-                    list->nano_compatible = false;
-                }
-                bool default_shader = is_default_shader_path(path) &&
-                    strcmp(kind, "shader_vsps") == 0;
-                if ((strcmp(kind, "shader_vsps") == 0 || strcmp(kind, "shader_cs") == 0) && !default_shader)
-                    list->nano_compatible = false;
-                if (!default_shader)
-                    export_add_file(list, path, path);
-                if (!default_shader && (strcmp(kind, "shader_vsps") == 0 || strcmp(kind, "shader_cs") == 0))
+                export_add_file(list, path, path);
+                if (strcmp(kind, "shader_vsps") == 0 || strcmp(kind, "shader_cs") == 0)
                     collect_shader_includes(list, path, 0);
                 if (strcmp(kind, "mesh_gltf") == 0)
                     collect_gltf_refs(list, path);
@@ -900,6 +895,22 @@ static bool copy_bytes(FILE* dst, FILE* src, unsigned long long count) {
     return true;
 }
 
+static bool lt_export_normal_exe_internal(const char* base_exe_path,
+                                          const char* project_path,
+                                          const char* output_exe_path,
+                                          char* err,
+                                          int err_sz);
+
+bool lt_export_normal_exe(const char* base_exe_path,
+                          const char* project_path,
+                          const char* output_exe_path,
+                          char* err,
+                          int err_sz)
+{
+    return lt_export_normal_exe_internal(base_exe_path, project_path, output_exe_path,
+                                         err, err_sz);
+}
+
 static bool write_entry(FILE* out, const char* pack_path, const void* data, size_t size) {
     char norm[MAX_PATH_LEN] = {};
     normalize_path(pack_path, norm, MAX_PATH_LEN);
@@ -912,22 +923,24 @@ static bool write_entry(FILE* out, const char* pack_path, const void* data, size
            fwrite(data, 1, size, out) == size;
 }
 
-bool lt_export_single_exe(const char* base_exe_path,
-                          const char* project_path,
-                          const char* output_exe_path,
-                          char* err,
-                          int err_sz)
+// Build a self-contained normal player executable. The embedded project uses a
+// short synthetic path ("p") because every byte saved in the pack also reduces
+// the final exe when users run an external compressor afterwards.
+static bool lt_export_normal_exe_internal(const char* base_exe_path,
+                                          const char* project_path,
+                                          const char* output_exe_path,
+                                          char* err,
+                                          int err_sz)
 {
     set_err(err, err_sz, "");
     if (!base_exe_path || !base_exe_path[0] ||
         !project_path || !project_path[0] ||
         !output_exe_path || !output_exe_path[0]) {
-        set_err(err, err_sz, "Usage: --export-single <project.lt> <output.exe>");
+        set_err(err, err_sz, "Usage: --export <project.lt> <output.exe>");
         return false;
     }
 
     ExportList list = {};
-    list.nano_compatible = true;
     if (!collect_project_refs(&list, project_path, err, err_sz))
         return false;
 
@@ -939,8 +952,7 @@ bool lt_export_single_exe(const char* base_exe_path,
     }
 
     char actual_base_exe[MAX_PATH_LEN] = {};
-    choose_export_base_exe(base_exe_path, list.needs_asset_loaders,
-                           list.nano_compatible, actual_base_exe, MAX_PATH_LEN);
+    choose_normal_export_base_exe(base_exe_path, actual_base_exe, MAX_PATH_LEN);
 
     FILE* base = fopen(actual_base_exe, "rb");
     if (!base) {
@@ -988,9 +1000,10 @@ bool lt_export_single_exe(const char* base_exe_path,
     memcpy(hdr.magic, k_data_magic, sizeof(k_data_magic));
     hdr.version = k_pack_version;
     hdr.file_count = (unsigned int)(list.count + 1);
-    hdr.project_path_len = (unsigned int)strlen(k_embedded_project);
+    const char* embedded_project_path = k_embedded_project;
+    hdr.project_path_len = (unsigned int)strlen(embedded_project_path);
     if (fwrite(&hdr, 1, sizeof(hdr), out) != sizeof(hdr) ||
-        fwrite(k_embedded_project, 1, hdr.project_path_len, out) != hdr.project_path_len) {
+        fwrite(embedded_project_path, 1, hdr.project_path_len, out) != hdr.project_path_len) {
         fclose(out);
         lt_free_file(project_bytes);
         set_err(err, err_sz, "Failed while writing pack header.");
@@ -999,7 +1012,10 @@ bool lt_export_single_exe(const char* base_exe_path,
 
     void* packed_project_bytes = nullptr;
     size_t packed_project_size = 0;
-    if (!minify_project_text(project_bytes, project_size, &packed_project_bytes, &packed_project_size)) {
+    bool project_packed = minify_project_text(project_bytes, project_size,
+                                              &packed_project_bytes,
+                                              &packed_project_size);
+    if (!project_packed) {
         fclose(out);
         lt_free_file(project_bytes);
         set_err(err, err_sz, "Failed while minifying project.");
@@ -1007,7 +1023,7 @@ bool lt_export_single_exe(const char* base_exe_path,
     }
     lt_free_file(project_bytes);
 
-    if (!write_entry(out, k_embedded_project, packed_project_bytes, packed_project_size)) {
+    if (!write_entry(out, embedded_project_path, packed_project_bytes, packed_project_size)) {
         fclose(out);
         lt_free_file(packed_project_bytes);
         set_err(err, err_sz, "Failed while writing project entry.");

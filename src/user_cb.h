@@ -10,6 +10,7 @@ extern ID3D11Buffer* g_user_cb_buf;
 
 void user_cb_init();
 void user_cb_shutdown();
+void user_cb_clear();
 void user_cb_update();  // call each frame before render
 void user_cb_bind();    // compatibility hook; command binding is per-shader
 void user_cb_sync_command_params(Command* c, const Resource* shader);

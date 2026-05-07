@@ -1182,7 +1182,6 @@ static bool res_upload_texture_rgba32f(Resource* r, const char* source_label,
                                  DXGI_FORMAT_R32G32B32A32_FLOAT, (UINT)(w * sizeof(float) * 4));
 }
 
-#ifndef LAZYTOOL_PROCEDURAL_ONLY
 static bool res_load_texture_file_into(Resource* r, const char* path) {
     void* bytes = nullptr;
     size_t byte_count = 0;
@@ -1322,20 +1321,7 @@ ResHandle res_load_texture(const char* name, const char* path) {
     }
     return handle;
 }
-#else
-bool res_reload_texture(Resource*, const char*) {
-    log_warn("Texture reload unavailable in procedural-only player.");
-    return false;
-}
 
-ResHandle res_load_texture(const char* name, const char* path) {
-    log_warn("Texture skipped in procedural-only player: %s (%s)",
-        name ? name : "", path ? path : "");
-    return INVALID_HANDLE;
-}
-#endif
-
-#ifndef LAZYTOOL_PROCEDURAL_ONLY
 static cgltf_image* res_gltf_texture_image(cgltf_texture* tex) {
     if (!tex) return nullptr;
     cgltf_image* img = tex->image ? tex->image : tex->basisu_image;
@@ -1712,7 +1698,6 @@ static bool res_push_mesh_part(MeshPart* parts, int* part_count, const char* par
     (*part_count)++;
     return true;
 }
-#endif
 
 bool res_set_mesh_primitive(Resource* r, MeshPrimitiveType type) {
     if (!r) return false;
@@ -1793,7 +1778,6 @@ static void res_cgltf_file_release(const cgltf_memory_options*,
     lt_free_file(data);
 }
 
-#ifndef LAZYTOOL_PROCEDURAL_ONLY
 ResHandle res_load_mesh(const char* name, const char* path) {
     ResHandle handle = res_alloc(name, RES_MESH);
     if (handle == INVALID_HANDLE) return INVALID_HANDLE;
@@ -1929,16 +1913,6 @@ ResHandle res_load_mesh(const char* name, const char* path) {
              name, r->vert_count, r->idx_count, r->mesh_part_count, r->mesh_material_count);
     return handle;
 }
-#else
-ResHandle res_load_mesh(const char* name, const char* path) {
-    ResHandle handle = res_alloc(name ? name : "mesh", RES_MESH);
-    if (handle == INVALID_HANDLE)
-        return INVALID_HANDLE;
-    char msg[512] = {};
-    snprintf(msg, sizeof(msg), "Mesh skipped in procedural-only player: '%s'", path ? path : "");
-    return res_mesh_fallback_cube(handle, msg);
-}
-#endif
 
 void res_rename(ResHandle h, const char* new_name) {
     Resource* r = res_get(h);
