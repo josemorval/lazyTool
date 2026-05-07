@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdarg>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -298,7 +299,7 @@ struct CommandDef {
     bool cull_back = true;
     bool unsupported_bindings = false;
     float pos[3] = {0,0,0};
-    float rot[3] = {0,0,0};
+    float rotq[4] = {0,0,0,1};
     float scale[3] = {1,1,1};
     bool clear_color_enabled = true;
     float clear_color[4] = {0,0,0,1};
@@ -357,6 +358,51 @@ static float tokf(const std::vector<std::string>& t, size_t i, float def = 0.0f)
 }
 static int toki(const std::vector<std::string>& t, size_t i, int def = 0) {
     return i < t.size() ? std::atoi(t[i].c_str()) : def;
+}
+
+struct Q4 { float x, y, z, w; };
+
+static Q4 qnorm(Q4 q) {
+    float len = std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+    if (len <= 1e-8f) return {0,0,0,1};
+    float inv = 1.0f / len;
+    return {q.x * inv, q.y * inv, q.z * inv, q.w * inv};
+}
+
+static Q4 quat_from_euler_xyz(float x, float y, float z) {
+    float cx = std::cos(x), sx = std::sin(x);
+    float cy = std::cos(y), sy = std::sin(y);
+    float cz = std::cos(z), sz = std::sin(z);
+    float m00 = cy * cz;
+    float m01 = cy * sz;
+    float m02 = -sy;
+    float m10 = sx * sy * cz - cx * sz;
+    float m11 = sx * sy * sz + cx * cz;
+    float m12 = sx * cy;
+    float m20 = cx * sy * cz + sx * sz;
+    float m21 = cx * sy * sz - sx * cz;
+    float m22 = cx * cy;
+    Q4 q = {0,0,0,1};
+    float tr = m00 + m11 + m22;
+    if (tr > 0.0f) {
+        float s = std::sqrt(tr + 1.0f) * 2.0f;
+        q.w = 0.25f * s; q.x = (m12 - m21) / s; q.y = (m20 - m02) / s; q.z = (m01 - m10) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        float s = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f;
+        q.w = (m12 - m21) / s; q.x = 0.25f * s; q.y = (m01 + m10) / s; q.z = (m20 + m02) / s;
+    } else if (m11 > m22) {
+        float s = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f;
+        q.w = (m20 - m02) / s; q.x = (m01 + m10) / s; q.y = 0.25f * s; q.z = (m12 + m21) / s;
+    } else {
+        float s = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f;
+        q.w = (m01 - m10) / s; q.x = (m20 + m02) / s; q.y = (m12 + m21) / s; q.z = 0.25f * s;
+    }
+    return qnorm(q);
+}
+
+static void store_q(float out[4], Q4 q) {
+    q = qnorm(q);
+    out[0] = q.x; out[1] = q.y; out[2] = q.z; out[3] = q.w;
 }
 
 static Project parse_lt(const std::string& lt_path) {
@@ -439,8 +485,13 @@ static Project parse_lt(const std::string& lt_path) {
                 cur->cull_back = toki(t,5,1) != 0;
             } else if (tag == "transform" && t.size() >= 10) {
                 for (int i = 0; i < 3; i++) cur->pos[i] = tokf(t, (size_t)1 + i);
-                for (int i = 0; i < 3; i++) cur->rot[i] = tokf(t, (size_t)4 + i);
+                store_q(cur->rotq, quat_from_euler_xyz(tokf(t, 4), tokf(t, 5), tokf(t, 6)));
                 for (int i = 0; i < 3; i++) cur->scale[i] = tokf(t, (size_t)7 + i, 1.0f);
+            } else if (tag == "transformq" && t.size() >= 11) {
+                for (int i = 0; i < 3; i++) cur->pos[i] = tokf(t, (size_t)1 + i);
+                Q4 q = {tokf(t,4), tokf(t,5), tokf(t,6), tokf(t,7,1.0f)};
+                store_q(cur->rotq, q);
+                for (int i = 0; i < 3; i++) cur->scale[i] = tokf(t, (size_t)8 + i, 1.0f);
             } else if (tag == "clear" && t.size() >= 8) {
                 cur->clear_color_enabled = toki(t,1,1) != 0;
                 for (int i = 0; i < 4; i++) cur->clear_color[i] = tokf(t, (size_t)2 + i, i==3?1.0f:0.0f);
@@ -481,7 +532,7 @@ static Project parse_lt(const std::string& lt_path) {
             TimelineKeyDef k;
             k.frame = toki(t,1,0);
             int n = 0;
-            if (cur_track->kind == TK_COMMAND_TRANSFORM) n = 9;
+            if (cur_track->kind == TK_COMMAND_TRANSFORM) n = 10;
             else if (cur_track->kind == TK_COMMAND_ENABLED) n = 1;
             else if (cur_track->kind == TK_CAMERA) n = 8;
             else if (cur_track->kind == TK_DIRLIGHT) n = 10;
@@ -489,7 +540,20 @@ static Project parse_lt(const std::string& lt_path) {
             if (val_integral(cur_track->type) || cur_track->kind == TK_COMMAND_ENABLED) {
                 for (int i = 0; i < n && i < 4; i++) k.ival[i] = toki(t, (size_t)2 + i, 0);
             } else {
-                for (int i = 0; i < n && i < 16; i++) k.fval[i] = tokf(t, (size_t)2 + i, 0.0f);
+                int value_count = (int)t.size() - 2;
+                if (cur_track->kind == TK_COMMAND_TRANSFORM && value_count == 9) {
+                    for (int i = 0; i < 3; i++) k.fval[i] = tokf(t, (size_t)2 + i, 0.0f);
+                    Q4 q = quat_from_euler_xyz(tokf(t,5), tokf(t,6), tokf(t,7));
+                    k.fval[3] = q.x; k.fval[4] = q.y; k.fval[5] = q.z; k.fval[6] = q.w;
+                    for (int i = 0; i < 3; i++) k.fval[7 + i] = tokf(t, (size_t)8 + i, 1.0f);
+                } else {
+                    for (int i = 0; i < n && i < 16; i++) k.fval[i] = tokf(t, (size_t)2 + i, 0.0f);
+                    if (cur_track->kind == TK_COMMAND_TRANSFORM) {
+                        Q4 q = {k.fval[3], k.fval[4], k.fval[5], k.fval[6]};
+                        q = qnorm(q);
+                        k.fval[3] = q.x; k.fval[4] = q.y; k.fval[5] = q.z; k.fval[6] = q.w;
+                    }
+                }
             }
             cur_track->keys.push_back(k);
         } else if (tag == "end_timeline") {
@@ -830,15 +894,15 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     for (size_t i = 0; i < shader_sources.size(); i++) fprintf(f, " { sh_src_%u, sizeof(sh_src_%u)-1, 0, 0, 0 },\n", (unsigned)i, (unsigned)i);
     fprintf(f, "};\n");
 
-    fprintf(f, "typedef struct { int type,enabled,shader,topology,mk,vc,ic,ccen,cden,useq; float cc[4],dc,pos[3],rot[3],scl[3],q[4]; } Cmd;\n");
+    fprintf(f, "typedef struct { int type,enabled,shader,topology,mk,vc,ic,ccen,cden; float cc[4],dc,pos[3],q[4],scl[3]; } Cmd;\n");
     fprintf(f, "static Cmd cmd[%u] = {\n", (unsigned)(out_cmds.empty() ? 1 : out_cmds.size()));
-    if (out_cmds.empty()) fprintf(f, " {0,0,-1,1,0,0,0,0,0,0,{0.0f,0.0f,0.0f,1.0f},1.0f,{0.0f,0.0f,0.0f},{0.0f,0.0f,0.0f},{1.0f,1.0f,1.0f},{0.0f,0.0f,0.0f,1.0f}},\n");
+    if (out_cmds.empty()) fprintf(f, " {0,0,-1,1,0,0,0,0,0,{0.0f,0.0f,0.0f,1.0f},1.0f,{0.0f,0.0f,0.0f},{0.0f,0.0f,0.0f,1.0f},{1.0f,1.0f,1.0f}},\n");
     for (size_t i = 0; i < out_cmds.size(); i++) {
         const CommandDef& c = out_cmds[i];
         int shidx = shader_resource_index(p, c.shader, shader_res_indices);
-        fprintf(f, " {%d,%d,%d,%d,%d,%d,%d,%d,%d,0,{", (c.type == CT_CLEAR ? 1 : 2), c.enabled?1:0, shidx, c.topology, c.mesh_kind, c.vertex_count, c.instance_count, c.clear_color_enabled?1:0, c.clear_depth?1:0);
+        fprintf(f, " {%d,%d,%d,%d,%d,%d,%d,%d,%d,{", (c.type == CT_CLEAR ? 1 : 2), c.enabled?1:0, shidx, c.topology, c.mesh_kind, c.vertex_count, c.instance_count, c.clear_color_enabled?1:0, c.clear_depth?1:0);
         emit_float_array(f, c.clear_color, 4); fprintf(f, "},"); emit_float_literal(f, c.depth_clear); fprintf(f, ",{");
-        emit_float_array(f, c.pos, 3); fprintf(f, "},{"); emit_float_array(f, c.rot, 3); fprintf(f, "},{"); emit_float_array(f, c.scale, 3); fprintf(f, "},{0.0f,0.0f,0.0f,1.0f}},\n");
+        emit_float_array(f, c.pos, 3); fprintf(f, "},{"); emit_float_array(f, c.rotq, 4); fprintf(f, "},{"); emit_float_array(f, c.scale, 3); fprintf(f, "}},\n");
     }
     fprintf(f, "};\n");
 
@@ -893,15 +957,15 @@ static void rotxyz(float* rr,M4* out){ float cx=cs(rr[0]),sx=sn(rr[0]),cy=cs(rr[
 static Q qn(Q q){ float l=q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w; if(l<0.00000001f){q.x=q.y=q.z=0;q.w=1;return q;} float r=rsq(l); q.x*=r;q.y*=r;q.z*=r;q.w*=r; return q; }
 static Q qfm(M4* m){ Q q; float m00=m->m[0],m01=m->m[1],m02=m->m[2],m10=m->m[4],m11=m->m[5],m12=m->m[6],m20=m->m[8],m21=m->m[9],m22=m->m[10],tr=m00+m11+m22,s; q.x=q.y=q.z=0;q.w=1; if(tr>0){s=sqt(tr+1.0f)*2.0f; q.w=0.25f*s; q.x=(m12-m21)/s; q.y=(m20-m02)/s; q.z=(m01-m10)/s;} else if(m00>m11&&m00>m22){s=sqt(1.0f+m00-m11-m22)*2.0f; q.w=(m12-m21)/s; q.x=0.25f*s; q.y=(m01+m10)/s; q.z=(m20+m02)/s;} else if(m11>m22){s=sqt(1.0f+m11-m00-m22)*2.0f; q.w=(m20-m02)/s; q.x=(m01+m10)/s; q.y=0.25f*s; q.z=(m12+m21)/s;} else {s=sqt(1.0f+m22-m00-m11)*2.0f; q.w=(m01-m10)/s; q.x=(m20+m02)/s; q.y=(m12+m21)/s; q.z=0.25f*s;} return qn(q); }
 static Q qfe(float* r){ M4 m; rotxyz(r,&m); return qfm(&m); }
+static Q qfa(float* r){ Q q; q.x=r[0];q.y=r[1];q.z=r[2];q.w=r[3]; return qn(q); }
 static Q ql(Q a,Q b,float t){ Q q; float d; a=qn(a); b=qn(b); d=a.x*b.x+a.y*b.y+a.z*b.z+a.w*b.w; if(d<0){b.x=-b.x;b.y=-b.y;b.z=-b.z;b.w=-b.w;} q.x=lerp(a.x,b.x,t);q.y=lerp(a.y,b.y,t);q.z=lerp(a.z,b.z,t);q.w=lerp(a.w,b.w,t); return qn(q); }
 static M4 qmat(Q q){ M4 m; float xx,yy,zz,xy,xz,yz,xw,yw,zw; q=qn(q); xx=q.x*q.x;yy=q.y*q.y;zz=q.z*q.z;xy=q.x*q.y;xz=q.x*q.z;yz=q.y*q.z;xw=q.x*q.w;yw=q.y*q.w;zw=q.z*q.w; mid(&m); m.m[0]=1.0f-2.0f*(yy+zz);m.m[1]=2.0f*(xy+zw);m.m[2]=2.0f*(xz-yw);m.m[4]=2.0f*(xy-zw);m.m[5]=1.0f-2.0f*(xx+zz);m.m[6]=2.0f*(yz+xw);m.m[8]=2.0f*(xz+yw);m.m[9]=2.0f*(yz-xw);m.m[10]=1.0f-2.0f*(xx+yy); return m; }
-static void setq(Cmd* c,Q q){ c->useq=1; q=qn(q); c->q[0]=q.x;c->q[1]=q.y;c->q[2]=q.z;c->q[3]=q.w; }
-static void world(Cmd* c,M4* out){ M4 s,t,r; Q q; mid(&s);mid(&t); s.m[0]=c->scl[0];s.m[5]=c->scl[1];s.m[10]=c->scl[2]; t.m[12]=c->pos[0];t.m[13]=c->pos[1];t.m[14]=c->pos[2]; if(c->useq){q.x=c->q[0];q.y=c->q[1];q.z=c->q[2];q.w=c->q[3]; r=qmat(q);} else rotxyz(c->rot,&r); *out=mmul(mmul(s,r),t); }
+static void world(Cmd* c,M4* out){ M4 s,t,r; Q q; mid(&s);mid(&t); s.m[0]=c->scl[0];s.m[5]=c->scl[1];s.m[10]=c->scl[2]; t.m[12]=c->pos[0];t.m[13]=c->pos[1];t.m[14]=c->pos[2]; q.x=c->q[0];q.y=c->q[1];q.z=c->q[2];q.w=c->q[3]; r=qmat(q); *out=mmul(mmul(s,r),t); }
 static void viewproj(M4* out,float tsec){ float cp=cs(cam[4]), fwd[3]={sn(cam[3])*cp,sn(cam[4]),cs(cam[3])*cp}; float eye[3]={cam[0],cam[1],cam[2]}, at[3]={eye[0]+fwd[0],eye[1]+fwd[1],eye[2]+fwd[2]}, up[3]={0,1,0}; float z[3]={eye[0]-at[0],eye[1]-at[1],eye[2]-at[2]}; float iz=rsq(z[0]*z[0]+z[1]*z[1]+z[2]*z[2]); z[0]*=iz;z[1]*=iz;z[2]*=iz; float x[3]={z[1]*up[2]-z[2]*up[1],z[2]*up[0]-z[0]*up[2],z[0]*up[1]-z[1]*up[0]}; float ix=rsq(x[0]*x[0]+x[1]*x[1]+x[2]*x[2]); x[0]*=ix;x[1]*=ix;x[2]*=ix; float y[3]={x[1]*z[2]-x[2]*z[1],x[2]*z[0]-x[0]*z[2],x[0]*z[1]-x[1]*z[0]}; M4 v,p; mid(&v); zmem(&p,sizeof(p)); v.m[0]=x[0];v.m[1]=y[0];v.m[2]=z[0]; v.m[4]=x[1];v.m[5]=y[1];v.m[6]=z[1]; v.m[8]=x[2];v.m[9]=y[2];v.m[10]=z[2]; v.m[12]=-(x[0]*eye[0]+x[1]*eye[1]+x[2]*eye[2]); v.m[13]=-(y[0]*eye[0]+y[1]*eye[1]+y[2]*eye[2]); v.m[14]=-(z[0]*eye[0]+z[1]*eye[1]+z[2]*eye[2]); float f=cs(cam[5]*0.5f)/sn(cam[5]*0.5f); float asp=(float)W/(float)H; p.m[0]=f/asp; p.m[5]=f; p.m[10]=cam[7]/(cam[6]-cam[7]); p.m[11]=-1; p.m[14]=(cam[6]*cam[7])/(cam[6]-cam[7]); *out=mmul(v,p); }
 static int comps(int ty){ return (ty==1||ty==4)?1:(ty==2||ty==5)?2:(ty==3||ty==6)?3:(ty==7)?4:0; }
 static int isint(int ty){ return ty>=1&&ty<=3; }
 )LT64K", f);
-    fputs(R"LT64K(static void apply_track(Tr* r, float fr){ int a=-1,b=-1,i,n=r->count,qok=0; Q qq; for(i=0;i<n;i++){ if((float)key[r->start+i].fr<=fr)a=i; if((float)key[r->start+i].fr>=fr){b=i;break;} } if(a<0)a=b>=0?b:0; if(b<0)b=a; Key A=key[r->start+a],B=key[r->start+b],O=A; float tt=0; if(a!=b && !r->integral){ int span=B.fr-A.fr; tt=span>0?(fr-(float)A.fr)/(float)span:0; tt=cl(tt,0,1); if(r->kind==2){ for(i=0;i<3;i++)O.fv[i]=lerp(A.fv[i],B.fv[i],tt); qq=ql(qfe(A.fv+3),qfe(B.fv+3),tt); qok=1; for(i=6;i<9;i++)O.fv[i]=lerp(A.fv[i],B.fv[i],tt); } else if(r->kind==4){ for(i=0;i<8;i++)O.fv[i]=(i==3)?lerpa(A.fv[i],B.fv[i],tt):lerp(A.fv[i],B.fv[i],tt); } else { int cnt=(r->kind==5)?10:comps(r->type); if(r->kind==1 && r->target>=0&&r->target<UVN && uv[r->target].src==3){ for(i=0;i<cnt;i++)O.fv[i]=lerp(A.fv[i],B.fv[i],tt); qq=ql(qfe(A.fv),qfe(B.fv),tt); qok=1; } else for(i=0;i<cnt;i++)O.fv[i]=lerp(A.fv[i],B.fv[i],tt); } } if(r->kind==1 && r->target>=0&&r->target<UVN){ int c=comps(uv[r->target].type); for(i=0;i<c&&i<4;i++){ if(isint(uv[r->target].type))uv[r->target].iv[i]=O.iv[i]; else uv[r->target].fv[i]=O.fv[i]; } if(uv[r->target].src_cmd>=0&&uv[r->target].src_cmd<CMDN){ Cmd* cc=cmd+uv[r->target].src_cmd; if(uv[r->target].src==2)for(i=0;i<3;i++)cc->pos[i]=O.fv[i]; else if(uv[r->target].src==3){ for(i=0;i<3;i++)cc->rot[i]=O.fv[i]; if(qok)setq(cc,qq); else cc->useq=0; } else if(uv[r->target].src==4)for(i=0;i<3;i++)cc->scl[i]=O.fv[i]; } else if(uv[r->target].src==6){ cam[3]=wrap(O.fv[0]); cam[4]=cl(O.fv[1],-1.50f,1.50f); } } else if(r->kind==2 && r->target>=0&&r->target<CMDN){ Cmd* c=cmd+r->target; for(i=0;i<3;i++){c->pos[i]=O.fv[i];c->rot[i]=O.fv[3+i];c->scl[i]=O.fv[6+i];} if(qok)setq(c,qq); else c->useq=0; } else if(r->kind==3 && r->target>=0&&r->target<CMDN){ cmd[r->target].enabled=O.iv[0]!=0; } else if(r->kind==4){ for(i=0;i<8;i++)cam[i]=O.fv[i]; cam[3]=wrap(cam[3]); cam[4]=cl(cam[4],-1.50f,1.50f); } else if(r->kind==5){ for(i=0;i<10;i++)dl[i]=O.fv[i]; } }
+    fputs(R"LT64K(static void apply_track(Tr* r, float fr){ int a=-1,b=-1,i,n=r->count; Q qq; for(i=0;i<n;i++){ if((float)key[r->start+i].fr<=fr)a=i; if((float)key[r->start+i].fr>=fr){b=i;break;} } if(a<0)a=b>=0?b:0; if(b<0)b=a; Key A=key[r->start+a],B=key[r->start+b],O=A; float tt=0; if(a!=b && !r->integral){ int span=B.fr-A.fr; tt=span>0?(fr-(float)A.fr)/(float)span:0; tt=cl(tt,0,1); if(r->kind==2){ for(i=0;i<3;i++)O.fv[i]=lerp(A.fv[i],B.fv[i],tt); qq=ql(qfa(A.fv+3),qfa(B.fv+3),tt); O.fv[3]=qq.x;O.fv[4]=qq.y;O.fv[5]=qq.z;O.fv[6]=qq.w; for(i=7;i<10;i++)O.fv[i]=lerp(A.fv[i],B.fv[i],tt); } else if(r->kind==4){ for(i=0;i<8;i++)O.fv[i]=(i==3)?lerpa(A.fv[i],B.fv[i],tt):lerp(A.fv[i],B.fv[i],tt); } else { int cnt=(r->kind==5)?10:comps(r->type); if(r->kind==1 && r->target>=0&&r->target<UVN && uv[r->target].src==3){ if(uv[r->target].type==7){ qq=ql(qfa(A.fv),qfa(B.fv),tt); O.fv[0]=qq.x;O.fv[1]=qq.y;O.fv[2]=qq.z;O.fv[3]=qq.w; } else { for(i=0;i<cnt;i++)O.fv[i]=lerp(A.fv[i],B.fv[i],tt); } } else for(i=0;i<cnt;i++)O.fv[i]=lerp(A.fv[i],B.fv[i],tt); } } if(r->kind==1 && r->target>=0&&r->target<UVN){ int c=comps(uv[r->target].type); for(i=0;i<c&&i<4;i++){ if(isint(uv[r->target].type))uv[r->target].iv[i]=O.iv[i]; else uv[r->target].fv[i]=O.fv[i]; } if(uv[r->target].src_cmd>=0&&uv[r->target].src_cmd<CMDN){ Cmd* cc=cmd+uv[r->target].src_cmd; if(uv[r->target].src==2)for(i=0;i<3;i++)cc->pos[i]=O.fv[i]; else if(uv[r->target].src==3){ qq=uv[r->target].type==7?qfa(O.fv):qfe(O.fv); cc->q[0]=qq.x;cc->q[1]=qq.y;cc->q[2]=qq.z;cc->q[3]=qq.w; } else if(uv[r->target].src==4)for(i=0;i<3;i++)cc->scl[i]=O.fv[i]; } else if(uv[r->target].src==6){ cam[3]=wrap(O.fv[0]); cam[4]=cl(O.fv[1],-1.50f,1.50f); } } else if(r->kind==2 && r->target>=0&&r->target<CMDN){ Cmd* c=cmd+r->target; for(i=0;i<3;i++)c->pos[i]=O.fv[i]; for(i=0;i<4;i++)c->q[i]=O.fv[3+i]; for(i=0;i<3;i++)c->scl[i]=O.fv[7+i]; } else if(r->kind==3 && r->target>=0&&r->target<CMDN){ cmd[r->target].enabled=O.iv[0]!=0; } else if(r->kind==4){ for(i=0;i<8;i++)cam[i]=O.fv[i]; cam[3]=wrap(cam[3]); cam[4]=cl(cam[4],-1.50f,1.50f); } else if(r->kind==5){ for(i=0;i<10;i++)dl[i]=O.fv[i]; } }
 static void timeline(float sec){ if(!TL_ON||TL_LEN<1)return; float fr=sec*(float)TL_FPS; if(TL_LOOP)while(fr>=(float)TL_LEN)fr-=(float)TL_LEN; if(fr>(float)(TL_LEN-1))fr=(float)(TL_LEN-1); if(!TL_LERP)fr=(float)((int)fr); for(int i=0;i<TRN;i++)if(tr[i].enabled)apply_track(tr+i,fr); }
 static void fill_user(UserCB* u){ int i,j; zmem(u,sizeof(*u)); for(i=0;i<UVN&&i<64;i++){ if(isint(uv[i].type)) cpy(u->slots[i],uv[i].iv,comps(uv[i].type)*4); else for(j=0;j<comps(uv[i].type);j++)u->slots[i][j]=uv[i].fv[j]; } }
 static HRESULT compile(const char* src, unsigned int len, const char* e, const char* m, ID3DBlob** b){ ID3DBlob* er=0; HRESULT hr=D3DCompile(src,len,0,0,0,e,m,D3DCOMPILE_OPTIMIZATION_LEVEL3,0,b,&er); if(er)ID3D10Blob_Release(er); return hr; }

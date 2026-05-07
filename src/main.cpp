@@ -180,6 +180,168 @@ Mat4 mat4_rotation_xyz(Vec3 a) {
     return mat4_mul(mat4_mul(rx, ry), rz);
 }
 
+Quat quat_identity() {
+    return {0.0f, 0.0f, 0.0f, 1.0f};
+}
+
+Quat quat_normalize(Quat q) {
+    float len = sqrtf(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    if (len <= 1e-8f)
+        return quat_identity();
+    float inv = 1.0f / len;
+    return {q.x * inv, q.y * inv, q.z * inv, q.w * inv};
+}
+
+Quat quat_from_array(const float q[4]) {
+    if (!q)
+        return quat_identity();
+    return quat_normalize({q[0], q[1], q[2], q[3]});
+}
+
+void quat_to_array(Quat q, float out[4]) {
+    if (!out)
+        return;
+    q = quat_normalize(q);
+    out[0] = q.x;
+    out[1] = q.y;
+    out[2] = q.z;
+    out[3] = q.w;
+}
+
+Quat quat_from_mat4(const Mat4& m) {
+    float m00 = m.m[0],  m01 = m.m[1],  m02 = m.m[2];
+    float m10 = m.m[4],  m11 = m.m[5],  m12 = m.m[6];
+    float m20 = m.m[8],  m21 = m.m[9],  m22 = m.m[10];
+    Quat q = quat_identity();
+    float trace = m00 + m11 + m22;
+
+    if (trace > 0.0f) {
+        float s = sqrtf(trace + 1.0f) * 2.0f;
+        q.w = 0.25f * s;
+        q.x = (m12 - m21) / s;
+        q.y = (m20 - m02) / s;
+        q.z = (m01 - m10) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        float s = sqrtf(1.0f + m00 - m11 - m22) * 2.0f;
+        q.w = (m12 - m21) / s;
+        q.x = 0.25f * s;
+        q.y = (m01 + m10) / s;
+        q.z = (m20 + m02) / s;
+    } else if (m11 > m22) {
+        float s = sqrtf(1.0f + m11 - m00 - m22) * 2.0f;
+        q.w = (m20 - m02) / s;
+        q.x = (m01 + m10) / s;
+        q.y = 0.25f * s;
+        q.z = (m12 + m21) / s;
+    } else {
+        float s = sqrtf(1.0f + m22 - m00 - m11) * 2.0f;
+        q.w = (m01 - m10) / s;
+        q.x = (m20 + m02) / s;
+        q.y = (m12 + m21) / s;
+        q.z = 0.25f * s;
+    }
+    return quat_normalize(q);
+}
+
+Quat quat_from_euler_xyz(Vec3 r) {
+    return quat_from_mat4(mat4_rotation_xyz(r));
+}
+
+Quat quat_slerp(Quat a, Quat b, float t) {
+    a = quat_normalize(a);
+    b = quat_normalize(b);
+    float dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    if (dot < 0.0f) {
+        dot = -dot;
+        b.x = -b.x; b.y = -b.y; b.z = -b.z; b.w = -b.w;
+    }
+
+    if (dot > 0.9995f) {
+        Quat q = {
+            a.x + (b.x - a.x) * t,
+            a.y + (b.y - a.y) * t,
+            a.z + (b.z - a.z) * t,
+            a.w + (b.w - a.w) * t
+        };
+        return quat_normalize(q);
+    }
+
+    dot = clampf(dot, -1.0f, 1.0f);
+    float theta0 = acosf(dot);
+    float theta = theta0 * t;
+    float sin_theta = sinf(theta);
+    float sin_theta0 = sinf(theta0);
+    if (fabsf(sin_theta0) <= 1e-8f)
+        return a;
+
+    float s0 = cosf(theta) - dot * sin_theta / sin_theta0;
+    float s1 = sin_theta / sin_theta0;
+    Quat q = {
+        a.x * s0 + b.x * s1,
+        a.y * s0 + b.y * s1,
+        a.z * s0 + b.z * s1,
+        a.w * s0 + b.w * s1
+    };
+    return quat_normalize(q);
+}
+
+Mat4 mat4_rotation_quat(Quat q) {
+    q = quat_normalize(q);
+    float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
+    float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
+    float xw = q.x * q.w, yw = q.y * q.w, zw = q.z * q.w;
+
+    Mat4 m = mat4_identity();
+    m.m[0]  = 1.0f - 2.0f * (yy + zz);
+    m.m[1]  = 2.0f * (xy + zw);
+    m.m[2]  = 2.0f * (xz - yw);
+    m.m[4]  = 2.0f * (xy - zw);
+    m.m[5]  = 1.0f - 2.0f * (xx + zz);
+    m.m[6]  = 2.0f * (yz + xw);
+    m.m[8]  = 2.0f * (xz + yw);
+    m.m[9]  = 2.0f * (yz - xw);
+    m.m[10] = 1.0f - 2.0f * (xx + yy);
+    return m;
+}
+
+static float angle_wrap_near(float reference, float angle) {
+    const float pi = 3.14159265358979323846f;
+    const float two_pi = 6.28318530717958647692f;
+    while (angle - reference > pi) angle -= two_pi;
+    while (angle - reference < -pi) angle += two_pi;
+    return angle;
+}
+
+void quat_to_euler_xyz(Quat q, const float* reference, float out[3]) {
+    if (!out)
+        return;
+    Mat4 rot = mat4_rotation_quat(q);
+    float sy = -clampf(rot.m[2], -1.0f, 1.0f);
+    float y = asinf(sy);
+    float cy = cosf(y);
+    float x = 0.0f;
+    float z = 0.0f;
+
+    if (fabsf(cy) > 1e-5f) {
+        x = atan2f(rot.m[6], rot.m[10]);
+        z = atan2f(rot.m[1], rot.m[0]);
+    } else {
+        y = sy >= 0.0f ? 1.57079632679f : -1.57079632679f;
+        z = 0.0f;
+        x = sy >= 0.0f ? atan2f(rot.m[4], rot.m[5]) : atan2f(-rot.m[4], rot.m[5]);
+    }
+
+    if (reference) {
+        x = angle_wrap_near(reference[0], x);
+        y = angle_wrap_near(reference[1], y);
+        z = angle_wrap_near(reference[2], z);
+    }
+
+    out[0] = x;
+    out[1] = y;
+    out[2] = z;
+}
+
 Vec3 camera_eye(const Camera& c) {
     return v3(c.position[0], c.position[1], c.position[2]);
 }

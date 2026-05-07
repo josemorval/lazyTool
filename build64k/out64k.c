@@ -169,47 +169,41 @@ static Sh sh[1] = {
     },
 };
 typedef struct {
-    int type, enabled, shader, topology, mk, vc, ic, ccen, cden, useq;
-    float cc[4], dc, pos[3], rot[3], scl[3], q[4];
+    int type, enabled, shader, topology, mk, vc, ic, ccen, cden;
+    float cc[4], dc, pos[3], q[4], scl[3];
 } Cmd;
 static Cmd cmd[3] = {
     {
-        1, 1, -1, 1, 0, 3, 1, 1, 1, 0, {
+        1, 1, -1, 1, 0, 3, 1, 1, 1, {
             0.0399999991f, 0.0199999996f, 0.0f, 1.0f
         }, 1.0f, {
             0.0f, 0.0f, 0.0f
         }, {
-            0.0f, 0.0f, 0.0f
+            0.0f, 0.0f, 0.0f, 1.0f
         }, {
             1.0f, 1.0f, 1.0f
-        }, {
-            0.0f, 0.0f, 0.0f, 1.0f
         }
     },
     {
-        2, 1, 0, 1, 1, 36, 1, 1, 1, 0, {
+        2, 1, 0, 1, 1, 36, 1, 1, 1, {
             0.0500000007f, 0.0500000007f, 0.0799999982f, 1.0f
         }, 1.0f, {
             0.0f, 0.0f, 0.0f
         }, {
-            0.0f, 0.0f, 0.0f
+            0.0f, 0.0f, 0.0f, 1.0f
         }, {
             1.0f, 1.0f, 1.0f
-        }, {
-            0.0f, 0.0f, 0.0f, 1.0f
         }
     },
     {
-        2, 1, 0, 1, 1, 36, 1, 1, 1, 0, {
+        2, 1, 0, 1, 1, 36, 1, 1, 1, {
             0.0500000007f, 0.0500000007f, 0.0799999982f, 1.0f
         }, 1.0f, {
             0.0f, -2.0f, 0.0f
         }, {
-            0.0f, 0.0f, 0.0f
+            0.0f, 0.0f, 0.0f, 1.0f
         }, {
             5.0f, 0.100000001f, 5.0f
-        }, {
-            0.0f, 0.0f, 0.0f, 1.0f
         }
     },
 };
@@ -456,6 +450,14 @@ static Q qfe(float* r) {
     rotxyz(r, &m);
     return qfm(&m);
 }
+static Q qfa(float* r) {
+    Q q;
+    q.x=r[0];
+    q.y=r[1];
+    q.z=r[2];
+    q.w=r[3];
+    return qn(q);
+}
 static Q ql(Q a, Q b, float t) {
     Q q;
     float d;
@@ -499,14 +501,6 @@ static M4 qmat(Q q) {
     m.m[10]=1.0f-2.0f*(xx+yy);
     return m;
 }
-static void setq(Cmd* c, Q q) {
-    c->useq=1;
-    q=qn(q);
-    c->q[0]=q.x;
-    c->q[1]=q.y;
-    c->q[2]=q.z;
-    c->q[3]=q.w;
-}
 static void world(Cmd* c, M4* out) {
     M4 s, t, r;
     Q q;
@@ -518,14 +512,11 @@ static void world(Cmd* c, M4* out) {
     t.m[12]=c->pos[0];
     t.m[13]=c->pos[1];
     t.m[14]=c->pos[2];
-    if(c->useq) {
-        q.x=c->q[0];
-        q.y=c->q[1];
-        q.z=c->q[2];
-        q.w=c->q[3];
-        r=qmat(q);
-    }
-    else rotxyz(c->rot, &r);
+    q.x=c->q[0];
+    q.y=c->q[1];
+    q.z=c->q[2];
+    q.w=c->q[3];
+    r=qmat(q);
     *out=mmul(mmul(s, r), t);
 }
 static void viewproj(M4* out, float tsec) {
@@ -587,7 +578,7 @@ static int isint(int ty) {
     return ty>=1&&ty<=3;
 }
 static void apply_track(Tr* r, float fr) {
-    int a=-1, b=-1, i, n=r->count, qok=0;
+    int a=-1, b=-1, i, n=r->count;
     Q qq;
     for(i=0;i<n;i++) {
         if((float)key[r->start+i].fr<=fr)a=i;
@@ -606,9 +597,12 @@ static void apply_track(Tr* r, float fr) {
         tt=cl(tt, 0, 1);
         if(r->kind==2) {
             for(i=0;i<3;i++)O.fv[i]=lerp(A.fv[i], B.fv[i], tt);
-            qq=ql(qfe(A.fv+3), qfe(B.fv+3), tt);
-            qok=1;
-            for(i=6;i<9;i++)O.fv[i]=lerp(A.fv[i], B.fv[i], tt);
+            qq=ql(qfa(A.fv+3), qfa(B.fv+3), tt);
+            O.fv[3]=qq.x;
+            O.fv[4]=qq.y;
+            O.fv[5]=qq.z;
+            O.fv[6]=qq.w;
+            for(i=7;i<10;i++)O.fv[i]=lerp(A.fv[i], B.fv[i], tt);
         }
         else if(r->kind==4) {
             for(i=0;i<8;i++)O.fv[i]=(i==3)?lerpa(A.fv[i], B.fv[i], tt):lerp(A.fv[i], B.fv[i], tt);
@@ -616,9 +610,16 @@ static void apply_track(Tr* r, float fr) {
         else {
             int cnt=(r->kind==5)?10:comps(r->type);
             if(r->kind==1 && r->target>=0&&r->target<UVN && uv[r->target].src==3) {
-                for(i=0;i<cnt;i++)O.fv[i]=lerp(A.fv[i], B.fv[i], tt);
-                qq=ql(qfe(A.fv), qfe(B.fv), tt);
-                qok=1;
+                if(uv[r->target].type==7) {
+                    qq=ql(qfa(A.fv), qfa(B.fv), tt);
+                    O.fv[0]=qq.x;
+                    O.fv[1]=qq.y;
+                    O.fv[2]=qq.z;
+                    O.fv[3]=qq.w;
+                }
+                else {
+                    for(i=0;i<cnt;i++)O.fv[i]=lerp(A.fv[i], B.fv[i], tt);
+                }
             }
             else for(i=0;i<cnt;i++)O.fv[i]=lerp(A.fv[i], B.fv[i], tt);
         }
@@ -633,9 +634,11 @@ static void apply_track(Tr* r, float fr) {
             Cmd* cc=cmd+uv[r->target].src_cmd;
             if(uv[r->target].src==2)for(i=0;i<3;i++)cc->pos[i]=O.fv[i];
             else if(uv[r->target].src==3) {
-                for(i=0;i<3;i++)cc->rot[i]=O.fv[i];
-                if(qok)setq(cc, qq);
-                else cc->useq=0;
+                qq=uv[r->target].type==7?qfa(O.fv):qfe(O.fv);
+                cc->q[0]=qq.x;
+                cc->q[1]=qq.y;
+                cc->q[2]=qq.z;
+                cc->q[3]=qq.w;
             }
             else if(uv[r->target].src==4)for(i=0;i<3;i++)cc->scl[i]=O.fv[i];
         }
@@ -646,13 +649,9 @@ static void apply_track(Tr* r, float fr) {
     }
     else if(r->kind==2 && r->target>=0&&r->target<CMDN) {
         Cmd* c=cmd+r->target;
-        for(i=0;i<3;i++) {
-            c->pos[i]=O.fv[i];
-            c->rot[i]=O.fv[3+i];
-            c->scl[i]=O.fv[6+i];
-        }
-        if(qok)setq(c, qq);
-        else c->useq=0;
+        for(i=0;i<3;i++)c->pos[i]=O.fv[i];
+        for(i=0;i<4;i++)c->q[i]=O.fv[3+i];
+        for(i=0;i<3;i++)c->scl[i]=O.fv[7+i];
     }
     else if(r->kind==3 && r->target>=0&&r->target<CMDN) {
         cmd[r->target].enabled=O.iv[0]!=0;

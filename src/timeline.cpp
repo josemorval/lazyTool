@@ -29,157 +29,12 @@ static float timeline_wrap_angle(float a) {
     return a;
 }
 
-static float timeline_wrap_angle_near(float reference, float angle) {
-    while (angle - reference > TIMELINE_PI) angle -= TIMELINE_TWO_PI;
-    while (angle - reference < -TIMELINE_PI) angle += TIMELINE_TWO_PI;
-    return angle;
-}
-
 static float timeline_lerp(float a, float b, float t) {
     return a + (b - a) * t;
 }
 
 static float timeline_lerp_angle(float a, float b, float t) {
     return a + timeline_wrap_angle(b - a) * t;
-}
-
-struct TimelineQuat {
-    float x, y, z, w;
-};
-
-static TimelineQuat timeline_quat_normalize(TimelineQuat q) {
-    float len = sqrtf(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
-    if (len <= 1e-8f)
-        return {0.0f, 0.0f, 0.0f, 1.0f};
-    float inv = 1.0f / len;
-    return {q.x * inv, q.y * inv, q.z * inv, q.w * inv};
-}
-
-static TimelineQuat timeline_quat_from_mat4(const Mat4& m) {
-    float m00 = m.m[0],  m01 = m.m[1],  m02 = m.m[2];
-    float m10 = m.m[4],  m11 = m.m[5],  m12 = m.m[6];
-    float m20 = m.m[8],  m21 = m.m[9],  m22 = m.m[10];
-    TimelineQuat q = {0.0f, 0.0f, 0.0f, 1.0f};
-    float trace = m00 + m11 + m22;
-
-    // The engine matrices use the same row-major/sign convention as
-    // mat4_rotation_xyz(). These formulas are the matching matrix->quat
-    // inverse, so Euler keys such as 0 and 2*pi become the same orientation.
-    if (trace > 0.0f) {
-        float s = sqrtf(trace + 1.0f) * 2.0f;
-        q.w = 0.25f * s;
-        q.x = (m12 - m21) / s;
-        q.y = (m20 - m02) / s;
-        q.z = (m01 - m10) / s;
-    } else if (m00 > m11 && m00 > m22) {
-        float s = sqrtf(1.0f + m00 - m11 - m22) * 2.0f;
-        q.w = (m12 - m21) / s;
-        q.x = 0.25f * s;
-        q.y = (m01 + m10) / s;
-        q.z = (m20 + m02) / s;
-    } else if (m11 > m22) {
-        float s = sqrtf(1.0f + m11 - m00 - m22) * 2.0f;
-        q.w = (m20 - m02) / s;
-        q.x = (m01 + m10) / s;
-        q.y = 0.25f * s;
-        q.z = (m12 + m21) / s;
-    } else {
-        float s = sqrtf(1.0f + m22 - m00 - m11) * 2.0f;
-        q.w = (m01 - m10) / s;
-        q.x = (m20 + m02) / s;
-        q.y = (m12 + m21) / s;
-        q.z = 0.25f * s;
-    }
-    return timeline_quat_normalize(q);
-}
-
-static TimelineQuat timeline_quat_from_euler_xyz(const float* r) {
-    Mat4 m = mat4_rotation_xyz(v3(r[0], r[1], r[2]));
-    return timeline_quat_from_mat4(m);
-}
-
-static TimelineQuat timeline_quat_slerp(TimelineQuat a, TimelineQuat b, float t) {
-    a = timeline_quat_normalize(a);
-    b = timeline_quat_normalize(b);
-    float dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
-    if (dot < 0.0f) {
-        dot = -dot;
-        b.x = -b.x; b.y = -b.y; b.z = -b.z; b.w = -b.w;
-    }
-
-    if (dot > 0.9995f) {
-        TimelineQuat q = {
-            timeline_lerp(a.x, b.x, t),
-            timeline_lerp(a.y, b.y, t),
-            timeline_lerp(a.z, b.z, t),
-            timeline_lerp(a.w, b.w, t)
-        };
-        return timeline_quat_normalize(q);
-    }
-
-    dot = clampf(dot, -1.0f, 1.0f);
-    float theta0 = acosf(dot);
-    float theta = theta0 * t;
-    float sin_theta = sinf(theta);
-    float sin_theta0 = sinf(theta0);
-    if (fabsf(sin_theta0) <= 1e-8f)
-        return a;
-
-    float s0 = cosf(theta) - dot * sin_theta / sin_theta0;
-    float s1 = sin_theta / sin_theta0;
-    TimelineQuat q = {
-        a.x * s0 + b.x * s1,
-        a.y * s0 + b.y * s1,
-        a.z * s0 + b.z * s1,
-        a.w * s0 + b.w * s1
-    };
-    return timeline_quat_normalize(q);
-}
-
-static Mat4 timeline_mat4_from_quat(TimelineQuat q) {
-    q = timeline_quat_normalize(q);
-    float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
-    float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
-    float xw = q.x * q.w, yw = q.y * q.w, zw = q.z * q.w;
-
-    Mat4 m = mat4_identity();
-    m.m[0]  = 1.0f - 2.0f * (yy + zz);
-    m.m[1]  = 2.0f * (xy + zw);
-    m.m[2]  = 2.0f * (xz - yw);
-    m.m[4]  = 2.0f * (xy - zw);
-    m.m[5]  = 1.0f - 2.0f * (xx + zz);
-    m.m[6]  = 2.0f * (yz + xw);
-    m.m[8]  = 2.0f * (xz + yw);
-    m.m[9]  = 2.0f * (yz - xw);
-    m.m[10] = 1.0f - 2.0f * (xx + yy);
-    return m;
-}
-
-static void timeline_euler_xyz_from_mat4(const Mat4& rot, const float reference[3], float out[3]) {
-    float sy = -clampf(rot.m[2], -1.0f, 1.0f);
-    float y = asinf(sy);
-    float cy = cosf(y);
-    float x = 0.0f;
-    float z = 0.0f;
-
-    if (fabsf(cy) > 1e-5f) {
-        x = atan2f(rot.m[6], rot.m[10]);
-        z = atan2f(rot.m[1], rot.m[0]);
-    } else {
-        y = sy >= 0.0f ? 1.57079632679f : -1.57079632679f;
-        z = 0.0f;
-        x = sy >= 0.0f ? atan2f(rot.m[4], rot.m[5]) : atan2f(-rot.m[4], rot.m[5]);
-    }
-
-    if (reference) {
-        x = timeline_wrap_angle_near(reference[0], x);
-        y = timeline_wrap_angle_near(reference[1], y);
-        z = timeline_wrap_angle_near(reference[2], z);
-    }
-
-    out[0] = x;
-    out[1] = y;
-    out[2] = z;
 }
 
 static void timeline_sample_command_transform(const TimelineKey& a, const TimelineKey& b,
@@ -190,13 +45,10 @@ static void timeline_sample_command_transform(const TimelineKey& a, const Timeli
     for (int i = 0; i < 3; i++)
         out->fval[i] = timeline_lerp(a.fval[i], b.fval[i], t);
 
-    TimelineQuat qa = timeline_quat_from_euler_xyz(&a.fval[3]);
-    TimelineQuat qb = timeline_quat_from_euler_xyz(&b.fval[3]);
-    TimelineQuat q = timeline_quat_slerp(qa, qb, t);
-    Mat4 rot = timeline_mat4_from_quat(q);
-    timeline_euler_xyz_from_mat4(rot, &a.fval[3], &out->fval[3]);
+    Quat q = quat_slerp(quat_from_array(&a.fval[3]), quat_from_array(&b.fval[3]), t);
+    quat_to_array(q, &out->fval[3]);
 
-    for (int i = 6; i < 9; i++)
+    for (int i = 7; i < 10; i++)
         out->fval[i] = timeline_lerp(a.fval[i], b.fval[i], t);
 }
 
@@ -258,7 +110,7 @@ int timeline_track_value_count(const TimelineTrack& track) {
     case TIMELINE_TRACK_USER_VAR:
         return timeline_res_type_components(track.value_type);
     case TIMELINE_TRACK_COMMAND_TRANSFORM:
-        return 9;
+        return 10;
     case TIMELINE_TRACK_COMMAND_ENABLED:
         return 1;
     case TIMELINE_TRACK_CAMERA:
@@ -612,8 +464,8 @@ static bool timeline_capture_command_transform(TimelineTrack& track, TimelineKey
     if (!c)
         return false;
     for (int i = 0; i < 3; i++) key.fval[i] = c->pos[i];
-    for (int i = 0; i < 3; i++) key.fval[3 + i] = c->rot[i];
-    for (int i = 0; i < 3; i++) key.fval[6 + i] = c->scale[i];
+    quat_to_array(quat_from_array(c->rotq), &key.fval[3]);
+    for (int i = 0; i < 3; i++) key.fval[7 + i] = c->scale[i];
     return true;
 }
 
@@ -712,13 +564,16 @@ static bool timeline_sample_user_var_special_rotation(const TimelineTrack& track
 
     UserCBSourceKind source_kind = timeline_user_var_source_kind(track);
     if (source_kind == USER_CB_SOURCE_COMMAND_ROTATION) {
-        TimelineQuat qa = timeline_quat_from_euler_xyz(a.fval);
-        TimelineQuat qb = timeline_quat_from_euler_xyz(b.fval);
-        TimelineQuat q = timeline_quat_slerp(qa, qb, t);
-        Mat4 rot = timeline_mat4_from_quat(q);
-        timeline_euler_xyz_from_mat4(rot, a.fval, out->fval);
-        if (timeline_track_value_count(track) > 3)
-            out->fval[3] = timeline_lerp(a.fval[3], b.fval[3], t);
+        if (track.value_type == RES_FLOAT4) {
+            quat_to_array(quat_slerp(quat_from_array(a.fval), quat_from_array(b.fval), t), out->fval);
+            return true;
+        }
+
+        Quat q = quat_slerp(
+            quat_from_euler_xyz(v3(a.fval[0], a.fval[1], a.fval[2])),
+            quat_from_euler_xyz(v3(b.fval[0], b.fval[1], b.fval[2])),
+            t);
+        quat_to_euler_xyz(q, a.fval, out->fval);
         return true;
     }
 
@@ -821,8 +676,15 @@ static void timeline_apply_user_var_to_source(UserCBEntry& e, const TimelineKey&
         Command* c = cmd_get(cmd_find_by_name(e.source_target));
         if (!c)
             return;
+        if (source_kind == USER_CB_SOURCE_COMMAND_ROTATION) {
+            if (e.type == RES_FLOAT4)
+                quat_to_array(quat_from_array(key.fval), c->rotq);
+            else
+                quat_to_array(quat_from_euler_xyz(v3(key.fval[0], key.fval[1], key.fval[2])), c->rotq);
+            return;
+        }
         float* dst = source_kind == USER_CB_SOURCE_COMMAND_POSITION ? c->pos :
-                     source_kind == USER_CB_SOURCE_COMMAND_ROTATION ? c->rot : c->scale;
+                     c->scale;
         for (int i = 0; i < 3; i++)
             dst[i] = key.fval[i];
         return;
@@ -879,8 +741,8 @@ static void timeline_apply_command_transform(const TimelineTrack& track, const T
     if (!c)
         return;
     for (int i = 0; i < 3; i++) c->pos[i] = key.fval[i];
-    for (int i = 0; i < 3; i++) c->rot[i] = key.fval[3 + i];
-    for (int i = 0; i < 3; i++) c->scale[i] = key.fval[6 + i];
+    quat_to_array(quat_from_array(&key.fval[3]), c->rotq);
+    for (int i = 0; i < 3; i++) c->scale[i] = key.fval[7 + i];
 }
 
 static void timeline_apply_command_enabled(const TimelineTrack& track, const TimelineKey& key) {

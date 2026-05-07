@@ -677,8 +677,11 @@ bool project_save_text(const char* path) {
         fprintf(f, "  render_state %s %s %s %s %s %s %s\n",
             bool_str(c.color_write), bool_str(c.depth_test), bool_str(c.depth_write),
             bool_str(c.alpha_blend), bool_str(c.cull_back), bool_str(c.shadow_cast), bool_str(c.shadow_receive));
-        fprintf(f, "  transform %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n",
-            c.pos[0], c.pos[1], c.pos[2], c.rot[0], c.rot[1], c.rot[2], c.scale[0], c.scale[1], c.scale[2]);
+        Quat rotq = quat_from_array(c.rotq);
+        fprintf(f, "  transformq %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n",
+            c.pos[0], c.pos[1], c.pos[2],
+            rotq.x, rotq.y, rotq.z, rotq.w,
+            c.scale[0], c.scale[1], c.scale[2]);
         fprintf(f, "  clear %s %.9g %.9g %.9g %.9g %s %.9g\n",
             bool_str(c.clear_color_enabled), c.clear_color[0], c.clear_color[1], c.clear_color[2], c.clear_color[3],
             bool_str(c.clear_depth), c.depth_clear_val);
@@ -925,9 +928,23 @@ bool project_load_text(const char* path) {
                         key->ival[i] = v ? atoi(v) : 0;
                     }
                 } else {
-                    for (int i = 0; i < n; i++) {
-                        char* v = strtok(nullptr, " \t\r\n");
-                        key->fval[i] = v ? (float)atof(v) : 0.0f;
+                    float values[16] = {};
+                    int value_count = 0;
+                    for (char* v = strtok(nullptr, " \t\r\n");
+                         v && value_count < 16;
+                         v = strtok(nullptr, " \t\r\n")) {
+                        values[value_count++] = (float)atof(v);
+                    }
+
+                    if (track.kind == TIMELINE_TRACK_COMMAND_TRANSFORM && value_count == 9) {
+                        for (int i = 0; i < 3; i++) key->fval[i] = values[i];
+                        quat_to_array(quat_from_euler_xyz(v3(values[3], values[4], values[5])), &key->fval[3]);
+                        for (int i = 0; i < 3; i++) key->fval[7 + i] = values[6 + i];
+                    } else {
+                        for (int i = 0; i < n && i < value_count; i++)
+                            key->fval[i] = values[i];
+                        if (track.kind == TIMELINE_TRACK_COMMAND_TRANSFORM)
+                            quat_to_array(quat_from_array(&key->fval[3]), &key->fval[3]);
                     }
                 }
             }
@@ -1134,7 +1151,15 @@ bool project_load_text(const char* path) {
                 cur->shadow_receive = atoi(strtok(nullptr, " \t\r\n")) != 0;
             } else if (strcmp(tag, "transform") == 0) {
                 for (int i = 0; i < 3; i++) cur->pos[i] = (float)atof(strtok(nullptr, " \t\r\n"));
-                for (int i = 0; i < 3; i++) cur->rot[i] = (float)atof(strtok(nullptr, " \t\r\n"));
+                float euler[3] = {};
+                for (int i = 0; i < 3; i++) euler[i] = (float)atof(strtok(nullptr, " \t\r\n"));
+                quat_to_array(quat_from_euler_xyz(v3(euler[0], euler[1], euler[2])), cur->rotq);
+                for (int i = 0; i < 3; i++) cur->scale[i] = (float)atof(strtok(nullptr, " \t\r\n"));
+            } else if (strcmp(tag, "transformq") == 0) {
+                for (int i = 0; i < 3; i++) cur->pos[i] = (float)atof(strtok(nullptr, " \t\r\n"));
+                float q[4] = {};
+                for (int i = 0; i < 4; i++) q[i] = (float)atof(strtok(nullptr, " \t\r\n"));
+                quat_to_array(quat_from_array(q), cur->rotq);
                 for (int i = 0; i < 3; i++) cur->scale[i] = (float)atof(strtok(nullptr, " \t\r\n"));
             } else if (strcmp(tag, "clear") == 0) {
                 cur->clear_color_enabled = atoi(strtok(nullptr, " \t\r\n")) != 0;

@@ -204,12 +204,21 @@ static bool user_cb_read_scene_source(UserCBSourceKind kind, const char* target,
         Command* c = cmd_get(cmd_find_by_name(target ? target : ""));
         if (!c)
             return false;
+        if (kind == USER_CB_SOURCE_COMMAND_ROTATION) {
+            if (type == RES_FLOAT4) {
+                quat_to_array(quat_from_array(c->rotq), out);
+            } else {
+                quat_to_euler_xyz(quat_from_array(c->rotq), nullptr, out);
+                out[3] = 0.0f;
+            }
+            return true;
+        }
         const float* src = kind == USER_CB_SOURCE_COMMAND_POSITION ? c->pos :
-                           kind == USER_CB_SOURCE_COMMAND_ROTATION ? c->rot : c->scale;
+                           c->scale;
         out[0] = src[0];
         out[1] = src[1];
         out[2] = src[2];
-        out[3] = kind == USER_CB_SOURCE_COMMAND_ROTATION ? 0.0f : 1.0f;
+        out[3] = 1.0f;
         return true;
     }
     case USER_CB_SOURCE_CAMERA_POSITION:

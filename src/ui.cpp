@@ -83,7 +83,6 @@ struct UiViewportGizmoDrag {
     CmdHandle            cmd;
     int                  axis;
     float                initial_pos[3];
-    float                initial_rot[3];
     float                initial_scale[3];
     float                axis_world_len;
     float                axis_screen_len;
@@ -4770,6 +4769,43 @@ static bool ui_command_has_transform(const Command* c) {
                  c->type == CMD_INDIRECT_DRAW);
 }
 
+static bool ui_quat_array_close(const float a[4], const float b[4]) {
+    if (!a || !b)
+        return false;
+    for (int i = 0; i < 4; i++) {
+        if (fabsf(a[i] - b[i]) > 0.00001f)
+            return false;
+    }
+    return true;
+}
+
+static bool ui_command_rotation_editor(Command* c) {
+    static CmdHandle s_edit_cmd = INVALID_HANDLE;
+    static float s_edit_euler[3] = {};
+    static float s_edit_rotq[4] = {};
+
+    if (!c)
+        return false;
+
+    CmdHandle h = cmd_find_by_name(c->name);
+    if (h != s_edit_cmd || !ui_quat_array_close(c->rotq, s_edit_rotq)) {
+        quat_to_euler_xyz(quat_from_array(c->rotq), h == s_edit_cmd ? s_edit_euler : nullptr, s_edit_euler);
+        quat_to_array(quat_from_array(c->rotq), s_edit_rotq);
+        s_edit_cmd = h;
+    }
+
+    bool changed = ui_tinted_transform_row(
+        "Rotation", s_edit_euler, 0.01f,
+        ImVec4(0.055f, 0.130f, 0.070f, 0.3f),
+        ImVec4(0.080f, 0.200f, 0.105f, 0.5f)
+    );
+    if (changed) {
+        quat_to_array(quat_from_euler_xyz(v3(s_edit_euler[0], s_edit_euler[1], s_edit_euler[2])), c->rotq);
+        quat_to_array(quat_from_array(c->rotq), s_edit_rotq);
+    }
+    return changed;
+}
+
 static void ui_command_transform_editor(Command* c) {
     if (!c)
         return;
@@ -4782,11 +4818,7 @@ static void ui_command_transform_editor(Command* c) {
         ImVec4(0.230f, 0.080f, 0.070f, 0.5f)
     );
 
-    transform_changed |= ui_tinted_transform_row(
-        "Rotation", c->rot, 0.01f,
-        ImVec4(0.055f, 0.130f, 0.070f, 0.3f),
-        ImVec4(0.080f, 0.200f, 0.105f, 0.5f)
-    );
+    transform_changed |= ui_command_rotation_editor(c);
 
     transform_changed |= ui_tinted_transform_row(
         "Scale", c->scale, 0.001f,
@@ -6063,33 +6095,6 @@ static float ui_wrap_angle_near(float angle, float target) {
     return target;
 }
 
-static void ui_extract_rotation_xyz(const Mat4& rot, const float reference[3], float out[3]) {
-    float sy = -clampf(rot.m[2], -1.0f, 1.0f);
-    float y = asinf(sy);
-    float cy = cosf(y);
-    float x = 0.0f;
-    float z = 0.0f;
-
-    if (fabsf(cy) > 1e-5f) {
-        x = atan2f(rot.m[6], rot.m[10]);
-        z = atan2f(rot.m[1], rot.m[0]);
-    } else {
-        y = sy >= 0.0f ? 1.57079632679f : -1.57079632679f;
-        z = 0.0f;
-        x = sy >= 0.0f ? atan2f(rot.m[4], rot.m[5]) : atan2f(-rot.m[4], rot.m[5]);
-    }
-
-    if (reference) {
-        x = ui_wrap_angle_near(reference[0], x);
-        y = ui_wrap_angle_near(reference[1], y);
-        z = ui_wrap_angle_near(reference[2], z);
-    }
-
-    out[0] = x;
-    out[1] = y;
-    out[2] = z;
-}
-
 static void ui_draw_translate_axis(ImDrawList* dl, ImVec2 origin, ImVec2 end, ImU32 col, float thickness) {
     ImVec2 dir = ui_imvec2_norm(ui_imvec2_sub(end, origin));
     ImVec2 tangent = ImVec2(-dir.y, dir.x);
@@ -6190,11 +6195,7 @@ static void ui_apply_gizmo_drag(Command* c, const UiViewportGizmoDrag* drag, Vec
         float delta_angle = ui_wrap_angle_near(0.0f, current_angle - drag->ring_start_angle);
         Mat4 delta_rot = ui_gizmo_axis_rotation_matrix(drag->axis, delta_angle);
         Mat4 final_rot = mat4_mul(delta_rot, drag->initial_rot_matrix);
-        float euler[3] = {};
-        ui_extract_rotation_xyz(final_rot, drag->initial_rot, euler);
-        c->rot[0] = euler[0];
-        c->rot[1] = euler[1];
-        c->rot[2] = euler[2];
+        quat_to_array(quat_from_mat4(final_rot), c->rotq);
     } else if (drag->mode == UI_GIZMO_SCALE) {
         c->scale[drag->axis] = drag->initial_scale[drag->axis] + axis_motion / screen_len;
         if (c->scale[drag->axis] < 0.001f)
@@ -6246,7 +6247,7 @@ static void ui_draw_viewport_gizmo(ImVec2 rect_min, ImVec2 rect_max, bool hovere
 
     origin_world = v3(c->pos[0], c->pos[1], c->pos[2]);
     view_proj = ui_mat4_from_raw(g_dx.scene_cb_data.view_proj);
-    rot = mat4_rotation_xyz(v3(c->rot[0], c->rot[1], c->rot[2]));
+    rot = mat4_rotation_quat(quat_from_array(c->rotq));
     axis_world[0] = ui_gizmo_axis_dir_from_rotation(rot, 0);
     axis_world[1] = ui_gizmo_axis_dir_from_rotation(rot, 1);
     axis_world[2] = ui_gizmo_axis_dir_from_rotation(rot, 2);
@@ -6315,7 +6316,6 @@ static void ui_draw_viewport_gizmo(ImVec2 rect_min, ImVec2 rect_max, bool hovere
             s_viewport_gizmo_drag.cmd = g_sel_cmd;
             s_viewport_gizmo_drag.axis = hovered_axis;
             memcpy(s_viewport_gizmo_drag.initial_pos, c->pos, sizeof(c->pos));
-            memcpy(s_viewport_gizmo_drag.initial_rot, c->rot, sizeof(c->rot));
             memcpy(s_viewport_gizmo_drag.initial_scale, c->scale, sizeof(c->scale));
             s_viewport_gizmo_drag.axis_world_len = axis_world_len;
             s_viewport_gizmo_drag.axis_screen_len = axis_screen_len[hovered_axis];

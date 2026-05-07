@@ -253,7 +253,7 @@ struct Command {
     bool      shadow_cast;
     bool      shadow_receive;
     float     pos[3];
-    float     rot[3];
+    float     rotq[4];
     float     scale[3];
 
     ResHandle tex_handles[MAX_TEX_SLOTS];
@@ -363,6 +363,7 @@ inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi 
 
 struct Vec3 { float x, y, z; };
 struct Mat4 { float m[16]; };
+struct Quat { float x, y, z, w; };
 
 inline Vec3 v3(float x, float y, float z)         { return {x, y, z}; }
 inline Vec3 v3_add(Vec3 a, Vec3 b)                { return {a.x+b.x, a.y+b.y, a.z+b.z}; }
@@ -385,4 +386,13 @@ Mat4 mat4_orthographic(float width, float height, float near_z, float far_z);
 Mat4 mat4_translation(Vec3 t);
 Mat4 mat4_scale(Vec3 s);
 Mat4 mat4_rotation_xyz(Vec3 r);
+Mat4 mat4_rotation_quat(Quat q);
+Quat quat_identity();
+Quat quat_normalize(Quat q);
+Quat quat_from_array(const float q[4]);
+void quat_to_array(Quat q, float out[4]);
+Quat quat_from_mat4(const Mat4& m);
+Quat quat_from_euler_xyz(Vec3 r);
+Quat quat_slerp(Quat a, Quat b, float t);
+void quat_to_euler_xyz(Quat q, const float* reference, float out[3]);
 Vec3 camera_eye(const Camera& c);

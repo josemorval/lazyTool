@@ -412,6 +412,7 @@ CmdHandle cmd_alloc(const char* name, CmdType type) {
             g_commands[i].cull_back        = true;
             g_commands[i].shadow_cast      = false;
             g_commands[i].shadow_receive   = false;
+            g_commands[i].rotq[3]          = 1.0f;
             g_commands[i].scale[0]         = 1.0f;
             g_commands[i].scale[1]         = 1.0f;
             g_commands[i].scale[2]         = 1.0f;
@@ -771,7 +772,7 @@ static D3D11_PRIMITIVE_TOPOLOGY command_draw_topology(const Command& c) {
 
 static Mat4 command_world_matrix(const Command& c) {
     Mat4 s = mat4_scale(v3(c.scale[0], c.scale[1], c.scale[2]));
-    Mat4 r = mat4_rotation_xyz(v3(c.rot[0], c.rot[1], c.rot[2]));
+    Mat4 r = mat4_rotation_quat(quat_from_array(c.rotq));
     Mat4 t = mat4_translation(v3(c.pos[0], c.pos[1], c.pos[2]));
     return mat4_mul(mat4_mul(s, r), t);
 }
