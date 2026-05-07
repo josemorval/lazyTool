@@ -546,6 +546,7 @@ void project_new_default() {
 
 // Serialize the current scene/editor state into the custom text format.
 bool project_save_text(const char* path) {
+    user_cb_enforce_unique_names();
     ensure_parent_dir(path);
     FILE* f = fopen(path, "wb");
     if (!f) {
@@ -681,6 +682,9 @@ bool project_save_text(const char* path) {
         fprintf(f, "  clear %s %.9g %.9g %.9g %.9g %s %.9g\n",
             bool_str(c.clear_color_enabled), c.clear_color[0], c.clear_color[1], c.clear_color[2], c.clear_color[3],
             bool_str(c.clear_depth), c.depth_clear_val);
+        fprintf(f, "  clear_sources %s %s\n",
+            c.clear_color_source[0] ? c.clear_color_source : "-",
+            c.clear_depth_source[0] ? c.clear_depth_source : "-");
         fprintf(f, "  vertex_count %d\n", c.vertex_count);
         fprintf(f, "  instance %d\n", c.instance_count);
         fprintf(f, "  threads %d %d %d\n", c.thread_x, c.thread_y, c.thread_z);
@@ -832,6 +836,37 @@ bool project_load_text(const char* path) {
     CmdHandle pending_parent_cmds[MAX_COMMANDS] = {};
     char pending_parent_names[MAX_COMMANDS][MAX_NAME] = {};
     int pending_parent_count = 0;
+    struct UserVarNameRemap {
+        char old_name[MAX_NAME];
+        char new_name[MAX_NAME];
+        ResType type;
+    };
+    UserVarNameRemap user_var_remaps[MAX_USER_CB_VARS] = {};
+    int user_var_remap_count = 0;
+    auto remember_user_var_name = [&](const char* old_name, ResType type, const char* new_name) {
+        if (!old_name || !old_name[0] || !new_name || !new_name[0] ||
+            strcmp(old_name, new_name) == 0 || user_var_remap_count >= MAX_USER_CB_VARS)
+            return;
+        UserVarNameRemap& remap = user_var_remaps[user_var_remap_count++];
+        strncpy(remap.old_name, old_name, MAX_NAME - 1);
+        remap.old_name[MAX_NAME - 1] = '\0';
+        strncpy(remap.new_name, new_name, MAX_NAME - 1);
+        remap.new_name[MAX_NAME - 1] = '\0';
+        remap.type = type;
+    };
+    auto remap_user_var_name = [&](const char* name, ResType type) -> const char* {
+        if (!name)
+            return "";
+        for (int i = user_var_remap_count - 1; i >= 0; i--) {
+            const UserVarNameRemap& remap = user_var_remaps[i];
+            if (strcmp(remap.old_name, name) != 0)
+                continue;
+            if (type != RES_NONE && remap.type != type)
+                continue;
+            return remap.new_name;
+        }
+        return name;
+    };
     int timeline_load_track = -1;
     const char* cursor = (const char*)project_bytes;
     const char* end = cursor + project_size;
@@ -868,10 +903,14 @@ bool project_load_text(const char* path) {
             char* type = strtok(nullptr, " \t\r\n");
             strtok(nullptr, " \t\r\n"); // key_count, kept for readability in the text format.
             char* enabled = strtok(nullptr, " \t\r\n");
+            TimelineTrackKind track_kind = timeline_track_kind_from_token(kind);
+            ResType track_type = res_type_from_token(type);
+            const char* remapped_target = track_kind == TIMELINE_TRACK_USER_VAR ?
+                remap_user_var_name(target ? target : "", track_type) : (target ? target : "");
             timeline_load_track = timeline_add_track(
-                timeline_track_kind_from_token(kind),
-                target ? target : "",
-                res_type_from_token(type));
+                track_kind,
+                remapped_target,
+                track_type);
             if (timeline_load_track >= 0 && enabled)
                 g_timeline_tracks[timeline_load_track].enabled = atoi(enabled) != 0;
         } else if (strcmp(tag, "timeline_key") == 0) {
@@ -1029,6 +1068,7 @@ bool project_load_text(const char* path) {
             if (name && type != RES_NONE && user_cb_add_var(name, type)) {
                 int idx = g_user_cb_count - 1;
                 UserCBEntry& e = g_user_cb_entries[idx];
+                remember_user_var_name(name, type, e.name);
                 for (int i = 0; i < 4; i++) {
                     char* v = strtok(nullptr, " \t\r\n");
                     e.ival[i] = v ? atoi(v) : 0;
@@ -1046,8 +1086,9 @@ bool project_load_text(const char* path) {
             char* kind_tok = strtok(nullptr, " \t\r\n");
             char* target = strtok(nullptr, " \t\r\n");
             if (name && kind_tok) {
+                const char* actual_name = remap_user_var_name(name, RES_NONE);
                 for (int i = 0; i < g_user_cb_count; i++) {
-                    if (strcmp(g_user_cb_entries[i].name, name) != 0)
+                    if (strcmp(g_user_cb_entries[i].name, actual_name) != 0)
                         continue;
                     user_cb_set_scene_source(i, user_cb_source_kind_from_token(kind_tok),
                                              target && strcmp(target, "-") != 0 ? target : "");
@@ -1100,6 +1141,17 @@ bool project_load_text(const char* path) {
                 for (int i = 0; i < 4; i++) cur->clear_color[i] = (float)atof(strtok(nullptr, " \t\r\n"));
                 cur->clear_depth = atoi(strtok(nullptr, " \t\r\n")) != 0;
                 cur->depth_clear_val = (float)atof(strtok(nullptr, " \t\r\n"));
+            } else if (strcmp(tag, "clear_sources") == 0) {
+                char* color_src = strtok(nullptr, " \t\r\n");
+                char* depth_src = strtok(nullptr, " \t\r\n");
+                if (color_src && strcmp(color_src, "-") != 0) {
+                    strncpy(cur->clear_color_source, remap_user_var_name(color_src, RES_NONE), MAX_NAME - 1);
+                    cur->clear_color_source[MAX_NAME - 1] = '\0';
+                }
+                if (depth_src && strcmp(depth_src, "-") != 0) {
+                    strncpy(cur->clear_depth_source, remap_user_var_name(depth_src, RES_NONE), MAX_NAME - 1);
+                    cur->clear_depth_source[MAX_NAME - 1] = '\0';
+                }
             } else if (strcmp(tag, "vertex_count") == 0) {
                 cur->vertex_count = atoi(strtok(nullptr, " \t\r\n"));
             } else if (strcmp(tag, "instance") == 0) {

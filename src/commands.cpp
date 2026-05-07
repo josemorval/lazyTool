@@ -1025,6 +1025,30 @@ static void validate_dispatch_command(Command& c, const Resource* shader, bool i
     validation_finish(c, issues);
 }
 
+static void command_resolve_clear_values(const Command& c, float out_color[4], float* out_depth) {
+    for (int i = 0; i < 4; i++)
+        out_color[i] = c.clear_color[i];
+    if (out_depth)
+        *out_depth = c.depth_clear_val;
+
+    if (c.clear_color_source[0]) {
+        const UserCBEntry* e = user_cb_get(c.clear_color_source);
+        if (e && (e->type == RES_FLOAT3 || e->type == RES_FLOAT4)) {
+            out_color[0] = e->fval[0];
+            out_color[1] = e->fval[1];
+            out_color[2] = e->fval[2];
+            if (e->type == RES_FLOAT4)
+                out_color[3] = e->fval[3];
+        }
+    }
+
+    if (out_depth && c.clear_depth_source[0]) {
+        const UserCBEntry* e = user_cb_get(c.clear_depth_source);
+        if (e && e->type == RES_FLOAT)
+            *out_depth = clampf(e->fval[0], 0.0f, 1.0f);
+    }
+}
+
 static UINT collect_draw_rtvs(const Command& c, ID3D11RenderTargetView** out_rtvs, UINT max_rtvs) {
     if (!out_rtvs || max_rtvs == 0)
         return 0;
@@ -1449,9 +1473,12 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
     case CMD_CLEAR: {
         ID3D11RenderTargetView* rtv = c.clear_color_enabled ? get_rtv(c.rt) : nullptr;
         ID3D11DepthStencilView* dsv = get_draw_dsv(c);
-        if (rtv && c.clear_color_enabled) g_dx.ctx->ClearRenderTargetView(rtv, c.clear_color);
+        float clear_color[4] = {};
+        float clear_depth = 1.0f;
+        command_resolve_clear_values(c, clear_color, &clear_depth);
+        if (rtv && c.clear_color_enabled) g_dx.ctx->ClearRenderTargetView(rtv, clear_color);
         if (dsv && c.clear_depth)
-            g_dx.ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, c.depth_clear_val, 0);
+            g_dx.ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, clear_depth, 0);
         break;
     }
 

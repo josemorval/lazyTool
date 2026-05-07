@@ -4,6 +4,7 @@
 #include "dx11_ctx.h"
 #include "log.h"
 #include "ui.h"
+#include "timeline.h"
 #include <string.h>
 
 // user_cb.cpp manages the user-defined constant buffer bound at b1. It lets
@@ -24,9 +25,13 @@ void user_cb_sync_command_params(Command* c, const Resource*) {
         c->param_count = 0;
 }
 void user_cb_bind_for_command(Command*, const Resource*, bool, bool, bool) {}
+void user_cb_enforce_unique_names() {}
 bool user_cb_type_supported(ResType) { return false; }
 bool user_cb_add_var(const char*, ResType) { return false; }
 bool user_cb_add_from_resource(ResHandle) { return false; }
+int user_cb_find(const char*) { return -1; }
+const UserCBEntry* user_cb_get(const char*) { return nullptr; }
+bool user_cb_rename(int, const char*) { return false; }
 bool user_cb_set_source(int, ResHandle) { return false; }
 bool user_cb_set_scene_source(int, UserCBSourceKind, const char*) { return false; }
 void user_cb_refresh_entry(int) {}
@@ -34,18 +39,41 @@ const char* user_cb_source_kind_token(UserCBSourceKind) { return "none"; }
 UserCBSourceKind user_cb_source_kind_from_token(const char*) { return USER_CB_SOURCE_NONE; }
 void user_cb_detach_resource(ResHandle) {}
 void user_cb_rename_command_references(const char*, const char*) {}
+void user_cb_rename_variable_references(const char*, const char*) {}
+void user_cb_delete_variable_references(const char*) {}
+void user_cb_rename_resource_references(ResHandle, const char*, const char*) {}
 void user_cb_remove(int) {}
 void user_cb_move(int, int) {}
 int user_cb_slot_offset(int idx) { return idx * 16; }
 #else
 static ID3D11Buffer* s_command_cb_buf = nullptr;
 
-static bool user_cb_name_exists(const char* name) {
+static bool user_cb_name_exists_except(const char* name, int except_idx) {
+    if (!name || !name[0])
+        return false;
     for (int i = 0; i < g_user_cb_count; i++) {
+        if (i == except_idx)
+            continue;
         if (strcmp(g_user_cb_entries[i].name, name) == 0)
             return true;
     }
     return false;
+}
+
+static bool user_cb_name_exists_before(const char* name, int before_idx) {
+    if (!name || !name[0])
+        return false;
+    if (before_idx > g_user_cb_count)
+        before_idx = g_user_cb_count;
+    for (int i = 0; i < before_idx; i++) {
+        if (strcmp(g_user_cb_entries[i].name, name) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool user_cb_name_exists(const char* name) {
+    return user_cb_name_exists_except(name, -1);
 }
 
 static UserCBEntry* user_cb_find_global_entry(const char* name, ResType type) {
@@ -60,9 +88,9 @@ static UserCBEntry* user_cb_find_global_entry(const char* name, ResType type) {
     return nullptr;
 }
 
-static void user_cb_make_unique_name(const char* base, char* out, int out_sz) {
+static void user_cb_make_unique_name_except(const char* base, char* out, int out_sz, int except_idx) {
     const char* src = (base && base[0]) ? base : "var";
-    if (!user_cb_name_exists(src)) {
+    if (!user_cb_name_exists_except(src, except_idx)) {
         strncpy(out, src, out_sz - 1);
         out[out_sz - 1] = '\0';
         return;
@@ -70,12 +98,16 @@ static void user_cb_make_unique_name(const char* base, char* out, int out_sz) {
 
     for (int i = 1; i < 1000; i++) {
         snprintf(out, out_sz, "%s_%d", src, i);
-        if (!user_cb_name_exists(out))
+        if (!user_cb_name_exists_except(out, except_idx))
             return;
     }
 
     strncpy(out, src, out_sz - 1);
     out[out_sz - 1] = '\0';
+}
+
+static void user_cb_make_unique_name(const char* base, char* out, int out_sz) {
+    user_cb_make_unique_name_except(base, out, out_sz, -1);
 }
 
 static void user_cb_copy_from_resource(UserCBEntry* e, const Resource* r) {
@@ -320,8 +352,36 @@ void user_cb_clear() {
     g_user_cb_count = 0;
 }
 
+void user_cb_enforce_unique_names() {
+    for (int i = 0; i < g_user_cb_count; i++) {
+        UserCBEntry& e = g_user_cb_entries[i];
+        if (e.name[0] && !user_cb_name_exists_before(e.name, i))
+            continue;
+
+        char old_name[MAX_NAME] = {};
+        strncpy(old_name, e.name, MAX_NAME - 1);
+        old_name[MAX_NAME - 1] = '\0';
+
+        char next_name[MAX_NAME] = {};
+        user_cb_make_unique_name_except(old_name[0] ? old_name : "var", next_name, MAX_NAME, i);
+        if (!next_name[0] || strcmp(old_name, next_name) == 0)
+            continue;
+
+        strncpy(e.name, next_name, MAX_NAME - 1);
+        e.name[MAX_NAME - 1] = '\0';
+
+        if (old_name[0] && !user_cb_name_exists_before(old_name, i))
+            user_cb_rename_variable_references(old_name, e.name);
+
+        log_warn("UserCB: renamed duplicate variable '%s' -> '%s'",
+                 old_name[0] ? old_name : "(empty)", e.name);
+        app_request_scene_render();
+    }
+}
+
 // Pack the latest user variable values into the shared GPU buffer.
 void user_cb_update() {
+    user_cb_enforce_unique_names();
     if (!g_user_cb_buf) return;
 
     UserCBData data = {};
@@ -514,6 +574,101 @@ void user_cb_bind_for_command(Command* c, const Resource* shader, bool bind_vs, 
     if (bind_cs) g_dx.ctx->CSSetConstantBuffers(slot, 1, &s_command_cb_buf);
 }
 
+int user_cb_find(const char* name) {
+    if (!name || !name[0])
+        return -1;
+    for (int i = 0; i < g_user_cb_count; i++) {
+        if (strcmp(g_user_cb_entries[i].name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+const UserCBEntry* user_cb_get(const char* name) {
+    int idx = user_cb_find(name);
+    return idx >= 0 ? &g_user_cb_entries[idx] : nullptr;
+}
+
+void user_cb_rename_variable_references(const char* old_name, const char* new_name) {
+    if (!old_name || !old_name[0] || !new_name || !new_name[0] ||
+        strcmp(old_name, new_name) == 0)
+        return;
+
+    timeline_rename_tracks_for_user_var(old_name, new_name);
+    for (int c_i = 0; c_i < MAX_COMMANDS; c_i++) {
+        Command& c = g_commands[c_i];
+        if (!c.active)
+            continue;
+        if (strcmp(c.clear_color_source, old_name) == 0) {
+            strncpy(c.clear_color_source, new_name, MAX_NAME - 1);
+            c.clear_color_source[MAX_NAME - 1] = '\0';
+        }
+        if (strcmp(c.clear_depth_source, old_name) == 0) {
+            strncpy(c.clear_depth_source, new_name, MAX_NAME - 1);
+            c.clear_depth_source[MAX_NAME - 1] = '\0';
+        }
+    }
+}
+
+void user_cb_delete_variable_references(const char* name) {
+    if (!name || !name[0])
+        return;
+
+    timeline_delete_tracks_for_user_var(name);
+    for (int c_i = 0; c_i < MAX_COMMANDS; c_i++) {
+        Command& c = g_commands[c_i];
+        if (!c.active)
+            continue;
+        if (strcmp(c.clear_color_source, name) == 0)
+            c.clear_color_source[0] = '\0';
+        if (strcmp(c.clear_depth_source, name) == 0)
+            c.clear_depth_source[0] = '\0';
+    }
+}
+
+void user_cb_rename_resource_references(ResHandle h, const char* old_name, const char* new_name) {
+    if (h == INVALID_HANDLE || !old_name || !old_name[0] || !new_name || !new_name[0] ||
+        strcmp(old_name, new_name) == 0)
+        return;
+
+    for (int i = 0; i < g_user_cb_count; i++) {
+        UserCBEntry& e = g_user_cb_entries[i];
+        UserCBSourceKind source_kind = e.source_kind;
+        if (source_kind == USER_CB_SOURCE_NONE && e.source != INVALID_HANDLE)
+            source_kind = USER_CB_SOURCE_RESOURCE;
+        if (source_kind != USER_CB_SOURCE_RESOURCE || e.source != h)
+            continue;
+        if (strcmp(e.name, old_name) != 0)
+            continue;
+        user_cb_rename(i, new_name);
+    }
+}
+
+bool user_cb_rename(int idx, const char* name) {
+    if (idx < 0 || idx >= g_user_cb_count)
+        return false;
+
+    char next_name[MAX_NAME] = {};
+    user_cb_make_unique_name_except(name, next_name, MAX_NAME, idx);
+    if (!next_name[0])
+        return false;
+
+    UserCBEntry& e = g_user_cb_entries[idx];
+    if (strcmp(e.name, next_name) == 0)
+        return true;
+
+    char old_name[MAX_NAME] = {};
+    strncpy(old_name, e.name, MAX_NAME - 1);
+    old_name[MAX_NAME - 1] = '\0';
+
+    strncpy(e.name, next_name, MAX_NAME - 1);
+    e.name[MAX_NAME - 1] = '\0';
+    user_cb_rename_variable_references(old_name, e.name);
+    log_info("UserCB: renamed '%s' -> '%s'", old_name, e.name);
+    app_request_scene_render();
+    return true;
+}
+
 bool user_cb_type_supported(ResType type) {
     switch (type) {
     case RES_FLOAT:
@@ -549,6 +704,7 @@ bool user_cb_add_var(const char* name, ResType type) {
 
     log_info("UserCB: created '%s' at slot %d (preferred b2, offset %d bytes)",
              e->name, slot, slot * 16);
+    app_request_scene_render();
     return true;
 }
 
@@ -578,6 +734,7 @@ bool user_cb_add_from_resource(ResHandle h) {
 
     log_info("UserCB: added '%s' linked to resource '%s' at slot %d (preferred b2, offset %d bytes)",
              e->name, r->name, slot, slot * 16);
+    app_request_scene_render();
     return true;
 }
 
@@ -587,6 +744,7 @@ bool user_cb_set_source(int idx, ResHandle h) {
     UserCBEntry* e = &g_user_cb_entries[idx];
     if (h == INVALID_HANDLE) {
         user_cb_clear_source(e);
+        app_request_scene_render();
         return true;
     }
 
@@ -601,6 +759,7 @@ bool user_cb_set_source(int idx, ResHandle h) {
     e->source_kind = USER_CB_SOURCE_RESOURCE;
     e->source_target[0] = '\0';
     user_cb_copy_from_resource(e, r);
+    app_request_scene_render();
     return true;
 }
 
@@ -627,6 +786,7 @@ bool user_cb_set_scene_source(int idx, UserCBSourceKind kind, const char* target
         user_cb_clear_source(e);
         return false;
     }
+    app_request_scene_render();
     return true;
 }
 
@@ -689,9 +849,14 @@ void user_cb_rename_command_references(const char* old_name, const char* new_nam
 
 void user_cb_remove(int idx) {
     if (idx < 0 || idx >= g_user_cb_count) return;
+    char removed_name[MAX_NAME] = {};
+    strncpy(removed_name, g_user_cb_entries[idx].name, MAX_NAME - 1);
+    removed_name[MAX_NAME - 1] = '\0';
+    user_cb_delete_variable_references(removed_name);
     for (int i = idx; i < g_user_cb_count - 1; i++)
         g_user_cb_entries[i] = g_user_cb_entries[i + 1];
     memset(&g_user_cb_entries[--g_user_cb_count], 0, sizeof(UserCBEntry));
+    app_request_scene_render();
 }
 
 void user_cb_move(int from, int to) {
@@ -703,6 +868,7 @@ void user_cb_move(int from, int to) {
     for (int i = from; i != to; i += dir)
         g_user_cb_entries[i] = g_user_cb_entries[i + dir];
     g_user_cb_entries[to] = tmp;
+    app_request_scene_render();
 }
 
 int user_cb_slot_offset(int idx) { return idx * 16; }

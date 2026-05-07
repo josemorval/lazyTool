@@ -402,6 +402,7 @@ void timeline_update(float scene_time_seconds) {
 }
 
 int timeline_find_track(TimelineTrackKind kind, const char* target, ResType value_type) {
+    (void)value_type;
     if (!target) target = "";
     for (int i = 0; i < g_timeline_track_count; i++) {
         TimelineTrack& t = g_timeline_tracks[i];
@@ -409,8 +410,8 @@ int timeline_find_track(TimelineTrackKind kind, const char* target, ResType valu
             continue;
         if (strcmp(t.target, target) != 0)
             continue;
-        if (kind == TIMELINE_TRACK_USER_VAR && t.value_type != value_type)
-            continue;
+        if (kind == TIMELINE_TRACK_USER_VAR)
+            return i;
         return i;
     }
     return -1;
@@ -420,9 +421,17 @@ int timeline_add_track(TimelineTrackKind kind, const char* target, ResType value
     if (kind == TIMELINE_TRACK_NONE)
         return -1;
     if (!target) target = "";
+    if (kind == TIMELINE_TRACK_USER_VAR) {
+        int user_idx = timeline_user_var_index(target);
+        if (user_idx >= 0)
+            value_type = g_user_cb_entries[user_idx].type;
+    }
     int existing = timeline_find_track(kind, target, value_type);
-    if (existing >= 0)
+    if (existing >= 0) {
+        if (kind == TIMELINE_TRACK_USER_VAR)
+            g_timeline_tracks[existing].value_type = value_type;
         return existing;
+    }
     if (g_timeline_track_count >= MAX_TIMELINE_TRACKS)
         return -1;
 
@@ -478,10 +487,44 @@ void timeline_rename_tracks_for_command(const char* old_target, const char* new_
     }
 }
 
+void timeline_delete_tracks_for_user_var(const char* target) {
+    if (!target || !target[0])
+        return;
+    for (int i = g_timeline_track_count - 1; i >= 0; i--) {
+        TimelineTrack& track = g_timeline_tracks[i];
+        if (!track.active || track.kind != TIMELINE_TRACK_USER_VAR)
+            continue;
+        if (strcmp(track.target, target) == 0)
+            timeline_delete_track(i);
+    }
+}
+
+void timeline_rename_tracks_for_user_var(const char* old_target, const char* new_target) {
+    if (!old_target || !old_target[0] || !new_target || !new_target[0] ||
+        strcmp(old_target, new_target) == 0)
+        return;
+
+    for (int i = 0; i < g_timeline_track_count; i++) {
+        TimelineTrack& track = g_timeline_tracks[i];
+        if (!track.active || track.kind != TIMELINE_TRACK_USER_VAR)
+            continue;
+        if (strcmp(track.target, old_target) != 0)
+            continue;
+        strncpy(track.target, new_target, MAX_NAME - 1);
+        track.target[MAX_NAME - 1] = '\0';
+        int user_idx = timeline_user_var_index(new_target);
+        if (user_idx >= 0)
+            track.value_type = g_user_cb_entries[user_idx].type;
+    }
+}
+
 bool timeline_track_target_exists(const TimelineTrack& track) {
     switch (track.kind) {
     case TIMELINE_TRACK_USER_VAR:
-        return timeline_user_var_index(track.target) >= 0;
+    {
+        int idx = timeline_user_var_index(track.target);
+        return idx >= 0 && g_user_cb_entries[idx].type == track.value_type;
+    }
     case TIMELINE_TRACK_COMMAND_TRANSFORM:
     case TIMELINE_TRACK_COMMAND_ENABLED:
         return cmd_find_by_name(track.target) != INVALID_HANDLE;

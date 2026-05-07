@@ -16,6 +16,7 @@
 #include "nanosvg/nanosvg.h"
 #include <d3dcompiler.h>
 #include <psapi.h>
+#include <float.h>
 #include <stdlib.h>
 #include <vector>
 #pragma comment(lib, "psapi.lib")
@@ -67,7 +68,7 @@ static bool s_ui_base_style_valid = false;
 static ImFont* s_code_font = nullptr;
 static float s_code_font_size = 16.0f;
 static bool s_shader_editor_auto_save_compile = false;
-static bool s_shader_editor_format_on_save = true;
+static bool s_shader_source_editor_focused = false;
 
 enum UiViewportGizmoMode {
     UI_GIZMO_NONE = 0,
@@ -620,6 +621,25 @@ static void ui_recompile_all_shaders() {
             fallback++;
     }
     log_info("Recompiled shaders: %d total, %d OK, %d fallback/error", total, ok, fallback);
+}
+
+static void ui_recompile_selected_shader() {
+    ResHandle h = INVALID_HANDLE;
+    if (Resource* selected = res_get(g_sel_res)) {
+        if (selected->type == RES_SHADER)
+            h = g_sel_res;
+    }
+    if (h == INVALID_HANDLE) {
+        if (Command* c = cmd_get(g_sel_cmd))
+            h = c->shader;
+    }
+
+    Resource* r = res_get(h);
+    if (!r || r->type != RES_SHADER) {
+        log_warn("No selected shader to compile.");
+        return;
+    }
+    ui_recompile_shader_resource(h, r, r->path);
 }
 
 static void ui_make_standalone_output_path(const char* project_path, char* out, int out_sz) {
@@ -1765,6 +1785,42 @@ static int ui_code_line_from_offset(const std::vector<UiCodeLine>& lines, int of
     return best;
 }
 
+struct UiShaderErrorMarker {
+    int  line;
+    char message[256];
+};
+
+static bool ui_shader_compile_error_marker(const Resource* r, UiShaderErrorMarker* out) {
+    if (!r || !out || !r->compile_err[0])
+        return false;
+
+    const char* p = r->compile_err;
+    while ((p = strchr(p, '(')) != nullptr) {
+        char* end_line = nullptr;
+        long line = strtol(p + 1, &end_line, 10);
+        if (line > 0 && end_line && (*end_line == ',' || *end_line == ')')) {
+            const char* close = strstr(end_line, "):");
+            if (close) {
+                const char* msg = close + 2;
+                while (*msg == ' ' || *msg == '\t')
+                    msg++;
+                const char* msg_end = msg;
+                while (*msg_end && *msg_end != '\r' && *msg_end != '\n')
+                    msg_end++;
+                int len = (int)(msg_end - msg);
+                if (len >= (int)sizeof(out->message))
+                    len = (int)sizeof(out->message) - 1;
+                out->line = (int)line;
+                memcpy(out->message, msg, len);
+                out->message[len] = '\0';
+                return true;
+            }
+        }
+        p++;
+    }
+    return false;
+}
+
 static bool ui_shader_editor_has_selection(const UiShaderSourceEditor* ed) {
     return ed && ed->select_anchor != ed->cursor;
 }
@@ -2196,7 +2252,7 @@ static bool ui_shader_code_editor_handle_input(UiShaderSourceEditor* ed,
     return changed;
 }
 
-static bool ui_shader_code_editor(UiShaderSourceEditor* ed) {
+static bool ui_shader_code_editor(UiShaderSourceEditor* ed, const Resource* shader_resource) {
     if (!ed || !ed->text)
         return false;
 
@@ -2328,6 +2384,8 @@ static bool ui_shader_code_editor(UiShaderSourceEditor* ed) {
     bool has_selection = ui_shader_editor_has_selection(ed);
     if (has_selection)
         ui_shader_editor_selection(ed, &sel_a, &sel_b);
+    UiShaderErrorMarker error_marker = {};
+    bool has_error_marker = ui_shader_compile_error_marker(shader_resource, &error_marker);
 
     for (int i = first_line; i < last_line; i++) {
         const UiCodeLine& line = lines[i];
@@ -2336,6 +2394,39 @@ static bool ui_shader_code_editor(UiShaderSourceEditor* ed) {
             dl->AddRectFilled(ImVec2(clip.Min.x, y),
                               ImVec2(clip.Max.x, y + line_h),
                               ImGui::GetColorU32(ImVec4(0.13f, 0.10f, 0.09f, 0.75f)));
+        }
+        if (has_error_marker && i == error_marker.line - 1) {
+            float text_x = origin.x + gutter_w;
+            int cols = ui_code_visual_cols(line.begin, line.end);
+            if (cols < 1)
+                cols = 1;
+            float underline_x1 = text_x + (float)cols * char_w;
+            if (underline_x1 > clip.Max.x - ui_px(4.0f))
+                underline_x1 = clip.Max.x - ui_px(4.0f);
+            ImU32 error_col = ImGui::GetColorU32(ImVec4(1.0f, 0.22f, 0.18f, 1.0f));
+            ImU32 error_bg = ImGui::GetColorU32(ImVec4(0.36f, 0.04f, 0.04f, 0.92f));
+            float underline_y = y + line_h - ui_px(2.0f);
+            dl->AddLine(ImVec2(text_x, underline_y), ImVec2(underline_x1, underline_y),
+                        error_col, ui_px(1.6f));
+            if (error_marker.message[0]) {
+                ImVec2 msg_sz = ImGui::CalcTextSize(error_marker.message);
+                float msg_x = text_x;
+                float msg_y = y - line_h;
+                if (msg_y < clip.Min.y)
+                    msg_y = y + ui_px(1.0f);
+                float msg_w = msg_sz.x + ui_px(10.0f);
+                if (msg_x + msg_w > clip.Max.x - ui_px(4.0f))
+                    msg_w = clip.Max.x - ui_px(4.0f) - msg_x;
+                if (msg_w > ui_px(30.0f)) {
+                    ImVec2 msg_min = ImVec2(msg_x, msg_y);
+                    ImVec2 msg_max = ImVec2(msg_x + msg_w, msg_y + line_h);
+                    dl->AddRectFilled(msg_min, msg_max, error_bg, ui_px(3.0f));
+                    dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                                ImVec2(msg_min.x + ui_px(5.0f), msg_min.y),
+                                ImGui::GetColorU32(ImVec4(1.0f, 0.82f, 0.80f, 1.0f)),
+                                error_marker.message);
+                }
+            }
         }
 
         if (has_selection) {
@@ -2453,140 +2544,9 @@ static bool ui_write_text_file_atomic(const char* path, const char* text) {
     return true;
 }
 
-static const char* ui_trim_line(const char* begin, const char* end, const char** trimmed_end) {
-    while (begin < end && (*begin == ' ' || *begin == '\t'))
-        begin++;
-    while (end > begin && (end[-1] == ' ' || end[-1] == '\t'))
-        end--;
-    if (trimmed_end)
-        *trimmed_end = end;
-    return begin;
-}
-
-static bool ui_line_starts_with(const char* begin, const char* end, const char* word) {
-    int len = (int)strlen(word);
-    if (end - begin < len)
-        return false;
-    if (strncmp(begin, word, len) != 0)
-        return false;
-    return end - begin == len || begin[len] == ' ' || begin[len] == '\t' || begin[len] == ':';
-}
-
-static void ui_hlsl_count_braces(const char* begin, const char* end, int* open_count, int* close_count) {
-    bool in_string = false;
-    bool in_char = false;
-    bool escape = false;
-    for (const char* p = begin; p < end; p++) {
-        if (!in_string && !in_char && p + 1 < end && p[0] == '/' && p[1] == '/')
-            break;
-        if (escape) {
-            escape = false;
-            continue;
-        }
-        if ((in_string || in_char) && *p == '\\') {
-            escape = true;
-            continue;
-        }
-        if (!in_char && *p == '"') {
-            in_string = !in_string;
-            continue;
-        }
-        if (!in_string && *p == '\'') {
-            in_char = !in_char;
-            continue;
-        }
-        if (in_string || in_char)
-            continue;
-        if (*p == '{')
-            (*open_count)++;
-        else if (*p == '}')
-            (*close_count)++;
-    }
-}
-
-static char* ui_format_hlsl_tabs(const char* text) {
-    if (!text)
-        return nullptr;
-    size_t in_len = strlen(text);
-    size_t cap = in_len * 2 + 4096;
-    char* out = (char*)malloc(cap);
-    if (!out)
-        return nullptr;
-    size_t out_len = 0;
-    int indent = 0;
-    const char* line = text;
-    while (*line) {
-        const char* end = line;
-        while (*end && *end != '\n' && *end != '\r')
-            end++;
-        const char* trimmed_end = nullptr;
-        const char* trimmed = ui_trim_line(line, end, &trimmed_end);
-        bool empty = trimmed >= trimmed_end;
-        int line_indent = indent;
-        if (!empty && *trimmed == '}')
-            line_indent--;
-        if (!empty && (ui_line_starts_with(trimmed, trimmed_end, "case") ||
-                       ui_line_starts_with(trimmed, trimmed_end, "default")))
-            line_indent--;
-        if (line_indent < 0)
-            line_indent = 0;
-
-        size_t need = out_len + (size_t)line_indent + (size_t)(trimmed_end - trimmed) + 2;
-        if (need > cap) {
-            cap = need + 4096;
-            char* next = (char*)realloc(out, cap);
-            if (!next) {
-                free(out);
-                return nullptr;
-            }
-            out = next;
-        }
-        if (!empty) {
-            for (int i = 0; i < line_indent; i++)
-                out[out_len++] = '\t';
-            memcpy(out + out_len, trimmed, (size_t)(trimmed_end - trimmed));
-            out_len += (size_t)(trimmed_end - trimmed);
-        }
-        out[out_len++] = '\n';
-
-        int opens = 0;
-        int closes = 0;
-        ui_hlsl_count_braces(trimmed, trimmed_end, &opens, &closes);
-        indent += opens - closes;
-        if (indent < 0)
-            indent = 0;
-
-        if (*end == '\r' && end[1] == '\n')
-            line = end + 2;
-        else if (*end)
-            line = end + 1;
-        else
-            line = end;
-    }
-    out[out_len] = '\0';
-    return out;
-}
-
 static bool ui_shader_editor_save(UiShaderSourceEditor* ed, ResHandle h, Resource* r, bool compile_after) {
     if (!ed || !ed->ok || !ed->text || !r)
         return false;
-    if (s_shader_editor_format_on_save) {
-        char* formatted = ui_format_hlsl_tabs(ed->text);
-        if (formatted) {
-            size_t len = strlen(formatted);
-            if (len + 1 > ed->cap) {
-                char* next = (char*)realloc(ed->text, len + 4096);
-                if (next) {
-                    ed->text = next;
-                    ed->cap = len + 4096;
-                }
-            }
-            if (len + 1 <= ed->cap) {
-                memcpy(ed->text, formatted, len + 1);
-            }
-            free(formatted);
-        }
-    }
     if (!ui_write_text_file_atomic(ed->path, ed->text)) {
         log_error("Shader source save failed: %s", ed->path);
         return false;
@@ -2609,32 +2569,6 @@ static void ui_shader_source_viewer(ResHandle h, Resource* r) {
 
     if (ImGui::Button("Reload Source", ImVec2(-1.0f, 0.0f)))
         ui_shader_editor_load(&ed, h, path);
-    if (ImGui::Button("Format", ImVec2(-1.0f, 0.0f))) {
-        char* formatted = ui_format_hlsl_tabs(ed.text);
-        if (formatted) {
-            size_t len = strlen(formatted);
-            if (len + 1 > ed.cap) {
-                char* next = (char*)realloc(ed.text, len + 4096);
-                if (next) {
-                    ed.text = next;
-                    ed.cap = len + 4096;
-                }
-            }
-            if (len + 1 <= ed.cap) {
-                memcpy(ed.text, formatted, len + 1);
-                ed.dirty = true;
-                ed.last_edit_time = ImGui::GetTime();
-            }
-            free(formatted);
-        }
-    }
-    if (ImGui::Button("Save", ImVec2(-1.0f, 0.0f)))
-        ui_shader_editor_save(&ed, h, r, false);
-    if (ImGui::Button("Save + Compile", ImVec2(-1.0f, 0.0f)))
-        ui_shader_editor_save(&ed, h, r, true);
-    ImGui::TextWrapped("Auto Save + Compile: %s  Format On Save: %s",
-        s_shader_editor_auto_save_compile ? "on" : "off",
-        s_shader_editor_format_on_save ? "on" : "off");
 
     if (!ed.path[0]) {
         ImGui::TextDisabled("No shader path.");
@@ -2646,7 +2580,10 @@ static void ui_shader_source_viewer(ResHandle h, Resource* r) {
     }
 
     ImGui::TextDisabled("%zu bytes%s", strlen(ed.text), ed.dirty ? "  modified" : "");
-    ui_shader_code_editor(&ed);
+    if (ed.editor_focused && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S))
+        ui_shader_editor_save(&ed, h, r, false);
+    ui_shader_code_editor(&ed, r);
+    s_shader_source_editor_focused = ed.editor_focused;
 
     if (s_shader_editor_auto_save_compile && ed.dirty && ImGui::GetTime() - ed.last_edit_time > 0.65)
         ui_shader_editor_save(&ed, h, r, true);
@@ -4599,12 +4536,6 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         } else {
             ImGui::TextColored({0.35f, 1, 0.45f, 1}, "Status: OK");
         }
-        if (r->compile_err[0]) {
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                r->compiled_ok ? ImVec4{1, 0.75f, 0.25f, 1} : ImVec4{1, 0.35f, 0.3f, 1});
-            ImGui::TextWrapped("%s", r->compile_err);
-            ImGui::PopStyleColor();
-        }
 
         static ResHandle shader_edit = INVALID_HANDLE;
         static char shader_path[MAX_PATH_LEN] = {};
@@ -4621,20 +4552,6 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             strncpy(r->path, shader_path, MAX_PATH_LEN - 1);
             r->path[MAX_PATH_LEN - 1] = '\0';
             ui_recompile_shader_resource(h, r, r->path);
-        }
-
-        if (r->cs) {
-            if (ImGui::Button("Recompile CS")) {
-                strncpy(r->path, shader_path, MAX_PATH_LEN - 1);
-                r->path[MAX_PATH_LEN - 1] = '\0';
-                ui_recompile_shader_resource(h, r, r->path);
-            }
-        } else {
-            if (ImGui::Button("Recompile VS+PS")) {
-                strncpy(r->path, shader_path, MAX_PATH_LEN - 1);
-                r->path[MAX_PATH_LEN - 1] = '\0';
-                ui_recompile_shader_resource(h, r, r->path);
-            }
         }
 
         ui_inspector_section("SOURCE");
@@ -4880,6 +4797,47 @@ static void ui_command_transform_editor(Command* c) {
         timeline_capture_if_tracked(TIMELINE_TRACK_COMMAND_TRANSFORM, c->name, RES_NONE);
 }
 
+static bool ui_user_cb_source_combo(const char* label, char* source_name, ResType type_a, ResType type_b = RES_NONE) {
+    if (!source_name)
+        return false;
+
+    const UserCBEntry* current = user_cb_get(source_name);
+    char preview[160] = {};
+    if (current && (current->type == type_a || current->type == type_b)) {
+        snprintf(preview, sizeof(preview), "%s", current->name);
+    } else if (source_name[0]) {
+        snprintf(preview, sizeof(preview), "(missing) %s", source_name);
+    } else {
+        snprintf(preview, sizeof(preview), "(manual)");
+    }
+
+    bool changed = false;
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::BeginCombo(label, preview)) {
+        bool manual = source_name[0] == '\0';
+        if (ImGui::Selectable("(manual)", manual)) {
+            source_name[0] = '\0';
+            changed = true;
+        }
+        ImGui::Separator();
+        for (int i = 0; i < g_user_cb_count; i++) {
+            UserCBEntry& e = g_user_cb_entries[i];
+            if (e.type != type_a && e.type != type_b)
+                continue;
+            bool selected = strcmp(source_name, e.name) == 0;
+            ImGui::PushID(i);
+            if (ImGui::Selectable(e.name, selected)) {
+                strncpy(source_name, e.name, MAX_NAME - 1);
+                source_name[MAX_NAME - 1] = '\0';
+                changed = true;
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndCombo();
+    }
+    return changed;
+}
+
 static void ui_inspector_command(Command* c) {
     if (ImGui::Checkbox("Enabled", &c->enabled)) {
         timeline_capture_if_tracked(TIMELINE_TRACK_COMMAND_ENABLED, c->name, RES_NONE);
@@ -4954,12 +4912,27 @@ static void ui_inspector_command(Command* c) {
 
     case CMD_CLEAR: {
         ui_inspector_section("CLEAR");
-        ImGui::Checkbox("Clear Color", &c->clear_color_enabled);
-        if (c->clear_color_enabled)
-            ImGui::ColorEdit4("Clear Color Value",  c->clear_color);
-        ImGui::Checkbox("Clear Depth",   &c->clear_depth);
-        if (c->clear_depth)
-            ImGui::DragFloat("Depth Value", &c->depth_clear_val, 0.01f, 0.f, 1.f);
+        bool clear_changed = false;
+        clear_changed |= ImGui::Checkbox("Clear Color", &c->clear_color_enabled);
+        if (c->clear_color_enabled) {
+            clear_changed |= ui_user_cb_source_combo("Color Source", c->clear_color_source, RES_FLOAT3, RES_FLOAT4);
+            if (c->clear_color_source[0]) {
+                ImGui::TextWrapped("Clear color is driven by UserCB '%s'.", c->clear_color_source);
+            } else {
+                clear_changed |= ImGui::ColorEdit4("Clear Color Value", c->clear_color);
+            }
+        }
+        clear_changed |= ImGui::Checkbox("Clear Depth", &c->clear_depth);
+        if (c->clear_depth) {
+            clear_changed |= ui_user_cb_source_combo("Depth Source", c->clear_depth_source, RES_FLOAT);
+            if (c->clear_depth_source[0]) {
+                ImGui::TextWrapped("Depth clear is driven by UserCB '%s'.", c->clear_depth_source);
+            } else {
+                clear_changed |= ImGui::DragFloat("Depth Value", &c->depth_clear_val, 0.01f, 0.f, 1.f);
+            }
+        }
+        if (clear_changed)
+            app_request_scene_render();
 
         ui_inspector_section("TARGETS");
         res_combo_render_target("Render Target##clrt", &c->rt);
@@ -5513,6 +5486,7 @@ static void ui_panel_selection_state(bool embedded = false) {
 
 static void ui_panel_user_cb() {
     ImGui::Begin("User CB (b2)");
+    user_cb_enforce_unique_names();
 
     ImGui::TextDisabled("Slot = 16 bytes (float4). Recommended: cbuffer UserCB : register(b2).");
     ImGui::Separator();
@@ -5528,6 +5502,8 @@ static void ui_panel_user_cb() {
         ImGui::TableSetupColumn("Value",  ImGuiTableColumnFlags_WidthStretch, 2.f);
         ImGui::TableHeadersRow();
 
+        static char s_ucb_name_edit[MAX_USER_CB_VARS][MAX_NAME] = {};
+        static int s_ucb_name_editing = -1;
         for (int i = 0; i < g_user_cb_count; i++) {
             UserCBEntry& e = g_user_cb_entries[i];
             user_cb_refresh_entry(i);
@@ -5538,7 +5514,26 @@ static void ui_panel_user_cb() {
             ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("+%d", user_cb_slot_offset(i));
             ImGui::TableSetColumnIndex(2);
             ImGui::SetNextItemWidth(-1.f);
-            ImGui::InputText("##name", e.name, MAX_NAME);
+            if (s_ucb_name_editing != i) {
+                strncpy(s_ucb_name_edit[i], e.name, MAX_NAME - 1);
+                s_ucb_name_edit[i][MAX_NAME - 1] = '\0';
+            }
+            bool rename_enter = ImGui::InputText("##name", s_ucb_name_edit[i], MAX_NAME,
+                ImGuiInputTextFlags_EnterReturnsTrue);
+            if (ImGui::IsItemActivated())
+                s_ucb_name_editing = i;
+            bool rename_commit = s_ucb_name_editing == i &&
+                (rename_enter || ImGui::IsItemDeactivatedAfterEdit());
+            if (rename_commit) {
+                user_cb_rename(i, s_ucb_name_edit[i]);
+                strncpy(s_ucb_name_edit[i], e.name, MAX_NAME - 1);
+                s_ucb_name_edit[i][MAX_NAME - 1] = '\0';
+                s_ucb_name_editing = -1;
+            } else if (s_ucb_name_editing == i && ImGui::IsItemDeactivated()) {
+                strncpy(s_ucb_name_edit[i], e.name, MAX_NAME - 1);
+                s_ucb_name_edit[i][MAX_NAME - 1] = '\0';
+                s_ucb_name_editing = -1;
+            }
             ImGui::TableSetColumnIndex(3);
             ImGui::Text("%s", res_type_str(e.type));
             ImGui::TableSetColumnIndex(4);
@@ -5633,11 +5628,22 @@ static void ui_panel_user_cb() {
             if (user_changed)
                 timeline_capture_if_tracked(TIMELINE_TRACK_USER_VAR, e.name, e.type);
             ImGui::SameLine();
-            if (ImGui::SmallButton("^") && i > 0)                   user_cb_move(i, i - 1);
+            if (ImGui::SmallButton("^") && i > 0) {
+                s_ucb_name_editing = -1;
+                user_cb_move(i, i - 1);
+            }
             ImGui::SameLine();
-            if (ImGui::SmallButton("v") && i < g_user_cb_count - 1) user_cb_move(i, i + 1);
+            if (ImGui::SmallButton("v") && i < g_user_cb_count - 1) {
+                s_ucb_name_editing = -1;
+                user_cb_move(i, i + 1);
+            }
             ImGui::SameLine();
-            if (ImGui::SmallButton("x")) { user_cb_remove(i); ImGui::PopID(); break; }
+            if (ImGui::SmallButton("x")) {
+                s_ucb_name_editing = -1;
+                user_cb_remove(i);
+                ImGui::PopID();
+                break;
+            }
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -5747,11 +5753,6 @@ static void ui_panel_general(bool embedded = false) {
         bool auto_save_compile = ui_shader_auto_save_compile();
         if (ImGui::Checkbox("Auto Save + Compile", &auto_save_compile)) {
             ui_set_shader_auto_save_compile(auto_save_compile);
-            settings_dirty = true;
-        }
-        bool format_on_save = ui_shader_format_on_save();
-        if (ImGui::Checkbox("Format On Save", &format_on_save)) {
-            ui_set_shader_format_on_save(format_on_save);
             settings_dirty = true;
         }
         ImGui::TextDisabled("Shader source editor defaults. Saved outside project files.");
@@ -6433,6 +6434,17 @@ static UiPanelTone ui_current_panel_tone() {
     return s_panel_tone_count > 0 ? s_panel_tone_stack[s_panel_tone_count - 1] : UI_PANEL_DEFAULT;
 }
 
+static void ui_lock_current_window_scroll_x() {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (!window)
+        return;
+    window->Scroll.x = 0.0f;
+    window->ScrollMax.x = 0.0f;
+    window->ScrollTarget.x = FLT_MAX;
+    window->ScrollbarX = false;
+    ImGui::SetScrollX(0.0f);
+}
+
 static void ui_apply_gray_tool_style() {
     ImGuiStyle& s = ImGui::GetStyle();
     s.WindowPadding = ImVec2(8.0f, 8.0f);
@@ -6930,7 +6942,13 @@ static bool ui_begin_tool_panel(const char* id, const char* title, const char* d
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_margin_px(8.0f), ui_margin_px(7.0f)));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ui_panel_bg(tone));
     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.220f, 0.205f, 0.200f, 1.0f));
+    float child_w = size.x > 0.0f ? size.x : ImGui::GetContentRegionAvail().x;
+    float content_w = child_w - ui_margin_px(16.0f);
+    if (content_w < ui_px(1.0f))
+        content_w = ui_px(1.0f);
+    ImGui::SetNextWindowContentSize(ImVec2(content_w, 0.0f));
     bool open = ImGui::BeginChild(id, size, true);
+    ui_lock_current_window_scroll_x();
     ui_panel_header(title, detail,
                     action_a, clicked_a, action_b, clicked_b, action_c, clicked_c,
                     action_d, clicked_d, action_e, clicked_e, action_f, clicked_f,
@@ -6939,6 +6957,7 @@ static bool ui_begin_tool_panel(const char* id, const char* title, const char* d
 }
 
 static void ui_end_tool_panel() {
+    ui_lock_current_window_scroll_x();
     ImGui::EndChild();
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar();
@@ -6955,6 +6974,7 @@ static bool ui_header_only_panel(const char* id, const char* title, const char* 
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ui_panel_bg(tone));
     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.220f, 0.205f, 0.200f, 1.0f));
     if (ImGui::BeginChild(id, size, true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+        ui_lock_current_window_scroll_x();
         ui_panel_header(title, detail);
         clicked = ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0);
     }
@@ -7177,8 +7197,9 @@ static void ui_draw_shortcuts_popup() {
         }
 
         if (ui_begin_shortcut_section("##shortcuts_project", "PROJECT", table_flags)) {
-            ui_draw_shortcut_row("F5", "Compile shaders");
-            ui_draw_shortcut_row("Ctrl+S", "Save project");
+            ui_draw_shortcut_row("F5", "Compile all shaders");
+            ui_draw_shortcut_row("Ctrl+D", "Compile selected shader");
+            ui_draw_shortcut_row("Ctrl+S", "Save shader source or project");
             ui_draw_shortcut_row("F1", "Toggle this shortcuts panel");
             ImGui::EndTable();
         }
@@ -7464,7 +7485,7 @@ static void ui_timeline_track_label(const TimelineTrack& track, char* out, int o
     out[0] = '\0';
     switch (track.kind) {
     case TIMELINE_TRACK_USER_VAR:
-        snprintf(out, out_sz, "User  %s", track.target);
+        snprintf(out, out_sz, "%s", track.target);
         break;
     case TIMELINE_TRACK_COMMAND_TRANSFORM:
         snprintf(out, out_sz, "Transform  %s", track.target);
@@ -7689,7 +7710,16 @@ static void ui_draw_timeline_window() {
     ImGui::SetNextWindowViewport(vp->ID);
     ImGui::SetNextWindowSize(ImVec2(ui_px(920.0f), ui_px(420.0f)), ImGuiCond_FirstUseEver);
     ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar;
-    if (!ImGui::Begin("Timeline", nullptr, window_flags)) {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ui_panel_bg(UI_PANEL_DEFAULT));
+    ImGui::PushStyleColor(ImGuiCol_ResizeGrip, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_ResizeGripHovered, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_ResizeGripActive, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    bool timeline_window_open = ImGui::Begin("Timeline", nullptr, window_flags);
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar(2);
+    if (!timeline_window_open) {
         ImGui::End();
         return;
     }
@@ -7698,12 +7728,27 @@ static void ui_draw_timeline_window() {
     snprintf(detail, sizeof(detail), "%s  frame %d / %d  %.2fs",
              timeline_enabled() ? "active" : "disabled",
              timeline_current_frame(), timeline_length_frames() - 1, app_scene_time());
-    if (!ui_begin_tool_panel("##timeline_panel", "TIMELINE", detail,
-                             ImGui::GetContentRegionAvail(), UI_PANEL_DEFAULT)) {
-        ui_end_tool_panel();
+    if (s_panel_tone_count < (int)(sizeof(s_panel_tone_stack) / sizeof(s_panel_tone_stack[0])))
+        s_panel_tone_stack[s_panel_tone_count++] = UI_PANEL_DEFAULT;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_margin_px(8.0f), ui_margin_px(7.0f)));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui_panel_bg(UI_PANEL_DEFAULT));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.220f, 0.205f, 0.200f, 1.0f));
+    float timeline_child_w = ImGui::GetContentRegionAvail().x;
+    float timeline_content_w = timeline_child_w - ui_margin_px(16.0f);
+    if (timeline_content_w < ui_px(1.0f))
+        timeline_content_w = ui_px(1.0f);
+    ImGui::SetNextWindowContentSize(ImVec2(timeline_content_w, 0.0f));
+    if (!ImGui::BeginChild("##timeline_panel", ImGui::GetContentRegionAvail(), true)) {
+        ImGui::EndChild();
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar();
+        if (s_panel_tone_count > 0)
+            s_panel_tone_count--;
         ImGui::End();
         return;
     }
+    ui_lock_current_window_scroll_x();
+    ui_panel_header("TIMELINE", detail);
 
     ImGuiIO& io = ImGui::GetIO();
     bool track_enabled = timeline_enabled();
@@ -7870,8 +7915,7 @@ static void ui_draw_timeline_window() {
     int visible_last = visible_first + visible_count;
 
     int pending_length_frames = -1;
-    ImGuiTableFlags flags = ImGuiTableFlags_ScrollY |
-        ImGuiTableFlags_BordersOuterV | ImGuiTableFlags_SizingFixedFit;
+    ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit;
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleColor(ImGuiCol_TableBorderStrong, ImVec4(0.18f, 0.17f, 0.17f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_TableBorderLight, ImVec4(0.14f, 0.14f, 0.15f, 1.0f));
@@ -7948,8 +7992,9 @@ static void ui_draw_timeline_window() {
             if (f % 5 == 0) {
                 char label[16] = {};
                 snprintf(label, sizeof(label), "%d", f);
-                dl->AddText(ImVec2(floorf(slot_min.x + ui_margin_px(4.0f)),
-                                   floorf(grid_min.y + ui_margin_px(5.0f))),
+                ImVec2 label_sz = ImGui::CalcTextSize(label);
+                dl->AddText(ImVec2(floorf(slot_min.x + (slot_size.x - label_sz.x) * 0.5f),
+                                   floorf(grid_min.y + (ruler_h - label_sz.y) * 0.5f)),
                             subtle_text_col, label);
             }
             ImGui::PopID();
@@ -8009,15 +8054,21 @@ static void ui_draw_timeline_window() {
                                              row_min.y + floorf((row_h - checkbox_size) * 0.5f)));
             if (ui_timeline_track_enable_checkbox("##track_enabled", &track.enabled, checkbox_size))
                 app_request_scene_render();
-            ImGui::SameLine(0.0f, ui_margin_px(7.0f));
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + floorf((row_h - ImGui::GetTextLineHeight()) * 0.5f));
             char label[128] = {};
             ui_timeline_track_label(track, label, sizeof(label));
             bool missing = !timeline_track_target_exists(track);
-            if (missing || !track.enabled)
-                ImGui::TextDisabled("%s", label);
-            else
-                ImGui::TextUnformatted(label);
+            float label_left = row_min.x + ui_margin_px(9.0f) + checkbox_size + ui_margin_px(7.0f);
+            float label_right = row_max.x - ui_margin_px(8.0f);
+            char fitted_label[128] = {};
+            ui_fit_text_ellipsis(label, label_right - label_left, fitted_label, sizeof(fitted_label));
+            ImVec2 label_sz = ImGui::CalcTextSize(fitted_label);
+            float label_x = label_left;
+            float label_y = row_min.y + floorf((row_h - label_sz.y) * 0.5f);
+            dl->PushClipRect(ImVec2(label_left, row_min.y), ImVec2(label_right, row_max.y), true);
+            dl->AddText(ImVec2(floorf(label_x), floorf(label_y)),
+                        ImGui::GetColorU32((missing || !track.enabled) ? ImGuiCol_TextDisabled : ImGuiCol_Text),
+                        fitted_label);
+            dl->PopClipRect();
 
             if (row_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
                 ImGui::OpenPopup("##track_menu");
@@ -8093,7 +8144,12 @@ static void ui_draw_timeline_window() {
     if (!track_enabled)
         ImGui::EndDisabled();
 
-    ui_end_tool_panel();
+    ui_lock_current_window_scroll_x();
+    ImGui::EndChild();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar();
+    if (s_panel_tone_count > 0)
+        s_panel_tone_count--;
     ImGui::End();
 }
 
@@ -8457,14 +8513,6 @@ bool ui_shader_auto_save_compile() {
     return s_shader_editor_auto_save_compile;
 }
 
-void ui_set_shader_format_on_save(bool enabled) {
-    s_shader_editor_format_on_save = enabled;
-}
-
-bool ui_shader_format_on_save() {
-    return s_shader_editor_format_on_save;
-}
-
 void ui_init() {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -8506,11 +8554,15 @@ void ui_draw() {
     ImGui::NewFrame();
 
     ImGuiIO& io = ImGui::GetIO();
+    bool shader_editor_was_focused = s_shader_source_editor_focused;
+    s_shader_source_editor_focused = false;
     bool hotkeys_ok = !io.WantTextInput && !ImGui::IsAnyItemActive();
     bool editor_selection_hotkeys_ok = hotkeys_ok && !s_timeline_keyboard_focus;
     if (ImGui::IsKeyPressed(ImGuiKey_F5, false))
         ui_recompile_all_shaders();
-    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false))
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false))
+        ui_recompile_selected_shader();
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false) && !shader_editor_was_focused)
         s_project_file_mode = PROJECT_FILE_SAVE;
     if (hotkeys_ok && ImGui::IsKeyPressed(ImGuiKey_F1, false))
         s_shortcuts_popup_open = !s_shortcuts_popup_open;
@@ -8556,6 +8608,16 @@ void ui_draw() {
     ImGui::End();
 
     ui_draw_timeline_window();
+
+    bool mouse_activity = io.WantCaptureMouse && (io.MouseWheel != 0.0f || io.MouseWheelH != 0.0f);
+    for (int i = 0; i < 5; i++) {
+        mouse_activity = mouse_activity || (io.WantCaptureMouse &&
+            (io.MouseClicked[i] || io.MouseReleased[i] || io.MouseDown[i]));
+    }
+    bool keyboard_activity = io.WantCaptureKeyboard &&
+        (ImGui::IsAnyItemActive() || ImGui::IsAnyItemFocused());
+    if (mouse_activity || keyboard_activity)
+        app_request_scene_render();
 
     ImGui::Render();
 }

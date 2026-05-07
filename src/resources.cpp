@@ -1917,8 +1917,12 @@ ResHandle res_load_mesh(const char* name, const char* path) {
 void res_rename(ResHandle h, const char* new_name) {
     Resource* r = res_get(h);
     if (!r || r->is_builtin) return;
+    char old_name[MAX_NAME] = {};
+    strncpy(old_name, r->name, MAX_NAME - 1);
+    old_name[MAX_NAME - 1] = '\0';
     strncpy(r->name, new_name, MAX_NAME - 1);
     r->name[MAX_NAME - 1] = '\0';
+    user_cb_rename_resource_references(h, old_name, r->name);
     res_sync_size_resource(h);
 }
 

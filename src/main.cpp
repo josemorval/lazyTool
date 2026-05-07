@@ -363,7 +363,10 @@ void app_request_scene_render() {
 }
 
 void app_set_scene_paused(bool paused) {
+    if (g_scene_paused == paused)
+        return;
     g_scene_paused = paused;
+    app_request_scene_render();
 }
 
 void app_set_scene_time(float seconds) {

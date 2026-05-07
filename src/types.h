@@ -270,8 +270,10 @@ struct Command {
 
     float    clear_color[4];
     bool     clear_color_enabled;
+    char     clear_color_source[MAX_NAME];
     bool     clear_depth;
     float    depth_clear_val;
+    char     clear_depth_source[MAX_NAME];
     int      vertex_count;
 
     int      instance_count;
