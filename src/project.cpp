@@ -854,12 +854,14 @@ bool project_load_text(const char* path) {
             char* play_dir = strtok(nullptr, " \t\r\n");
             char* loop = strtok(nullptr, " \t\r\n");
             char* enabled = strtok(nullptr, " \t\r\n");
+            char* interpolate = strtok(nullptr, " \t\r\n");
             if (fps) timeline_set_fps(atoi(fps));
             if (length) timeline_set_length_frames(atoi(length));
             if (frame) timeline_set_current_frame(atoi(frame));
             if (play_dir) timeline_set_play_dir(atoi(play_dir));
             if (loop) timeline_set_loop(atoi(loop) != 0);
             if (enabled) timeline_set_enabled(atoi(enabled) != 0);
+            if (interpolate) timeline_set_interpolate_frames(atoi(interpolate) != 0);
         } else if (strcmp(tag, "timeline_track") == 0) {
             char* kind = strtok(nullptr, " \t\r\n");
             char* target = strtok(nullptr, " \t\r\n");

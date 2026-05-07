@@ -4254,17 +4254,39 @@ static void ui_validate_dirlight_cascades(Resource* r) {
     }
 }
 
+
+static void ui_timeline_capture_user_vars_for_resource(ResHandle h) {
+    if (h == INVALID_HANDLE)
+        return;
+
+    for (int i = 0; i < g_user_cb_count; i++) {
+        UserCBEntry& e = g_user_cb_entries[i];
+        UserCBSourceKind source_kind = e.source_kind;
+        if (source_kind == USER_CB_SOURCE_NONE && e.source != INVALID_HANDLE)
+            source_kind = USER_CB_SOURCE_RESOURCE;
+        if (source_kind != USER_CB_SOURCE_RESOURCE || e.source != h)
+            continue;
+
+        // Resource-backed UserCB entries are copied from the resource lazily.
+        // Refresh before capturing so an edited resource value becomes the new
+        // key value immediately, matching the transform auto-key behaviour.
+        user_cb_refresh_entry(i);
+        timeline_capture_if_tracked(TIMELINE_TRACK_USER_VAR, e.name, e.type);
+    }
+}
+
 static void ui_inspector_resource(Resource* r, ResHandle h) {
     if (r->is_builtin) ImGui::TextDisabled("(built-in — read only name)");
 
+    bool value_changed = false;
     switch (r->type) {
-    case RES_INT:    ImGui::InputInt("value",   &r->ival[0]);       break;
-    case RES_INT2:   ImGui::InputInt2("value",   r->ival);          break;
-    case RES_INT3:   ImGui::InputInt3("value",   r->ival);          break;
-    case RES_FLOAT:  ImGui::DragFloat("value",  &r->fval[0], 0.01f); break;
-    case RES_FLOAT2: ImGui::DragFloat2("value",  r->fval,    0.01f); break;
-    case RES_FLOAT3: ImGui::ColorEdit3("value",  r->fval);          break;
-    case RES_FLOAT4: ImGui::ColorEdit4("value",  r->fval);          break;
+    case RES_INT:    value_changed = ImGui::InputInt("value",   &r->ival[0]);       break;
+    case RES_INT2:   value_changed = ImGui::InputInt2("value",   r->ival);          break;
+    case RES_INT3:   value_changed = ImGui::InputInt3("value",   r->ival);          break;
+    case RES_FLOAT:  value_changed = ImGui::DragFloat("value",  &r->fval[0], 0.01f); break;
+    case RES_FLOAT2: value_changed = ImGui::DragFloat2("value",  r->fval,    0.01f); break;
+    case RES_FLOAT3: value_changed = ImGui::ColorEdit3("value",  r->fval);          break;
+    case RES_FLOAT4: value_changed = ImGui::ColorEdit4("value",  r->fval);          break;
 
     case RES_RENDER_TEXTURE2D: {
         static ResHandle s_edit_rt = INVALID_HANDLE;
@@ -4774,6 +4796,11 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
     }
 
     default: break;
+    }
+
+    if (value_changed) {
+        ui_timeline_capture_user_vars_for_resource(h);
+        app_request_scene_render();
     }
 }
 
@@ -7457,16 +7484,52 @@ static void ui_timeline_track_label(const TimelineTrack& track, char* out, int o
     }
 }
 
+static bool ui_timeline_track_enable_checkbox(const char* id, bool* value, float size) {
+    if (!value)
+        return false;
+
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, ImVec2(size, size));
+    bool changed = false;
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+        *value = !*value;
+        changed = true;
+    }
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImRect r(p, ImVec2(p.x + size, p.y + size));
+    bool hovered = ImGui::IsItemHovered();
+    ImU32 bg = ImGui::GetColorU32(*value ? ImVec4(0.24f, 0.13f, 0.08f, 0.94f)
+                                         : ImVec4(0.10f, 0.10f, 0.11f, 0.95f));
+    ImU32 border = ImGui::GetColorU32(hovered ? ImVec4(0.95f, 0.47f, 0.18f, 0.95f)
+                                              : ImVec4(0.55f, 0.28f, 0.17f, 0.82f));
+    dl->AddRectFilled(r.Min, r.Max, bg, ui_px(3.0f));
+    dl->AddRect(r.Min, r.Max, border, ui_px(3.0f), 0, ui_px(1.0f));
+
+    if (*value) {
+        ImVec2 a = ImVec2(r.Min.x + size * 0.24f, r.Min.y + size * 0.53f);
+        ImVec2 b = ImVec2(r.Min.x + size * 0.43f, r.Min.y + size * 0.72f);
+        ImVec2 c = ImVec2(r.Min.x + size * 0.78f, r.Min.y + size * 0.28f);
+        ImU32 check_col = ImGui::GetColorU32(ImVec4(0.93f, 0.43f, 0.22f, 1.0f));
+        dl->AddLine(a, b, check_col, ui_px(2.2f));
+        dl->AddLine(b, c, check_col, ui_px(2.2f));
+    }
+
+    return changed;
+}
+
 static void ui_timeline_draw_slot(int track_index, int frame, ImVec2 slot_size) {
     TimelineTrack& track = g_timeline_tracks[track_index];
     bool has_key = timeline_find_key_index(track, frame) >= 0;
     bool selected = ui_timeline_slot_selected(track_index, frame);
 
+    // Keep the interactive item constrained to the slot size. Using
+    // TableGetCellBgRect() here makes the button inherit the current table-row
+    // background height before the row has been finalized, which can inflate
+    // the timeline rows dramatically when scrolling is enabled.
     ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
     ImRect cell_rect(cursor_pos,
                      ImVec2(cursor_pos.x + slot_size.x, cursor_pos.y + slot_size.y));
-    if (ImGuiTable* table = ImGui::GetCurrentTable())
-        cell_rect = ImGui::TableGetCellBgRect(table, ImGui::TableGetColumnIndex());
     cell_rect.Min.x += ui_px(0.5f);
     cell_rect.Max.x -= ui_px(0.5f);
     cell_rect.Min.y += ui_px(0.5f);
@@ -7530,6 +7593,90 @@ static void ui_timeline_draw_slot(int track_index, int frame, ImVec2 slot_size) 
         dl->AddPolyline(pts, 4, ImGui::GetColorU32(ImVec4(0.18f, 0.12f, 0.06f, 1.0f)),
             true, ui_px(1.0f));
     }
+}
+
+static bool ui_timeline_scrollbar(const char* id, int* first_frame, int max_first_frame,
+                                  int visible_count, int total_frames, float left_offset) {
+    if (!first_frame)
+        return false;
+
+    float width = ImGui::GetContentRegionAvail().x;
+    if (width < 1.0f)
+        width = 1.0f;
+
+    const float bar_h = ui_px(9.0f);
+    const float track_h = ui_px(4.0f);
+    const float min_thumb_w = ui_px(22.0f);
+
+    ImGui::InvisibleButton(id, ImVec2(width, bar_h));
+    ImRect outer(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+
+    float track_left = outer.Min.x + left_offset;
+    if (track_left > outer.Max.x - min_thumb_w)
+        track_left = outer.Min.x;
+    ImRect track(ImVec2(track_left, floorf((outer.Min.y + outer.Max.y - track_h) * 0.5f)),
+                 ImVec2(outer.Max.x, floorf((outer.Min.y + outer.Max.y + track_h) * 0.5f)));
+
+    float track_w = track.GetWidth();
+    if (track_w < 1.0f)
+        track_w = 1.0f;
+
+    float thumb_w = track_w;
+    if (total_frames > 0 && visible_count < total_frames) {
+        thumb_w = track_w * ((float)visible_count / (float)total_frames);
+        if (thumb_w < min_thumb_w) thumb_w = min_thumb_w;
+        if (thumb_w > track_w) thumb_w = track_w;
+    }
+
+    float range_w = track_w - thumb_w;
+    float t = (max_first_frame > 0) ? ((float)(*first_frame) / (float)max_first_frame) : 0.0f;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    ImRect thumb(ImVec2(track.Min.x + range_w * t, track.Min.y),
+                 ImVec2(track.Min.x + range_w * t + thumb_w, track.Max.y));
+
+    ImGuiIO& io = ImGui::GetIO();
+    static float s_drag_offset = 0.0f;
+    if (ImGui::IsItemActivated()) {
+        s_drag_offset = ImGui::IsMouseHoveringRect(thumb.Min, thumb.Max) ?
+                        (io.MousePos.x - thumb.Min.x) : thumb_w * 0.5f;
+    }
+
+    bool changed = false;
+    if (ImGui::IsItemActive() && max_first_frame > 0 && range_w > 0.0f) {
+        float new_thumb_x = io.MousePos.x - s_drag_offset;
+        float new_t = (new_thumb_x - track.Min.x) / range_w;
+        if (new_t < 0.0f) new_t = 0.0f;
+        if (new_t > 1.0f) new_t = 1.0f;
+        int new_first = (int)(new_t * (float)max_first_frame + 0.5f);
+        if (new_first < 0) new_first = 0;
+        if (new_first > max_first_frame) new_first = max_first_frame;
+        if (*first_frame != new_first) {
+            *first_frame = new_first;
+            changed = true;
+        }
+
+        t = (float)(*first_frame) / (float)max_first_frame;
+        thumb.Min.x = track.Min.x + range_w * t;
+        thumb.Max.x = thumb.Min.x + thumb_w;
+    }
+
+    bool hovered = ImGui::IsItemHovered() || ImGui::IsMouseHoveringRect(thumb.Min, thumb.Max);
+    ImU32 track_col = ImGui::GetColorU32(ImGuiCol_ScrollbarBg);
+    ImU32 thumb_col = ImGui::GetColorU32(ImGui::IsItemActive() ? ImGuiCol_ScrollbarGrabActive :
+                                         (hovered ? ImGuiCol_ScrollbarGrabHovered : ImGuiCol_ScrollbarGrab));
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(track.Min, track.Max, track_col, track_h * 0.5f);
+    dl->AddRectFilled(thumb.Min, thumb.Max, thumb_col, track_h * 0.5f);
+
+    if (hovered) {
+        int last = *first_frame + visible_count - 1;
+        if (last >= total_frames) last = total_frames - 1;
+        ImGui::SetTooltip("Frames %d - %d", *first_frame, last);
+    }
+
+    return changed;
 }
 
 static void ui_draw_timeline_window() {
@@ -7652,6 +7799,21 @@ static void ui_draw_timeline_window() {
         timeline_set_loop(!loop);
     if (loop)
         ImGui::PopStyleColor(3);
+    ImGui::SameLine(0.0f, ui_margin_px(10.0f));
+    bool interpolate_frames = timeline_interpolate_frames();
+    if (interpolate_frames) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.33f, 0.18f, 0.10f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.24f, 0.12f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.58f, 0.30f, 0.14f, 1.0f));
+    }
+    if (ImGui::Button(interpolate_frames ? "Linear" : "Step"))
+        timeline_set_interpolate_frames(!interpolate_frames);
+    if (interpolate_frames)
+        ImGui::PopStyleColor(3);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(interpolate_frames ?
+                          "Linear interpolation between real timeline frames" :
+                          "Stepped playback: hold each real timeline frame");
     ImGui::SameLine(0.0f, ui_margin_px(18.0f));
     ImGui::SetNextItemWidth(ui_px(112.0f));
     ImGui::SliderFloat("zoom", &s_timeline_slot_zoom, 0.55f, 1.60f, "%.2f");
@@ -7664,19 +7826,23 @@ static void ui_draw_timeline_window() {
     ui_timeline_add_tracks();
     ImGui::Separator();
 
-    ImVec2 slot_size = ImVec2(ui_px(22.0f * s_timeline_slot_zoom), ui_px(18.0f));
+    const float row_h = ImGui::GetFrameHeight();
+    const float ruler_h = ui_px(32.0f);
+    const float scrollbar_h = ui_px(14.0f);
+    ImVec2 slot_size = ImVec2(ui_px(22.0f * s_timeline_slot_zoom), row_h);
     const float col_w = slot_size.x + ui_px(2.0f);
-    const float track_col_w = ui_px(210.0f);
-    int max_visible_frames = (int)(40.0f / s_timeline_slot_zoom);
-    if (max_visible_frames < 24) max_visible_frames = 24;
-    if (max_visible_frames > 80) max_visible_frames = 80;
-    int fit_visible_frames = (int)((ImGui::GetContentRegionAvail().x - track_col_w) / col_w);
-    if (fit_visible_frames < 8) fit_visible_frames = 8;
+    const float track_col_w = ui_px(230.0f);
+
+    // Paint only the frame columns that physically fit in the current window.
+    // Column width is fixed by zoom only; resizing the timeline changes how many
+    // frame slots are shown, not their size.
+    const float timeline_avail_w = ImGui::GetContentRegionAvail().x;
+    int fit_visible_frames = (int)((timeline_avail_w - track_col_w) / col_w);
+    if (fit_visible_frames < 1) fit_visible_frames = 1;
     int visible_count = timeline_length_frames();
-    if (visible_count > max_visible_frames)
-        visible_count = max_visible_frames;
     if (visible_count > fit_visible_frames)
         visible_count = fit_visible_frames;
+    const float timeline_table_w = track_col_w + (float)visible_count * col_w;
     int max_first_frame = timeline_length_frames() - visible_count;
     if (max_first_frame < 0) max_first_frame = 0;
     if (s_timeline_ensure_current_visible) {
@@ -7700,53 +7866,81 @@ static void ui_draw_timeline_window() {
             if (s_timeline_visible_first_frame > max_first_frame) s_timeline_visible_first_frame = max_first_frame;
         }
     }
-    ImGui::SetNextItemWidth(-1.0f);
-    if (max_first_frame > 0) {
-        ImGui::SliderInt("##timeline_scroll", &s_timeline_visible_first_frame,
-                         0, max_first_frame, "first %d", ImGuiSliderFlags_NoInput);
-    } else {
-        int zero = 0;
-        ImGui::BeginDisabled();
-        ImGui::SliderInt("##timeline_scroll", &zero, 0, 0, "first 0", ImGuiSliderFlags_NoInput);
-        ImGui::EndDisabled();
-    }
-    if (s_timeline_visible_first_frame < 0) s_timeline_visible_first_frame = 0;
-    if (s_timeline_visible_first_frame > max_first_frame) s_timeline_visible_first_frame = max_first_frame;
     int visible_first = s_timeline_visible_first_frame;
     int visible_last = visible_first + visible_count;
 
     int pending_length_frames = -1;
     ImGuiTableFlags flags = ImGuiTableFlags_ScrollY |
-        ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
         ImGuiTableFlags_BordersOuterV | ImGuiTableFlags_SizingFixedFit;
-    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(ui_px(1.0f), ui_px(2.0f)));
-    if (ImGui::BeginTable("##timeline_table", visible_count + 1, flags, ImVec2(0.0f, 0.0f))) {
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_TableBorderStrong, ImVec4(0.18f, 0.17f, 0.17f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TableBorderLight, ImVec4(0.14f, 0.14f, 0.15f, 1.0f));
+
+    float table_h = ImGui::GetContentRegionAvail().y - scrollbar_h - ui_margin_px(3.0f);
+    if (table_h < ruler_h + row_h * 2.0f)
+        table_h = ruler_h + row_h * 2.0f;
+
+    // The timeline grid is intentionally drawn manually inside a two-column
+    // table. Track labels stay in one fixed column, while frame slots keep a
+    // constant width and never get squeezed by ImGui table layout.
+    if (ImGui::BeginTable("##timeline_table", 2, flags, ImVec2(timeline_table_w, table_h))) {
         ImGui::TableSetupScrollFreeze(1, 1);
         ImGui::TableSetupColumn("Track", ImGuiTableColumnFlags_WidthFixed, track_col_w);
-        for (int f = visible_first; f < visible_last; f++) {
-            char label[16] = {};
-            if (f % 5 == 0)
-                snprintf(label, sizeof(label), "%d", f);
-            ImGui::TableSetupColumn(label, ImGuiTableColumnFlags_WidthFixed, col_w);
-        }
+        ImGui::TableSetupColumn("Frames", ImGuiTableColumnFlags_WidthFixed, (float)visible_count * col_w);
 
-        ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImU32 header_bg = ImGui::GetColorU32(ImVec4(0.105f, 0.102f, 0.108f, 1.0f));
+        const ImU32 header_bg_2 = ImGui::GetColorU32(ImVec4(0.088f, 0.086f, 0.092f, 1.0f));
+        const ImU32 track_bg = ImGui::GetColorU32(ImVec4(0.070f, 0.069f, 0.073f, 1.0f));
+        const ImU32 track_bg_alt = ImGui::GetColorU32(ImVec4(0.088f, 0.085f, 0.088f, 1.0f));
+        const ImU32 grid_bg = ImGui::GetColorU32(ImVec4(0.060f, 0.060f, 0.064f, 1.0f));
+        const ImU32 grid_bg_alt = ImGui::GetColorU32(ImVec4(0.074f, 0.073f, 0.077f, 1.0f));
+        const ImU32 grid_line_col = ImGui::GetColorU32(ImVec4(0.18f, 0.18f, 0.19f, 0.72f));
+        const ImU32 grid_line_major_col = ImGui::GetColorU32(ImVec4(0.25f, 0.24f, 0.24f, 0.85f));
+        const ImU32 row_line_col = ImGui::GetColorU32(ImVec4(0.12f, 0.12f, 0.13f, 1.0f));
+        const ImU32 current_band_col = ImGui::GetColorU32(ImVec4(0.37f, 0.16f, 0.06f, 0.48f));
+        const ImU32 current_line_col = ImGui::GetColorU32(ImVec4(0.95f, 0.38f, 0.10f, 1.0f));
+        const ImU32 subtle_text_col = ImGui::GetColorU32(ImVec4(0.58f, 0.55f, 0.52f, 1.0f));
+
+        ImGui::TableNextRow(ImGuiTableRowFlags_Headers, ruler_h);
         ImGui::TableSetColumnIndex(0);
+        ImVec2 track_header_min = ImGui::GetCursorScreenPos();
+        ImVec2 track_header_max = ImVec2(track_header_min.x + track_col_w, track_header_min.y + ruler_h);
+        dl->AddRectFilled(track_header_min, track_header_max, header_bg, ui_px(2.0f));
+        dl->AddLine(ImVec2(track_header_min.x, track_header_max.y - 1.0f),
+                    ImVec2(track_header_max.x, track_header_max.y - 1.0f),
+                    row_line_col, ui_px(1.0f));
+        ImGui::SetCursorScreenPos(ImVec2(track_header_min.x + ui_margin_px(10.0f),
+                                         track_header_min.y + floorf((ruler_h - ImGui::GetTextLineHeight()) * 0.5f)));
         ImGui::TextDisabled("Track");
+
+        ImGui::TableSetColumnIndex(1);
+        ImVec2 grid_origin = ImGui::GetCursorScreenPos();
+        ImVec2 grid_min = grid_origin;
+        ImVec2 grid_max = ImVec2(grid_origin.x + (float)visible_count * col_w,
+                                 grid_origin.y + ruler_h);
+        dl->AddRectFilled(grid_min, grid_max, header_bg_2, ui_px(2.0f));
+        dl->AddLine(ImVec2(grid_min.x, grid_max.y - 1.0f), ImVec2(grid_max.x, grid_max.y - 1.0f),
+                    row_line_col, ui_px(1.0f));
+
+        for (int i = 0; i <= visible_count; i++) {
+            int f = visible_first + i;
+            float x = grid_min.x + (float)i * col_w;
+            bool major = (f % 5) == 0;
+            float tick_h = major ? ui_px(12.0f) : ui_px(6.0f);
+            dl->AddLine(ImVec2(x, grid_max.y - tick_h), ImVec2(x, grid_max.y),
+                        major ? grid_line_major_col : grid_line_col, ui_px(1.0f));
+            if (i < visible_count)
+                dl->AddLine(ImVec2(x, grid_min.y), ImVec2(x, grid_max.y),
+                            major ? grid_line_major_col : grid_line_col, ui_px(1.0f));
+        }
         for (int f = visible_first; f < visible_last; f++) {
-            ImGui::TableSetColumnIndex((f - visible_first) + 1);
+            int frame_index = f - visible_first;
+            ImVec2 slot_min = ImVec2(grid_min.x + (float)frame_index * col_w, grid_min.y);
+            ImVec2 slot_max = ImVec2(slot_min.x + slot_size.x, slot_min.y + ruler_h);
             ImGui::PushID(f);
-            if (f == timeline_current_frame())
-                ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg,
-                    ImGui::GetColorU32(ImVec4(0.25f, 0.13f, 0.07f, 0.78f)));
-            ImVec2 header_pos = ImGui::GetCursorScreenPos();
-            ImRect header_rect(header_pos,
-                               ImVec2(header_pos.x + col_w,
-                                      header_pos.y + ImGui::GetFrameHeight()));
-            if (ImGuiTable* table = ImGui::GetCurrentTable())
-                header_rect = ImGui::TableGetCellBgRect(table, ImGui::TableGetColumnIndex());
-            ImGui::SetCursorScreenPos(header_rect.Min);
-            ImGui::InvisibleButton("##frame_header", header_rect.GetSize());
+            ImGui::SetCursorScreenPos(slot_min);
+            ImGui::InvisibleButton("##frame_header", ImVec2(slot_size.x, ruler_h));
             if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
                 pending_length_frames = f + 1;
             if (ImGui::IsItemHovered())
@@ -7754,35 +7948,80 @@ static void ui_draw_timeline_window() {
             if (f % 5 == 0) {
                 char label[16] = {};
                 snprintf(label, sizeof(label), "%d", f);
-                ImVec2 ts = ImGui::CalcTextSize(label);
-                ImGui::GetWindowDrawList()->AddText(
-                    ImVec2(floorf((header_rect.Min.x + header_rect.Max.x - ts.x) * 0.5f),
-                           floorf((header_rect.Min.y + header_rect.Max.y - ts.y) * 0.5f)),
-                    ImGui::GetColorU32(ImVec4(0.55f, 0.52f, 0.50f, 1.0f)),
-                    label);
+                dl->AddText(ImVec2(floorf(slot_min.x + ui_margin_px(4.0f)),
+                                   floorf(grid_min.y + ui_margin_px(5.0f))),
+                            subtle_text_col, label);
             }
             ImGui::PopID();
         }
 
+        if (timeline_current_frame() >= visible_first && timeline_current_frame() < visible_last) {
+            int current_index = timeline_current_frame() - visible_first;
+            float playhead_x = grid_min.x + (float)current_index * col_w + col_w * 0.5f;
+            float band_min_x = grid_min.x + (float)current_index * col_w;
+            float band_max_x = band_min_x + col_w;
+            dl->AddRectFilled(ImVec2(band_min_x, grid_min.y), ImVec2(band_max_x, grid_max.y),
+                              current_band_col);
+            dl->AddLine(ImVec2(playhead_x, grid_min.y), ImVec2(playhead_x, grid_max.y),
+                        current_line_col, ui_px(2.0f));
+
+            char cur_label[16] = {};
+            snprintf(cur_label, sizeof(cur_label), "%d", timeline_current_frame());
+            ImVec2 label_sz = ImGui::CalcTextSize(cur_label);
+            float badge_w = label_sz.x + ui_margin_px(12.0f);
+            float badge_h = ui_px(18.0f);
+            float badge_x = playhead_x - badge_w * 0.5f;
+            if (badge_x < grid_min.x + ui_px(2.0f)) badge_x = grid_min.x + ui_px(2.0f);
+            if (badge_x + badge_w > grid_max.x - ui_px(2.0f)) badge_x = grid_max.x - ui_px(2.0f) - badge_w;
+            ImVec2 badge_min = ImVec2(floorf(badge_x), floorf(grid_min.y + ui_px(1.0f)));
+            ImVec2 badge_max = ImVec2(badge_min.x + badge_w, badge_min.y + badge_h);
+            dl->AddRectFilled(badge_min, badge_max,
+                              ImGui::GetColorU32(ImVec4(0.58f, 0.26f, 0.10f, 1.0f)), ui_px(3.0f));
+            dl->AddRect(badge_min, badge_max,
+                        ImGui::GetColorU32(ImVec4(0.95f, 0.45f, 0.12f, 1.0f)), ui_px(3.0f), 0, ui_px(1.0f));
+            dl->AddText(ImVec2(floorf(badge_min.x + (badge_w - label_sz.x) * 0.5f),
+                               floorf(badge_min.y + (badge_h - label_sz.y) * 0.5f)),
+                        ImGui::GetColorU32(ImVec4(0.98f, 0.90f, 0.82f, 1.0f)), cur_label);
+        }
+
+        int visible_track_row = 0;
         for (int t = 0; t < g_timeline_track_count; t++) {
             TimelineTrack& track = g_timeline_tracks[t];
             if (!track.active)
                 continue;
 
             ImGui::PushID(t);
-            ImGui::TableNextRow();
+            ImGui::TableNextRow(0, row_h);
+            ImU32 left_row_bg = (visible_track_row & 1) ? track_bg_alt : track_bg;
+            ImU32 right_row_bg = (visible_track_row & 1) ? grid_bg_alt : grid_bg;
+
             ImGui::TableSetColumnIndex(0);
+            ImVec2 row_min = ImGui::GetCursorScreenPos();
+            ImVec2 row_max = ImVec2(row_min.x + track_col_w, row_min.y + row_h);
+            bool row_hovered = ImGui::IsMouseHoveringRect(row_min, row_max);
+            dl->AddRectFilled(row_min, row_max,
+                              row_hovered ? ImGui::GetColorU32(ImVec4(0.12f, 0.11f, 0.11f, 1.0f)) : left_row_bg);
+            dl->AddLine(ImVec2(row_min.x, row_max.y - 1.0f), ImVec2(row_max.x, row_max.y - 1.0f),
+                        row_line_col, ui_px(1.0f));
+
+            float checkbox_size = ui_px(18.0f);
+            ImGui::SetCursorScreenPos(ImVec2(row_min.x + ui_margin_px(9.0f),
+                                             row_min.y + floorf((row_h - checkbox_size) * 0.5f)));
+            if (ui_timeline_track_enable_checkbox("##track_enabled", &track.enabled, checkbox_size))
+                app_request_scene_render();
+            ImGui::SameLine(0.0f, ui_margin_px(7.0f));
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + floorf((row_h - ImGui::GetTextLineHeight()) * 0.5f));
             char label[128] = {};
             ui_timeline_track_label(track, label, sizeof(label));
             bool missing = !timeline_track_target_exists(track);
-            if (ImGui::Checkbox("##track_enabled", &track.enabled))
-                app_request_scene_render();
-            ImGui::SameLine(0.0f, ui_margin_px(5.0f));
             if (missing || !track.enabled)
                 ImGui::TextDisabled("%s", label);
             else
                 ImGui::TextUnformatted(label);
-            if (ImGui::BeginPopupContextItem("##track_menu")) {
+
+            if (row_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+                ImGui::OpenPopup("##track_menu");
+            if (ImGui::BeginPopup("##track_menu")) {
                 if (ImGui::MenuItem("Delete Track")) {
                     if (s_timeline_slot_selection.valid) {
                         if (s_timeline_slot_selection.track_index == t)
@@ -7799,21 +8038,55 @@ static void ui_draw_timeline_window() {
                 ImGui::EndPopup();
             }
 
+            ImGui::TableSetColumnIndex(1);
+            grid_origin = ImGui::GetCursorScreenPos();
+            grid_min = grid_origin;
+            grid_max = ImVec2(grid_origin.x + (float)visible_count * col_w,
+                              grid_origin.y + row_h);
+            dl->AddRectFilled(grid_min, grid_max, right_row_bg);
+            dl->AddLine(ImVec2(grid_min.x, grid_max.y - 1.0f), ImVec2(grid_max.x, grid_max.y - 1.0f),
+                        row_line_col, ui_px(1.0f));
+
+            for (int i = 0; i <= visible_count; i++) {
+                int f = visible_first + i;
+                float x = grid_min.x + (float)i * col_w;
+                bool major = (f % 5) == 0;
+                dl->AddLine(ImVec2(x, grid_min.y), ImVec2(x, grid_max.y),
+                            major ? grid_line_major_col : grid_line_col, ui_px(1.0f));
+            }
+            if (timeline_current_frame() >= visible_first && timeline_current_frame() < visible_last) {
+                int current_index = timeline_current_frame() - visible_first;
+                float band_min_x = grid_min.x + (float)current_index * col_w;
+                float band_max_x = band_min_x + col_w;
+                float playhead_x = band_min_x + col_w * 0.5f;
+                dl->AddRectFilled(ImVec2(band_min_x, grid_min.y), ImVec2(band_max_x, grid_max.y),
+                                  ImGui::GetColorU32(ImVec4(0.32f, 0.14f, 0.05f, 0.38f)));
+                dl->AddLine(ImVec2(playhead_x, grid_min.y), ImVec2(playhead_x, grid_max.y),
+                            current_line_col, ui_px(2.0f));
+            }
+
             for (int f = visible_first; f < visible_last; f++) {
-                ImGui::TableSetColumnIndex((f - visible_first) + 1);
-                if (f == timeline_current_frame())
-                    ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg,
-                        ImGui::GetColorU32(ImVec4(0.25f, 0.13f, 0.07f, 0.58f)));
+                int frame_index = f - visible_first;
                 ImGui::PushID(f);
+                ImGui::SetCursorScreenPos(ImVec2(grid_min.x + (float)frame_index * col_w, grid_min.y));
                 ui_timeline_draw_slot(t, f, slot_size);
                 ImGui::PopID();
             }
             ImGui::PopID();
+            visible_track_row++;
         }
 
         ImGui::EndTable();
     }
+    ImGui::PopStyleColor(2);
     ImGui::PopStyleVar();
+
+    ui_timeline_scrollbar("##timeline_scroll", &s_timeline_visible_first_frame,
+                          max_first_frame, visible_count, timeline_length_frames(),
+                          track_col_w + ui_px(2.0f));
+    if (s_timeline_visible_first_frame < 0) s_timeline_visible_first_frame = 0;
+    if (s_timeline_visible_first_frame > max_first_frame) s_timeline_visible_first_frame = max_first_frame;
+
     if (pending_length_frames > 0)
         timeline_set_length_frames(pending_length_frames);
 

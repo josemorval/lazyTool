@@ -51,6 +51,8 @@ bool timeline_enabled();
 void timeline_set_enabled(bool enabled);
 bool timeline_loop();
 void timeline_set_loop(bool loop);
+bool timeline_interpolate_frames();
+void timeline_set_interpolate_frames(bool enabled);
 int  timeline_play_dir();
 void timeline_set_play_dir(int dir);
 

@@ -1,0 +1,100 @@
+lazyTool_project 1
+
+camera_fps 1.37560272 14.0048866 13.1840172 -2.84669852 -0.808479548 1.04700005 0.00100000005 100
+
+dirlight 5.7735033 5.7735033 5.7735033 0 0 0 1 0.898999989 0.899999976 1 1024 1204 0.00999999978 20 8 8 1 5 0.649999976 0.443228424 8 8 0.00999999978 10 0.921136975 8 8 0.00999999978 10 1.69907975 8 8 0.00999999978 10 5 8 8 0.00999999978 10
+
+resources
+resource mesh_primitive normal_cube cube
+resource shader_vsps normal_color shaders/default.hlsl
+resource value float3 test 0 0 0 0 1 0 0 0
+
+user_cb
+user_var float4_0 float4 - 0 0 0 0 0 0 0 0
+user_var test float3 test|float3 0 0 0 0 1 0 0 0
+end_user_cb
+
+commands
+command clear clear_scene 1
+  targets scene_color|builtin_scene_color scene_depth|builtin_scene_depth
+  mrts 0
+  mesh_shader - -
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 0 0
+  transform 0 0 0 0 0 0 1 1 1
+  clear 1 0.0399999991 0.0199999996 0 1 1 1
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+command draw_mesh cube 1
+  targets scene_color|builtin_scene_color scene_depth|builtin_scene_depth
+  mrts 0
+  mesh_shader normal_cube|mesh normal_color|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 1
+  transform 0 0 0 0 0 0 1 1 1
+  clear 1 0.0500000007 0.0500000007 0.0799999982 1 1 1
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+command draw_mesh ground 1
+  targets scene_color|builtin_scene_color scene_depth|builtin_scene_depth
+  mrts 0
+  mesh_shader normal_cube|mesh normal_color|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 1
+  transform 0 -2 0 0 0 0 5 0.100000001 5
+  clear 1 0.0500000007 0.0500000007 0.0799999982 1 1 1
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+
+timeline
+timeline_settings 7 41 8 0 1 1
+timeline_track camera camera ? 5 1
+timeline_key 0 9.08301926 4.67694998 0.180185124 -1.59869432 -0.400479645 1.04700005 0.00100000005 100
+timeline_key 10 -0.551251292 16.3368721 16.4349747 3.12448597 -0.910479546 1.04700005 0.00100000005 100
+timeline_key 20 -5.42498684 1.19592237 -0.173835978 1.57948172 -0.430479378 1.04700005 0.00100000005 100
+timeline_key 30 0.379143685 4.86137056 -8.38254356 -0.0255179014 -0.625479281 1.04700005 0.00100000005 100
+timeline_key 40 9.08301926 4.67694998 0.180185124 -1.59869432 -0.400479645 1.04700005 0.00100000005 100
+timeline_track user test float3 3 1
+timeline_key 0 0 0 0
+timeline_key 8 1 0 0
+timeline_key 18 0 0 0
+end_timeline
