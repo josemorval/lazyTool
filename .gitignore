@@ -1,5 +1,7 @@
 bin/*
 assets/*
+!assets/icons/
+!assets/icons/**
 debug
 imgui.ini
 *.zip

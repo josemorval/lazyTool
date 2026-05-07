@@ -104,10 +104,27 @@ int timeline_length_frames() {
     return s_timeline_length_frames;
 }
 
+static void timeline_prune_keys_to_length() {
+    for (int t = 0; t < g_timeline_track_count; t++) {
+        TimelineTrack& track = g_timeline_tracks[t];
+        if (!track.active)
+            continue;
+        int write = 0;
+        for (int k = 0; k < track.key_count; k++) {
+            if (track.keys[k].frame < s_timeline_length_frames)
+                track.keys[write++] = track.keys[k];
+        }
+        for (int k = write; k < track.key_count; k++)
+            memset(&track.keys[k], 0, sizeof(TimelineKey));
+        track.key_count = write;
+    }
+}
+
 void timeline_set_length_frames(int frames) {
     if (frames < 1) frames = 1;
     if (frames > MAX_TIMELINE_FRAMES) frames = MAX_TIMELINE_FRAMES;
     s_timeline_length_frames = frames;
+    timeline_prune_keys_to_length();
     int old_frame = s_timeline_current_frame;
     s_timeline_current_frame = timeline_clamp_frame(s_timeline_current_frame);
     if (s_timeline_current_frame != old_frame && !s_timeline_setting_scene_time && s_timeline_fps > 0)
@@ -189,6 +206,7 @@ int timeline_add_track(TimelineTrackKind kind, const char* target, ResType value
     TimelineTrack& t = g_timeline_tracks[index];
     memset(&t, 0, sizeof(t));
     t.active = true;
+    t.enabled = true;
     t.kind = kind;
     t.value_type = value_type;
     strncpy(t.target, target, MAX_NAME - 1);
@@ -202,6 +220,38 @@ void timeline_delete_track(int track_index) {
     for (int i = track_index; i < g_timeline_track_count - 1; i++)
         g_timeline_tracks[i] = g_timeline_tracks[i + 1];
     memset(&g_timeline_tracks[--g_timeline_track_count], 0, sizeof(TimelineTrack));
+}
+
+void timeline_delete_tracks_for_command(const char* target) {
+    if (!target || !target[0])
+        return;
+    for (int i = g_timeline_track_count - 1; i >= 0; i--) {
+        TimelineTrack& track = g_timeline_tracks[i];
+        if (!track.active)
+            continue;
+        bool command_track = track.kind == TIMELINE_TRACK_COMMAND_TRANSFORM ||
+                             track.kind == TIMELINE_TRACK_COMMAND_ENABLED;
+        if (command_track && strcmp(track.target, target) == 0)
+            timeline_delete_track(i);
+    }
+}
+
+void timeline_rename_tracks_for_command(const char* old_target, const char* new_target) {
+    if (!old_target || !old_target[0] || !new_target || !new_target[0] ||
+        strcmp(old_target, new_target) == 0)
+        return;
+
+    for (int i = 0; i < g_timeline_track_count; i++) {
+        TimelineTrack& track = g_timeline_tracks[i];
+        if (!track.active)
+            continue;
+        bool command_track = track.kind == TIMELINE_TRACK_COMMAND_TRANSFORM ||
+                             track.kind == TIMELINE_TRACK_COMMAND_ENABLED;
+        if (!command_track || strcmp(track.target, old_target) != 0)
+            continue;
+        strncpy(track.target, new_target, MAX_NAME - 1);
+        track.target[MAX_NAME - 1] = '\0';
+    }
 }
 
 bool timeline_track_target_exists(const TimelineTrack& track) {
@@ -473,7 +523,7 @@ static void timeline_apply_dirlight(const TimelineKey& key) {
 void timeline_apply_current() {
     for (int i = 0; i < g_timeline_track_count; i++) {
         TimelineTrack& track = g_timeline_tracks[i];
-        if (!track.active || track.key_count <= 0)
+        if (!track.active || !track.enabled || track.key_count <= 0)
             continue;
 
         TimelineKey sampled = {};
@@ -504,9 +554,10 @@ void timeline_write_project(FILE* f) {
         if (!track.active)
             continue;
 
-        fprintf(f, "timeline_track %s %s %s %d\n",
+        fprintf(f, "timeline_track %s %s %s %d %d\n",
                 timeline_track_kind_token(track.kind), track.target,
-                res_type_str(track.value_type), track.key_count);
+                res_type_str(track.value_type), track.key_count,
+                track.enabled ? 1 : 0);
 
         int n = timeline_track_value_count(track);
         bool integral = timeline_track_uses_integral_values(track);

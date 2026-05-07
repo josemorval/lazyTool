@@ -10,6 +10,7 @@ enum LogLevel { LOG_INFO = 0, LOG_WARN, LOG_ERROR };
 
 struct LogEntry {
     LogLevel level;
+    char     time[16];
     char     msg[LOG_MSG_LEN];
 };
 

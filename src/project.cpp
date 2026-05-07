@@ -628,11 +628,19 @@ bool project_save_text(const char* path) {
     for (int i = 0; i < g_user_cb_count; i++) {
         UserCBEntry& e = g_user_cb_entries[i];
         char source_ref[MAX_PATH_LEN] = {};
-        res_ref(e.source, source_ref, MAX_PATH_LEN);
+        if (e.source_kind == USER_CB_SOURCE_RESOURCE)
+            res_ref(e.source, source_ref, MAX_PATH_LEN);
+        else
+            snprintf(source_ref, sizeof(source_ref), "-");
         fprintf(f, "user_var %s %s %s %d %d %d %d %.9g %.9g %.9g %.9g\n",
             e.name, res_type_token(e.type), source_ref,
             e.ival[0], e.ival[1], e.ival[2], e.ival[3],
             e.fval[0], e.fval[1], e.fval[2], e.fval[3]);
+        if (e.source_kind != USER_CB_SOURCE_NONE && e.source_kind != USER_CB_SOURCE_RESOURCE) {
+            fprintf(f, "user_var_source %s %s %s\n",
+                e.name, user_cb_source_kind_token(e.source_kind),
+                e.source_target[0] ? e.source_target : "-");
+        }
     }
     fprintf(f, "end_user_cb\n");
 
@@ -676,6 +684,7 @@ bool project_save_text(const char* path) {
         fprintf(f, "  vertex_count %d\n", c.vertex_count);
         fprintf(f, "  instance %d\n", c.instance_count);
         fprintf(f, "  threads %d %d %d\n", c.thread_x, c.thread_y, c.thread_z);
+        fprintf(f, "  compute_on_reset %s\n", bool_str(c.compute_on_reset));
         char dispatch_ref[MAX_PATH_LEN] = {};
         res_ref(c.dispatch_size_source, dispatch_ref, MAX_PATH_LEN);
         fprintf(f, "  dispatch_from %s\n", dispatch_ref);
@@ -725,11 +734,22 @@ bool project_save_text(const char* path) {
         for (int p_i = 0; p_i < c.param_count; p_i++) {
             CommandParam& p = c.params[p_i];
             char source_ref[MAX_PATH_LEN] = {};
-            res_ref(p.source, source_ref, MAX_PATH_LEN);
+            UserCBSourceKind source_kind = p.source_kind;
+            if (source_kind == USER_CB_SOURCE_NONE && p.source != INVALID_HANDLE)
+                source_kind = USER_CB_SOURCE_RESOURCE;
+            if (source_kind == USER_CB_SOURCE_RESOURCE)
+                res_ref(p.source, source_ref, MAX_PATH_LEN);
+            else
+                snprintf(source_ref, sizeof(source_ref), "-");
             fprintf(f, "  param %s %s %s %s %d %d %d %d %.9g %.9g %.9g %.9g\n",
                 p.name, res_type_str(p.type), bool_str(p.enabled), source_ref,
                 p.ival[0], p.ival[1], p.ival[2], p.ival[3],
                 p.fval[0], p.fval[1], p.fval[2], p.fval[3]);
+            if (source_kind != USER_CB_SOURCE_NONE && source_kind != USER_CB_SOURCE_RESOURCE) {
+                fprintf(f, "  param_source %s %s %s\n",
+                    p.name, user_cb_source_kind_token(source_kind),
+                    p.source_target[0] ? p.source_target : "-");
+            }
         }
         fprintf(f, "end_command\n");
     }
@@ -844,10 +864,14 @@ bool project_load_text(const char* path) {
             char* kind = strtok(nullptr, " \t\r\n");
             char* target = strtok(nullptr, " \t\r\n");
             char* type = strtok(nullptr, " \t\r\n");
+            strtok(nullptr, " \t\r\n"); // key_count, kept for readability in the text format.
+            char* enabled = strtok(nullptr, " \t\r\n");
             timeline_load_track = timeline_add_track(
                 timeline_track_kind_from_token(kind),
                 target ? target : "",
                 res_type_from_token(type));
+            if (timeline_load_track >= 0 && enabled)
+                g_timeline_tracks[timeline_load_track].enabled = atoi(enabled) != 0;
         } else if (strcmp(tag, "timeline_key") == 0) {
             char* frame_tok = strtok(nullptr, " \t\r\n");
             TimelineKey* key = frame_tok ? timeline_set_key(timeline_load_track, atoi(frame_tok)) : nullptr;
@@ -1015,6 +1039,19 @@ bool project_load_text(const char* path) {
                 if (source_h != INVALID_HANDLE)
                     user_cb_set_source(idx, source_h);
             }
+        } else if (strcmp(tag, "user_var_source") == 0) {
+            char* name = strtok(nullptr, " \t\r\n");
+            char* kind_tok = strtok(nullptr, " \t\r\n");
+            char* target = strtok(nullptr, " \t\r\n");
+            if (name && kind_tok) {
+                for (int i = 0; i < g_user_cb_count; i++) {
+                    if (strcmp(g_user_cb_entries[i].name, name) != 0)
+                        continue;
+                    user_cb_set_scene_source(i, user_cb_source_kind_from_token(kind_tok),
+                                             target && strcmp(target, "-") != 0 ? target : "");
+                    break;
+                }
+            }
         } else if (strcmp(tag, "command") == 0) {
             char* kind = strtok(nullptr, " \t\r\n");
             char* name = strtok(nullptr, " \t\r\n");
@@ -1069,6 +1106,9 @@ bool project_load_text(const char* path) {
                 cur->thread_x = atoi(strtok(nullptr, " \t\r\n"));
                 cur->thread_y = atoi(strtok(nullptr, " \t\r\n"));
                 cur->thread_z = atoi(strtok(nullptr, " \t\r\n"));
+            } else if (strcmp(tag, "compute_on_reset") == 0) {
+                char* enabled = strtok(nullptr, " \t\r\n");
+                cur->compute_on_reset = enabled ? atoi(enabled) != 0 : false;
             } else if (strcmp(tag, "dispatch_from") == 0) {
                 cur->dispatch_size_source = res_by_ref(strtok(nullptr, " \t\r\n"), res_lookup_types());
             } else if (strcmp(tag, "indirect_args") == 0) {
@@ -1112,8 +1152,25 @@ bool project_load_text(const char* path) {
                 p->type = res_type_from_token(type);
                 p->enabled = enabled ? atoi(enabled) != 0 : true;
                 p->source = res_by_ref(source, res_lookup_types(p->type));
+                p->source_kind = p->source != INVALID_HANDLE ? USER_CB_SOURCE_RESOURCE : USER_CB_SOURCE_NONE;
                 for (int i = 0; i < 4; i++) p->ival[i] = atoi(strtok(nullptr, " \t\r\n"));
                 for (int i = 0; i < 4; i++) p->fval[i] = (float)atof(strtok(nullptr, " \t\r\n"));
+            } else if (strcmp(tag, "param_source") == 0 && cur) {
+                char* name = strtok(nullptr, " \t\r\n");
+                char* kind_tok = strtok(nullptr, " \t\r\n");
+                char* target = strtok(nullptr, " \t\r\n");
+                if (name && kind_tok) {
+                    for (int p_i = 0; p_i < cur->param_count; p_i++) {
+                        CommandParam& p = cur->params[p_i];
+                        if (strcmp(p.name, name) != 0)
+                            continue;
+                        p.source_kind = user_cb_source_kind_from_token(kind_tok);
+                        p.source = INVALID_HANDLE;
+                        strncpy(p.source_target, target && strcmp(target, "-") != 0 ? target : "", MAX_NAME - 1);
+                        p.source_target[MAX_NAME - 1] = '\0';
+                        break;
+                    }
+                }
             }
         }
     }

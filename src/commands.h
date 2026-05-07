@@ -14,9 +14,11 @@ CmdHandle cmd_alloc(const char* name, CmdType type);
 void      cmd_free(CmdHandle h);
 Command*  cmd_get(CmdHandle h);
 CmdHandle cmd_find_by_name(const char* name);
+bool      cmd_rename(CmdHandle h, const char* name);
 CmdHandle cmd_move(CmdHandle moving, CmdHandle target, bool after_target);
 
 void      cmd_execute_all();
+void      cmd_set_reset_execution(bool active);
 
 const char* cmd_type_str(CmdType t);
 void        cmd_make_unique_name(const char* base, char* out, int out_sz);

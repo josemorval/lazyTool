@@ -34,6 +34,10 @@ static void app_settings_apply_defaults() {
     g_camera_controls.fast_mult = 4.0f;
     g_camera_controls.slow_mult = 0.25f;
     g_camera_controls.mouse_sensitivity = 0.0025f;
+
+    ui_set_code_font_size(16.0f);
+    ui_set_shader_auto_save_compile(false);
+    ui_set_shader_format_on_save(true);
 }
 
 void app_settings_save() {
@@ -48,6 +52,9 @@ void app_settings_save() {
     fprintf(f, "shader_validation_warnings %d\n", g_dx.shader_validation_warnings ? 1 : 0);
     fprintf(f, "profiler %d\n", g_profiler_enabled ? 1 : 0);
     fprintf(f, "ui_scale %.9g\n", ui_global_scale());
+    fprintf(f, "code_font_size %.9g\n", ui_code_font_size());
+    fprintf(f, "shader_auto_save_compile %d\n", ui_shader_auto_save_compile() ? 1 : 0);
+    fprintf(f, "shader_format_on_save %d\n", ui_shader_format_on_save() ? 1 : 0);
     fprintf(f, "scene_grid_enabled %d\n", g_dx.scene_grid_enabled ? 1 : 0);
     fprintf(f, "scene_grid_color_r %.9g\n", g_dx.scene_grid_color[0]);
     fprintf(f, "scene_grid_color_g %.9g\n", g_dx.scene_grid_color[1]);
@@ -85,6 +92,9 @@ void app_settings_load_or_create() {
         else if (strcmp(key, "shader_validation_warnings") == 0) g_dx.shader_validation_warnings = atoi(value) != 0;
         else if (strcmp(key, "profiler") == 0) g_profiler_enabled = atoi(value) != 0;
         else if (strcmp(key, "ui_scale") == 0) ui_set_global_scale((float)atof(value));
+        else if (strcmp(key, "code_font_size") == 0) ui_set_code_font_size((float)atof(value));
+        else if (strcmp(key, "shader_auto_save_compile") == 0) ui_set_shader_auto_save_compile(atoi(value) != 0);
+        else if (strcmp(key, "shader_format_on_save") == 0) ui_set_shader_format_on_save(atoi(value) != 0);
         else if (strcmp(key, "scene_grid_enabled") == 0) g_dx.scene_grid_enabled = atoi(value) != 0;
         else if (strcmp(key, "scene_grid_color_r") == 0) g_dx.scene_grid_color[0] = (float)atof(value);
         else if (strcmp(key, "scene_grid_color_g") == 0) g_dx.scene_grid_color[1] = (float)atof(value);

@@ -3,6 +3,7 @@
 #include "dx11_ctx.h"
 #include "user_cb.h"
 #include "log.h"
+#include "timeline.h"
 #include <stdarg.h>
 #include <string.h>
 
@@ -26,6 +27,7 @@ static bool    s_gpu_overflow_warned = false;
 static uint64_t s_gpu_submit_frame = 0;
 static uint64_t s_gpu_last_ready_frame = 0;
 static bool    s_gpu_frame_capture_open = false;
+static bool    s_cmd_reset_execution = true;
 
 #define GPU_PROFILE_LATENCY 6
 #define GPU_PROFILE_MAX_EVENTS 512
@@ -177,6 +179,10 @@ void cmd_shutdown() {
     s_gpu_frame_capture_open = false;
     memset(s_cmd_profile_ms, 0, sizeof(s_cmd_profile_ms));
     s_frame_profile_ms = 0.0f;
+}
+
+void cmd_set_reset_execution(bool active) {
+    s_cmd_reset_execution = active;
 }
 
 float cmd_profile_ms(CmdHandle h) {
@@ -344,11 +350,47 @@ static void cmd_gpu_end_command(int event_index) {
     g_dx.ctx->End(s_gpu_active_slot->events[event_index].end);
 }
 
+static bool cmd_name_exists_except(const char* name, CmdHandle except) {
+    if (!name || !name[0])
+        return false;
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        CmdHandle h = (CmdHandle)(i + 1);
+        if (h == except)
+            continue;
+        if (g_commands[i].active && strcmp(g_commands[i].name, name) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void cmd_make_unique_name_except(const char* base, char* out, int out_sz, CmdHandle except) {
+    if (!out || out_sz <= 0)
+        return;
+    const char* src = (base && base[0]) ? base : "cmd";
+    if (!cmd_name_exists_except(src, except)) {
+        strncpy(out, src, out_sz - 1);
+        out[out_sz - 1] = '\0';
+        return;
+    }
+
+    for (int i = 1; i < 1000; i++) {
+        snprintf(out, out_sz, "%s_%d", src, i);
+        if (!cmd_name_exists_except(out, except))
+            return;
+    }
+
+    strncpy(out, src, out_sz - 1);
+    out[out_sz - 1] = '\0';
+}
+
 CmdHandle cmd_alloc(const char* name, CmdType type) {
+    char unique_name[MAX_NAME] = {};
+    cmd_make_unique_name_except(name, unique_name, MAX_NAME, INVALID_HANDLE);
     for (int i = 0; i < MAX_COMMANDS; i++) {
         if (!g_commands[i].active) {
             memset(&g_commands[i], 0, sizeof(Command));
-            strncpy(g_commands[i].name, name, MAX_NAME - 1);
+            strncpy(g_commands[i].name, unique_name, MAX_NAME - 1);
+            g_commands[i].name[MAX_NAME - 1] = '\0';
             g_commands[i].type             = type;
             g_commands[i].active           = true;
             g_commands[i].enabled          = true;
@@ -386,6 +428,7 @@ CmdHandle cmd_alloc(const char* name, CmdType type) {
             g_commands[i].thread_x         = 1;
             g_commands[i].thread_y         = 1;
             g_commands[i].thread_z         = 1;
+            g_commands[i].compute_on_reset = false;
             g_commands[i].dispatch_size_source = INVALID_HANDLE;
             for (int r = 0; r < MAX_DRAW_RENDER_TARGETS - 1; r++) g_commands[i].mrt_handles[r] = INVALID_HANDLE;
             for (int t = 0; t < MAX_TEX_SLOTS; t++) g_commands[i].tex_handles[t] = INVALID_HANDLE;
@@ -402,10 +445,13 @@ CmdHandle cmd_alloc(const char* name, CmdType type) {
 void cmd_free(CmdHandle h) {
     Command* c = cmd_get(h);
     if (!c) return;
+    char deleted_name[MAX_NAME] = {};
+    strncpy(deleted_name, c->name, MAX_NAME - 1);
     for (int i = 0; i < MAX_COMMANDS; i++) {
         if (g_commands[i].active && g_commands[i].parent == h)
             cmd_free((CmdHandle)(i + 1));
     }
+    timeline_delete_tracks_for_command(deleted_name);
     c->active = false;
     c->parent = INVALID_HANDLE;
     g_command_count--;
@@ -426,6 +472,31 @@ CmdHandle cmd_find_by_name(const char* name) {
             return (CmdHandle)(i + 1);
     }
     return INVALID_HANDLE;
+}
+
+bool cmd_rename(CmdHandle h, const char* name) {
+    Command* c = cmd_get(h);
+    if (!c)
+        return false;
+
+    char next_name[MAX_NAME] = {};
+    cmd_make_unique_name_except(name, next_name, MAX_NAME, h);
+    if (!next_name[0])
+        return false;
+    if (strcmp(c->name, next_name) == 0)
+        return true;
+
+    char old_name[MAX_NAME] = {};
+    strncpy(old_name, c->name, MAX_NAME - 1);
+    old_name[MAX_NAME - 1] = '\0';
+
+    strncpy(c->name, next_name, MAX_NAME - 1);
+    c->name[MAX_NAME - 1] = '\0';
+
+    timeline_rename_tracks_for_command(old_name, c->name);
+    user_cb_rename_command_references(old_name, c->name);
+    log_info("Command renamed: %s -> %s", old_name, c->name);
+    return true;
 }
 
 CmdHandle cmd_move(CmdHandle moving, CmdHandle target, bool after_target) {
@@ -1366,6 +1437,11 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         return;
 
     Command& c = *cp;
+    if ((c.type == CMD_DISPATCH || c.type == CMD_INDIRECT_DISPATCH) &&
+        c.compute_on_reset && !s_cmd_reset_execution) {
+        return;
+    }
+
     int gpu_event = cmd_gpu_begin_command(h);
 
     switch (c.type) {
@@ -1596,17 +1672,7 @@ void cmd_execute_all() {
 }
 
 void cmd_make_unique_name(const char* base, char* out, int out_sz) {
-    bool found = false;
-    for (int i = 0; i < MAX_COMMANDS && !found; i++)
-        if (g_commands[i].active && strcmp(g_commands[i].name, base) == 0) found = true;
-    if (!found) { strncpy(out, base, out_sz - 1); out[out_sz-1] = '\0'; return; }
-    for (int i = 1; i < 1000; i++) {
-        snprintf(out, out_sz, "%s_%d", base, i);
-        bool dup = false;
-        for (int j = 0; j < MAX_COMMANDS; j++)
-            if (g_commands[j].active && strcmp(g_commands[j].name, out) == 0) { dup = true; break; }
-        if (!dup) return;
-    }
+    cmd_make_unique_name_except(base, out, out_sz, INVALID_HANDLE);
 }
 
 void cmd_profile_begin_frame_capture() {

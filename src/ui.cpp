@@ -10,11 +10,14 @@
 #include "embedded_pack.h"
 #include "timeline.h"
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 #include "nanosvg/nanosvg.h"
 #include <d3dcompiler.h>
 #include <psapi.h>
+#include <stdlib.h>
+#include <vector>
 #pragma comment(lib, "psapi.lib")
 
 // The UI module is the editor shell. It presents resources, commands,
@@ -44,6 +47,8 @@ static bool s_right_panel_general_open = false;
 static bool s_shortcuts_popup_open = false;
 static bool s_timeline_window_open = false;
 static bool s_timeline_keyboard_focus = false;
+static int s_timeline_visible_first_frame = 0;
+static bool s_timeline_ensure_current_visible = false;
 static bool s_scene_surface_resize_armed = true;
 static int s_scene_surface_host_w = 0;
 static int s_scene_surface_host_h = 0;
@@ -59,6 +64,10 @@ static float s_ui_global_scale = k_ui_scale_default;
 static bool s_ui_scale_dirty = false;
 static ImGuiStyle s_ui_base_style = {};
 static bool s_ui_base_style_valid = false;
+static ImFont* s_code_font = nullptr;
+static float s_code_font_size = 16.0f;
+static bool s_shader_editor_auto_save_compile = false;
+static bool s_shader_editor_format_on_save = true;
 
 enum UiViewportGizmoMode {
     UI_GIZMO_NONE = 0,
@@ -1326,21 +1335,111 @@ static void command_param_copy_from_resource(CommandParam* p, const Resource* r)
 }
 
 static void ui_command_param_source_combo(CommandParam* p) {
-    Resource* src = res_get(p->source);
-    if (ImGui::BeginCombo("##source", src ? ui_resource_display_name(*src) : "(hardcoded)")) {
-        if (ImGui::Selectable("(hardcoded)", p->source == INVALID_HANDLE))
+    UserCBSourceKind source_kind = p->source_kind;
+    if (source_kind == USER_CB_SOURCE_NONE && p->source != INVALID_HANDLE)
+        source_kind = USER_CB_SOURCE_RESOURCE;
+    Resource* src = source_kind == USER_CB_SOURCE_RESOURCE ? res_get(p->source) : nullptr;
+    char label[160] = {};
+    if (source_kind == USER_CB_SOURCE_RESOURCE && src) {
+        snprintf(label, sizeof(label), "%s", ui_resource_display_name(*src));
+    } else if (source_kind == USER_CB_SOURCE_COMMAND_POSITION) {
+        snprintf(label, sizeof(label), "%s Position", p->source_target);
+    } else if (source_kind == USER_CB_SOURCE_COMMAND_ROTATION) {
+        snprintf(label, sizeof(label), "%s Rotation", p->source_target);
+    } else if (source_kind == USER_CB_SOURCE_COMMAND_SCALE) {
+        snprintf(label, sizeof(label), "%s Scale", p->source_target);
+    } else if (source_kind == USER_CB_SOURCE_CAMERA_POSITION) {
+        snprintf(label, sizeof(label), "Camera Position");
+    } else if (source_kind == USER_CB_SOURCE_CAMERA_ROTATION) {
+        snprintf(label, sizeof(label), "Camera Rotation");
+    } else if (source_kind == USER_CB_SOURCE_DIRLIGHT_POSITION) {
+        snprintf(label, sizeof(label), "Dir Light Position");
+    } else if (source_kind == USER_CB_SOURCE_DIRLIGHT_TARGET) {
+        snprintf(label, sizeof(label), "Dir Light Target");
+    } else {
+        snprintf(label, sizeof(label), "(hardcoded)");
+    }
+
+    if (ImGui::BeginCombo("##source", label)) {
+        if (ImGui::Selectable("(hardcoded)", source_kind == USER_CB_SOURCE_NONE)) {
             p->source = INVALID_HANDLE;
+            p->source_kind = USER_CB_SOURCE_NONE;
+            p->source_target[0] = '\0';
+        }
+        ImGui::Separator();
+        ImGui::TextDisabled("Resources");
         for (int i = 0; i < MAX_RESOURCES; i++) {
             Resource& r = g_resources[i];
             if (!r.active || r.is_builtin || r.type != p->type) continue;
             ResHandle h = (ResHandle)(i + 1);
-            bool sel = p->source == h;
+            bool sel = source_kind == USER_CB_SOURCE_RESOURCE && p->source == h;
             ImGui::PushID(i);
             if (ImGui::Selectable(ui_resource_display_name(r), sel)) {
                 p->source = h;
+                p->source_kind = USER_CB_SOURCE_RESOURCE;
+                p->source_target[0] = '\0';
                 command_param_copy_from_resource(p, &r);
             }
             ImGui::PopID();
+        }
+        if (p->type == RES_FLOAT3 || p->type == RES_FLOAT4) {
+            ImGui::Separator();
+            ImGui::TextDisabled("Scene transforms");
+            if (ImGui::Selectable("Camera Position", source_kind == USER_CB_SOURCE_CAMERA_POSITION)) {
+                p->source = INVALID_HANDLE;
+                p->source_kind = USER_CB_SOURCE_CAMERA_POSITION;
+                snprintf(p->source_target, MAX_NAME, "camera");
+            }
+            if (ImGui::Selectable("Camera Rotation", source_kind == USER_CB_SOURCE_CAMERA_ROTATION)) {
+                p->source = INVALID_HANDLE;
+                p->source_kind = USER_CB_SOURCE_CAMERA_ROTATION;
+                snprintf(p->source_target, MAX_NAME, "camera");
+            }
+            if (ImGui::Selectable("Dir Light Position", source_kind == USER_CB_SOURCE_DIRLIGHT_POSITION)) {
+                p->source = INVALID_HANDLE;
+                p->source_kind = USER_CB_SOURCE_DIRLIGHT_POSITION;
+                snprintf(p->source_target, MAX_NAME, "dirlight");
+            }
+            if (ImGui::Selectable("Dir Light Target", source_kind == USER_CB_SOURCE_DIRLIGHT_TARGET)) {
+                p->source = INVALID_HANDLE;
+                p->source_kind = USER_CB_SOURCE_DIRLIGHT_TARGET;
+                snprintf(p->source_target, MAX_NAME, "dirlight");
+            }
+            for (int c_i = 0; c_i < MAX_COMMANDS; c_i++) {
+                Command& c = g_commands[c_i];
+                bool has_transform = c.active && (c.type == CMD_DRAW_MESH ||
+                                                  c.type == CMD_DRAW_INSTANCED ||
+                                                  c.type == CMD_INDIRECT_DRAW);
+                if (!has_transform)
+                    continue;
+                ImGui::PushID(10000 + c_i);
+                char item[128] = {};
+                snprintf(item, sizeof(item), "%s Position", c.name);
+                if (ImGui::Selectable(item, source_kind == USER_CB_SOURCE_COMMAND_POSITION &&
+                                            strcmp(p->source_target, c.name) == 0)) {
+                    p->source = INVALID_HANDLE;
+                    p->source_kind = USER_CB_SOURCE_COMMAND_POSITION;
+                    strncpy(p->source_target, c.name, MAX_NAME - 1);
+                    p->source_target[MAX_NAME - 1] = '\0';
+                }
+                snprintf(item, sizeof(item), "%s Rotation", c.name);
+                if (ImGui::Selectable(item, source_kind == USER_CB_SOURCE_COMMAND_ROTATION &&
+                                            strcmp(p->source_target, c.name) == 0)) {
+                    p->source = INVALID_HANDLE;
+                    p->source_kind = USER_CB_SOURCE_COMMAND_ROTATION;
+                    strncpy(p->source_target, c.name, MAX_NAME - 1);
+                    p->source_target[MAX_NAME - 1] = '\0';
+                }
+                snprintf(item, sizeof(item), "%s Scale", c.name);
+                if (ImGui::Selectable(item, source_kind == USER_CB_SOURCE_COMMAND_SCALE &&
+                                            strcmp(p->source_target, c.name) == 0)) {
+                    p->source = INVALID_HANDLE;
+                    p->source_kind = USER_CB_SOURCE_COMMAND_SCALE;
+                    strncpy(p->source_target, c.name, MAX_NAME - 1);
+                    p->source_target[MAX_NAME - 1] = '\0';
+                }
+                ImGui::PopID();
+            }
         }
         ImGui::EndCombo();
     }
@@ -1352,6 +1451,1205 @@ static void ui_inspector_section(const char* title) {
     ImGui::TextUnformatted(title);
     ImGui::PopStyleColor();
     ImGui::Separator();
+}
+
+static bool ui_ascii_ident_start(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+}
+
+static bool ui_ascii_ident_char(char c) {
+    return ui_ascii_ident_start(c) || (c >= '0' && c <= '9');
+}
+
+static bool ui_token_matches(const char* token, int len, const char* word) {
+    return len == (int)strlen(word) && strncmp(token, word, len) == 0;
+}
+
+static bool ui_hlsl_keyword(const char* token, int len) {
+    static const char* words[] = {
+        "if", "else", "for", "while", "do", "switch", "case", "default", "break",
+        "continue", "return", "discard", "struct", "cbuffer", "tbuffer", "class",
+        "namespace", "static", "const", "uniform", "volatile", "groupshared",
+        "in", "out", "inout", "true", "false", "register", "packoffset",
+        "numthreads", "linear", "centroid", "nointerpolation", "precise"
+    };
+    for (int i = 0; i < (int)(sizeof(words) / sizeof(words[0])); i++)
+        if (ui_token_matches(token, len, words[i]))
+            return true;
+    return false;
+}
+
+static bool ui_hlsl_type_keyword(const char* token, int len) {
+    static const char* words[] = {
+        "void", "bool", "int", "uint", "dword", "half", "float", "double",
+        "bool2", "bool3", "bool4", "int2", "int3", "int4", "uint2", "uint3", "uint4",
+        "half2", "half3", "half4", "float2", "float3", "float4",
+        "float2x2", "float2x3", "float2x4", "float3x2", "float3x3", "float3x4",
+        "float4x2", "float4x3", "float4x4", "matrix",
+        "Texture1D", "Texture2D", "Texture3D", "TextureCube",
+        "Texture1DArray", "Texture2DArray", "TextureCubeArray",
+        "RWTexture1D", "RWTexture2D", "RWTexture3D", "RWTexture1DArray", "RWTexture2DArray",
+        "Buffer", "RWBuffer", "StructuredBuffer", "RWStructuredBuffer",
+        "AppendStructuredBuffer", "ConsumeStructuredBuffer", "ByteAddressBuffer",
+        "RWByteAddressBuffer", "SamplerState", "SamplerComparisonState"
+    };
+    for (int i = 0; i < (int)(sizeof(words) / sizeof(words[0])); i++)
+        if (ui_token_matches(token, len, words[i]))
+            return true;
+    return false;
+}
+
+static bool ui_hlsl_semantic(const char* token, int len) {
+    return (len > 3 && strncmp(token, "SV_", 3) == 0) ||
+           ui_token_matches(token, len, "POSITION") ||
+           ui_token_matches(token, len, "NORMAL") ||
+           ui_token_matches(token, len, "TEXCOORD") ||
+           ui_token_matches(token, len, "COLOR") ||
+           ui_token_matches(token, len, "TARGET");
+}
+
+static const char* ui_skip_spaces(const char* p, const char* end) {
+    while (p < end && (*p == ' ' || *p == '\t'))
+        p++;
+    return p;
+}
+
+static void ui_hlsl_emit_span(const char* begin, const char* end, ImVec4 color) {
+    if (!begin || !end || end <= begin)
+        return;
+    ImGui::PushStyleColor(ImGuiCol_Text, color);
+    ImGui::TextUnformatted(begin, end);
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0.0f, 0.0f);
+}
+
+static void ui_hlsl_render_line(const char* begin, const char* end, int line_no) {
+    ImVec4 normal = ImVec4(0.83f, 0.81f, 0.78f, 1.0f);
+    ImVec4 muted = ImVec4(0.55f, 0.52f, 0.50f, 1.0f);
+    ImVec4 keyword = ImVec4(0.95f, 0.50f, 0.30f, 1.0f);
+    ImVec4 type = ImVec4(0.48f, 0.72f, 1.00f, 1.0f);
+    ImVec4 number = ImVec4(0.80f, 0.62f, 0.95f, 1.0f);
+    ImVec4 string_col = ImVec4(0.86f, 0.72f, 0.38f, 1.0f);
+    ImVec4 comment = ImVec4(0.42f, 0.68f, 0.44f, 1.0f);
+    ImVec4 preproc = ImVec4(0.72f, 0.58f, 0.86f, 1.0f);
+    ImVec4 function_col = ImVec4(0.88f, 0.82f, 0.55f, 1.0f);
+
+    ImGui::TextDisabled("%4d  ", line_no);
+    ImGui::SameLine(0.0f, 0.0f);
+
+    const char* first = ui_skip_spaces(begin, end);
+    if (first < end && *first == '#') {
+        if (first > begin)
+            ui_hlsl_emit_span(begin, first, normal);
+        ui_hlsl_emit_span(first, end, preproc);
+        ImGui::NewLine();
+        return;
+    }
+
+    const char* p = begin;
+    while (p < end) {
+        if (*p == ' ' || *p == '\t') {
+            const char* s = p++;
+            while (p < end && (*p == ' ' || *p == '\t'))
+                p++;
+            ui_hlsl_emit_span(s, p, normal);
+            continue;
+        }
+
+        if (p + 1 < end && p[0] == '/' && p[1] == '/') {
+            ui_hlsl_emit_span(p, end, comment);
+            p = end;
+            continue;
+        }
+
+        if (*p == '"' || *p == '\'') {
+            char quote = *p;
+            const char* s = p++;
+            while (p < end) {
+                if (*p == '\\' && p + 1 < end) {
+                    p += 2;
+                    continue;
+                }
+                if (*p++ == quote)
+                    break;
+            }
+            ui_hlsl_emit_span(s, p, string_col);
+            continue;
+        }
+
+        if (ui_ascii_ident_start(*p)) {
+            const char* s = p++;
+            while (p < end && ui_ascii_ident_char(*p))
+                p++;
+            int len = (int)(p - s);
+            const char* next = ui_skip_spaces(p, end);
+            ImVec4 col = normal;
+            if (ui_hlsl_type_keyword(s, len))
+                col = type;
+            else if (ui_hlsl_keyword(s, len))
+                col = keyword;
+            else if (ui_hlsl_semantic(s, len))
+                col = preproc;
+            else if (next < end && *next == '(')
+                col = function_col;
+            ui_hlsl_emit_span(s, p, col);
+            continue;
+        }
+
+        if ((*p >= '0' && *p <= '9') ||
+            (*p == '.' && p + 1 < end && p[1] >= '0' && p[1] <= '9')) {
+            const char* s = p++;
+            while (p < end && (ui_ascii_ident_char(*p) || *p == '.' || *p == '+' || *p == '-'))
+                p++;
+            ui_hlsl_emit_span(s, p, number);
+            continue;
+        }
+
+        ui_hlsl_emit_span(p, p + 1, muted);
+        p++;
+    }
+    ImGui::NewLine();
+}
+
+static void ui_hlsl_code_view(const char* text) {
+    if (!text || !text[0]) {
+        ImGui::TextDisabled("(empty source)");
+        return;
+    }
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+    int line_no = 1;
+    const char* line = text;
+    while (*line) {
+        const char* end = line;
+        while (*end && *end != '\n' && *end != '\r')
+            end++;
+        ui_hlsl_render_line(line, end, line_no++);
+        if (*end == '\r' && end[1] == '\n')
+            line = end + 2;
+        else if (*end)
+            line = end + 1;
+        else
+            line = end;
+    }
+    ImGui::PopStyleVar();
+}
+
+struct UiShaderSourceEditor {
+    ResHandle h;
+    char      path[MAX_PATH_LEN];
+    char*     text;
+    size_t    cap;
+    int       cursor;
+    int       select_anchor;
+    bool      editor_focused;
+    bool      dragging_selection;
+    bool      cursor_follow;
+    bool      ok;
+    bool      dirty;
+    double    last_edit_time;
+};
+
+struct UiTextResizeData {
+    char**  text;
+    size_t* cap;
+};
+
+static int ui_text_resize_callback(ImGuiInputTextCallbackData* data) {
+    if (data->EventFlag != ImGuiInputTextFlags_CallbackResize)
+        return 0;
+    UiTextResizeData* resize = (UiTextResizeData*)data->UserData;
+    if (!resize || !resize->text || !resize->cap)
+        return 1;
+    size_t new_cap = (size_t)data->BufTextLen + 4096;
+    char* next = (char*)realloc(*resize->text, new_cap);
+    if (!next)
+        return 1;
+    *resize->text = next;
+    *resize->cap = new_cap;
+    data->Buf = next;
+    return 0;
+}
+
+struct UiCodeLine {
+    const char* begin;
+    const char* end;
+    int         offset;
+};
+
+static int ui_code_text_len(const UiShaderSourceEditor* ed) {
+    return (ed && ed->text) ? (int)strlen(ed->text) : 0;
+}
+
+static int ui_code_clamp_offset(const UiShaderSourceEditor* ed, int offset) {
+    int len = ui_code_text_len(ed);
+    if (offset < 0) return 0;
+    if (offset > len) return len;
+    return offset;
+}
+
+static int ui_code_tab_next_col(int col) {
+    return ((col / 4) + 1) * 4;
+}
+
+static int ui_code_visual_cols(const char* begin, const char* end) {
+    int col = 0;
+    for (const char* p = begin; p && p < end; p++)
+        col = (*p == '\t') ? ui_code_tab_next_col(col) : col + 1;
+    return col;
+}
+
+static int ui_code_visual_cols_to(const char* begin, const char* at) {
+    return ui_code_visual_cols(begin, at);
+}
+
+static int ui_code_offset_from_col(const UiCodeLine& line, int target_col) {
+    if (target_col <= 0)
+        return line.offset;
+
+    int col = 0;
+    const char* p = line.begin;
+    while (p < line.end) {
+        int next_col = (*p == '\t') ? ui_code_tab_next_col(col) : col + 1;
+        if (target_col < next_col || (target_col == next_col && *p != '\t'))
+            break;
+        col = next_col;
+        p++;
+    }
+    return line.offset + (int)(p - line.begin);
+}
+
+static void ui_code_build_lines(const char* text, std::vector<UiCodeLine>& lines, int* max_cols) {
+    lines.clear();
+    if (max_cols) *max_cols = 0;
+    if (!text)
+        return;
+
+    const char* p = text;
+    while (true) {
+        const char* begin = p;
+        const char* end = p;
+        while (*end && *end != '\n' && *end != '\r')
+            end++;
+        UiCodeLine line = { begin, end, (int)(begin - text) };
+        lines.push_back(line);
+        if (max_cols) {
+            int cols = ui_code_visual_cols(begin, end);
+            if (cols > *max_cols)
+                *max_cols = cols;
+        }
+        if (!*end)
+            break;
+        if (*end == '\r' && end[1] == '\n')
+            p = end + 2;
+        else
+            p = end + 1;
+        if (!*p) {
+            UiCodeLine empty = { p, p, (int)(p - text) };
+            lines.push_back(empty);
+            break;
+        }
+    }
+}
+
+static int ui_code_line_from_offset(const std::vector<UiCodeLine>& lines, int offset) {
+    if (lines.empty())
+        return 0;
+    int best = 0;
+    for (int i = 0; i < (int)lines.size(); i++) {
+        if (lines[i].offset <= offset)
+            best = i;
+        else
+            break;
+    }
+    return best;
+}
+
+static bool ui_shader_editor_has_selection(const UiShaderSourceEditor* ed) {
+    return ed && ed->select_anchor != ed->cursor;
+}
+
+static void ui_shader_editor_selection(const UiShaderSourceEditor* ed, int* out_a, int* out_b) {
+    int a = ed ? ed->select_anchor : 0;
+    int b = ed ? ed->cursor : 0;
+    if (a > b) {
+        int tmp = a;
+        a = b;
+        b = tmp;
+    }
+    if (out_a) *out_a = a;
+    if (out_b) *out_b = b;
+}
+
+static void ui_shader_editor_mark_dirty(UiShaderSourceEditor* ed) {
+    if (!ed)
+        return;
+    ed->dirty = true;
+    ed->last_edit_time = ImGui::GetTime();
+}
+
+static bool ui_shader_editor_reserve(UiShaderSourceEditor* ed, size_t need) {
+    if (!ed)
+        return false;
+    if (need <= ed->cap)
+        return true;
+
+    size_t next_cap = ed->cap ? ed->cap : 8192;
+    while (next_cap < need)
+        next_cap += 4096;
+    char* next = (char*)realloc(ed->text, next_cap);
+    if (!next)
+        return false;
+    ed->text = next;
+    ed->cap = next_cap;
+    return true;
+}
+
+static bool ui_shader_editor_delete_range(UiShaderSourceEditor* ed, int a, int b) {
+    if (!ed || !ed->text)
+        return false;
+    int len = ui_code_text_len(ed);
+    if (a < 0) a = 0;
+    if (b > len) b = len;
+    if (a > b) {
+        int tmp = a;
+        a = b;
+        b = tmp;
+    }
+    if (a == b)
+        return false;
+    memmove(ed->text + a, ed->text + b, (size_t)(len - b + 1));
+    ed->cursor = a;
+    ed->select_anchor = a;
+    ed->cursor_follow = true;
+    ui_shader_editor_mark_dirty(ed);
+    return true;
+}
+
+static bool ui_shader_editor_delete_selection(UiShaderSourceEditor* ed) {
+    if (!ui_shader_editor_has_selection(ed))
+        return false;
+    int a = 0, b = 0;
+    ui_shader_editor_selection(ed, &a, &b);
+    return ui_shader_editor_delete_range(ed, a, b);
+}
+
+static bool ui_shader_editor_insert_bytes(UiShaderSourceEditor* ed, const char* text, int insert_len) {
+    if (!ed || !text || insert_len <= 0)
+        return false;
+    if (!ed->text) {
+        if (!ui_shader_editor_reserve(ed, 8192))
+            return false;
+        ed->text[0] = '\0';
+    }
+    if (ui_shader_editor_has_selection(ed))
+        ui_shader_editor_delete_selection(ed);
+
+    int len = ui_code_text_len(ed);
+    ed->cursor = ui_code_clamp_offset(ed, ed->cursor);
+    if (!ui_shader_editor_reserve(ed, (size_t)len + (size_t)insert_len + 1))
+        return false;
+
+    memmove(ed->text + ed->cursor + insert_len, ed->text + ed->cursor,
+            (size_t)(len - ed->cursor + 1));
+    memcpy(ed->text + ed->cursor, text, (size_t)insert_len);
+    ed->cursor += insert_len;
+    ed->select_anchor = ed->cursor;
+    ed->cursor_follow = true;
+    ui_shader_editor_mark_dirty(ed);
+    return true;
+}
+
+static void ui_shader_editor_set_cursor(UiShaderSourceEditor* ed, int cursor, bool extend_selection) {
+    if (!ed)
+        return;
+    ed->cursor = ui_code_clamp_offset(ed, cursor);
+    if (!extend_selection)
+        ed->select_anchor = ed->cursor;
+    ed->cursor_follow = true;
+}
+
+static void ui_shader_editor_copy_selection(UiShaderSourceEditor* ed) {
+    if (!ed || !ed->text || !ui_shader_editor_has_selection(ed))
+        return;
+    int a = 0, b = 0;
+    ui_shader_editor_selection(ed, &a, &b);
+    int len = b - a;
+    char* tmp = (char*)malloc((size_t)len + 1);
+    if (!tmp)
+        return;
+    memcpy(tmp, ed->text + a, (size_t)len);
+    tmp[len] = '\0';
+    ImGui::SetClipboardText(tmp);
+    free(tmp);
+}
+
+static int ui_shader_editor_word_left(const UiShaderSourceEditor* ed) {
+    if (!ed || !ed->text)
+        return 0;
+    int p = ui_code_clamp_offset(ed, ed->cursor);
+    while (p > 0 && (ed->text[p - 1] == ' ' || ed->text[p - 1] == '\t' ||
+                     ed->text[p - 1] == '\n' || ed->text[p - 1] == '\r'))
+        p--;
+    if (p > 0 && ui_ascii_ident_char(ed->text[p - 1])) {
+        while (p > 0 && ui_ascii_ident_char(ed->text[p - 1]))
+            p--;
+    } else {
+        while (p > 0 && ed->text[p - 1] != ' ' && ed->text[p - 1] != '\t' &&
+               ed->text[p - 1] != '\n' && ed->text[p - 1] != '\r' &&
+               !ui_ascii_ident_char(ed->text[p - 1]))
+            p--;
+    }
+    return p;
+}
+
+static int ui_shader_editor_word_right(const UiShaderSourceEditor* ed) {
+    if (!ed || !ed->text)
+        return 0;
+    int len = ui_code_text_len(ed);
+    int p = ui_code_clamp_offset(ed, ed->cursor);
+    while (p < len && (ed->text[p] == ' ' || ed->text[p] == '\t' ||
+                       ed->text[p] == '\n' || ed->text[p] == '\r'))
+        p++;
+    if (p < len && ui_ascii_ident_char(ed->text[p])) {
+        while (p < len && ui_ascii_ident_char(ed->text[p]))
+            p++;
+    } else {
+        while (p < len && ed->text[p] != ' ' && ed->text[p] != '\t' &&
+               ed->text[p] != '\n' && ed->text[p] != '\r' &&
+               !ui_ascii_ident_char(ed->text[p]))
+            p++;
+    }
+    return p;
+}
+
+static void ui_shader_editor_move_vertical(UiShaderSourceEditor* ed,
+                                           const std::vector<UiCodeLine>& lines,
+                                           int dir,
+                                           bool extend_selection) {
+    if (!ed || lines.empty())
+        return;
+    int line_i = ui_code_line_from_offset(lines, ui_code_clamp_offset(ed, ed->cursor));
+    int next_i = line_i + dir;
+    if (next_i < 0) next_i = 0;
+    if (next_i >= (int)lines.size()) next_i = (int)lines.size() - 1;
+    int col = ui_code_visual_cols_to(lines[line_i].begin,
+        lines[line_i].begin + (ed->cursor - lines[line_i].offset));
+    ui_shader_editor_set_cursor(ed, ui_code_offset_from_col(lines[next_i], col), extend_selection);
+}
+
+static int ui_utf8_encode(unsigned int c, char out[5]) {
+    if (c < 0x80) {
+        out[0] = (char)c;
+        out[1] = '\0';
+        return 1;
+    }
+    if (c < 0x800) {
+        out[0] = (char)(0xC0 | (c >> 6));
+        out[1] = (char)(0x80 | (c & 0x3F));
+        out[2] = '\0';
+        return 2;
+    }
+    if (c < 0x10000) {
+        out[0] = (char)(0xE0 | (c >> 12));
+        out[1] = (char)(0x80 | ((c >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (c & 0x3F));
+        out[3] = '\0';
+        return 3;
+    }
+    if (c <= 0x10FFFF) {
+        out[0] = (char)(0xF0 | (c >> 18));
+        out[1] = (char)(0x80 | ((c >> 12) & 0x3F));
+        out[2] = (char)(0x80 | ((c >> 6) & 0x3F));
+        out[3] = (char)(0x80 | (c & 0x3F));
+        out[4] = '\0';
+        return 4;
+    }
+    return 0;
+}
+
+struct UiHlslDrawPalette {
+    ImU32 normal;
+    ImU32 muted;
+    ImU32 keyword;
+    ImU32 type;
+    ImU32 number;
+    ImU32 string_col;
+    ImU32 comment;
+    ImU32 preproc;
+    ImU32 function_col;
+};
+
+static UiHlslDrawPalette ui_hlsl_draw_palette() {
+    UiHlslDrawPalette p = {};
+    p.normal       = ImGui::GetColorU32(ImVec4(0.83f, 0.81f, 0.78f, 1.0f));
+    p.muted        = ImGui::GetColorU32(ImVec4(0.55f, 0.52f, 0.50f, 1.0f));
+    p.keyword      = ImGui::GetColorU32(ImVec4(0.95f, 0.50f, 0.30f, 1.0f));
+    p.type         = ImGui::GetColorU32(ImVec4(0.48f, 0.72f, 1.00f, 1.0f));
+    p.number       = ImGui::GetColorU32(ImVec4(0.80f, 0.62f, 0.95f, 1.0f));
+    p.string_col   = ImGui::GetColorU32(ImVec4(0.86f, 0.72f, 0.38f, 1.0f));
+    p.comment      = ImGui::GetColorU32(ImVec4(0.42f, 0.68f, 0.44f, 1.0f));
+    p.preproc      = ImGui::GetColorU32(ImVec4(0.72f, 0.58f, 0.86f, 1.0f));
+    p.function_col = ImGui::GetColorU32(ImVec4(0.88f, 0.82f, 0.55f, 1.0f));
+    return p;
+}
+
+static float ui_code_draw_span(ImDrawList* dl, ImFont* font, float font_size,
+                               float x, float y, float line_x,
+                               const char* begin, const char* end,
+                               ImU32 color, float char_w) {
+    const char* p = begin;
+    while (p < end) {
+        if (*p == '\t') {
+            int col = (int)((x - line_x) / char_w + 0.01f);
+            x = line_x + (float)ui_code_tab_next_col(col) * char_w;
+            p++;
+            continue;
+        }
+        if (*p == ' ') {
+            x += char_w;
+            p++;
+            continue;
+        }
+        const char* s = p;
+        while (p < end && *p != '\t' && *p != ' ')
+            p++;
+        dl->AddText(font, font_size, ImVec2(x, y), color, s, p);
+        x += ImGui::CalcTextSize(s, p).x;
+    }
+    return x;
+}
+
+static void ui_hlsl_draw_line_at(ImDrawList* dl, ImVec2 pos,
+                                 const char* begin, const char* end,
+                                 float char_w, const UiHlslDrawPalette& pal) {
+    ImFont* font = ImGui::GetFont();
+    float font_size = ImGui::GetFontSize();
+    float x = pos.x;
+    float line_x = pos.x;
+
+    const char* first = ui_skip_spaces(begin, end);
+    if (first < end && *first == '#') {
+        x = ui_code_draw_span(dl, font, font_size, x, pos.y, line_x, begin, first, pal.normal, char_w);
+        ui_code_draw_span(dl, font, font_size, x, pos.y, line_x, first, end, pal.preproc, char_w);
+        return;
+    }
+
+    const char* p = begin;
+    while (p < end) {
+        if (*p == ' ' || *p == '\t') {
+            const char* s = p++;
+            while (p < end && (*p == ' ' || *p == '\t'))
+                p++;
+            x = ui_code_draw_span(dl, font, font_size, x, pos.y, line_x, s, p, pal.normal, char_w);
+            continue;
+        }
+
+        if (p + 1 < end && p[0] == '/' && p[1] == '/') {
+            ui_code_draw_span(dl, font, font_size, x, pos.y, line_x, p, end, pal.comment, char_w);
+            return;
+        }
+
+        if (*p == '"' || *p == '\'') {
+            char quote = *p;
+            const char* s = p++;
+            while (p < end) {
+                if (*p == '\\' && p + 1 < end) {
+                    p += 2;
+                    continue;
+                }
+                if (*p++ == quote)
+                    break;
+            }
+            x = ui_code_draw_span(dl, font, font_size, x, pos.y, line_x, s, p, pal.string_col, char_w);
+            continue;
+        }
+
+        if (ui_ascii_ident_start(*p)) {
+            const char* s = p++;
+            while (p < end && ui_ascii_ident_char(*p))
+                p++;
+            int len = (int)(p - s);
+            const char* next = ui_skip_spaces(p, end);
+            ImU32 col = pal.normal;
+            if (ui_hlsl_type_keyword(s, len))
+                col = pal.type;
+            else if (ui_hlsl_keyword(s, len))
+                col = pal.keyword;
+            else if (ui_hlsl_semantic(s, len))
+                col = pal.preproc;
+            else if (next < end && *next == '(')
+                col = pal.function_col;
+            x = ui_code_draw_span(dl, font, font_size, x, pos.y, line_x, s, p, col, char_w);
+            continue;
+        }
+
+        if ((*p >= '0' && *p <= '9') ||
+            (*p == '.' && p + 1 < end && p[1] >= '0' && p[1] <= '9')) {
+            const char* s = p++;
+            while (p < end && (ui_ascii_ident_char(*p) || *p == '.' || *p == '+' || *p == '-'))
+                p++;
+            x = ui_code_draw_span(dl, font, font_size, x, pos.y, line_x, s, p, pal.number, char_w);
+            continue;
+        }
+
+        x = ui_code_draw_span(dl, font, font_size, x, pos.y, line_x, p, p + 1, pal.muted, char_w);
+        p++;
+    }
+}
+
+static int ui_shader_editor_cursor_from_mouse(const std::vector<UiCodeLine>& lines,
+                                              ImVec2 origin,
+                                              float gutter_w,
+                                              float line_h,
+                                              float char_w,
+                                              ImVec2 mouse) {
+    if (lines.empty())
+        return 0;
+    int line_i = (int)floorf((mouse.y - origin.y) / line_h);
+    if (line_i < 0) line_i = 0;
+    if (line_i >= (int)lines.size()) line_i = (int)lines.size() - 1;
+    float local_x = mouse.x - origin.x - gutter_w;
+    int col = (int)floorf(local_x / char_w + 0.5f);
+    return ui_code_offset_from_col(lines[line_i], col);
+}
+
+static bool ui_shader_code_editor_handle_input(UiShaderSourceEditor* ed,
+                                               const std::vector<UiCodeLine>& lines) {
+    if (!ed || !ed->editor_focused)
+        return false;
+
+    ImGuiIO& io = ImGui::GetIO();
+    bool changed = false;
+    bool shift = io.KeyShift;
+    bool ctrl = io.KeyCtrl;
+
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_A)) {
+        ed->select_anchor = 0;
+        ed->cursor = ui_code_text_len(ed);
+        ed->cursor_follow = true;
+    }
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_C))
+        ui_shader_editor_copy_selection(ed);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_X)) {
+        ui_shader_editor_copy_selection(ed);
+        changed |= ui_shader_editor_delete_selection(ed);
+    }
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_V)) {
+        if (const char* clip = ImGui::GetClipboardText())
+            changed |= ui_shader_editor_insert_bytes(ed, clip, (int)strlen(clip));
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true)) {
+        int next = ctrl ? ui_shader_editor_word_left(ed) : ed->cursor - 1;
+        ui_shader_editor_set_cursor(ed, next, shift);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true)) {
+        int next = ctrl ? ui_shader_editor_word_right(ed) : ed->cursor + 1;
+        ui_shader_editor_set_cursor(ed, next, shift);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true))
+        ui_shader_editor_move_vertical(ed, lines, -1, shift);
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true))
+        ui_shader_editor_move_vertical(ed, lines, 1, shift);
+
+    if (ImGui::IsKeyPressed(ImGuiKey_Home, true)) {
+        int line_i = ui_code_line_from_offset(lines, ed->cursor);
+        ui_shader_editor_set_cursor(ed, lines.empty() ? 0 : lines[line_i].offset, shift);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_End, true)) {
+        int line_i = ui_code_line_from_offset(lines, ed->cursor);
+        int end_offset = lines.empty() ? ui_code_text_len(ed) :
+            lines[line_i].offset + (int)(lines[line_i].end - lines[line_i].begin);
+        ui_shader_editor_set_cursor(ed, end_offset, shift);
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey_Backspace, true)) {
+        if (ui_shader_editor_has_selection(ed))
+            changed |= ui_shader_editor_delete_selection(ed);
+        else
+            changed |= ui_shader_editor_delete_range(ed, ed->cursor - 1, ed->cursor);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete, true)) {
+        if (ui_shader_editor_has_selection(ed))
+            changed |= ui_shader_editor_delete_selection(ed);
+        else
+            changed |= ui_shader_editor_delete_range(ed, ed->cursor, ed->cursor + 1);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter, true) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, true))
+        changed |= ui_shader_editor_insert_bytes(ed, "\n", 1);
+    if (ImGui::IsKeyPressed(ImGuiKey_Tab, true))
+        changed |= ui_shader_editor_insert_bytes(ed, "\t", 1);
+
+    if (!ctrl || io.KeyAlt) {
+        for (int n = 0; n < io.InputQueueCharacters.Size; n++) {
+            unsigned int c = (unsigned int)io.InputQueueCharacters[n];
+            if (c < 32 || c == 127 || c == '\t' || c == '\r' || c == '\n')
+                continue;
+            char utf8[5] = {};
+            int len = ui_utf8_encode(c, utf8);
+            if (len > 0)
+                changed |= ui_shader_editor_insert_bytes(ed, utf8, len);
+        }
+    }
+    io.InputQueueCharacters.resize(0);
+    return changed;
+}
+
+static bool ui_shader_code_editor(UiShaderSourceEditor* ed) {
+    if (!ed || !ed->text)
+        return false;
+
+    bool changed = false;
+    float editor_h = ImGui::GetContentRegionAvail().y;
+    if (editor_h < ui_px(300.0f))
+        editor_h = ui_px(360.0f);
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.055f, 0.052f, 0.055f, 1.0f));
+    if (s_code_font)
+        ImGui::PushFont(s_code_font, s_code_font_size);
+    ImGui::BeginChild("##shader_source_code_editor", ImVec2(0.0f, editor_h), true,
+        ImGuiWindowFlags_HorizontalScrollbar);
+
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    ImGuiID editor_id = window->GetID("##shader_source_code_editor_active");
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    float line_h = ImGui::GetTextLineHeight();
+    float char_w = ImGui::CalcTextSize("M").x;
+    if (char_w <= 0.0f)
+        char_w = ImGui::GetFontSize() * 0.6f;
+    float gutter_w = ImGui::CalcTextSize("0000  ").x + ui_px(10.0f);
+
+    std::vector<UiCodeLine> lines;
+    int max_cols = 0;
+    ui_code_build_lines(ed->text, lines, &max_cols);
+    if (lines.empty()) {
+        UiCodeLine line = { ed->text, ed->text, 0 };
+        lines.push_back(line);
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    bool hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+    bool content_hovered = hovered && window->InnerRect.Contains(io.MousePos);
+    if (content_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        ed->editor_focused = true;
+        ed->dragging_selection = true;
+        ImGui::SetActiveID(editor_id, window);
+        ImGui::SetFocusID(editor_id, window);
+        ImGui::FocusWindow(window);
+        int cursor = ui_shader_editor_cursor_from_mouse(lines, origin, gutter_w, line_h, char_w, io.MousePos);
+        ui_shader_editor_set_cursor(ed, cursor, io.KeyShift);
+    } else if (ed->editor_focused && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !content_hovered) {
+        ed->editor_focused = false;
+        ed->dragging_selection = false;
+        if (GImGui && GImGui->ActiveId == editor_id)
+            ImGui::ClearActiveID();
+    }
+
+    if (ed->dragging_selection) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left) && content_hovered) {
+            int cursor = ui_shader_editor_cursor_from_mouse(lines, origin, gutter_w, line_h, char_w, io.MousePos);
+            ui_shader_editor_set_cursor(ed, cursor, true);
+        }
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+            ed->dragging_selection = false;
+    }
+
+    if (ed->editor_focused) {
+        ImGui::SetActiveID(editor_id, window);
+        ImGui::SetFocusID(editor_id, window);
+        ImGui::FocusWindow(window);
+        ImGui::SetActiveIdUsingAllKeyboardKeys();
+        ImGui::SetNextFrameWantCaptureKeyboard(true);
+        ImGui::SetKeyOwner(ImGuiKey_Tab, editor_id);
+        ImGui::SetKeyOwner(ImGuiKey_LeftArrow, editor_id);
+        ImGui::SetKeyOwner(ImGuiKey_RightArrow, editor_id);
+        ImGui::SetKeyOwner(ImGuiKey_UpArrow, editor_id);
+        ImGui::SetKeyOwner(ImGuiKey_DownArrow, editor_id);
+        ImGui::SetKeyOwner(ImGuiKey_Backspace, editor_id);
+        ImGui::SetKeyOwner(ImGuiKey_Delete, editor_id);
+        ImGui::SetKeyOwner(ImGuiKey_Enter, editor_id);
+        ImGui::SetKeyOwner(ImGuiKey_KeypadEnter, editor_id);
+        changed |= ui_shader_code_editor_handle_input(ed, lines);
+        if (changed) {
+            ui_code_build_lines(ed->text, lines, &max_cols);
+            if (lines.empty()) {
+                UiCodeLine line = { ed->text, ed->text, 0 };
+                lines.push_back(line);
+            }
+        }
+    }
+
+    int cursor_line = ui_code_line_from_offset(lines, ui_code_clamp_offset(ed, ed->cursor));
+    int cursor_col = 0;
+    if (!lines.empty()) {
+        const UiCodeLine& line = lines[cursor_line];
+        const char* cursor_ptr = line.begin + (ed->cursor - line.offset);
+        if (cursor_ptr < line.begin) cursor_ptr = line.begin;
+        if (cursor_ptr > line.end) cursor_ptr = line.end;
+        cursor_col = ui_code_visual_cols_to(line.begin, cursor_ptr);
+    }
+
+    float content_w = gutter_w + (float)(max_cols + 8) * char_w;
+    float min_w = ImGui::GetWindowWidth() - ui_px(6.0f);
+    if (content_w < min_w)
+        content_w = min_w;
+    float content_h = (float)lines.size() * line_h + ui_px(12.0f);
+
+    if (ed->cursor_follow) {
+        float scroll_y = ImGui::GetScrollY();
+        float scroll_x = ImGui::GetScrollX();
+        float view_h = ImGui::GetWindowHeight() - ui_px(14.0f);
+        float view_w = ImGui::GetWindowWidth() - ui_px(18.0f);
+        float cursor_y = (float)cursor_line * line_h;
+        float cursor_x = gutter_w + (float)cursor_col * char_w;
+        if (cursor_y < scroll_y)
+            ImGui::SetScrollY(cursor_y);
+        else if (cursor_y + line_h > scroll_y + view_h)
+            ImGui::SetScrollY(cursor_y + line_h - view_h);
+        if (cursor_x < scroll_x)
+            ImGui::SetScrollX(cursor_x);
+        else if (cursor_x + char_w > scroll_x + view_w)
+            ImGui::SetScrollX(cursor_x + char_w - view_w);
+        ed->cursor_follow = false;
+    }
+
+    float scroll_y = ImGui::GetScrollY();
+    int first_line = (int)floorf(scroll_y / line_h) - 2;
+    int last_line = (int)ceilf((scroll_y + ImGui::GetWindowHeight()) / line_h) + 2;
+    if (first_line < 0) first_line = 0;
+    if (last_line > (int)lines.size()) last_line = (int)lines.size();
+
+    ImRect clip = window->ClipRect;
+    dl->PushClipRect(clip.Min, clip.Max, true);
+    UiHlslDrawPalette pal = ui_hlsl_draw_palette();
+    int sel_a = 0, sel_b = 0;
+    bool has_selection = ui_shader_editor_has_selection(ed);
+    if (has_selection)
+        ui_shader_editor_selection(ed, &sel_a, &sel_b);
+
+    for (int i = first_line; i < last_line; i++) {
+        const UiCodeLine& line = lines[i];
+        float y = origin.y + (float)i * line_h;
+        if (i == cursor_line && ed->editor_focused) {
+            dl->AddRectFilled(ImVec2(clip.Min.x, y),
+                              ImVec2(clip.Max.x, y + line_h),
+                              ImGui::GetColorU32(ImVec4(0.13f, 0.10f, 0.09f, 0.75f)));
+        }
+
+        if (has_selection) {
+            int line_start = line.offset;
+            int line_end = line.offset + (int)(line.end - line.begin);
+            if (sel_b >= line_start && sel_a <= line_end + 1) {
+                int a = sel_a > line_start ? sel_a : line_start;
+                int b = sel_b < line_end ? sel_b : line_end;
+                if (a <= b) {
+                    const char* pa = line.begin + (a - line_start);
+                    const char* pb = line.begin + (b - line_start);
+                    float x0 = origin.x + gutter_w + (float)ui_code_visual_cols_to(line.begin, pa) * char_w;
+                    float x1 = origin.x + gutter_w + (float)ui_code_visual_cols_to(line.begin, pb) * char_w;
+                    if (sel_b > line_end && b == line_end)
+                        x1 += char_w * 0.55f;
+                    if (x1 <= x0)
+                        x1 = x0 + char_w * 0.55f;
+                    dl->AddRectFilled(ImVec2(x0, y),
+                                      ImVec2(x1, y + line_h),
+                                      ImGui::GetColorU32(ImVec4(0.55f, 0.28f, 0.16f, 0.55f)));
+                }
+            }
+        }
+
+        char line_no[16] = {};
+        snprintf(line_no, sizeof(line_no), "%4d", i + 1);
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                    ImVec2(origin.x, y), pal.muted, line_no);
+        ui_hlsl_draw_line_at(dl, ImVec2(origin.x + gutter_w, y),
+                             line.begin, line.end, char_w, pal);
+    }
+
+    if (ed->editor_focused) {
+        double t = ImGui::GetTime();
+        if (fmod(t, 1.2) < 0.8) {
+            float x = origin.x + gutter_w + (float)cursor_col * char_w;
+            float y = origin.y + (float)cursor_line * line_h;
+            dl->AddLine(ImVec2(x, y + 1.0f),
+                        ImVec2(x, y + line_h - 1.0f),
+                        ImGui::GetColorU32(ImGuiCol_InputTextCursor), 1.0f);
+        }
+    }
+    dl->PopClipRect();
+
+    ImGui::Dummy(ImVec2(content_w, content_h));
+    ImGui::EndChild();
+    if (s_code_font)
+        ImGui::PopFont();
+    ImGui::PopStyleColor();
+    return changed;
+}
+
+static bool ui_shader_editor_load(UiShaderSourceEditor* ed, ResHandle h, const char* path) {
+    if (!ed)
+        return false;
+    free(ed->text);
+    ed->text = nullptr;
+    ed->cap = 0;
+    ed->ok = false;
+    ed->dirty = false;
+    ed->cursor = 0;
+    ed->select_anchor = 0;
+    ed->editor_focused = false;
+    ed->dragging_selection = false;
+    ed->cursor_follow = false;
+    ed->h = h;
+    strncpy(ed->path, path ? path : "", MAX_PATH_LEN - 1);
+    ed->path[MAX_PATH_LEN - 1] = '\0';
+
+    if (!ed->path[0])
+        return false;
+
+    void* data = nullptr;
+    size_t size = 0;
+    if (!lt_read_file(ed->path, &data, &size))
+        return false;
+
+    ed->cap = size + 4096;
+    if (ed->cap < 8192)
+        ed->cap = 8192;
+    ed->text = (char*)malloc(ed->cap);
+    if (!ed->text) {
+        lt_free_file(data);
+        ed->cap = 0;
+        return false;
+    }
+    memcpy(ed->text, data, size);
+    ed->text[size] = '\0';
+    lt_free_file(data);
+    ed->ok = true;
+    return true;
+}
+
+static bool ui_write_text_file_atomic(const char* path, const char* text) {
+    if (!path || !path[0] || !text)
+        return false;
+    char tmp_path[MAX_PATH_LEN + 16] = {};
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+
+    FILE* f = fopen(tmp_path, "wb");
+    if (!f)
+        return false;
+    size_t len = strlen(text);
+    bool ok = fwrite(text, 1, len, f) == len;
+    ok = fflush(f) == 0 && ok;
+    ok = fclose(f) == 0 && ok;
+    if (!ok) {
+        DeleteFileA(tmp_path);
+        return false;
+    }
+    if (!MoveFileExA(tmp_path, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(tmp_path);
+        return false;
+    }
+    return true;
+}
+
+static const char* ui_trim_line(const char* begin, const char* end, const char** trimmed_end) {
+    while (begin < end && (*begin == ' ' || *begin == '\t'))
+        begin++;
+    while (end > begin && (end[-1] == ' ' || end[-1] == '\t'))
+        end--;
+    if (trimmed_end)
+        *trimmed_end = end;
+    return begin;
+}
+
+static bool ui_line_starts_with(const char* begin, const char* end, const char* word) {
+    int len = (int)strlen(word);
+    if (end - begin < len)
+        return false;
+    if (strncmp(begin, word, len) != 0)
+        return false;
+    return end - begin == len || begin[len] == ' ' || begin[len] == '\t' || begin[len] == ':';
+}
+
+static void ui_hlsl_count_braces(const char* begin, const char* end, int* open_count, int* close_count) {
+    bool in_string = false;
+    bool in_char = false;
+    bool escape = false;
+    for (const char* p = begin; p < end; p++) {
+        if (!in_string && !in_char && p + 1 < end && p[0] == '/' && p[1] == '/')
+            break;
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if ((in_string || in_char) && *p == '\\') {
+            escape = true;
+            continue;
+        }
+        if (!in_char && *p == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (!in_string && *p == '\'') {
+            in_char = !in_char;
+            continue;
+        }
+        if (in_string || in_char)
+            continue;
+        if (*p == '{')
+            (*open_count)++;
+        else if (*p == '}')
+            (*close_count)++;
+    }
+}
+
+static char* ui_format_hlsl_tabs(const char* text) {
+    if (!text)
+        return nullptr;
+    size_t in_len = strlen(text);
+    size_t cap = in_len * 2 + 4096;
+    char* out = (char*)malloc(cap);
+    if (!out)
+        return nullptr;
+    size_t out_len = 0;
+    int indent = 0;
+    const char* line = text;
+    while (*line) {
+        const char* end = line;
+        while (*end && *end != '\n' && *end != '\r')
+            end++;
+        const char* trimmed_end = nullptr;
+        const char* trimmed = ui_trim_line(line, end, &trimmed_end);
+        bool empty = trimmed >= trimmed_end;
+        int line_indent = indent;
+        if (!empty && *trimmed == '}')
+            line_indent--;
+        if (!empty && (ui_line_starts_with(trimmed, trimmed_end, "case") ||
+                       ui_line_starts_with(trimmed, trimmed_end, "default")))
+            line_indent--;
+        if (line_indent < 0)
+            line_indent = 0;
+
+        size_t need = out_len + (size_t)line_indent + (size_t)(trimmed_end - trimmed) + 2;
+        if (need > cap) {
+            cap = need + 4096;
+            char* next = (char*)realloc(out, cap);
+            if (!next) {
+                free(out);
+                return nullptr;
+            }
+            out = next;
+        }
+        if (!empty) {
+            for (int i = 0; i < line_indent; i++)
+                out[out_len++] = '\t';
+            memcpy(out + out_len, trimmed, (size_t)(trimmed_end - trimmed));
+            out_len += (size_t)(trimmed_end - trimmed);
+        }
+        out[out_len++] = '\n';
+
+        int opens = 0;
+        int closes = 0;
+        ui_hlsl_count_braces(trimmed, trimmed_end, &opens, &closes);
+        indent += opens - closes;
+        if (indent < 0)
+            indent = 0;
+
+        if (*end == '\r' && end[1] == '\n')
+            line = end + 2;
+        else if (*end)
+            line = end + 1;
+        else
+            line = end;
+    }
+    out[out_len] = '\0';
+    return out;
+}
+
+static bool ui_shader_editor_save(UiShaderSourceEditor* ed, ResHandle h, Resource* r, bool compile_after) {
+    if (!ed || !ed->ok || !ed->text || !r)
+        return false;
+    if (s_shader_editor_format_on_save) {
+        char* formatted = ui_format_hlsl_tabs(ed->text);
+        if (formatted) {
+            size_t len = strlen(formatted);
+            if (len + 1 > ed->cap) {
+                char* next = (char*)realloc(ed->text, len + 4096);
+                if (next) {
+                    ed->text = next;
+                    ed->cap = len + 4096;
+                }
+            }
+            if (len + 1 <= ed->cap) {
+                memcpy(ed->text, formatted, len + 1);
+            }
+            free(formatted);
+        }
+    }
+    if (!ui_write_text_file_atomic(ed->path, ed->text)) {
+        log_error("Shader source save failed: %s", ed->path);
+        return false;
+    }
+    ed->dirty = false;
+    log_info("Shader source saved: %s", ed->path);
+    if (compile_after)
+        ui_recompile_shader_resource(h, r, r->path);
+    return true;
+}
+
+static void ui_shader_source_viewer(ResHandle h, Resource* r) {
+    static UiShaderSourceEditor ed = {};
+    const char* path = r ? r->path : "";
+    bool reload = ed.h != h || strcmp(ed.path, path ? path : "") != 0;
+
+    if (reload) {
+        ui_shader_editor_load(&ed, h, path);
+    }
+
+    if (ImGui::Button("Reload Source", ImVec2(-1.0f, 0.0f)))
+        ui_shader_editor_load(&ed, h, path);
+    if (ImGui::Button("Format", ImVec2(-1.0f, 0.0f))) {
+        char* formatted = ui_format_hlsl_tabs(ed.text);
+        if (formatted) {
+            size_t len = strlen(formatted);
+            if (len + 1 > ed.cap) {
+                char* next = (char*)realloc(ed.text, len + 4096);
+                if (next) {
+                    ed.text = next;
+                    ed.cap = len + 4096;
+                }
+            }
+            if (len + 1 <= ed.cap) {
+                memcpy(ed.text, formatted, len + 1);
+                ed.dirty = true;
+                ed.last_edit_time = ImGui::GetTime();
+            }
+            free(formatted);
+        }
+    }
+    if (ImGui::Button("Save", ImVec2(-1.0f, 0.0f)))
+        ui_shader_editor_save(&ed, h, r, false);
+    if (ImGui::Button("Save + Compile", ImVec2(-1.0f, 0.0f)))
+        ui_shader_editor_save(&ed, h, r, true);
+    ImGui::TextWrapped("Auto Save + Compile: %s  Format On Save: %s",
+        s_shader_editor_auto_save_compile ? "on" : "off",
+        s_shader_editor_format_on_save ? "on" : "off");
+
+    if (!ed.path[0]) {
+        ImGui::TextDisabled("No shader path.");
+        return;
+    }
+    if (!ed.ok || !ed.text) {
+        ImGui::TextDisabled("Could not read source: %s", ed.path);
+        return;
+    }
+
+    ImGui::TextDisabled("%zu bytes%s", strlen(ed.text), ed.dirty ? "  modified" : "");
+    ui_shader_code_editor(&ed);
+
+    if (s_shader_editor_auto_save_compile && ed.dirty && ImGui::GetTime() - ed.last_edit_time > 0.65)
+        ui_shader_editor_save(&ed, h, r, true);
 }
 
 static bool ui_tinted_transform_row(const char* label, float* v, float speed,
@@ -1434,10 +2732,16 @@ static void ui_command_shader_params(Command* c, Resource* shader) {
 
         ImGui::TextDisabled("Value");
         ImGui::SameLine(96.0f);
-        if (src && src->type == p.type)
+        UserCBSourceKind source_kind = p.source_kind;
+        if (source_kind == USER_CB_SOURCE_NONE && p.source != INVALID_HANDLE)
+            source_kind = USER_CB_SOURCE_RESOURCE;
+        if (source_kind != USER_CB_SOURCE_NONE) {
+            ImGui::TextDisabled("(source driven)");
+        } else if (src && src->type == p.type) {
             ui_user_cb_value_editor(p.type, src->ival, src->fval, 0.0f);
-        else
+        } else {
             ui_user_cb_value_editor(p.type, p.ival, p.fval, 0.0f);
+        }
 
         if (!p.enabled)
             ImGui::EndDisabled();
@@ -1948,6 +3252,7 @@ static bool ui_resource_row(int index, Resource& r) {
         if (ImGui::MenuItem("Delete")) {
             res_free(h);
             if (g_sel_res == h) g_sel_res = INVALID_HANDLE;
+            app_request_scene_render();
             deleted = true;
         }
         ImGui::EndPopup();
@@ -2075,7 +3380,7 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
         if (ImGui::InputText("##rename_cmd", s_rename_buf, MAX_NAME,
             ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll))
         {
-            strncpy(c.name, s_rename_buf, MAX_NAME - 1);
+            cmd_rename(h, s_rename_buf);
             s_rename_active = false;
         }
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) s_rename_active = false;
@@ -2237,7 +3542,10 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
             }
         }
         ImGui::Separator();
-        ImGui::MenuItem("Enabled", nullptr, &c.enabled);
+        if (ImGui::MenuItem("Enabled", nullptr, &c.enabled)) {
+            timeline_capture_if_tracked(TIMELINE_TRACK_COMMAND_ENABLED, c.name, RES_NONE);
+            app_request_scene_render();
+        }
         if (c.type == CMD_REPEAT) {
             if (ImGui::MenuItem("Add Dispatch Child")) {
                 char uname[MAX_NAME];
@@ -2269,6 +3577,7 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
         if (ImGui::MenuItem("Delete")) {
             cmd_free(h);
             if (g_sel_cmd == h) g_sel_cmd = INVALID_HANDLE;
+            app_request_scene_render();
             deleted = true;
         }
         ImGui::EndPopup();
@@ -3260,7 +4569,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
     }
 
     case RES_SHADER: {
-        ImGui::Text("Path: %s", r->path);
+        ImGui::TextWrapped("Path: %s", r->path);
         if (!r->compiled_ok) {
             ImGui::TextColored({1, 0.25f, 0.2f, 1}, "Status: FALLBACK");
         } else if (r->using_fallback) {
@@ -3268,9 +4577,12 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         } else {
             ImGui::TextColored({0.35f, 1, 0.45f, 1}, "Status: OK");
         }
-        if (r->compile_err[0])
-            ImGui::TextColored(r->compiled_ok ? ImVec4{1, 0.75f, 0.25f, 1} : ImVec4{1, 0.35f, 0.3f, 1},
-                "%s", r->compile_err);
+        if (r->compile_err[0]) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                r->compiled_ok ? ImVec4{1, 0.75f, 0.25f, 1} : ImVec4{1, 0.35f, 0.3f, 1});
+            ImGui::TextWrapped("%s", r->compile_err);
+            ImGui::PopStyleColor();
+        }
 
         static ResHandle shader_edit = INVALID_HANDLE;
         static char shader_path[MAX_PATH_LEN] = {};
@@ -3302,6 +4614,10 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
                 ui_recompile_shader_resource(h, r, r->path);
             }
         }
+
+        ui_inspector_section("SOURCE");
+        ui_shader_source_viewer(h, r);
+
         ImGui::Separator();
         if (r->shader_cb.active) {
             ImGui::Text("Reflected cbuffer: %s (b%u, %u bytes)",
@@ -3538,8 +4854,10 @@ static void ui_command_transform_editor(Command* c) {
 }
 
 static void ui_inspector_command(Command* c) {
-    if (ImGui::Checkbox("Enabled", &c->enabled))
+    if (ImGui::Checkbox("Enabled", &c->enabled)) {
         timeline_capture_if_tracked(TIMELINE_TRACK_COMMAND_ENABLED, c->name, RES_NONE);
+        app_request_scene_render();
+    }
 
     if (ui_command_has_transform(c))
         ui_command_transform_editor(c);
@@ -3731,6 +5049,7 @@ static void ui_inspector_command(Command* c) {
     case CMD_DISPATCH: {
         ui_inspector_section("COMPUTE");
         res_combo("Compute Shader##dp", &c->shader, RES_SHADER, false);
+        ImGui::Checkbox("Only On Reset", &c->compute_on_reset);
         res_combo_dispatch_source("Dispatch From##dp", &c->dispatch_size_source);
         if (c->dispatch_size_source != INVALID_HANDLE) {
             ImGui::InputInt3("Divisor XYZ", &c->thread_x);
@@ -3881,6 +5200,7 @@ static void ui_inspector_command(Command* c) {
     case CMD_INDIRECT_DISPATCH: {
         ui_inspector_section("INDIRECT COMMAND");
         res_combo("Shader##id", &c->shader, RES_SHADER, false);
+        ImGui::Checkbox("Only On Reset", &c->compute_on_reset);
         ui_inspector_section("SHADER PARAMETERS");
         ui_command_shader_params(c, res_get(c->shader));
         ui_inspector_section("INDIRECT BUFFER");
@@ -4183,7 +5503,8 @@ static void ui_panel_user_cb() {
 
         for (int i = 0; i < g_user_cb_count; i++) {
             UserCBEntry& e = g_user_cb_entries[i];
-            Resource* src = res_get(e.source);
+            user_cb_refresh_entry(i);
+            Resource* src = e.source_kind == USER_CB_SOURCE_RESOURCE ? res_get(e.source) : nullptr;
             ImGui::PushID(i);
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0); ImGui::Text("c%d", i);
@@ -4196,16 +5517,38 @@ static void ui_panel_user_cb() {
             ImGui::TableSetColumnIndex(4);
             ImGui::SetNextItemWidth(-1.f);
             bool user_changed = false;
-            if (ImGui::BeginCombo("##source", src ? ui_resource_display_name(*src) : "(hardcoded)")) {
-                if (ImGui::Selectable("(hardcoded)", e.source == INVALID_HANDLE)) {
+            char source_label[160] = {};
+            if (e.source_kind == USER_CB_SOURCE_RESOURCE && src) {
+                snprintf(source_label, sizeof(source_label), "%s", ui_resource_display_name(*src));
+            } else if (e.source_kind == USER_CB_SOURCE_COMMAND_POSITION) {
+                snprintf(source_label, sizeof(source_label), "%s Position", e.source_target);
+            } else if (e.source_kind == USER_CB_SOURCE_COMMAND_ROTATION) {
+                snprintf(source_label, sizeof(source_label), "%s Rotation", e.source_target);
+            } else if (e.source_kind == USER_CB_SOURCE_COMMAND_SCALE) {
+                snprintf(source_label, sizeof(source_label), "%s Scale", e.source_target);
+            } else if (e.source_kind == USER_CB_SOURCE_CAMERA_POSITION) {
+                snprintf(source_label, sizeof(source_label), "Camera Position");
+            } else if (e.source_kind == USER_CB_SOURCE_CAMERA_ROTATION) {
+                snprintf(source_label, sizeof(source_label), "Camera Rotation");
+            } else if (e.source_kind == USER_CB_SOURCE_DIRLIGHT_POSITION) {
+                snprintf(source_label, sizeof(source_label), "Dir Light Position");
+            } else if (e.source_kind == USER_CB_SOURCE_DIRLIGHT_TARGET) {
+                snprintf(source_label, sizeof(source_label), "Dir Light Target");
+            } else {
+                snprintf(source_label, sizeof(source_label), "(hardcoded)");
+            }
+            if (ImGui::BeginCombo("##source", source_label)) {
+                if (ImGui::Selectable("(hardcoded)", e.source_kind == USER_CB_SOURCE_NONE)) {
                     user_cb_set_source(i, INVALID_HANDLE);
                     user_changed = true;
                 }
+                ImGui::Separator();
+                ImGui::TextDisabled("Resources");
                 for (int r_i = 0; r_i < MAX_RESOURCES; r_i++) {
                     Resource& r = g_resources[r_i];
                     if (!r.active || r.is_builtin || r.type != e.type) continue;
                     ResHandle h = (ResHandle)(r_i + 1);
-                    bool sel = (e.source == h);
+                    bool sel = (e.source_kind == USER_CB_SOURCE_RESOURCE && e.source == h);
                     ImGui::PushID(r_i);
                     if (ImGui::Selectable(ui_resource_display_name(r), sel)) {
                         user_cb_set_source(i, h);
@@ -4213,12 +5556,51 @@ static void ui_panel_user_cb() {
                     }
                     ImGui::PopID();
                 }
+                if (e.type == RES_FLOAT3 || e.type == RES_FLOAT4) {
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Scene transforms");
+                    if (ImGui::Selectable("Camera Position", e.source_kind == USER_CB_SOURCE_CAMERA_POSITION)) {
+                        user_changed |= user_cb_set_scene_source(i, USER_CB_SOURCE_CAMERA_POSITION, "camera");
+                    }
+                    if (ImGui::Selectable("Camera Rotation", e.source_kind == USER_CB_SOURCE_CAMERA_ROTATION)) {
+                        user_changed |= user_cb_set_scene_source(i, USER_CB_SOURCE_CAMERA_ROTATION, "camera");
+                    }
+                    if (ImGui::Selectable("Dir Light Position", e.source_kind == USER_CB_SOURCE_DIRLIGHT_POSITION)) {
+                        user_changed |= user_cb_set_scene_source(i, USER_CB_SOURCE_DIRLIGHT_POSITION, "dirlight");
+                    }
+                    if (ImGui::Selectable("Dir Light Target", e.source_kind == USER_CB_SOURCE_DIRLIGHT_TARGET)) {
+                        user_changed |= user_cb_set_scene_source(i, USER_CB_SOURCE_DIRLIGHT_TARGET, "dirlight");
+                    }
+                    for (int c_i = 0; c_i < MAX_COMMANDS; c_i++) {
+                        Command& c = g_commands[c_i];
+                        if (!c.active || !ui_command_has_transform(&c))
+                            continue;
+                        ImGui::PushID(10000 + c_i);
+                        char item[128] = {};
+                        snprintf(item, sizeof(item), "%s Position", c.name);
+                        if (ImGui::Selectable(item, e.source_kind == USER_CB_SOURCE_COMMAND_POSITION &&
+                                                    strcmp(e.source_target, c.name) == 0)) {
+                            user_changed |= user_cb_set_scene_source(i, USER_CB_SOURCE_COMMAND_POSITION, c.name);
+                        }
+                        snprintf(item, sizeof(item), "%s Rotation", c.name);
+                        if (ImGui::Selectable(item, e.source_kind == USER_CB_SOURCE_COMMAND_ROTATION &&
+                                                    strcmp(e.source_target, c.name) == 0)) {
+                            user_changed |= user_cb_set_scene_source(i, USER_CB_SOURCE_COMMAND_ROTATION, c.name);
+                        }
+                        snprintf(item, sizeof(item), "%s Scale", c.name);
+                        if (ImGui::Selectable(item, e.source_kind == USER_CB_SOURCE_COMMAND_SCALE &&
+                                                    strcmp(e.source_target, c.name) == 0)) {
+                            user_changed |= user_cb_set_scene_source(i, USER_CB_SOURCE_COMMAND_SCALE, c.name);
+                        }
+                        ImGui::PopID();
+                    }
+                }
                 ImGui::EndCombo();
             }
             ImGui::TableSetColumnIndex(5);
-            src = res_get(e.source);
-            if (src && src->type == e.type)
-                user_changed |= ui_user_cb_value_editor(e.type, src->ival, src->fval);
+            src = e.source_kind == USER_CB_SOURCE_RESOURCE ? res_get(e.source) : nullptr;
+            if (e.source_kind != USER_CB_SOURCE_NONE)
+                ImGui::TextDisabled("(source driven)");
             else
                 user_changed |= ui_user_cb_value_editor(e.type, e.ival, e.fval);
             if (user_changed)
@@ -4329,6 +5711,25 @@ static void ui_panel_general(bool embedded = false) {
         ImGui::TextDisabled("Scales fonts and layout globally without changing project data.");
     }
 
+    if (ImGui::CollapsingHeader("Shader Editor", ImGuiTreeNodeFlags_DefaultOpen)) {
+        float font_size = ui_code_font_size();
+        if (ImGui::SliderFloat("Code Font Size", &font_size, 10.0f, 28.0f, "%.0f px")) {
+            ui_set_code_font_size(font_size);
+            settings_dirty = true;
+        }
+        bool auto_save_compile = ui_shader_auto_save_compile();
+        if (ImGui::Checkbox("Auto Save + Compile", &auto_save_compile)) {
+            ui_set_shader_auto_save_compile(auto_save_compile);
+            settings_dirty = true;
+        }
+        bool format_on_save = ui_shader_format_on_save();
+        if (ImGui::Checkbox("Format On Save", &format_on_save)) {
+            ui_set_shader_format_on_save(format_on_save);
+            settings_dirty = true;
+        }
+        ImGui::TextDisabled("Shader source editor defaults. Saved outside project files.");
+    }
+
     if (ImGui::CollapsingHeader("Application", ImGuiTreeNodeFlags_DefaultOpen)) {
         settings_dirty |= ImGui::Checkbox("VSync", &g_dx.vsync);
         ImGui::SameLine();
@@ -4336,9 +5737,15 @@ static void ui_panel_general(bool embedded = false) {
     }
 
     if (ImGui::CollapsingHeader("Viewport", ImGuiTreeNodeFlags_DefaultOpen)) {
-        settings_dirty |= ImGui::Checkbox("Show Grid", &g_dx.scene_grid_enabled);
-        settings_dirty |= ImGui::ColorEdit4("Grid Color", g_dx.scene_grid_color,
-            ImGuiColorEditFlags_Float | ImGuiColorEditFlags_AlphaBar);
+        if (ImGui::Checkbox("Show Grid", &g_dx.scene_grid_enabled)) {
+            settings_dirty = true;
+            app_request_scene_render();
+        }
+        if (ImGui::ColorEdit4("Grid Color", g_dx.scene_grid_color,
+            ImGuiColorEditFlags_Float | ImGuiColorEditFlags_AlphaBar)) {
+            settings_dirty = true;
+            app_request_scene_render();
+        }
         ImGui::TextDisabled("Infinite grid overlay on y=0. Alpha controls overall intensity.");
     }
 
@@ -4450,7 +5857,7 @@ static void ui_panel_log(bool embedded = false) {
         const char* prefix = "   ";
         if (e.level == LOG_WARN)  { col = {1.0f, 0.85f, 0.2f, 1.f};  prefix = "[W]"; }
         if (e.level == LOG_ERROR) { col = {1.0f, 0.35f, 0.3f, 1.f};  prefix = "[E]"; }
-        ImGui::TextColored(col, "%s %s", prefix, e.msg);
+        ImGui::TextColored(col, "[%s] %s %s", e.time[0] ? e.time : "--:--:--", prefix, e.msg);
     }
 
     if (g_log.scroll_to_bottom) {
@@ -5083,7 +6490,10 @@ enum UiIconKind {
     UI_ICON_FULLSCREEN_EXIT,
     UI_ICON_MAXIMIZE_SQUARE,
     UI_ICON_MINIMIZE,
-    UI_ICON_CLOSE
+    UI_ICON_CLOSE,
+    UI_ICON_TIMELINE,
+    UI_ICON_COMPILE,
+    UI_ICON_EXPORT_EXE
 };
 
 static const char* ui_svg_icon_path(UiIconKind icon) {
@@ -5102,6 +6512,9 @@ static const char* ui_svg_icon_path(UiIconKind icon) {
     case UI_ICON_MAXIMIZE_SQUARE:  return "assets/icons/lucide-square.svg";
     case UI_ICON_MINIMIZE:         return "assets/icons/lucide-minus.svg";
     case UI_ICON_CLOSE:            return "assets/icons/lucide-x.svg";
+    case UI_ICON_TIMELINE:         return "assets/icons/lucide-chart-no-axes-gantt.svg";
+    case UI_ICON_COMPILE:          return "assets/icons/lucide-hammer.svg";
+    case UI_ICON_EXPORT_EXE:       return "assets/icons/lucide-file-down.svg";
     default:                       return nullptr;
     }
 }
@@ -5127,6 +6540,9 @@ static NSVGimage* ui_svg_icon(UiIconKind icon) {
         { UI_ICON_MAXIMIZE_SQUARE, nullptr, false },
         { UI_ICON_MINIMIZE, nullptr, false },
         { UI_ICON_CLOSE, nullptr, false },
+        { UI_ICON_TIMELINE, nullptr, false },
+        { UI_ICON_COMPILE, nullptr, false },
+        { UI_ICON_EXPORT_EXE, nullptr, false },
     };
 
     for (int i = 0; i < (int)(sizeof(cache) / sizeof(cache[0])); i++) {
@@ -5328,11 +6744,13 @@ static bool ui_header_action_button(const char* action) {
         }
         if (clicked && strncmp(action, "Wireframe", 9) == 0) {
             g_dx.scene_wireframe = !g_dx.scene_wireframe;
+            app_request_scene_render();
             return true;
         }
         if (clicked && strncmp(action, "Grid", 4) == 0) {
             g_dx.scene_grid_enabled = !g_dx.scene_grid_enabled;
             app_settings_save();
+            app_request_scene_render();
             return true;
         }
         return clicked;
@@ -5745,6 +7163,7 @@ static void ui_draw_shortcuts_popup() {
             ui_draw_shortcut_row("I", "Insert or update key on selected slot");
             ui_draw_shortcut_row("Delete", "Delete key on selected slot");
             ui_draw_shortcut_row("Ctrl+C", "Copy selected key");
+            ui_draw_shortcut_row("Ctrl+X", "Cut selected key");
             ui_draw_shortcut_row("Ctrl+V", "Paste key into compatible selected slot");
             ImGui::EndTable();
         }
@@ -5901,6 +7320,16 @@ static void ui_timeline_paste_selected_slot() {
     app_request_scene_render();
 }
 
+static void ui_timeline_cut_selected_slot() {
+    if (!ui_timeline_slot_selection_valid())
+        return;
+    TimelineTrack& track = g_timeline_tracks[s_timeline_slot_selection.track_index];
+    if (timeline_find_key_index(track, s_timeline_slot_selection.frame) < 0)
+        return;
+    ui_timeline_copy_selected_slot();
+    timeline_delete_key(s_timeline_slot_selection.track_index, s_timeline_slot_selection.frame);
+}
+
 static void ui_timeline_delete_selected_slot() {
     if (!ui_timeline_slot_selection_valid())
         return;
@@ -5928,16 +7357,7 @@ static void ui_timeline_move_selection(int frame_delta, int track_delta) {
     if (frame >= timeline_length_frames()) frame = timeline_length_frames() - 1;
     ui_timeline_select_slot(track_index, frame);
     timeline_set_current_frame(frame);
-}
-
-static void ui_timeline_centered_text_disabled(const char* text) {
-    if (!text || !text[0])
-        return;
-    float avail = ImGui::GetContentRegionAvail().x;
-    float text_w = ImGui::CalcTextSize(text).x;
-    if (avail > text_w)
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + floorf((avail - text_w) * 0.5f));
-    ImGui::TextDisabled("%s", text);
+    s_timeline_ensure_current_visible = true;
 }
 
 static void ui_timeline_add_track_button(const char* label, TimelineTrackKind kind,
@@ -6042,12 +7462,23 @@ static void ui_timeline_draw_slot(int track_index, int frame, ImVec2 slot_size) 
     bool has_key = timeline_find_key_index(track, frame) >= 0;
     bool selected = ui_timeline_slot_selected(track_index, frame);
 
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    ImGui::InvisibleButton("##slot", slot_size);
+    ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
+    ImRect cell_rect(cursor_pos,
+                     ImVec2(cursor_pos.x + slot_size.x, cursor_pos.y + slot_size.y));
+    if (ImGuiTable* table = ImGui::GetCurrentTable())
+        cell_rect = ImGui::TableGetCellBgRect(table, ImGui::TableGetColumnIndex());
+    cell_rect.Min.x += ui_px(0.5f);
+    cell_rect.Max.x -= ui_px(0.5f);
+    cell_rect.Min.y += ui_px(0.5f);
+    cell_rect.Max.y -= ui_px(0.5f);
+
+    ImGui::SetCursorScreenPos(cell_rect.Min);
+    ImGui::InvisibleButton("##slot", cell_rect.GetSize());
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
         (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))) {
         ui_timeline_select_slot(track_index, frame);
         timeline_set_current_frame(frame);
+        s_timeline_ensure_current_visible = true;
     }
     if (ImGui::IsItemClicked(ImGuiMouseButton_Right))
         ui_timeline_select_slot(track_index, frame);
@@ -6057,10 +7488,12 @@ static void ui_timeline_draw_slot(int track_index, int frame, ImVec2 slot_size) 
             if (!timeline_capture_key(track_index, frame))
                 log_warn("Timeline: could not capture key.");
         }
-        if (has_key && ImGui::MenuItem("Copy Key"))
+        if (has_key && ImGui::MenuItem("Copy Key", "Ctrl+C"))
             ui_timeline_copy_selected_slot();
+        if (has_key && ImGui::MenuItem("Cut Key", "Ctrl+X"))
+            ui_timeline_cut_selected_slot();
         bool can_paste = ui_timeline_clipboard_compatible(track);
-        if (ImGui::MenuItem("Paste Key", nullptr, false, can_paste))
+        if (ImGui::MenuItem("Paste Key", "Ctrl+V", false, can_paste))
             ui_timeline_paste_selected_slot();
         if (has_key && ImGui::MenuItem("Delete Key"))
             timeline_delete_key(track_index, frame);
@@ -6068,7 +7501,8 @@ static void ui_timeline_draw_slot(int track_index, int frame, ImVec2 slot_size) 
     }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 q = ImVec2(p.x + slot_size.x, p.y + slot_size.y);
+    ImVec2 p = cell_rect.Min;
+    ImVec2 q = cell_rect.Max;
     bool hovered = ImGui::IsItemHovered();
     if (hovered)
         dl->AddRectFilled(p, q, ImGui::GetColorU32(ImVec4(0.31f, 0.17f, 0.08f, 0.46f)),
@@ -6127,14 +7561,20 @@ static void ui_draw_timeline_window() {
     ImGuiIO& io = ImGui::GetIO();
     bool track_enabled = timeline_enabled();
     bool timeline_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    bool timeline_hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows);
     s_timeline_keyboard_focus = timeline_focused;
     bool timeline_nav_active = track_enabled && timeline_focused &&
                                !io.WantTextInput && !ImGui::IsAnyItemActive() &&
                                !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+    bool timeline_mouse_nav_active = track_enabled && timeline_hovered &&
+                                     !io.WantTextInput && !ImGui::IsAnyItemActive() &&
+                                     !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
     if (timeline_nav_active) {
         int step = io.KeyShift ? 10 : 1;
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false))
             ui_timeline_copy_selected_slot();
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X, false))
+            ui_timeline_cut_selected_slot();
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V, false))
             ui_timeline_paste_selected_slot();
         if (ImGui::IsKeyPressed(ImGuiKey_Delete, false))
@@ -6144,14 +7584,18 @@ static void ui_draw_timeline_window() {
         if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false)) {
             if (ui_timeline_slot_selection_valid())
                 ui_timeline_move_selection(-step, 0);
-            else
+            else {
                 timeline_set_current_frame(timeline_current_frame() - step);
+                s_timeline_ensure_current_visible = true;
+            }
         }
         if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false)) {
             if (ui_timeline_slot_selection_valid())
                 ui_timeline_move_selection(step, 0);
-            else
+            else {
                 timeline_set_current_frame(timeline_current_frame() + step);
+                s_timeline_ensure_current_visible = true;
+            }
         }
         if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false))
             ui_timeline_move_selection(0, -1);
@@ -6161,11 +7605,13 @@ static void ui_draw_timeline_window() {
             if (ui_timeline_slot_selection_valid())
                 ui_timeline_move_selection(-timeline_length_frames(), 0);
             timeline_set_current_frame(0);
+            s_timeline_ensure_current_visible = true;
         }
         if (ImGui::IsKeyPressed(ImGuiKey_End, false)) {
             if (ui_timeline_slot_selection_valid())
                 ui_timeline_move_selection(timeline_length_frames(), 0);
             timeline_set_current_frame(timeline_length_frames() - 1);
+            s_timeline_ensure_current_visible = true;
         }
     }
 
@@ -6178,8 +7624,10 @@ static void ui_draw_timeline_window() {
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.24f, 0.12f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.58f, 0.30f, 0.14f, 1.0f));
     }
-    if (ImGui::Button(track_enabled ? "Track" : "No Track"))
+    if (ImGui::Button(track_enabled ? "Track" : "No Track")) {
         timeline_set_enabled(!track_enabled);
+        app_request_scene_render();
+    }
     if (track_enabled)
         ImGui::PopStyleColor(3);
     ImGui::SameLine(0.0f, ui_margin_px(18.0f));
@@ -6216,28 +7664,65 @@ static void ui_draw_timeline_window() {
     ui_timeline_add_tracks();
     ImGui::Separator();
 
+    ImVec2 slot_size = ImVec2(ui_px(22.0f * s_timeline_slot_zoom), ui_px(18.0f));
+    const float col_w = slot_size.x + ui_px(2.0f);
+    const float track_col_w = ui_px(210.0f);
     int max_visible_frames = (int)(40.0f / s_timeline_slot_zoom);
     if (max_visible_frames < 24) max_visible_frames = 24;
     if (max_visible_frames > 80) max_visible_frames = 80;
+    int fit_visible_frames = (int)((ImGui::GetContentRegionAvail().x - track_col_w) / col_w);
+    if (fit_visible_frames < 8) fit_visible_frames = 8;
     int visible_count = timeline_length_frames();
     if (visible_count > max_visible_frames)
         visible_count = max_visible_frames;
-    int visible_first = timeline_current_frame() - visible_count / 2;
+    if (visible_count > fit_visible_frames)
+        visible_count = fit_visible_frames;
     int max_first_frame = timeline_length_frames() - visible_count;
     if (max_first_frame < 0) max_first_frame = 0;
-    if (visible_first < 0) visible_first = 0;
-    if (visible_first > max_first_frame) visible_first = max_first_frame;
+    if (s_timeline_ensure_current_visible) {
+        int current = timeline_current_frame();
+        if (current < s_timeline_visible_first_frame)
+            s_timeline_visible_first_frame = current;
+        else if (current >= s_timeline_visible_first_frame + visible_count)
+            s_timeline_visible_first_frame = current - visible_count + 1;
+        s_timeline_ensure_current_visible = false;
+    }
+    if (s_timeline_visible_first_frame < 0) s_timeline_visible_first_frame = 0;
+    if (s_timeline_visible_first_frame > max_first_frame) s_timeline_visible_first_frame = max_first_frame;
+    if (timeline_mouse_nav_active) {
+        float wheel = io.MouseWheelH;
+        if (io.KeyShift)
+            wheel += io.MouseWheel;
+        if (wheel != 0.0f) {
+            int wheel_step = io.KeyCtrl ? 12 : 5;
+            s_timeline_visible_first_frame -= (int)(wheel * (float)wheel_step);
+            if (s_timeline_visible_first_frame < 0) s_timeline_visible_first_frame = 0;
+            if (s_timeline_visible_first_frame > max_first_frame) s_timeline_visible_first_frame = max_first_frame;
+        }
+    }
+    ImGui::SetNextItemWidth(-1.0f);
+    if (max_first_frame > 0) {
+        ImGui::SliderInt("##timeline_scroll", &s_timeline_visible_first_frame,
+                         0, max_first_frame, "first %d", ImGuiSliderFlags_NoInput);
+    } else {
+        int zero = 0;
+        ImGui::BeginDisabled();
+        ImGui::SliderInt("##timeline_scroll", &zero, 0, 0, "first 0", ImGuiSliderFlags_NoInput);
+        ImGui::EndDisabled();
+    }
+    if (s_timeline_visible_first_frame < 0) s_timeline_visible_first_frame = 0;
+    if (s_timeline_visible_first_frame > max_first_frame) s_timeline_visible_first_frame = max_first_frame;
+    int visible_first = s_timeline_visible_first_frame;
     int visible_last = visible_first + visible_count;
 
-    ImVec2 slot_size = ImVec2(ui_px(22.0f * s_timeline_slot_zoom), ui_px(18.0f));
-    const float col_w = slot_size.x + ui_px(2.0f);
-    ImGuiTableFlags flags = ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY |
+    int pending_length_frames = -1;
+    ImGuiTableFlags flags = ImGuiTableFlags_ScrollY |
         ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
         ImGuiTableFlags_BordersOuterV | ImGuiTableFlags_SizingFixedFit;
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(ui_px(1.0f), ui_px(2.0f)));
     if (ImGui::BeginTable("##timeline_table", visible_count + 1, flags, ImVec2(0.0f, 0.0f))) {
         ImGui::TableSetupScrollFreeze(1, 1);
-        ImGui::TableSetupColumn("Track", ImGuiTableColumnFlags_WidthFixed, ui_px(210.0f));
+        ImGui::TableSetupColumn("Track", ImGuiTableColumnFlags_WidthFixed, track_col_w);
         for (int f = visible_first; f < visible_last; f++) {
             char label[16] = {};
             if (f % 5 == 0)
@@ -6250,14 +7735,33 @@ static void ui_draw_timeline_window() {
         ImGui::TextDisabled("Track");
         for (int f = visible_first; f < visible_last; f++) {
             ImGui::TableSetColumnIndex((f - visible_first) + 1);
+            ImGui::PushID(f);
             if (f == timeline_current_frame())
                 ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg,
                     ImGui::GetColorU32(ImVec4(0.25f, 0.13f, 0.07f, 0.78f)));
+            ImVec2 header_pos = ImGui::GetCursorScreenPos();
+            ImRect header_rect(header_pos,
+                               ImVec2(header_pos.x + col_w,
+                                      header_pos.y + ImGui::GetFrameHeight()));
+            if (ImGuiTable* table = ImGui::GetCurrentTable())
+                header_rect = ImGui::TableGetCellBgRect(table, ImGui::TableGetColumnIndex());
+            ImGui::SetCursorScreenPos(header_rect.Min);
+            ImGui::InvisibleButton("##frame_header", header_rect.GetSize());
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+                pending_length_frames = f + 1;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Set timeline length to %d frames", f + 1);
             if (f % 5 == 0) {
                 char label[16] = {};
                 snprintf(label, sizeof(label), "%d", f);
-                ui_timeline_centered_text_disabled(label);
+                ImVec2 ts = ImGui::CalcTextSize(label);
+                ImGui::GetWindowDrawList()->AddText(
+                    ImVec2(floorf((header_rect.Min.x + header_rect.Max.x - ts.x) * 0.5f),
+                           floorf((header_rect.Min.y + header_rect.Max.y - ts.y) * 0.5f)),
+                    ImGui::GetColorU32(ImVec4(0.55f, 0.52f, 0.50f, 1.0f)),
+                    label);
             }
+            ImGui::PopID();
         }
 
         for (int t = 0; t < g_timeline_track_count; t++) {
@@ -6271,7 +7775,10 @@ static void ui_draw_timeline_window() {
             char label[128] = {};
             ui_timeline_track_label(track, label, sizeof(label));
             bool missing = !timeline_track_target_exists(track);
-            if (missing)
+            if (ImGui::Checkbox("##track_enabled", &track.enabled))
+                app_request_scene_render();
+            ImGui::SameLine(0.0f, ui_margin_px(5.0f));
+            if (missing || !track.enabled)
                 ImGui::TextDisabled("%s", label);
             else
                 ImGui::TextUnformatted(label);
@@ -6307,6 +7814,8 @@ static void ui_draw_timeline_window() {
         ImGui::EndTable();
     }
     ImGui::PopStyleVar();
+    if (pending_length_frames > 0)
+        timeline_set_length_frames(pending_length_frames);
 
     if (!track_enabled)
         ImGui::EndDisabled();
@@ -6366,12 +7875,8 @@ static void ui_top_bar() {
     }
     ImGui::SameLine();
     ui_align_frame_row(row_y);
-    if (ImGui::Button("Compile"))
+    if (ui_icon_button("##compile_button", UI_ICON_COMPILE, ImVec2(ui_px(28.0f), 0.0f), "Compile shaders"))
         ui_recompile_all_shaders();
-    ImGui::SameLine();
-    ui_align_frame_row(row_y);
-    if (ImGui::Button("Export EXE"))
-        ui_export_current_project_single_exe();
     ImGui::SameLine();
     ui_align_frame_row(row_y);
     bool timeline_was_open = s_timeline_window_open;
@@ -6380,10 +7885,14 @@ static void ui_top_bar() {
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.24f, 0.12f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.58f, 0.30f, 0.14f, 1.0f));
     }
-    if (ImGui::Button("Timeline"))
+    if (ui_icon_button("##timeline_button", UI_ICON_TIMELINE, ImVec2(ui_px(28.0f), 0.0f), "Timeline"))
         s_timeline_window_open = !s_timeline_window_open;
     if (timeline_was_open)
         ImGui::PopStyleColor(3);
+    ImGui::SameLine();
+    ui_align_frame_row(row_y);
+    if (ui_icon_button("##export_exe_button", UI_ICON_EXPORT_EXE, ImVec2(ui_px(28.0f), 0.0f), "Export EXE"))
+        ui_export_current_project_single_exe();
     ImGui::SameLine(0.0f, ui_margin_px(6.0f));
     ui_align_frame_row(row_y);
     if (ui_icon_button("##shortcuts_button", UI_ICON_HELP, ImVec2(ui_px(28.0f), 0.0f), "Shortcuts"))
@@ -6625,6 +8134,7 @@ static void ui_delete_selection() {
         cmd_free(g_sel_cmd);
         s_cmd_nav = INVALID_HANDLE;
         g_sel_cmd = INVALID_HANDLE;
+        app_request_scene_render();
         return;
     }
 
@@ -6635,14 +8145,18 @@ static void ui_delete_selection() {
         res_free(g_sel_res);
         s_res_nav = INVALID_HANDLE;
         g_sel_res = INVALID_HANDLE;
+        app_request_scene_render();
     }
 }
 
 static void ui_toggle_selected_command_enabled() {
     if (g_sel_cmd == INVALID_HANDLE)
         return;
-    if (Command* c = cmd_get(g_sel_cmd))
+    if (Command* c = cmd_get(g_sel_cmd)) {
         c->enabled = !c->enabled;
+        timeline_capture_if_tracked(TIMELINE_TRACK_COMMAND_ENABLED, c->name, RES_NONE);
+        app_request_scene_render();
+    }
 }
 
 void ui_set_global_scale(float scale) {
@@ -6652,6 +8166,30 @@ void ui_set_global_scale(float scale) {
 
 float ui_global_scale() {
     return s_ui_global_scale;
+}
+
+void ui_set_code_font_size(float size) {
+    s_code_font_size = clampf(size, 10.0f, 28.0f);
+}
+
+float ui_code_font_size() {
+    return s_code_font_size;
+}
+
+void ui_set_shader_auto_save_compile(bool enabled) {
+    s_shader_editor_auto_save_compile = enabled;
+}
+
+bool ui_shader_auto_save_compile() {
+    return s_shader_editor_auto_save_compile;
+}
+
+void ui_set_shader_format_on_save(bool enabled) {
+    s_shader_editor_format_on_save = enabled;
+}
+
+bool ui_shader_format_on_save() {
+    return s_shader_editor_format_on_save;
 }
 
 void ui_init() {
@@ -6666,6 +8204,10 @@ void ui_init() {
         io.FontDefault = ui_font;
     else
         io.Fonts->AddFontDefault();
+    ImFontConfig code_cfg = {};
+    code_cfg.SizePixels = s_code_font_size;
+    code_cfg.PixelSnapH = true;
+    s_code_font = io.Fonts->AddFontDefaultBitmap(&code_cfg);
 
     ui_apply_gray_tool_style();
     s_ui_base_style = ImGui::GetStyle();

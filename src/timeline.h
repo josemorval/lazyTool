@@ -26,6 +26,7 @@ struct TimelineKey {
 
 struct TimelineTrack {
     bool              active;
+    bool              enabled;
     TimelineTrackKind kind;
     char              target[MAX_NAME];
     ResType           value_type;
@@ -55,6 +56,8 @@ void timeline_set_play_dir(int dir);
 
 int  timeline_add_track(TimelineTrackKind kind, const char* target, ResType value_type);
 void timeline_delete_track(int track_index);
+void timeline_delete_tracks_for_command(const char* target);
+void timeline_rename_tracks_for_command(const char* old_target, const char* new_target);
 int  timeline_find_track(TimelineTrackKind kind, const char* target, ResType value_type);
 bool timeline_track_target_exists(const TimelineTrack& track);
 const char* timeline_track_kind_token(TimelineTrackKind kind);

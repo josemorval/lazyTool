@@ -89,6 +89,18 @@ enum {
     SHADER_STAGE_COMPUTE = 1 << 2
 };
 
+typedef enum {
+    USER_CB_SOURCE_NONE = 0,
+    USER_CB_SOURCE_RESOURCE,
+    USER_CB_SOURCE_COMMAND_POSITION,
+    USER_CB_SOURCE_COMMAND_ROTATION,
+    USER_CB_SOURCE_COMMAND_SCALE,
+    USER_CB_SOURCE_CAMERA_POSITION,
+    USER_CB_SOURCE_CAMERA_ROTATION,
+    USER_CB_SOURCE_DIRLIGHT_POSITION,
+    USER_CB_SOURCE_DIRLIGHT_TARGET
+} UserCBSourceKind;
+
 struct ShaderCBVar {
     char     name[MAX_NAME];
     ResType  type;
@@ -122,6 +134,8 @@ struct CommandParam {
     char      name[MAX_NAME];
     ResType   type;
     ResHandle source;
+    UserCBSourceKind source_kind;
+    char      source_target[MAX_NAME];
     int       ival[4];
     float     fval[4];
 };
@@ -262,6 +276,7 @@ struct Command {
 
     int      instance_count;
     int      thread_x, thread_y, thread_z;
+    bool     compute_on_reset;
     // Optional source for dispatch dimensions. When this is set, thread_x/y/z
     // stop meaning "explicit dispatch counts" and become divisors applied to
     // the source size. That lets a command express "dispatch from texture
@@ -287,6 +302,8 @@ struct UserCBEntry {
     char      name[MAX_NAME];
     ResType   type;
     ResHandle source;
+    UserCBSourceKind source_kind;
+    char      source_target[MAX_NAME];
     int       ival[4];
     float     fval[4];
 };

@@ -342,6 +342,7 @@ static uint64_t g_frame          = 0;
 static bool     g_restart_scene_requested = false;
 static bool     g_scene_paused = false;
 static bool     g_scene_render_requested = false;
+static bool     g_scene_reset_execution_pending = true;
 static CmdHandle g_default_pixelize_cmd = INVALID_HANDLE;
 static bool     g_player_mode = false;
 
@@ -391,6 +392,7 @@ static void app_restart_scene_runtime() {
     g_time = 0.0f;
     g_dt = 0.0f;
     g_frame = 0;
+    g_scene_reset_execution_pending = true;
     dx_create_scene_rt(g_dx.scene_width, g_dx.scene_height);
     Resource* dl = res_get(g_builtin_dirlight);
     if (dl && dl->shadow_width > 0 && dl->shadow_height > 0)
@@ -1235,7 +1237,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
             // Scene render
             dx_begin_scene();
+            cmd_set_reset_execution(g_scene_reset_execution_pending);
             cmd_execute_all();
+            cmd_set_reset_execution(false);
+            g_scene_reset_execution_pending = false;
             dx_render_scene_grid_overlay();
             dx_end_scene();
         }

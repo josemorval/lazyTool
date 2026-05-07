@@ -491,6 +491,7 @@ static bool project_line_is_known_default(const char* line) {
         strcmp(line, "vertex_count 3") == 0 ||
         strcmp(line, "instance 1") == 0 ||
         strcmp(line, "threads 1 1 1") == 0 ||
+        strcmp(line, "compute_on_reset 0") == 0 ||
         strcmp(line, "dispatch_from -") == 0 ||
         strcmp(line, "indirect_args - 0") == 0 ||
         strcmp(line, "repeat 1 1") == 0 ||

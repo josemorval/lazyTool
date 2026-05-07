@@ -20,7 +20,12 @@ bool user_cb_type_supported(ResType type);
 bool user_cb_add_var(const char* name, ResType type);
 bool user_cb_add_from_resource(ResHandle h);
 bool user_cb_set_source(int idx, ResHandle h);
+bool user_cb_set_scene_source(int idx, UserCBSourceKind kind, const char* target);
+void user_cb_refresh_entry(int idx);
+const char* user_cb_source_kind_token(UserCBSourceKind kind);
+UserCBSourceKind user_cb_source_kind_from_token(const char* token);
 void user_cb_detach_resource(ResHandle h);
+void user_cb_rename_command_references(const char* old_name, const char* new_name);
 void user_cb_remove(int idx);
 void user_cb_move(int from, int to);
 int  user_cb_slot_offset(int idx); // always idx * 16
