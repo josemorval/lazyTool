@@ -70,6 +70,8 @@ static float s_code_font_size = 16.0f;
 static bool s_shader_editor_auto_save_compile = false;
 static bool s_shader_source_editor_focused = false;
 
+static ResHandle ui_resource_handle_from_ptr(const Resource* r);
+
 enum UiViewportGizmoMode {
     UI_GIZMO_NONE = 0,
     UI_GIZMO_TRANSLATE,
@@ -458,16 +460,32 @@ static bool ui_reload_mesh_resource(Resource* r, const char* path) {
     if (!r || r->type != RES_MESH || !path || !path[0])
         return false;
 
-    strncpy(r->path, path, MAX_PATH_LEN - 1);
-    r->path[MAX_PATH_LEN - 1] = '\0';
-    res_release_gpu(r);
+    ResHandle owner_h = ui_resource_handle_from_ptr(r);
+    if (owner_h == INVALID_HANDLE)
+        return false;
 
-    ResHandle tmp = res_load_mesh(r->name, r->path);
+    char local_path[MAX_PATH_LEN] = {};
+    strncpy(local_path, path, MAX_PATH_LEN - 1);
+    local_path[MAX_PATH_LEN - 1] = '\0';
+
+    // Load into a temporary mesh first. The glTF importer creates embedded
+    // texture resources as generated children of that temporary mesh. Once the
+    // import succeeds, transfer those children to the mesh being edited before
+    // deleting the temporary mesh; otherwise the material slots would point at
+    // freed textures and show up as "(deleted)" in the inspector.
+    ResHandle tmp = res_load_mesh(r->name, local_path);
     if (tmp == INVALID_HANDLE)
         return false;
 
     Resource* src = res_get(tmp);
     if (src) {
+        res_free_generated_children(owner_h);
+        res_reassign_generated_children(tmp, owner_h);
+
+        strncpy(r->path, local_path, MAX_PATH_LEN - 1);
+        r->path[MAX_PATH_LEN - 1] = '\0';
+        res_release_gpu(r);
+
         r->vb = src->vb; r->ib = src->ib;
         r->vert_count = src->vert_count;
         r->idx_count  = src->idx_count;
@@ -4829,46 +4847,70 @@ static void ui_command_transform_editor(Command* c) {
         timeline_capture_if_tracked(TIMELINE_TRACK_COMMAND_TRANSFORM, c->name, RES_NONE);
 }
 
-static bool ui_user_cb_source_combo(const char* label, char* source_name, ResType type_a, ResType type_b = RES_NONE) {
+static Resource* ui_clear_source_resource(const char* source_name, ResType type) {
+    if (!source_name || !source_name[0])
+        return nullptr;
+    Resource* r = res_get(res_find_by_name(source_name));
+    return (r && r->type == type) ? r : nullptr;
+}
+
+static bool ui_clear_resource_source_combo(const char* label, char* source_name, ResType type) {
     if (!source_name)
         return false;
 
-    const UserCBEntry* current = user_cb_get(source_name);
+    Resource* current = ui_clear_source_resource(source_name, type);
+    const UserCBEntry* legacy_user_cb = current ? nullptr : user_cb_get(source_name);
     char preview[160] = {};
-    if (current && (current->type == type_a || current->type == type_b)) {
-        snprintf(preview, sizeof(preview), "%s", current->name);
+    if (current) {
+        snprintf(preview, sizeof(preview), "%s", ui_resource_display_name(*current));
+    } else if (legacy_user_cb && legacy_user_cb->type == type) {
+        snprintf(preview, sizeof(preview), "UserCB: %s", legacy_user_cb->name);
     } else if (source_name[0]) {
         snprintf(preview, sizeof(preview), "(missing) %s", source_name);
     } else {
-        snprintf(preview, sizeof(preview), "(manual)");
+        snprintf(preview, sizeof(preview), "(hardcoded)");
     }
 
     bool changed = false;
     ImGui::SetNextItemWidth(-1.0f);
     if (ImGui::BeginCombo(label, preview)) {
-        bool manual = source_name[0] == '\0';
-        if (ImGui::Selectable("(manual)", manual)) {
+        bool hardcoded = source_name[0] == '\0';
+        if (ImGui::Selectable("(hardcoded)", hardcoded)) {
             source_name[0] = '\0';
             changed = true;
         }
         ImGui::Separator();
-        for (int i = 0; i < g_user_cb_count; i++) {
-            UserCBEntry& e = g_user_cb_entries[i];
-            if (e.type != type_a && e.type != type_b)
+        ImGui::TextDisabled("Resources");
+        bool any_resource = false;
+        for (int i = 0; i < MAX_RESOURCES; i++) {
+            Resource& r = g_resources[i];
+            if (!r.active || r.is_builtin || r.type != type)
                 continue;
-            bool selected = strcmp(source_name, e.name) == 0;
+            any_resource = true;
+            bool selected = current == &r;
             ImGui::PushID(i);
-            if (ImGui::Selectable(e.name, selected)) {
-                strncpy(source_name, e.name, MAX_NAME - 1);
+            if (ImGui::Selectable(ui_resource_display_name(r), selected)) {
+                strncpy(source_name, r.name, MAX_NAME - 1);
                 source_name[MAX_NAME - 1] = '\0';
                 changed = true;
             }
             ImGui::PopID();
         }
+        if (!any_resource)
+            ImGui::TextDisabled("No %s resources.", res_type_str(type));
         ImGui::EndCombo();
     }
     return changed;
 }
+
+static bool ui_clear_source_valid(const char* source_name, ResType type) {
+    Resource* r = ui_clear_source_resource(source_name, type);
+    if (r)
+        return true;
+    const UserCBEntry* e = user_cb_get(source_name);
+    return e && e->type == type;
+}
+
 
 static void ui_inspector_command(Command* c) {
     if (ImGui::Checkbox("Enabled", &c->enabled)) {
@@ -4947,19 +4989,29 @@ static void ui_inspector_command(Command* c) {
         bool clear_changed = false;
         clear_changed |= ImGui::Checkbox("Clear Color", &c->clear_color_enabled);
         if (c->clear_color_enabled) {
-            clear_changed |= ui_user_cb_source_combo("Color Source", c->clear_color_source, RES_FLOAT3, RES_FLOAT4);
-            if (c->clear_color_source[0]) {
-                ImGui::TextWrapped("Clear color is driven by UserCB '%s'.", c->clear_color_source);
+            clear_changed |= ui_clear_resource_source_combo("Color Source", c->clear_color_source, RES_FLOAT4);
+            Resource* color_res = ui_clear_source_resource(c->clear_color_source, RES_FLOAT4);
+            if (color_res) {
+                ImGui::TextWrapped("Clear color is driven by resource '%s'.", color_res->name);
+            } else if (ui_clear_source_valid(c->clear_color_source, RES_FLOAT4)) {
+                ImGui::TextWrapped("Clear color is driven by legacy UserCB float4 '%s'.", c->clear_color_source);
             } else {
+                if (c->clear_color_source[0])
+                    ImGui::TextWrapped("Selected color source is missing or not float4; using the hardcoded fallback value.");
                 clear_changed |= ImGui::ColorEdit4("Clear Color Value", c->clear_color);
             }
         }
         clear_changed |= ImGui::Checkbox("Clear Depth", &c->clear_depth);
         if (c->clear_depth) {
-            clear_changed |= ui_user_cb_source_combo("Depth Source", c->clear_depth_source, RES_FLOAT);
-            if (c->clear_depth_source[0]) {
-                ImGui::TextWrapped("Depth clear is driven by UserCB '%s'.", c->clear_depth_source);
+            clear_changed |= ui_clear_resource_source_combo("Depth Source", c->clear_depth_source, RES_FLOAT);
+            Resource* depth_res = ui_clear_source_resource(c->clear_depth_source, RES_FLOAT);
+            if (depth_res) {
+                ImGui::TextWrapped("Depth clear is driven by resource '%s'.", depth_res->name);
+            } else if (ui_clear_source_valid(c->clear_depth_source, RES_FLOAT)) {
+                ImGui::TextWrapped("Depth clear is driven by legacy UserCB float '%s'.", c->clear_depth_source);
             } else {
+                if (c->clear_depth_source[0])
+                    ImGui::TextWrapped("Selected depth source is missing or not float; using the hardcoded fallback value.");
                 clear_changed |= ImGui::DragFloat("Depth Value", &c->depth_clear_val, 0.01f, 0.f, 1.f);
             }
         }

@@ -598,6 +598,11 @@ const UserCBEntry* user_cb_get(const char* name) {
     return idx >= 0 ? &g_user_cb_entries[idx] : nullptr;
 }
 
+static bool user_cb_clear_source_is_resource(const char* source_name, ResType type) {
+    Resource* r = res_get(res_find_by_name(source_name));
+    return r && r->type == type;
+}
+
 void user_cb_rename_variable_references(const char* old_name, const char* new_name) {
     if (!old_name || !old_name[0] || !new_name || !new_name[0] ||
         strcmp(old_name, new_name) == 0)
@@ -608,11 +613,13 @@ void user_cb_rename_variable_references(const char* old_name, const char* new_na
         Command& c = g_commands[c_i];
         if (!c.active)
             continue;
-        if (strcmp(c.clear_color_source, old_name) == 0) {
+        if (strcmp(c.clear_color_source, old_name) == 0 &&
+            !user_cb_clear_source_is_resource(old_name, RES_FLOAT4)) {
             strncpy(c.clear_color_source, new_name, MAX_NAME - 1);
             c.clear_color_source[MAX_NAME - 1] = '\0';
         }
-        if (strcmp(c.clear_depth_source, old_name) == 0) {
+        if (strcmp(c.clear_depth_source, old_name) == 0 &&
+            !user_cb_clear_source_is_resource(old_name, RES_FLOAT)) {
             strncpy(c.clear_depth_source, new_name, MAX_NAME - 1);
             c.clear_depth_source[MAX_NAME - 1] = '\0';
         }
@@ -628,9 +635,11 @@ void user_cb_delete_variable_references(const char* name) {
         Command& c = g_commands[c_i];
         if (!c.active)
             continue;
-        if (strcmp(c.clear_color_source, name) == 0)
+        if (strcmp(c.clear_color_source, name) == 0 &&
+            !user_cb_clear_source_is_resource(name, RES_FLOAT4))
             c.clear_color_source[0] = '\0';
-        if (strcmp(c.clear_depth_source, name) == 0)
+        if (strcmp(c.clear_depth_source, name) == 0 &&
+            !user_cb_clear_source_is_resource(name, RES_FLOAT))
             c.clear_depth_source[0] = '\0';
     }
 }
@@ -650,6 +659,21 @@ void user_cb_rename_resource_references(ResHandle h, const char* old_name, const
         if (strcmp(e.name, old_name) != 0)
             continue;
         user_cb_rename(i, new_name);
+    }
+
+    Resource* r = res_get(h);
+    for (int c_i = 0; c_i < MAX_COMMANDS; c_i++) {
+        Command& c = g_commands[c_i];
+        if (!c.active)
+            continue;
+        if (r && r->type == RES_FLOAT4 && strcmp(c.clear_color_source, old_name) == 0) {
+            strncpy(c.clear_color_source, new_name, MAX_NAME - 1);
+            c.clear_color_source[MAX_NAME - 1] = '\0';
+        }
+        if (r && r->type == RES_FLOAT && strcmp(c.clear_depth_source, old_name) == 0) {
+            strncpy(c.clear_depth_source, new_name, MAX_NAME - 1);
+            c.clear_depth_source[MAX_NAME - 1] = '\0';
+        }
     }
 }
 
@@ -814,6 +838,16 @@ void user_cb_detach_resource(ResHandle h) {
     for (int c_i = 0; c_i < MAX_COMMANDS; c_i++) {
         Command& c = g_commands[c_i];
         if (!c.active) continue;
+        if (r && strcmp(c.clear_color_source, r->name) == 0) {
+            if (r->type == RES_FLOAT4)
+                memcpy(c.clear_color, r->fval, sizeof(c.clear_color));
+            c.clear_color_source[0] = '\0';
+        }
+        if (r && strcmp(c.clear_depth_source, r->name) == 0) {
+            if (r->type == RES_FLOAT)
+                c.depth_clear_val = clampf(r->fval[0], 0.0f, 1.0f);
+            c.clear_depth_source[0] = '\0';
+        }
         for (int p_i = 0; p_i < c.param_count; p_i++) {
             CommandParam& p = c.params[p_i];
             if (p.source != h) continue;

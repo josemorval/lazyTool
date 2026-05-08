@@ -525,6 +525,43 @@ ResHandle res_alloc(const char* name, ResType type) {
     return INVALID_HANDLE;
 }
 
+static ResHandle res_handle_from_ptr(const Resource* r) {
+    if (!r)
+        return INVALID_HANDLE;
+    ptrdiff_t idx = r - g_resources;
+    if (idx < 0 || idx >= MAX_RESOURCES)
+        return INVALID_HANDLE;
+    return (ResHandle)(idx + 1);
+}
+
+void res_free_generated_children(ResHandle owner) {
+    if (owner == INVALID_HANDLE)
+        return;
+
+    // Generated children are real resources, but they are implementation
+    // details of their owner. Free them before replacing the owner asset so
+    // stale texture handles do not survive a glTF reload or primitive switch.
+    for (int i = 0; i < MAX_RESOURCES; i++) {
+        ResHandle child_h = (ResHandle)(i + 1);
+        if (child_h == owner)
+            continue;
+        Resource& child = g_resources[i];
+        if (child.active && child.is_generated && child.generated_from == owner)
+            res_free(child_h);
+    }
+}
+
+void res_reassign_generated_children(ResHandle old_owner, ResHandle new_owner) {
+    if (old_owner == INVALID_HANDLE || new_owner == INVALID_HANDLE || old_owner == new_owner)
+        return;
+
+    for (int i = 0; i < MAX_RESOURCES; i++) {
+        Resource& child = g_resources[i];
+        if (child.active && child.is_generated && child.generated_from == old_owner)
+            child.generated_from = new_owner;
+    }
+}
+
 void res_free(ResHandle h) {
     Resource* r = res_get(h);
     if (!r) return;
@@ -533,6 +570,9 @@ void res_free(ResHandle h) {
         if (owner && owner->size_handle == h)
             owner->size_handle = INVALID_HANDLE;
     }
+
+    res_free_generated_children(h);
+
     if (r->size_handle != INVALID_HANDLE) {
         ResHandle size_h = r->size_handle;
         r->size_handle = INVALID_HANDLE;
@@ -1322,6 +1362,14 @@ ResHandle res_load_texture(const char* name, const char* path) {
     return handle;
 }
 
+static void res_mark_generated_child(ResHandle child, ResHandle owner) {
+    Resource* r = res_get(child);
+    if (!r || owner == INVALID_HANDLE)
+        return;
+    r->is_generated = true;
+    r->generated_from = owner;
+}
+
 static cgltf_image* res_gltf_texture_image(cgltf_texture* tex) {
     if (!tex) return nullptr;
     cgltf_image* img = tex->image ? tex->image : tex->basisu_image;
@@ -1329,7 +1377,7 @@ static cgltf_image* res_gltf_texture_image(cgltf_texture* tex) {
     return img;
 }
 
-static ResHandle res_load_gltf_texture_ref(const char* mesh_name, int texture_index,
+static ResHandle res_load_gltf_texture_ref(ResHandle owner_mesh, const char* mesh_name, int texture_index,
                                            const char* dir, cgltf_texture* tex)
 {
     cgltf_image* img = res_gltf_texture_image(tex);
@@ -1338,7 +1386,13 @@ static ResHandle res_load_gltf_texture_ref(const char* mesh_name, int texture_in
     char base[MAX_NAME] = {};
     char uname[MAX_NAME] = {};
     snprintf(base, sizeof(base), "%s.texture%d", mesh_name, texture_index);
-    res_make_unique_name(base, uname, MAX_NAME);
+    // Generated glTF textures are hidden implementation details owned by the
+    // mesh, so they do not need globally unique resource names. Keeping the
+    // deterministic base name avoids inspector flicker between "texture0" and
+    // "texture0_1" when reloading the same glTF while the previous embedded
+    // textures are still alive during the temporary import.
+    strncpy(uname, base, MAX_NAME - 1);
+    uname[MAX_NAME - 1] = '\0';
 
     if (img->uri && img->uri[0]) {
         if (strncmp(img->uri, "data:", 5) == 0) {
@@ -1352,19 +1406,23 @@ static ResHandle res_load_gltf_texture_ref(const char* mesh_name, int texture_in
 
         char full[MAX_PATH_LEN] = {};
         res_path_join(dir, uri, full, MAX_PATH_LEN);
-        return res_load_texture(uname, full);
+        ResHandle h = res_load_texture(uname, full);
+        res_mark_generated_child(h, owner_mesh);
+        return h;
     }
 
     if (img->buffer_view && img->buffer_view->buffer && img->buffer_view->buffer->data) {
         const char* label = img->name ? img->name : uname;
         void* bytes = (char*)img->buffer_view->buffer->data + img->buffer_view->offset;
-        return res_load_texture_from_memory(uname, label, bytes, (int)img->buffer_view->size);
+        ResHandle h = res_load_texture_from_memory(uname, label, bytes, (int)img->buffer_view->size);
+        res_mark_generated_child(h, owner_mesh);
+        return h;
     }
 
     return INVALID_HANDLE;
 }
 
-static ResHandle res_load_gltf_texture_cached(const char* mesh_name, const char* dir,
+static ResHandle res_load_gltf_texture_cached(ResHandle owner_mesh, const char* mesh_name, const char* dir,
                                               cgltf_data* data, cgltf_texture* tex,
                                               ResHandle* cache, int cache_count)
 {
@@ -1382,7 +1440,7 @@ static ResHandle res_load_gltf_texture_cached(const char* mesh_name, const char*
         cache[texture_index] != INVALID_HANDLE)
         return cache[texture_index];
 
-    ResHandle loaded = res_load_gltf_texture_ref(mesh_name,
+    ResHandle loaded = res_load_gltf_texture_ref(owner_mesh, mesh_name,
         texture_index >= 0 ? texture_index : 0, dir, tex);
     if (cache && texture_index >= 0 && texture_index < cache_count)
         cache[texture_index] = loaded;
@@ -1390,16 +1448,16 @@ static ResHandle res_load_gltf_texture_cached(const char* mesh_name, const char*
 }
 
 static void res_load_gltf_material_texture_slot(MeshMaterial* dst, int slot,
-                                                const char* mesh_name, const char* dir,
+                                                ResHandle owner_mesh, const char* mesh_name, const char* dir,
                                                 cgltf_data* data, cgltf_texture* tex,
                                                 ResHandle* cache, int cache_count)
 {
     if (!dst || slot < 0 || slot >= MAX_MESH_MATERIAL_TEXTURES || !tex)
         return;
-    dst->textures[slot] = res_load_gltf_texture_cached(mesh_name, dir, data, tex, cache, cache_count);
+    dst->textures[slot] = res_load_gltf_texture_cached(owner_mesh, mesh_name, dir, data, tex, cache, cache_count);
 }
 
-static int res_load_gltf_materials(const char* mesh_name, const char* gltf_path,
+static int res_load_gltf_materials(ResHandle owner_mesh, const char* mesh_name, const char* gltf_path,
                                    cgltf_data* data, MeshMaterial* out_materials)
 {
     if (!out_materials)
@@ -1452,21 +1510,21 @@ static int res_load_gltf_materials(const char* mesh_name, const char* gltf_path,
         dst->alpha_blend = src->alpha_mode == cgltf_alpha_mode_blend;
 
         if (src->has_pbr_metallic_roughness) {
-            res_load_gltf_material_texture_slot(dst, 0, mesh_name, dir, data,
+            res_load_gltf_material_texture_slot(dst, 0, owner_mesh, mesh_name, dir, data,
                 src->pbr_metallic_roughness.base_color_texture.texture, texture_cache, texture_cache_count);
-            res_load_gltf_material_texture_slot(dst, 1, mesh_name, dir, data,
+            res_load_gltf_material_texture_slot(dst, 1, owner_mesh, mesh_name, dir, data,
                 src->pbr_metallic_roughness.metallic_roughness_texture.texture, texture_cache, texture_cache_count);
         } else if (src->has_pbr_specular_glossiness) {
-            res_load_gltf_material_texture_slot(dst, 0, mesh_name, dir, data,
+            res_load_gltf_material_texture_slot(dst, 0, owner_mesh, mesh_name, dir, data,
                 src->pbr_specular_glossiness.diffuse_texture.texture, texture_cache, texture_cache_count);
-            res_load_gltf_material_texture_slot(dst, 1, mesh_name, dir, data,
+            res_load_gltf_material_texture_slot(dst, 1, owner_mesh, mesh_name, dir, data,
                 src->pbr_specular_glossiness.specular_glossiness_texture.texture, texture_cache, texture_cache_count);
         }
-        res_load_gltf_material_texture_slot(dst, 2, mesh_name, dir, data,
+        res_load_gltf_material_texture_slot(dst, 2, owner_mesh, mesh_name, dir, data,
             src->normal_texture.texture, texture_cache, texture_cache_count);
-        res_load_gltf_material_texture_slot(dst, 3, mesh_name, dir, data,
+        res_load_gltf_material_texture_slot(dst, 3, owner_mesh, mesh_name, dir, data,
             src->emissive_texture.texture, texture_cache, texture_cache_count);
-        res_load_gltf_material_texture_slot(dst, 4, mesh_name, dir, data,
+        res_load_gltf_material_texture_slot(dst, 4, owner_mesh, mesh_name, dir, data,
             src->occlusion_texture.texture, texture_cache, texture_cache_count);
     }
 
@@ -1702,6 +1760,12 @@ static bool res_push_mesh_part(MeshPart* parts, int* part_count, const char* par
 bool res_set_mesh_primitive(Resource* r, MeshPrimitiveType type) {
     if (!r) return false;
 
+    // Switching a mesh away from a glTF import must release the embedded
+    // texture resources that were generated for the previous mesh contents.
+    ResHandle owner = res_handle_from_ptr(r);
+    if (owner != INVALID_HANDLE)
+        res_free_generated_children(owner);
+
     bool ok = false;
     switch (type) {
     case MESH_PRIM_CUBE:        ok = res_make_cube_mesh(r); break;
@@ -1744,6 +1808,7 @@ ResHandle res_create_mesh_primitive(const char* name, MeshPrimitiveType type) {
 static ResHandle res_mesh_fallback_cube(ResHandle handle, const char* msg) {
     Resource* r = res_get(handle);
     if (!r) return INVALID_HANDLE;
+    res_free_generated_children(handle);
     res_make_cube_mesh(r);
     r->compiled_ok = false;
     r->using_fallback = true;
@@ -1827,7 +1892,7 @@ ResHandle res_load_mesh(const char* name, const char* path) {
     for (int i = 0; i < MAX_MESH_PARTS; i++)
         res_init_mesh_part(&imported_parts[i]);
 
-    int imported_material_count = res_load_gltf_materials(name, path, data, imported_materials);
+    int imported_material_count = res_load_gltf_materials(handle, name, path, data, imported_materials);
     int imported_part_count = 0;
     bool part_overflow = false;
 

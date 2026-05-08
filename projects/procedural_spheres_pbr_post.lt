@@ -1,0 +1,452 @@
+lazyTool_project 1
+
+camera_fps 2.8906014 5.07924271 8.07480431 -2.90157175 -0.531109631 0.729556143 0.0199999996 80
+
+dirlight 4.54739523 7.95649338 5.12117004 0 0.449999988 0 1 0.930000007 0.819999993 3.5999999 3072 3072 0.0399999991 42 10 10 4 26 0.720000029 3.5 5 5 0.0250000004 10 8.5 8 8 0.0350000001 18 16 12 12 0.0500000007 30 26 18 18 0.0700000003 42
+
+resources
+resource mesh_primitive ground_cube cube
+resource mesh_primitive sphere_primitive sphere
+resource mesh_primitive fullscreen_tri fullscreen_triangle
+resource render_texture rt_hdr_scene 945 695 10 1 1 0 0 1
+resource render_texture rt_ssao_raw 945 695 41 1 1 0 0 1
+resource render_texture rt_ssao_tmp 945 695 41 1 1 0 0 1
+resource render_texture rt_ssao 945 695 41 1 1 0 0 1
+resource render_texture rt_bloom_a 237 174 10 1 1 0 0 4
+resource render_texture rt_bloom_b 237 174 10 1 1 0 0 4
+resource render_texture rt_coc 945 695 41 1 1 0 0 1
+resource render_texture rt_dof 945 695 10 1 1 0 0 1
+resource render_texture rt_lensflare 473 348 10 1 1 0 0 2
+resource shader_vsps proc_scene_pbr shaders/procedural_spheres_pbr_post/scene_pbr.hlsl
+resource shader_vsps proc_scene_shadow shaders/procedural_spheres_pbr_post/scene_shadow.hlsl
+resource shader_vsps proc_ssao shaders/procedural_spheres_pbr_post/ssao.hlsl
+resource shader_vsps proc_bilateral_blur shaders/procedural_spheres_pbr_post/bilateral_blur.hlsl
+resource shader_vsps proc_bloom_prefilter shaders/procedural_spheres_pbr_post/bloom_prefilter.hlsl
+resource shader_vsps proc_bloom_blur shaders/procedural_spheres_pbr_post/bloom_blur.hlsl
+resource shader_vsps proc_dof_coc shaders/procedural_spheres_pbr_post/dof_coc.hlsl
+resource shader_vsps proc_dof_blur shaders/procedural_spheres_pbr_post/dof_blur.hlsl
+resource shader_vsps proc_lensflare shaders/procedural_spheres_pbr_post/lensflare.hlsl
+resource shader_vsps proc_final_composite shaders/procedural_spheres_pbr_post/final_composite.hlsl
+
+user_cb
+end_user_cb
+
+commands
+command clear clear_hdr_and_depth 1
+  targets rt_hdr_scene|render_texture2d scene_depth|builtin_scene_depth
+  mrts 0
+  mesh_shader - -
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 1 0 0 0 1 1 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+command group scene_geometry 1
+  targets - -
+  mrts 0
+  mesh_shader - -
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 0 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+command draw_mesh draw_checker_ground 1
+  targets rt_hdr_scene|render_texture2d scene_depth|builtin_scene_depth
+  mrts 0
+  mesh_shader ground_cube|mesh proc_scene_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader proc_scene_shadow|shader
+  render_state 1 1 1 0 1 1 1
+  transformq 0 -0.0799999982 0 0 0 0 1 8 0.0799999982 8
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent scene_geometry
+  textures 1 shadow_map|builtin_shadow_map 7
+  srvs 0
+  uavs 0
+  params 5
+  param MaterialA float4 1 - 0 0 0 0 0.0350000001 0.0379999988 0.0419999994 1
+  param MaterialB float4 1 - 0 0 0 0 0.819999993 0.800000012 0.720000029 1
+  param MaterialParams float4 1 - 0 0 0 0 0 0.560000002 1.14999998 0
+  param PatternParams float4 1 - 0 0 0 0 1 1 1 0
+  param InstanceGrid float4 1 - 0 0 0 0 5 1.54999995 0.419999987 11
+end_command
+command draw_instanced draw_procedural_spheres 1
+  targets rt_hdr_scene|render_texture2d scene_depth|builtin_scene_depth
+  mrts 0
+  mesh_shader sphere_primitive|mesh proc_scene_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader proc_scene_shadow|shader
+  render_state 1 1 1 0 1 1 1
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 23
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent scene_geometry
+  textures 1 shadow_map|builtin_shadow_map 7
+  srvs 0
+  uavs 0
+  params 5
+  param MaterialA float4 1 - 0 0 0 0 0.100000001 0.25 0.340000004 1
+  param MaterialB float4 1 - 0 0 0 0 1 0.579999983 0.25 1
+  param MaterialParams float4 1 - 0 0 0 0 0.0799999982 0.379999995 3.25 1
+  param PatternParams float4 1 - 0 0 0 0 0.779999971 3.29999995 1.85000002 4.19999981
+  param InstanceGrid float4 1 - 0 0 0 0 5 1.54999995 0.449999988 13.3699999
+end_command
+command group postprocess_chain 1
+  targets - -
+  mrts 0
+  mesh_shader - -
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 0 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent -
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+command draw_mesh ssao_raw 1
+  targets rt_ssao_raw|render_texture2d -
+  mrts 0
+  mesh_shader fullscreen_tri|mesh proc_ssao|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent postprocess_chain
+  textures 1 scene_depth|builtin_scene_depth 0
+  srvs 0
+  uavs 0
+  params 2
+  param SSAOParams float4 1 - 0 0 0 0 0.819999993 1.54999995 0.0179999992 0.920000017
+  param SSAOParams2 float4 1 - 0 0 0 0 1.17999995 0.104999997 1 0
+end_command
+command draw_mesh ssao_bilateral_h 1
+  targets rt_ssao_tmp|render_texture2d -
+  mrts 0
+  mesh_shader fullscreen_tri|mesh proc_bilateral_blur|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent postprocess_chain
+  textures 2 rt_ssao_raw|render_texture2d 0 scene_depth|builtin_scene_depth 1
+  srvs 0
+  uavs 0
+  params 1
+  param BlurParams float4 1 - 0 0 0 0 1 1 2.20000005 0
+end_command
+command draw_mesh ssao_bilateral_v 1
+  targets rt_ssao|render_texture2d -
+  mrts 0
+  mesh_shader fullscreen_tri|mesh proc_bilateral_blur|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent postprocess_chain
+  textures 2 rt_ssao_tmp|render_texture2d 0 scene_depth|builtin_scene_depth 1
+  srvs 0
+  uavs 0
+  params 1
+  param BlurParams float4 1 - 0 0 0 0 0 1 2.20000005 0
+end_command
+command draw_mesh bloom_prefilter 1
+  targets rt_bloom_a|render_texture2d -
+  mrts 0
+  mesh_shader fullscreen_tri|mesh proc_bloom_prefilter|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent postprocess_chain
+  textures 1 rt_hdr_scene|render_texture2d 0
+  srvs 0
+  uavs 0
+  params 1
+  param BloomParams float4 1 - 0 0 0 0 1.35000002 0.349999994 0.850000024 12
+end_command
+command repeat bloom_blur_polish 1
+  targets - -
+  mrts 0
+  mesh_shader - -
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 0 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 2 1
+  parent postprocess_chain
+  textures 0
+  srvs 0
+  uavs 0
+  params 0
+end_command
+command draw_mesh bloom_blur_h 1
+  targets rt_bloom_b|render_texture2d -
+  mrts 0
+  mesh_shader fullscreen_tri|mesh proc_bloom_blur|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent bloom_blur_polish
+  textures 1 rt_bloom_a|render_texture2d 0
+  srvs 0
+  uavs 0
+  params 1
+  param BlurParams float4 1 - 0 0 0 0 1 1.35000002 0 0
+end_command
+command draw_mesh bloom_blur_v 1
+  targets rt_bloom_a|render_texture2d -
+  mrts 0
+  mesh_shader fullscreen_tri|mesh proc_bloom_blur|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent bloom_blur_polish
+  textures 1 rt_bloom_b|render_texture2d 0
+  srvs 0
+  uavs 0
+  params 1
+  param BlurParams float4 1 - 0 0 0 0 0 1.35000002 0 0
+end_command
+command draw_mesh dof_coc 1
+  targets rt_coc|render_texture2d -
+  mrts 0
+  mesh_shader fullscreen_tri|mesh proc_dof_coc|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent postprocess_chain
+  textures 1 scene_depth|builtin_scene_depth 0
+  srvs 0
+  uavs 0
+  params 1
+  param FocusParams float4 1 - 0 0 0 0 7.19999981 2.79999995 1.60000002 1.14999998
+end_command
+command draw_mesh dof_gather 1
+  targets rt_dof|render_texture2d -
+  mrts 0
+  mesh_shader fullscreen_tri|mesh proc_dof_blur|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent postprocess_chain
+  textures 3 rt_hdr_scene|render_texture2d 0 rt_coc|render_texture2d 1 scene_depth|builtin_scene_depth 2
+  srvs 0
+  uavs 0
+  params 1
+  param DoFParams float4 1 - 0 0 0 0 13.5 0.5 1.10000002 0
+end_command
+command draw_mesh lensflare_ghosts 1
+  targets rt_lensflare|render_texture2d -
+  mrts 0
+  mesh_shader fullscreen_tri|mesh proc_lensflare|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent postprocess_chain
+  textures 2 rt_bloom_a|render_texture2d 0 rt_hdr_scene|render_texture2d 1
+  srvs 0
+  uavs 0
+  params 1
+  param LensParams float4 1 - 0 0 0 0 1.25 1.54999995 0.419999987 0.0179999992
+end_command
+command draw_mesh final_composite 1
+  targets scene_color|builtin_scene_color -
+  mrts 0
+  mesh_shader fullscreen_tri|mesh proc_final_composite|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent postprocess_chain
+  textures 4 rt_dof|render_texture2d 0 rt_bloom_a|render_texture2d 1 rt_ssao|render_texture2d 2 rt_lensflare|render_texture2d 3
+  srvs 0
+  uavs 0
+  params 1
+  param CompositeParams float4 1 - 0 0 0 0 1.12 0.560000002 0.850000024 0.720000029
+end_command
+
+timeline
+timeline_settings 12 60 13 0 1 1 1
+timeline_track camera camera ? 8 1
+timeline_key 0 6.80000019 3.6500001 7.1500001 -2.38199997 -0.405000001 0.779999971 0.0199999996 80
+timeline_key 16 2.1500001 5.3499999 8.25 -3 -0.555000007 0.720000029 0.0199999996 80
+timeline_key 32 -6.25 3.0999999 5.69999981 2.29999995 -0.344999999 0.819999993 0.0199999996 80
+timeline_key 38 -3.90625 4.5062499 6.89999962 2.66310024 -0.460000008 0.774999976 0.0199999996 80
+timeline_key 39 -3.515625 4.7406249 7.09999943 2.77595043 -0.468000025 0.767499983 0.0199999996 80
+timeline_key 40 -3.125 4.9749999 7.29999924 2.85157895 -0.489888906 0.75999999 0.0199999996 80
+timeline_key 48 0 6.8499999 8.89999962 3.14159989 -0.665000021 0.699999988 0.0199999996 80
+timeline_key 59 6.80000019 3.6500001 7.1500001 -2.38199997 -0.405000001 0.779999971 0.0199999996 80
+end_timeline

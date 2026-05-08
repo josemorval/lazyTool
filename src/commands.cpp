@@ -1026,6 +1026,13 @@ static void validate_dispatch_command(Command& c, const Resource* shader, bool i
     validation_finish(c, issues);
 }
 
+static const Resource* command_clear_source_resource(const char* source_name, ResType type) {
+    if (!source_name || !source_name[0])
+        return nullptr;
+    const Resource* r = res_get(res_find_by_name(source_name));
+    return (r && r->type == type) ? r : nullptr;
+}
+
 static void command_resolve_clear_values(const Command& c, float out_color[4], float* out_depth) {
     for (int i = 0; i < 4; i++)
         out_color[i] = c.clear_color[i];
@@ -1033,20 +1040,32 @@ static void command_resolve_clear_values(const Command& c, float out_color[4], f
         *out_depth = c.depth_clear_val;
 
     if (c.clear_color_source[0]) {
-        const UserCBEntry* e = user_cb_get(c.clear_color_source);
-        if (e && (e->type == RES_FLOAT3 || e->type == RES_FLOAT4)) {
-            out_color[0] = e->fval[0];
-            out_color[1] = e->fval[1];
-            out_color[2] = e->fval[2];
-            if (e->type == RES_FLOAT4)
+        const Resource* r = command_clear_source_resource(c.clear_color_source, RES_FLOAT4);
+        if (r) {
+            out_color[0] = r->fval[0];
+            out_color[1] = r->fval[1];
+            out_color[2] = r->fval[2];
+            out_color[3] = r->fval[3];
+        } else {
+            const UserCBEntry* e = user_cb_get(c.clear_color_source);
+            if (e && e->type == RES_FLOAT4) {
+                out_color[0] = e->fval[0];
+                out_color[1] = e->fval[1];
+                out_color[2] = e->fval[2];
                 out_color[3] = e->fval[3];
+            }
         }
     }
 
     if (out_depth && c.clear_depth_source[0]) {
-        const UserCBEntry* e = user_cb_get(c.clear_depth_source);
-        if (e && e->type == RES_FLOAT)
-            *out_depth = clampf(e->fval[0], 0.0f, 1.0f);
+        const Resource* r = command_clear_source_resource(c.clear_depth_source, RES_FLOAT);
+        if (r) {
+            *out_depth = clampf(r->fval[0], 0.0f, 1.0f);
+        } else {
+            const UserCBEntry* e = user_cb_get(c.clear_depth_source);
+            if (e && e->type == RES_FLOAT)
+                *out_depth = clampf(e->fval[0], 0.0f, 1.0f);
+        }
     }
 }
 

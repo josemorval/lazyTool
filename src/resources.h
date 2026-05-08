@@ -26,6 +26,8 @@ void      res_shutdown();
 
 ResHandle res_alloc(const char* name, ResType type);
 void      res_free(ResHandle h);
+void      res_free_generated_children(ResHandle owner);
+void      res_reassign_generated_children(ResHandle old_owner, ResHandle new_owner);
 Resource* res_get(ResHandle h);
 ResHandle res_find_by_name(const char* name);
 

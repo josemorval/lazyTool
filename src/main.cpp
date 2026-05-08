@@ -1270,6 +1270,20 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     log_init();
 #ifndef LAZYTOOL_PLAYER_ONLY
     app_settings_load_or_create();
+
+    // Exported normal EXEs run through the same binary as the editor, but in
+    // player mode. The editor preferences file is not part of the project, so
+    // a freshly exported player may create/load its own lazytool_general.ini
+    // with editor-centric defaults. Keep player mode deterministic and cheap:
+    // no D3D debug layer, no GPU profiler queries, no shader warning spam, and
+    // no editor grid overlay.
+    if (g_player_mode) {
+        g_dx.d3d11_validation = false;
+        g_dx.d3d11_validation_active = false;
+        g_dx.shader_validation_warnings = false;
+        g_profiler_enabled = false;
+        g_dx.scene_grid_enabled = false;
+    }
 #endif
 
     if (!dx_init(hwnd, 1600, 900)) {
@@ -1406,7 +1420,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             cmd_execute_all();
             cmd_set_reset_execution(false);
             g_scene_reset_execution_pending = false;
-            dx_render_scene_grid_overlay();
+
+#ifndef LAZYTOOL_PLAYER_ONLY
+            // The grid is an editor viewport aid. Do not run it in player mode:
+            // it is a full-screen depth-reading pass and can be surprisingly
+            // visible in performance on post-heavy scenes.
+            if (!g_player_mode)
+                dx_render_scene_grid_overlay();
+#endif
             dx_end_scene();
         }
 

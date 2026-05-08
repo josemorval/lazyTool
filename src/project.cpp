@@ -289,6 +289,35 @@ static void res_ref(ResHandle h, char* out, int out_sz) {
     out[out_sz - 1] = '\0';
 }
 
+static void ref_base_name(const char* ref, char* out, int out_sz) {
+    if (!out || out_sz <= 0) return;
+    out[0] = '\0';
+    if (!ref) return;
+    strncpy(out, ref, out_sz - 1);
+    out[out_sz - 1] = '\0';
+    char* type_sep = strrchr(out, '|');
+    if (type_sep)
+        *type_sep = '\0';
+}
+
+static void clear_source_ref(const char* source_name, ResType type, char* out, int out_sz) {
+    if (!out || out_sz <= 0) return;
+    strncpy(out, "-", out_sz - 1);
+    out[out_sz - 1] = '\0';
+    if (!source_name || !source_name[0])
+        return;
+
+    ResHandle h = res_find_by_name(source_name);
+    Resource* r = res_get(h);
+    if (r && r->type == type) {
+        res_ref(h, out, out_sz);
+        return;
+    }
+
+    strncpy(out, source_name, out_sz - 1);
+    out[out_sz - 1] = '\0';
+}
+
 struct ResourceLookup {
     ResType types[4];
     int type_count;
@@ -685,9 +714,11 @@ bool project_save_text(const char* path) {
         fprintf(f, "  clear %s %.9g %.9g %.9g %.9g %s %.9g\n",
             bool_str(c.clear_color_enabled), c.clear_color[0], c.clear_color[1], c.clear_color[2], c.clear_color[3],
             bool_str(c.clear_depth), c.depth_clear_val);
-        fprintf(f, "  clear_sources %s %s\n",
-            c.clear_color_source[0] ? c.clear_color_source : "-",
-            c.clear_depth_source[0] ? c.clear_depth_source : "-");
+        char clear_color_ref[MAX_PATH_LEN] = {};
+        char clear_depth_ref[MAX_PATH_LEN] = {};
+        clear_source_ref(c.clear_color_source, RES_FLOAT4, clear_color_ref, MAX_PATH_LEN);
+        clear_source_ref(c.clear_depth_source, RES_FLOAT, clear_depth_ref, MAX_PATH_LEN);
+        fprintf(f, "  clear_sources %s %s\n", clear_color_ref, clear_depth_ref);
         fprintf(f, "  vertex_count %d\n", c.vertex_count);
         fprintf(f, "  instance %d\n", c.instance_count);
         fprintf(f, "  threads %d %d %d\n", c.thread_x, c.thread_y, c.thread_z);
@@ -1170,11 +1201,23 @@ bool project_load_text(const char* path) {
                 char* color_src = strtok(nullptr, " \t\r\n");
                 char* depth_src = strtok(nullptr, " \t\r\n");
                 if (color_src && strcmp(color_src, "-") != 0) {
-                    strncpy(cur->clear_color_source, remap_user_var_name(color_src, RES_NONE), MAX_NAME - 1);
+                    ResHandle h = res_by_ref(color_src, res_lookup_types(RES_FLOAT4));
+                    Resource* r = res_get(h);
+                    char fallback_name[MAX_NAME] = {};
+                    ref_base_name(color_src, fallback_name, MAX_NAME);
+                    strncpy(cur->clear_color_source,
+                            r ? r->name : remap_user_var_name(fallback_name, RES_NONE),
+                            MAX_NAME - 1);
                     cur->clear_color_source[MAX_NAME - 1] = '\0';
                 }
                 if (depth_src && strcmp(depth_src, "-") != 0) {
-                    strncpy(cur->clear_depth_source, remap_user_var_name(depth_src, RES_NONE), MAX_NAME - 1);
+                    ResHandle h = res_by_ref(depth_src, res_lookup_types(RES_FLOAT));
+                    Resource* r = res_get(h);
+                    char fallback_name[MAX_NAME] = {};
+                    ref_base_name(depth_src, fallback_name, MAX_NAME);
+                    strncpy(cur->clear_depth_source,
+                            r ? r->name : remap_user_var_name(fallback_name, RES_NONE),
+                            MAX_NAME - 1);
                     cur->clear_depth_source[MAX_NAME - 1] = '\0';
                 }
             } else if (strcmp(tag, "vertex_count") == 0) {
