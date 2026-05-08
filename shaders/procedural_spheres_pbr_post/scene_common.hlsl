@@ -1,3 +1,5 @@
+// Procedural scene parameters shared by ground/sphere material passes. UserCB
+// values drive material colors, roughness/metalness, patterns, and instancing.
 #ifndef PROCEDURAL_SPHERES_PBR_POST_SCENE_COMMON_HLSL
 #define PROCEDURAL_SPHERES_PBR_POST_SCENE_COMMON_HLSL
 

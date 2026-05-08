@@ -14,6 +14,11 @@
 // This module owns all editor/runtime resources: textures, meshes, shaders,
 // render targets, and the built-in handles that expose engine state to users.
 
+// Resource handles are one-based array indices. The editor keeps every resource
+// as a single POD record because that makes save/load, inspector editing, and
+// generated resources deterministic. GPU objects are released/recreated in-place
+// whenever a path, format, size, or primitive type changes.
+
 Resource  g_resources[MAX_RESOURCES] = {};
 int       g_resource_count = 0;
 
@@ -209,6 +214,9 @@ static void res_add_quad_face(Vertex* verts, uint32_t* idx, int* vert_cursor, in
     idx[(*index_cursor)++] = base + 3;
 }
 
+// Primitive mesh helpers write triangles in the same winding convention as the
+// renderer expects. Keeping the winding centralized avoids shadow/prepass bugs
+// when the tiny 64k player mirrors these primitives.
 static void res_add_oriented_tri(const Vertex* verts, uint32_t* idx, int* idx_count,
                                  uint32_t a, uint32_t b, uint32_t c)
 {
@@ -506,6 +514,9 @@ void res_shutdown() {
         if (g_resources[i].active && !g_resources[i].is_builtin) res_release_gpu(&g_resources[i]);
 }
 
+// Allocate a resource slot and initialize cross-type defaults. Every creation
+// function starts here so names, active flags, and invalid child handles use the
+// same baseline.
 ResHandle res_alloc(const char* name, ResType type) {
     for (int i = 0; i < MAX_RESOURCES; i++) {
         if (!g_resources[i].active) {
@@ -622,6 +633,9 @@ static void res_size_name_for(const Resource& r, char* out, int out_sz) {
 // Every size-bearing resource exposes a generated dimensions/count variable so
 // compute dispatches and shader params can stay data-driven instead of
 // hardcoding scene-dependent numbers in the project file.
+// Size resources are generated float/int values that mirror texture dimensions
+// or buffer counts. They let shaders and dispatch dimensions follow resource
+// changes without hardcoded constants in the project.
 void res_sync_size_resource(ResHandle h) {
     Resource* r = res_get(h);
     if (!r || r->is_generated)
@@ -682,6 +696,9 @@ ResHandle res_find_by_name(const char* name) {
     return INVALID_HANDLE;
 }
 
+// Release only GPU-side objects and generated children, leaving the Resource
+// record itself valid for the editor. This is used by reload/recreate paths where
+// names, handles, and command references must survive.
 void res_release_gpu(Resource* r) {
     if (r->srv) { r->srv->Release(); r->srv = nullptr; }
     if (r->rtv) { r->rtv->Release(); r->rtv = nullptr; }
@@ -856,6 +873,9 @@ bool res_recreate_render_texture(ResHandle h, int w, int hgt, DXGI_FORMAT fmt,
     return true;
 }
 
+// Create a 2D render texture with any combination of RTV/SRV/UAV/DSV views.
+// Scene-scaled targets are recreated when the viewport size changes, which is
+// why the requested divisor is stored alongside the concrete width/height.
 ResHandle res_create_render_texture(const char* name, int w, int h, DXGI_FORMAT fmt,
                                      bool want_rtv, bool want_srv, bool want_uav, bool want_dsv,
                                      int scene_scale_divisor)
@@ -1116,6 +1136,9 @@ void res_sync_scene_dependent_render_textures() {
         log_info("Resized %d scene-scaled render textures.", sync_count);
 }
 
+// Structured buffers are used for simulation data, instancing data, and indirect
+// argument blocks. The indirect flag switches the buffer misc flags so DX11
+// accepts it for Draw/DispatchIndirect.
 ResHandle res_create_structured_buffer(const char* name, int elem_size, int elem_count,
                                         bool want_srv, bool want_uav, bool want_indirect_args)
 {
@@ -1270,6 +1293,9 @@ static bool res_load_texture_file_into(Resource* r, const char* path) {
     return ok;
 }
 
+// Texture loading goes through lt_read_file() so normal editor runs and packed
+// player executables share the same code path. Disk files and appended-pack
+// files therefore behave identically after loading.
 bool res_reload_texture(Resource* r, const char* path) {
     if (!r || r->type != RES_TEXTURE2D || !path || !path[0])
         return false;
@@ -1843,6 +1869,9 @@ static void res_cgltf_file_release(const cgltf_memory_options*,
     lt_free_file(data);
 }
 
+// glTF import flattens the supported subset into one vertex/index buffer plus
+// per-part ranges. Materials and embedded textures become generated child
+// resources so deleting/reloading the owner mesh cleans them up automatically.
 ResHandle res_load_mesh(const char* name, const char* path) {
     ResHandle handle = res_alloc(name, RES_MESH);
     if (handle == INVALID_HANDLE) return INVALID_HANDLE;

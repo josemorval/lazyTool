@@ -24,6 +24,14 @@
 // The UI module is the editor shell. It presents resources, commands,
 // inspectors, logs, and the live scene view on top of the runtime state.
 
+// UI implementation notes:
+//   - most widgets edit POD data owned by resources.cpp, commands.cpp, timeline.cpp,
+//     or user_cb.cpp instead of duplicating state inside the UI layer.
+//   - popups, drag/drop state, code editor buffers, viewport gizmo state, and
+//     timeline selection stay here because they are immediate-mode interaction data.
+//   - expensive runtime work is requested through app_request_scene_render()/restart
+//     so editing panels can stay responsive.
+
 ResHandle g_sel_res = INVALID_HANDLE;
 CmdHandle g_sel_cmd = INVALID_HANDLE;
 bool g_scene_view_hovered = false;
@@ -3585,6 +3593,9 @@ static int ui_find_visible_command_index(const CmdHandle* items, int count, CmdH
     return -1;
 }
 
+// Resources panel: creation, filtering, selection, context menus, and resource
+// lifetime actions. The panel never touches raw DX11 objects directly; it calls
+// resource APIs so generated children and command references stay synchronized.
 static void ui_panel_resources(bool embedded = false) {
     if (!embedded) ImGui::Begin("Resources");
 
@@ -4012,6 +4023,9 @@ static void ui_draw_command_tree(CmdHandle parent, int depth) {
     }
 }
 
+// Command pipeline panel: tree display, group hierarchy, drag/drop reordering,
+// enable toggles, and per-command profiling display. Selection is kept as a
+// command handle so other panels can inspect the same object.
 static void ui_panel_commands(bool embedded = false) {
     if (!embedded) ImGui::Begin("Commands");
 
@@ -4912,6 +4926,9 @@ static bool ui_clear_source_valid(const char* source_name, ResType type) {
 }
 
 
+// Command inspector: edits draw/dispatch/clear/repeat fields and binding tables.
+// Most widgets write directly into Command POD fields, then request a scene
+// render/restart when the edit changes execution semantics.
 static void ui_inspector_command(Command* c) {
     if (ImGui::Checkbox("Enabled", &c->enabled)) {
         timeline_capture_if_tracked(TIMELINE_TRACK_COMMAND_ENABLED, c->name, RES_NONE);
@@ -5568,6 +5585,9 @@ static void ui_panel_selection_state(bool embedded = false) {
     if (!embedded) ImGui::End();
 }
 
+// UserCB panel: exposes global shader variables and live links to resources,
+// commands, camera and light data. The generated HLSL snippet mirrors the exact
+// slot packing used by user_cb.cpp.
 static void ui_panel_user_cb() {
     ImGui::Begin("User CB (b2)");
     user_cb_enforce_unique_names();
@@ -6273,6 +6293,9 @@ static void ui_handle_viewport_gizmo_hotkeys(bool hovered) {
         ui_set_viewport_gizmo_mode(UI_GIZMO_SCALE);
 }
 
+// Viewport transform gizmo. It is drawn in screen space from the selected
+// command's world transform, but edits the command's numeric transform fields so
+// save/load and timeline tracks keep using the same source of truth.
 static void ui_draw_viewport_gizmo(ImVec2 rect_min, ImVec2 rect_max, bool hovered) {
     Command* c = ui_selected_gizmo_command();
     Mat4 view_proj = {};
@@ -7752,6 +7775,9 @@ static bool ui_timeline_scrollbar(const char* id, int* first_frame, int max_firs
     return changed;
 }
 
+// Timeline window: track management, slot selection, key capture, copy/paste and
+// playback controls. It talks to timeline.cpp through a compact API so the same
+// tracks can be serialized and exported to the 64k player.
 static void ui_draw_timeline_window() {
     if (!s_timeline_window_open) {
         s_timeline_keyboard_focus = false;
@@ -8205,6 +8231,9 @@ static void ui_draw_timeline_window() {
     ImGui::End();
 }
 
+// Top toolbar aggregates project actions, shader compile, export, play/pause,
+// profiler status, timeline access, and frameless-window controls. Keeping it in
+// one place avoids hidden shortcuts for state-changing actions.
 static void ui_top_bar() {
     for (int i = 0; i < 3; i++)
         s_ui_window_control_screen_rects_valid[i] = false;

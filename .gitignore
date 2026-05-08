@@ -1,10 +1,24 @@
-bin/*
-assets/*
-!assets/icons/
-!assets/icons/**
-debug
-imgui.ini
-*.zip
-*.exe
+# Build outputs
+bin/
 *.obj
+*.pdb
+*.ilk
 *.map
+*.res
+
+# Local editor settings
+lazytool_general.ini
+
+# build64k generated artifacts
+build64k/build64k.exe
+build64k/out64k.c
+build64k/out64k.obj
+build64k/lt64k.exe
+build64k/lt64k_unpacked.exe
+build64k/lt64k.map
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vs/
+.vscode/

@@ -11,6 +11,11 @@
 // This module wraps the shared Direct3D 11 objects used by the whole tool:
 // swap chain, scene targets, depth buffers, samplers, and shared CBs.
 
+// The editor renders into an off-screen scene texture first. ImGui displays that
+// SRV inside the viewport, while player/export modes can present the scene
+// directly to the backbuffer. Keeping these paths separate allows the editor UI
+// to resize independently from the render graph.
+
 DX11Ctx g_dx = {};
 
 static const char* s_shadow_vs_src = R"HLSL(
@@ -208,6 +213,9 @@ static void safe_release_editor_grid() {
     if (s_editor_grid_vs) { s_editor_grid_vs->Release(); s_editor_grid_vs = nullptr; }
 }
 
+// Built-in shadow shader used when a draw command casts shadows but no explicit
+// shadow shader is assigned. It consumes the same mesh layout as normal draws and
+// writes only depth.
 static void create_builtin_shadow_shader() {
     ID3DBlob* blob = nullptr;
     ID3DBlob* err = nullptr;
@@ -232,6 +240,9 @@ static void create_builtin_shadow_shader() {
     blob->Release();
 }
 
+// The editor grid is a screen-space overlay reconstructed from depth and the
+// inverse view-projection matrix. It is not part of project output; it only helps
+// users orient the viewport.
 static bool create_editor_grid_shader() {
     safe_release_editor_grid();
 
@@ -285,6 +296,9 @@ static bool create_editor_grid_shader() {
     return true;
 }
 
+// Initialize the DX11 device, swap chain, shared constant buffers, state cache,
+// samplers, default scene targets, and optional debug info queue. All modules use
+// g_dx rather than owning independent devices.
 bool dx_init(HWND hwnd, int w, int h) {
     g_dx.hwnd   = hwnd;
     g_dx.width  = w;
@@ -427,6 +441,9 @@ bool dx_init(HWND hwnd, int w, int h) {
     return true;
 }
 
+// Recreate the editor/player scene color target and depth target. Resize paths
+// deliberately invalidate temporal history because matrices and texture sizes no
+// longer match the previous frame.
 void dx_create_scene_rt(int w, int h) {
     if (w < 1) w = 1;
     if (h < 1) h = 1;
@@ -671,6 +688,9 @@ void dx_debug_clear_messages() {
         g_dx.info_queue->ClearStoredMessages();
 }
 
+// Pull messages from the D3D11 info queue into lazyTool's log. This gives shader
+// and binding validation feedback directly in the editor instead of requiring an
+// external debugger.
 void dx_debug_log_messages() {
     if (!g_dx.d3d11_validation_active || !g_dx.info_queue)
         return;

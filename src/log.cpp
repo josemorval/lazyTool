@@ -1,6 +1,9 @@
 #include "log.h"
 #include <stdarg.h>
 
+// log.cpp stores a fixed-size ring buffer for editor-visible messages. It avoids
+// allocations during render/compile paths, and the UI consumes the ring directly.
+
 #ifndef LAZYTOOL_NO_LOG
 // The log is a fixed-size ring buffer so the UI can display recent messages
 // without allocating during normal frame updates.

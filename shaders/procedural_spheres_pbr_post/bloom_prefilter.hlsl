@@ -1,3 +1,5 @@
+// Bloom prefilter pass. It extracts bright HDR pixels with a soft knee before
+// the separable blur chain.
 #include "common.hlsl"
 
 /*

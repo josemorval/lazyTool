@@ -1,8 +1,10 @@
 #pragma once
 #include "types.h"
 
-// Public API for the user-defined constant buffer. Preferred convention:
-// SceneCB = b0, ObjectCB = b1, UserCB = b2.
+// Public API for user-editable shader parameters. Preferred convention:
+// SceneCB = b0, ObjectCB = b1, UserCB = b2. The reflection code also supports
+// older shaders that put their editable cbuffer in another slot, because the
+// actual register is taken from shader reflection rather than hardcoded here.
 
 extern UserCBEntry   g_user_cb_entries[MAX_USER_CB_VARS];
 extern int           g_user_cb_count;

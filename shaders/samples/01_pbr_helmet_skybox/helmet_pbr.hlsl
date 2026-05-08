@@ -1,3 +1,5 @@
+// Sample glTF material shader for the helmet. Uses conventional texture slots
+// for base color, metallic/roughness, normals, emissive and occlusion.
 /*
 Sample 01: physically based shading for DamagedHelmet.glb
 

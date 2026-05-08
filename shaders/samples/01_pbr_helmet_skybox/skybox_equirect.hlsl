@@ -1,3 +1,5 @@
+// Equirectangular skybox shader. Drawn as background/environment using a texture
+// sampled in direction space rather than mesh UVs.
 /*
 Sample 01: PBR helmet with an equirectangular skybox.
 

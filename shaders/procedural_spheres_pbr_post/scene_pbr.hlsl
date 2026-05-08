@@ -1,3 +1,5 @@
+// Main procedural PBR pass. It shades the checker ground and instanced spheres,
+// reads the cascaded shadow atlas, and outputs HDR color into the scene target.
 #include "scene_common.hlsl"
 
 /*

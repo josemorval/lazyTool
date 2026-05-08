@@ -1,3 +1,5 @@
+// Depth-of-field gather pass. Uses a golden-angle sample pattern to approximate
+// bokeh while rejecting depth-discontinuous samples.
 #include "common.hlsl"
 
 /*

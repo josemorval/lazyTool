@@ -101,6 +101,8 @@ typedef enum {
     USER_CB_SOURCE_DIRLIGHT_TARGET
 } UserCBSourceKind;
 
+// Reflection data for the shader-owned editable cbuffer. Offsets and sizes come
+// from D3D reflection, so CPU packing follows HLSL layout instead of guessing.
 struct ShaderCBVar {
     char     name[MAX_NAME];
     ResType  type;
@@ -157,6 +159,9 @@ struct MeshPart {
 };
 
 // ── resource ─────────────────────────────────────────────────────────────
+// Resource is a tagged union of editor values and GPU objects. Only fields that
+// match `type` are meaningful, but keeping one flat struct makes handles stable,
+// serialization simple, and ImGui inspectors straightforward.
 struct Resource {
     char     name[MAX_NAME];
     ResType  type;
@@ -227,6 +232,9 @@ struct Resource {
 };
 
 // ── command ──────────────────────────────────────────────────────────────
+// Command is the serialized form of a render-graph step. It intentionally stores
+// all possible command fields in one POD block; unused fields are harmless but
+// make copy, undo-like moves, project save/load, and 64k export much simpler.
 struct Command {
     char    name[MAX_NAME];
     CmdType type;
@@ -300,6 +308,9 @@ struct Command {
 };
 
 // ── user cbuffer entry ────────────────────────────────────────────────────
+// UserCB entries are global editor variables packed into float4-sized slots. A
+// source can be a resource, a command transform component, the camera, or the
+// directional light, allowing shaders to follow live editor state.
 struct UserCBEntry {
     char      name[MAX_NAME];
     ResType   type;
@@ -312,6 +323,9 @@ struct UserCBEntry {
 
 // ── scene cbuffer (b0, must match shaders/scene.hlsl) ────────────────────
 #pragma pack(push, 16)
+// SceneCBData is uploaded to b0 every frame. It contains current/previous camera
+// matrices, light data, shadow atlas metadata, and temporal values used by
+// post-processing and procedural animation. Keep this in sync with HLSL SceneCB.
 struct SceneCBData {
     float view_proj[16];
     float time_vec[4];

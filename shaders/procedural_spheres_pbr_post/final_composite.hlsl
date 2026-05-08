@@ -1,3 +1,5 @@
+// Final composite pass. It combines HDR scene color, SSAO, bloom, DoF and lens
+// flare, then tonemaps to the editor/player output.
 #include "common.hlsl"
 
 /*

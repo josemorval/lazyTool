@@ -15,6 +15,13 @@
 // project.cpp owns the text project format used to save and restore the full
 // editor state in a way that remains readable and diff-friendly.
 
+// Project format notes:
+//   - the format is line-oriented, stable, and easy to diff.
+//   - references are serialized by name plus optional type hints, then resolved
+//     back to handles during load.
+//   - load is intentionally more permissive than save so older files can survive
+//     new command/resource fields.
+
 static const char* bool_str(bool v) { return v ? "1" : "0"; }
 static char s_project_current_path[MAX_PATH_LEN] = {};
 
@@ -277,6 +284,9 @@ void project_reset_view_defaults() {
     project_reset_dirlight_defaults();
 }
 
+// References are serialized as name|type when possible. The type suffix makes
+// project files more robust against duplicate names and helps future tools read
+// the file without having to execute the whole loader.
 static void res_ref(ResHandle h, char* out, int out_sz) {
     if (!out || out_sz <= 0) return;
     Resource* r = res_get(h);
@@ -535,6 +545,9 @@ static void project_clear_user_data() {
 }
 
 // Create a minimal scene so the editor always opens with valid content.
+// Build the editor's minimal boot scene. This guarantees the viewport has a
+// renderable surface, depth buffer, default mesh, shader, and command pipeline
+// even before the user creates or loads a project.
 void project_new_default() {
     project_clear_user_data();
     project_reset_camera_defaults();
@@ -574,6 +587,9 @@ void project_new_default() {
 }
 
 // Serialize the current scene/editor state into the custom text format.
+// Save is deliberately verbose. Most command fields are written even when they
+// carry defaults, because stable output makes project diffs easier to inspect
+// and keeps the 64k exporter parser straightforward.
 bool project_save_text(const char* path) {
     user_cb_enforce_unique_names();
     ensure_parent_dir(path);
@@ -853,6 +869,9 @@ static bool project_read_line(const char*& cursor, const char* end, char* out, i
 // Parse a saved project file and rebuild the in-memory editor state. The text
 // format is append-friendly: older files may omit newer fields, and unknown
 // lines are ignored so experimental commands can survive round-trips.
+// Load is more permissive than save. Unknown lines are skipped, and missing
+// newer fields fall back to defaults, so older projects remain useful while the
+// editor's command/resource model evolves.
 bool project_load_text(const char* path) {
     void* project_bytes = nullptr;
     size_t project_size = 0;

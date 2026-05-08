@@ -1,3 +1,5 @@
+// Separable bloom blur pass. Direction and radius scale come from UserCB, so the
+// same shader is reused for both ping-pong passes.
 #include "common.hlsl"
 
 /*

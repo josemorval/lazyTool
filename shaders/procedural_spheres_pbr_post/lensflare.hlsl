@@ -1,3 +1,5 @@
+// Procedural lens flare pass. It derives ghosts, halo and streaks directly from
+// the bright scene image, avoiding any external dirt or flare textures.
 #include "common.hlsl"
 
 /*

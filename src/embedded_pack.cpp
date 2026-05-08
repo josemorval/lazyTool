@@ -6,6 +6,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+// embedded_pack.cpp implements the normal standalone-player export path. The
+// exporter appends a compact table of project/assets/shaders to lazyPlayer.exe,
+// and the runtime file API checks that in-memory pack before falling back to
+// disk. This keeps all resource loaders path-based while still producing a
+// single executable for asset-heavy projects.
+
 // Normal executable packaging.
 //
 // The normal player keeps the full runtime so asset-heavy projects can load
@@ -237,6 +243,9 @@ void lt_free_file(void* data) {
     free(data);
 }
 
+// The pack footer sits at the end of the executable so Windows can still load
+// the file normally. Startup scans backward for the magic footer, then maps the
+// packed entries into memory.
 static bool find_pack_footer(FILE* f, unsigned long long file_size, LtPackFooter* out_footer) {
     if (!f || !out_footer || file_size < sizeof(LtPackFooter))
         return false;
@@ -566,6 +575,9 @@ static bool project_timeline_block_disabled(const char* cursor, const char* end,
     return disabled && found_end;
 }
 
+// Project minification removes editor-only defaults while preserving semantic
+// lines the player/exporter needs. It intentionally stays conservative: a larger
+// but correct packed project is better than a tiny scene that changes behavior.
 static bool minify_project_text(const void* data, size_t size, void** out_data, size_t* out_size) {
     if (!data || !out_data || !out_size)
         return false;
@@ -616,6 +628,9 @@ static bool minify_project_text(const void* data, size_t size, void** out_data, 
     return true;
 }
 
+// Shader minification strips comments and whitespace only outside strings and
+// preprocessor-critical text. The goal is smaller exports, not source golfing at
+// the cost of compiler compatibility.
 static bool minify_hlsl_text(const void* data, size_t size, void** out_data, size_t* out_size) {
     if (!data || !out_data || !out_size)
         return false;
@@ -835,6 +850,9 @@ static void collect_shader_includes(ExportList* list, const char* shader_path, i
     lt_free_file(bytes);
 }
 
+// Walk the project file to collect referenced shaders, textures, mesh files, and
+// recursive shader includes. This defines exactly what is appended to a normal
+// standalone export.
 static bool collect_project_refs(ExportList* list, const char* project_path, char* err, int err_sz) {
     void* bytes = nullptr;
     size_t size = 0;
@@ -897,6 +915,9 @@ static bool copy_bytes(FILE* dst, FILE* src, unsigned long long count) {
     return true;
 }
 
+// Create a normal standalone EXE by copying the base player and appending the
+// packed payload. If the base executable already contains a pack, it is stripped
+// first so repeated exports do not nest old assets.
 static bool lt_export_normal_exe_internal(const char* base_exe_path,
                                           const char* project_path,
                                           const char* output_exe_path,

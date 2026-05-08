@@ -9,6 +9,11 @@
 // shader.cpp compiles HLSL, builds fallback shaders for error cases, and
 // reflects constant-buffer layouts so the editor can expose shader params.
 
+// Reflection is intentionally limited to simple scalar/vector variables. That
+// keeps the inspector predictable, fits the fixed CommandParam storage, and lets
+// project files store editable shader parameters without needing HLSL-specific
+// packing metadata beyond reflected byte offsets.
+
 static const char* s_fallback_vs = R"HLSL(
 cbuffer SceneCB : register(b0) {
     float4x4 ViewProj;
@@ -263,6 +268,9 @@ uint32_t shader_cb_next_layout_version() {
     return v;
 }
 
+// Reflect the shader's named UserCB cbuffer and ObjectCB usage. ObjectCB is
+// tracked separately because it is engine-owned, while UserCB variables become
+// editable command/global parameters packed at the reflected byte offsets.
 static void reflect_command_cbuffer(Resource* r, ID3DBlob* blob) {
     if (!r || !blob) return;
 
@@ -350,6 +358,9 @@ static void reflect_command_cbuffer(Resource* r, ID3DBlob* blob) {
     refl->Release();
 }
 
+// Reflect cbuffers and resource bindings from a compiled shader blob. The first
+// non-engine cbuffer becomes the editable UserCB layout; its actual register slot
+// is preserved so both old b1 and newer b2 shader conventions can work.
 static void reflect_shader_bindings(Resource* r, ID3DBlob* blob, uint32_t stage_mask) {
     if (!r || !blob || stage_mask == 0)
         return;
@@ -394,6 +405,9 @@ static void reflect_shader_bindings(Resource*, ID3DBlob*, uint32_t) {
 
 // Compile the standard VS/PS pair and reflect user-editable parameters from
 // the shader's constant-buffer layout.
+// Compile a VS/PS pair, create the input layout, then merge reflection from both
+// stages. On error the caller can keep the previous/fallback shader alive while
+// the compile log explains what failed.
 bool shader_compile_vs_ps(Resource* r, const char* path,
                           const char* vs_entry, const char* ps_entry)
 {
@@ -493,6 +507,8 @@ bool shader_compile_vs_ps(Resource* r, const char* path,
 }
 
 // Compute shaders use the same pipeline, but with a single entry point.
+// Compute compilation follows the same reflection path as VS/PS but with a
+// single CS blob. Dispatch commands then use the reflected layout for b# params.
 bool shader_compile_cs(Resource* r, const char* path, const char* cs_entry) {
     shader_release(r);
     strncpy(r->path, path ? path : "", MAX_PATH_LEN - 1);

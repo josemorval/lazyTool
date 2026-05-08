@@ -10,6 +10,17 @@
 // The command system is the runtime execution graph. Each command describes
 // one draw, dispatch, clear, or grouping step in the frame pipeline.
 
+// Implementation map:
+//   1. validation helpers collect user-facing warnings for incomplete bindings.
+//   2. GPU timestamp slots measure total frame time and per-command time without
+//      blocking every frame; old query frames are collected when ready.
+//   3. allocation/rename/move helpers preserve command names/handles for UI,
+//      timeline tracks, and UserCB source links.
+//   4. execution helpers bind render targets, depth, SRVs/UAVs, cbuffers, object
+//      transforms, materials, draw state, and optional shadow receivers.
+//   5. shadow prepass runs lazily before the first receiver/caster path needs it.
+//   6. repeat/group traversal expands the editor tree into the linear GPU work.
+
 Command g_commands[MAX_COMMANDS] = {};
 int     g_command_count = 0;
 bool    g_profiler_enabled = false;
@@ -33,6 +44,9 @@ static bool    s_cmd_reset_execution = true;
 #define GPU_PROFILE_MAX_EVENTS 512
 static const UINT k_shadow_map_ps_slot = 7;
 
+// Validation text is hashed so the UI/log can detect meaningful changes without
+// spamming repeated warnings every frame. The actual warning string remains
+// human-readable and is attached to the command for the inspector.
 static uint32_t validation_hash_text(const char* text) {
     uint32_t hash = 2166136261u;
     if (!text)
@@ -207,6 +221,9 @@ bool cmd_profile_total_ready() {
     return s_gpu_total_ready;
 }
 
+// GPU profiling is double-buffered over several frames. Directly waiting on the
+// most recent timestamp queries would stall the CPU, so begin/end records are
+// written this frame and collected only once the driver reports them ready.
 static void cmd_profile_reset_results() {
     memset(s_cmd_profile_ms, 0, sizeof(s_cmd_profile_ms));
     s_frame_profile_ms = 0.0f;
@@ -383,6 +400,10 @@ static void cmd_make_unique_name_except(const char* base, char* out, int out_sz,
     out[out_sz - 1] = '\0';
 }
 
+// Allocate a command in the first free slot. Handles are one-based indices so
+// zero can remain INVALID_HANDLE in project files and UI state. Defaults are set
+// here rather than in scattered UI code, keeping loaded and newly created
+// commands consistent.
 CmdHandle cmd_alloc(const char* name, CmdType type) {
     char unique_name[MAX_NAME] = {};
     cmd_make_unique_name_except(name, unique_name, MAX_NAME, INVALID_HANDLE);
@@ -500,6 +521,9 @@ bool cmd_rename(CmdHandle h, const char* name) {
     return true;
 }
 
+// Reorder commands by rebuilding the dense command array and remapping parent
+// handles. This keeps drag/drop simple while preserving group ownership after
+// the physical order changes.
 CmdHandle cmd_move(CmdHandle moving, CmdHandle target, bool after_target) {
     if (moving == INVALID_HANDLE || target == INVALID_HANDLE || moving == target)
         return moving;
@@ -683,6 +707,9 @@ static ID3D11RasterizerState* rasterizer_state_for(const Command& c, const MeshM
     return cull_back ? g_dx.rs_solid : g_dx.rs_cull_none;
 }
 
+// Translate editor-visible render toggles into cached DX11 state objects. glTF
+// material metadata can override culling/blending when a mesh part is
+// double-sided or alpha blended.
 static void apply_draw_state(const Command& c, const MeshMaterial* material) {
     ID3D11RasterizerState* rs = rasterizer_state_for(c, material, g_dx.scene_wireframe);
     g_dx.ctx->RSSetState(rs ? rs : g_dx.rs_solid);
@@ -917,6 +944,9 @@ static bool draw_command_has_ps_srv_binding(const Command& c, const Resource* me
     return false;
 }
 
+// Draw validation catches common graph mistakes before executing them: missing
+// shaders, invalid targets, unsafe feedback loops, unsupported UAV slot layouts,
+// and indirect-argument buffers that are too small for the DX11 call.
 static void validate_draw_command(Command& c, const Resource* mesh, const Resource* shader,
                                   bool procedural, bool indirect, const Resource* indirect_buf) {
     char issues[768] = {};
@@ -1161,6 +1191,9 @@ static bool command_is_effectively_enabled(CmdHandle h) {
     return depth < MAX_COMMANDS;
 }
 
+// Shadow rendering reuses the draw command data but binds only depth output and
+// a shadow vertex shader. The generated shadow pass deliberately ignores pixel
+// shaders so material shading cannot affect the depth atlas.
 static void execute_shadow_prepass_command(CmdHandle h) {
     Command* cp = cmd_get(h);
     if (!cp || !command_is_effectively_enabled(h))
@@ -1424,6 +1457,9 @@ static void resolve_dispatch_counts(const Command& c, UINT* out_x, UINT* out_y, 
     *out_z = z;
 }
 
+// Compute commands bind reflected parameters, SRVs and UAVs, then dispatch. The
+// binding tables are always cleared afterwards to avoid read/write hazards when
+// later graphics commands bind the same resources differently.
 static void execute_dispatch_command(Command& c) {
     Resource* shader = res_get(c.shader);
     validate_dispatch_command(c, shader, false, nullptr);
@@ -1457,6 +1493,9 @@ static void execute_indirect_dispatch_command(Command& c) {
     g_dx.ctx->CSSetShader(nullptr, nullptr, 0);
 }
 
+// Main command dispatcher. It is intentionally explicit instead of virtualized:
+// lazyTool stores commands as POD data so projects can serialize cleanly and the
+// UI can edit fields without allocating command subclasses.
 static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done);
 static void execute_repeat_command(CmdHandle repeat_h, Command& repeat, bool& shadow_prepass_done) {
     int count = repeat.repeat_count;

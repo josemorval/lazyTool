@@ -1,3 +1,5 @@
+// Default editor shader. It demonstrates the engine cbuffers, object transform,
+// directional lighting, and cascaded shadow atlas sampling used by normal draws.
 // Minimal example shader used by the default scene. It now samples the shared
 // shadow atlas and uses the cascade data exposed through SceneCB.
 cbuffer SceneCB : register(b0)
