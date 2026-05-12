@@ -1168,7 +1168,7 @@ static void cli_resolve_path_from_launch_dir(const char* launch_dir, char* path,
     if (!path || !path[0] || path_sz <= 0 || cli_path_is_absolute(path))
         return;
     char tmp[MAX_PATH_LEN] = {};
-    snprintf(tmp, sizeof(tmp), "%s\\%s", launch_dir && launch_dir[0] ? launch_dir : ".", path);
+    snprintf(tmp, sizeof(tmp), "%s/%s", launch_dir && launch_dir[0] ? launch_dir : ".", path);
     strncpy(path, tmp, path_sz - 1);
     path[path_sz - 1] = '\0';
 }

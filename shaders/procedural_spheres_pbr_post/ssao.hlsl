@@ -1,5 +1,3 @@
-// Screen-space ambient occlusion pass. It reconstructs view/world information
-// from scene depth and writes a single-channel occlusion mask.
 #include "common.hlsl"
 
 /*

@@ -10,14 +10,11 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <ctype.h>
+#include <float.h>
 
 // This module owns all editor/runtime resources: textures, meshes, shaders,
 // render targets, and the built-in handles that expose engine state to users.
-
-// Resource handles are one-based array indices. The editor keeps every resource
-// as a single POD record because that makes save/load, inspector editing, and
-// generated resources deterministic. GPU objects are released/recreated in-place
-// whenever a path, format, size, or primitive type changes.
 
 Resource  g_resources[MAX_RESOURCES] = {};
 int       g_resource_count = 0;
@@ -27,6 +24,21 @@ ResHandle g_builtin_scene_color = INVALID_HANDLE;
 ResHandle g_builtin_scene_depth = INVALID_HANDLE;
 ResHandle g_builtin_shadow_map  = INVALID_HANDLE;
 ResHandle g_builtin_dirlight    = INVALID_HANDLE;
+
+// Resource paths are stored with forward slashes so inspectors and project
+// files use one stable convention regardless of how the path was typed.
+static void res_store_path(char* dst, int dst_sz, const char* path) {
+    if (!dst || dst_sz <= 0)
+        return;
+    dst[0] = '\0';
+    if (!path)
+        return;
+
+    int di = 0;
+    for (int i = 0; path[i] && di < dst_sz - 1; i++)
+        dst[di++] = path[i] == '\\' ? '/' : path[i];
+    dst[di] = '\0';
+}
 
 struct Vertex { float pos[3]; float nor[3]; float uv[2]; };
 
@@ -214,9 +226,6 @@ static void res_add_quad_face(Vertex* verts, uint32_t* idx, int* vert_cursor, in
     idx[(*index_cursor)++] = base + 3;
 }
 
-// Primitive mesh helpers write triangles in the same winding convention as the
-// renderer expects. Keeping the winding centralized avoids shadow/prepass bugs
-// when the tiny 64k player mirrors these primitives.
 static void res_add_oriented_tri(const Vertex* verts, uint32_t* idx, int* idx_count,
                                  uint32_t a, uint32_t b, uint32_t c)
 {
@@ -406,6 +415,7 @@ const char* res_type_str(ResType t) {
     case RES_RENDER_TEXTURE2D:    return "RenderTexture2D";
     case RES_RENDER_TEXTURE3D:    return "RenderTexture3D";
     case RES_STRUCTURED_BUFFER:   return "StructuredBuffer";
+    case RES_GAUSSIAN_SPLAT:      return "GaussianSplat";
     case RES_MESH:                return "Mesh";
     case RES_SHADER:              return "Shader";
     case RES_BUILTIN_TIME:        return "[time]";
@@ -459,6 +469,7 @@ uint64_t res_estimate_gpu_bytes(const Resource& r) {
                (uint64_t)(r.depth > 0 ? r.depth : 0) *
                (uint64_t)res_format_bytes_per_pixel(r.tex_fmt);
     case RES_STRUCTURED_BUFFER:
+    case RES_GAUSSIAN_SPLAT:
         return (uint64_t)(r.elem_size > 0 ? r.elem_size : 0) *
                (uint64_t)(r.elem_count > 0 ? r.elem_count : 0);
     case RES_MESH:
@@ -514,9 +525,6 @@ void res_shutdown() {
         if (g_resources[i].active && !g_resources[i].is_builtin) res_release_gpu(&g_resources[i]);
 }
 
-// Allocate a resource slot and initialize cross-type defaults. Every creation
-// function starts here so names, active flags, and invalid child handles use the
-// same baseline.
 ResHandle res_alloc(const char* name, ResType type) {
     for (int i = 0; i < MAX_RESOURCES; i++) {
         if (!g_resources[i].active) {
@@ -605,6 +613,7 @@ static bool res_has_size_variable(const Resource& r) {
     case RES_RENDER_TEXTURE2D:
     case RES_RENDER_TEXTURE3D:
     case RES_STRUCTURED_BUFFER:
+    case RES_GAUSSIAN_SPLAT:
     case RES_BUILTIN_SCENE_COLOR:
     case RES_BUILTIN_SCENE_DEPTH:
     case RES_BUILTIN_SHADOW_MAP:
@@ -617,13 +626,13 @@ static bool res_has_size_variable(const Resource& r) {
 static ResType res_size_type_for(const Resource& r) {
     if (r.type == RES_RENDER_TEXTURE3D)
         return RES_INT3;
-    if (r.type == RES_STRUCTURED_BUFFER)
+    if (r.type == RES_STRUCTURED_BUFFER || r.type == RES_GAUSSIAN_SPLAT)
         return RES_INT;
     return RES_INT2;
 }
 
 static void res_size_name_for(const Resource& r, char* out, int out_sz) {
-    if (r.type == RES_STRUCTURED_BUFFER)
+    if (r.type == RES_STRUCTURED_BUFFER || r.type == RES_GAUSSIAN_SPLAT)
         snprintf(out, out_sz, "%s.count", r.name);
     else
         snprintf(out, out_sz, "%s.size", r.name);
@@ -633,9 +642,6 @@ static void res_size_name_for(const Resource& r, char* out, int out_sz) {
 // Every size-bearing resource exposes a generated dimensions/count variable so
 // compute dispatches and shader params can stay data-driven instead of
 // hardcoding scene-dependent numbers in the project file.
-// Size resources are generated float/int values that mirror texture dimensions
-// or buffer counts. They let shaders and dispatch dimensions follow resource
-// changes without hardcoded constants in the project.
 void res_sync_size_resource(ResHandle h) {
     Resource* r = res_get(h);
     if (!r || r->is_generated)
@@ -672,7 +678,7 @@ void res_sync_size_resource(ResHandle h) {
     strncpy(size_res->name, size_name, MAX_NAME - 1);
     size_res->name[MAX_NAME - 1] = '\0';
     size_res->type = size_type;
-    if (r->type == RES_STRUCTURED_BUFFER) {
+    if (r->type == RES_STRUCTURED_BUFFER || r->type == RES_GAUSSIAN_SPLAT) {
         size_res->ival[0] = r->elem_count > 0 ? r->elem_count : 1;
         size_res->ival[1] = 1;
         size_res->ival[2] = 1;
@@ -696,9 +702,6 @@ ResHandle res_find_by_name(const char* name) {
     return INVALID_HANDLE;
 }
 
-// Release only GPU-side objects and generated children, leaving the Resource
-// record itself valid for the editor. This is used by reload/recreate paths where
-// names, handles, and command references must survive.
 void res_release_gpu(Resource* r) {
     if (r->srv) { r->srv->Release(); r->srv = nullptr; }
     if (r->rtv) { r->rtv->Release(); r->rtv = nullptr; }
@@ -873,9 +876,6 @@ bool res_recreate_render_texture(ResHandle h, int w, int hgt, DXGI_FORMAT fmt,
     return true;
 }
 
-// Create a 2D render texture with any combination of RTV/SRV/UAV/DSV views.
-// Scene-scaled targets are recreated when the viewport size changes, which is
-// why the requested divisor is stored alongside the concrete width/height.
 ResHandle res_create_render_texture(const char* name, int w, int h, DXGI_FORMAT fmt,
                                      bool want_rtv, bool want_srv, bool want_uav, bool want_dsv,
                                      int scene_scale_divisor)
@@ -1105,6 +1105,13 @@ void res_reset_transient_gpu_resources() {
                 reset_count++;
             break;
         }
+        case RES_GAUSSIAN_SPLAT: {
+            char path[MAX_PATH_LEN] = {};
+            strncpy(path, r.path, MAX_PATH_LEN - 1);
+            if (path[0] && res_reload_gaussian_splat(&r, path))
+                reset_count++;
+            break;
+        }
         default:
             break;
         }
@@ -1136,9 +1143,6 @@ void res_sync_scene_dependent_render_textures() {
         log_info("Resized %d scene-scaled render textures.", sync_count);
 }
 
-// Structured buffers are used for simulation data, instancing data, and indirect
-// argument blocks. The indirect flag switches the buffer misc flags so DX11
-// accepts it for Draw/DispatchIndirect.
 ResHandle res_create_structured_buffer(const char* name, int elem_size, int elem_count,
                                         bool want_srv, bool want_uav, bool want_indirect_args)
 {
@@ -1190,10 +1194,8 @@ static bool res_upload_texture_2d(Resource* r, const char* source_label,
     r->has_rtv = false;
     r->has_uav = false;
     r->has_dsv = false;
-    if (source_label) {
-        strncpy(r->path, source_label, MAX_PATH_LEN - 1);
-        r->path[MAX_PATH_LEN - 1] = '\0';
-    }
+    if (source_label)
+        res_store_path(r->path, MAX_PATH_LEN, source_label);
 
     D3D11_TEXTURE2D_DESC td = {};
     td.Width     = (UINT)w;
@@ -1293,9 +1295,6 @@ static bool res_load_texture_file_into(Resource* r, const char* path) {
     return ok;
 }
 
-// Texture loading goes through lt_read_file() so normal editor runs and packed
-// player executables share the same code path. Disk files and appended-pack
-// files therefore behave identically after loading.
 bool res_reload_texture(Resource* r, const char* path) {
     if (!r || r->type != RES_TEXTURE2D || !path || !path[0])
         return false;
@@ -1374,7 +1373,7 @@ static void res_path_join(const char* dir, const char* file, char* out, int out_
         return;
     }
 
-    snprintf(out, out_sz, "%s\\%s", dir, file);
+    snprintf(out, out_sz, "%s/%s", dir, file);
 }
 
 ResHandle res_load_texture(const char* name, const char* path) {
@@ -1869,15 +1868,11 @@ static void res_cgltf_file_release(const cgltf_memory_options*,
     lt_free_file(data);
 }
 
-// glTF import flattens the supported subset into one vertex/index buffer plus
-// per-part ranges. Materials and embedded textures become generated child
-// resources so deleting/reloading the owner mesh cleans them up automatically.
 ResHandle res_load_mesh(const char* name, const char* path) {
     ResHandle handle = res_alloc(name, RES_MESH);
     if (handle == INVALID_HANDLE) return INVALID_HANDLE;
     Resource* r = res_get(handle);
-    strncpy(r->path, path, MAX_PATH_LEN - 1);
-    r->path[MAX_PATH_LEN - 1] = '\0';
+    res_store_path(r->path, MAX_PATH_LEN, path);
     r->compiled_ok = false;
     r->using_fallback = false;
     r->compile_err[0] = '\0';
@@ -2005,6 +2000,496 @@ ResHandle res_load_mesh(const char* name, const char* path) {
     r->compile_err[0] = '\0';
     log_info("Mesh loaded: %s (%d verts, %d idx, %d parts, %d materials)",
              name, r->vert_count, r->idx_count, r->mesh_part_count, r->mesh_material_count);
+    return handle;
+}
+
+
+// ── Gaussian Splat PLY resources ──────────────────────────────────────────
+// The runtime representation is intentionally simple and shader-friendly:
+// one immutable read-only StructuredBuffer exposed as SRV.  It stores one
+// decoded splat per element and leaves sorting/culling to user shaders or
+// additional compute passes.
+struct GaussianSplatGPU {
+    float pos_opacity[4]; // xyz center, alpha
+    float quat[4];        // xyzw quaternion, converted from common PLY wxyz
+    float scale[4];       // xyz world-space stddev-ish scale, w unused
+    float color[4];       // rgb base SH/DC color, a duplicate alpha for convenience
+};
+
+struct PlyPropertyDesc {
+    char name[64];
+    int  type;
+    int  size;
+};
+
+enum PlyScalarType {
+    PLY_SCALAR_INVALID = 0,
+    PLY_SCALAR_I8,
+    PLY_SCALAR_U8,
+    PLY_SCALAR_I16,
+    PLY_SCALAR_U16,
+    PLY_SCALAR_I32,
+    PLY_SCALAR_U32,
+    PLY_SCALAR_F32,
+    PLY_SCALAR_F64
+};
+
+struct PlyHeaderInfo {
+    bool ascii;
+    bool binary_little;
+    int vertex_count;
+    int prop_count;
+    int rest_count;
+    size_t data_offset;
+    PlyPropertyDesc props[128];
+};
+
+static int res_ply_scalar_type(const char* type_name) {
+    if (!type_name) return PLY_SCALAR_INVALID;
+    if (strcmp(type_name, "char") == 0 || strcmp(type_name, "int8") == 0 || strcmp(type_name, "int8_t") == 0) return PLY_SCALAR_I8;
+    if (strcmp(type_name, "uchar") == 0 || strcmp(type_name, "uint8") == 0 || strcmp(type_name, "uint8_t") == 0) return PLY_SCALAR_U8;
+    if (strcmp(type_name, "short") == 0 || strcmp(type_name, "int16") == 0 || strcmp(type_name, "int16_t") == 0) return PLY_SCALAR_I16;
+    if (strcmp(type_name, "ushort") == 0 || strcmp(type_name, "uint16") == 0 || strcmp(type_name, "uint16_t") == 0) return PLY_SCALAR_U16;
+    if (strcmp(type_name, "int") == 0 || strcmp(type_name, "int32") == 0 || strcmp(type_name, "int32_t") == 0) return PLY_SCALAR_I32;
+    if (strcmp(type_name, "uint") == 0 || strcmp(type_name, "uint32") == 0 || strcmp(type_name, "uint32_t") == 0) return PLY_SCALAR_U32;
+    if (strcmp(type_name, "float") == 0 || strcmp(type_name, "float32") == 0) return PLY_SCALAR_F32;
+    if (strcmp(type_name, "double") == 0 || strcmp(type_name, "float64") == 0) return PLY_SCALAR_F64;
+    return PLY_SCALAR_INVALID;
+}
+
+static int res_ply_scalar_size(int type) {
+    switch (type) {
+    case PLY_SCALAR_I8:
+    case PLY_SCALAR_U8:  return 1;
+    case PLY_SCALAR_I16:
+    case PLY_SCALAR_U16: return 2;
+    case PLY_SCALAR_I32:
+    case PLY_SCALAR_U32:
+    case PLY_SCALAR_F32: return 4;
+    case PLY_SCALAR_F64: return 8;
+    default:             return 0;
+    }
+}
+
+static bool res_ply_line_equals(const char* line, const char* word) {
+    return line && word && strcmp(line, word) == 0;
+}
+
+static void res_ply_trim_line(char* line) {
+    if (!line) return;
+    char* start = line;
+    while (*start && isspace((unsigned char)*start)) start++;
+    if (start != line)
+        memmove(line, start, strlen(start) + 1);
+    int len = (int)strlen(line);
+    while (len > 0 && isspace((unsigned char)line[len - 1]))
+        line[--len] = '\0';
+}
+
+static bool res_ply_parse_header(const unsigned char* bytes, size_t byte_count,
+                                 PlyHeaderInfo* out, char* err, int err_sz)
+{
+    if (!bytes || !out || byte_count < 16)
+        return false;
+    memset(out, 0, sizeof(*out));
+
+    size_t pos = 0;
+    bool saw_ply = false;
+    bool in_vertex = false;
+    while (pos < byte_count) {
+        size_t line_start = pos;
+        while (pos < byte_count && bytes[pos] != '\n')
+            pos++;
+        size_t line_end = pos;
+        if (pos < byte_count && bytes[pos] == '\n')
+            pos++;
+
+        size_t line_len = line_end - line_start;
+        if (line_len > 0 && bytes[line_start + line_len - 1] == '\r')
+            line_len--;
+        char line[512] = {};
+        if (line_len >= sizeof(line))
+            line_len = sizeof(line) - 1;
+        memcpy(line, bytes + line_start, line_len);
+        line[line_len] = '\0';
+        res_ply_trim_line(line);
+        if (!line[0])
+            continue;
+
+        if (!saw_ply) {
+            if (!res_ply_line_equals(line, "ply")) {
+                snprintf(err, err_sz, "PLY header must start with 'ply'.");
+                return false;
+            }
+            saw_ply = true;
+            continue;
+        }
+
+        if (res_ply_line_equals(line, "end_header")) {
+            out->data_offset = pos;
+            if (out->vertex_count <= 0) {
+                snprintf(err, err_sz, "PLY has no vertex element.");
+                return false;
+            }
+            if (!out->ascii && !out->binary_little) {
+                snprintf(err, err_sz, "PLY format must be ascii or binary_little_endian.");
+                return false;
+            }
+            return true;
+        }
+
+        char tmp[512] = {};
+        strncpy(tmp, line, sizeof(tmp) - 1);
+        char* tag = strtok(tmp, " \t");
+        if (!tag || tag[0] == '#')
+            continue;
+        if (strcmp(tag, "comment") == 0 || strcmp(tag, "obj_info") == 0)
+            continue;
+
+        if (strcmp(tag, "format") == 0) {
+            char* fmt = strtok(nullptr, " \t");
+            if (fmt && strcmp(fmt, "binary_little_endian") == 0)
+                out->binary_little = true;
+            else if (fmt && strcmp(fmt, "ascii") == 0)
+                out->ascii = true;
+            else {
+                snprintf(err, err_sz, "Unsupported PLY format '%s'.", fmt ? fmt : "?");
+                return false;
+            }
+        } else if (strcmp(tag, "element") == 0) {
+            char* elem_name = strtok(nullptr, " \t");
+            char* elem_count = strtok(nullptr, " \t");
+            in_vertex = elem_name && strcmp(elem_name, "vertex") == 0;
+            if (in_vertex)
+                out->vertex_count = elem_count ? atoi(elem_count) : 0;
+        } else if (strcmp(tag, "property") == 0 && in_vertex) {
+            char* type_name = strtok(nullptr, " \t");
+            if (type_name && strcmp(type_name, "list") == 0) {
+                snprintf(err, err_sz, "PLY vertex list properties are not supported.");
+                return false;
+            }
+            char* prop_name = strtok(nullptr, " \t");
+            int type = res_ply_scalar_type(type_name);
+            int size = res_ply_scalar_size(type);
+            if (!prop_name || type == PLY_SCALAR_INVALID || size <= 0) {
+                snprintf(err, err_sz, "Unsupported PLY vertex property.");
+                return false;
+            }
+            if (out->prop_count >= (int)(sizeof(out->props) / sizeof(out->props[0]))) {
+                snprintf(err, err_sz, "Too many PLY vertex properties.");
+                return false;
+            }
+            PlyPropertyDesc& prop = out->props[out->prop_count++];
+            strncpy(prop.name, prop_name, sizeof(prop.name) - 1);
+            prop.type = type;
+            prop.size = size;
+            if (strncmp(prop.name, "f_rest_", 7) == 0)
+                out->rest_count++;
+        }
+    }
+
+    snprintf(err, err_sz, "PLY is missing end_header.");
+    return false;
+}
+
+static int res_ply_find_prop(const PlyHeaderInfo& hdr, const char* name) {
+    for (int i = 0; i < hdr.prop_count; i++)
+        if (strcmp(hdr.props[i].name, name) == 0)
+            return i;
+    return -1;
+}
+
+static float res_ply_read_binary_scalar(const unsigned char* p, int type) {
+    switch (type) {
+    case PLY_SCALAR_I8:  return (float)*(const signed char*)p;
+    case PLY_SCALAR_U8:  return (float)*(const unsigned char*)p;
+    case PLY_SCALAR_I16: { int16_t v = 0; memcpy(&v, p, sizeof(v)); return (float)v; }
+    case PLY_SCALAR_U16: { uint16_t v = 0; memcpy(&v, p, sizeof(v)); return (float)v; }
+    case PLY_SCALAR_I32: { int32_t v = 0; memcpy(&v, p, sizeof(v)); return (float)v; }
+    case PLY_SCALAR_U32: { uint32_t v = 0; memcpy(&v, p, sizeof(v)); return (float)v; }
+    case PLY_SCALAR_F32: { float v = 0.0f; memcpy(&v, p, sizeof(v)); return v; }
+    case PLY_SCALAR_F64: { double v = 0.0; memcpy(&v, p, sizeof(v)); return (float)v; }
+    default:             return 0.0f;
+    }
+}
+
+static float res_sigmoid_stable(float x) {
+    if (x >= 0.0f) {
+        float e = expf(-x);
+        return 1.0f / (1.0f + e);
+    }
+    float e = expf(x);
+    return e / (1.0f + e);
+}
+
+static void res_normalize_quat_xyzw(float q[4]) {
+    float len = sqrtf(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+    if (len <= 1e-8f) {
+        q[0] = 0.0f; q[1] = 0.0f; q[2] = 0.0f; q[3] = 1.0f;
+        return;
+    }
+    float inv = 1.0f / len;
+    q[0] *= inv; q[1] *= inv; q[2] *= inv; q[3] *= inv;
+}
+
+static void res_set_splat_err(Resource* r, const char* msg) {
+    if (!r) return;
+    r->compiled_ok = false;
+    r->using_fallback = false;
+    snprintf(r->compile_err, sizeof(r->compile_err), "%s", msg ? msg : "Gaussian splat load failed");
+    log_error("GaussianSplat: %s", r->compile_err);
+}
+
+static bool res_upload_gaussian_splat_buffer(Resource* r, const GaussianSplatGPU* splats,
+                                             int splat_count, const char* source_label,
+                                             int rest_count, float avg_scale,
+                                             const float bounds_min[3], const float bounds_max[3])
+{
+    if (!r || !splats || splat_count <= 0)
+        return false;
+
+    res_release_gpu(r);
+    r->type = RES_GAUSSIAN_SPLAT;
+    r->elem_size = sizeof(GaussianSplatGPU);
+    r->elem_count = splat_count;
+    r->has_srv = true;
+    r->has_uav = false;
+    r->has_rtv = false;
+    r->has_dsv = false;
+    r->indirect_args = false;
+    r->width = splat_count;
+    r->height = 1;
+    r->depth = 1;
+    r->tex_fmt = DXGI_FORMAT_UNKNOWN;
+    r->splat_rest_count = rest_count;
+    r->splat_avg_scale = avg_scale;
+    if (rest_count >= 45) r->splat_sh_degree = 3;
+    else if (rest_count >= 24) r->splat_sh_degree = 2;
+    else if (rest_count >= 9) r->splat_sh_degree = 1;
+    else r->splat_sh_degree = 0;
+    for (int i = 0; i < 3; i++) {
+        r->splat_bounds_min[i] = bounds_min ? bounds_min[i] : 0.0f;
+        r->splat_bounds_max[i] = bounds_max ? bounds_max[i] : 0.0f;
+    }
+    if (source_label)
+        res_store_path(r->path, MAX_PATH_LEN, source_label);
+
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = (UINT)(sizeof(GaussianSplatGPU) * (size_t)splat_count);
+    bd.Usage = D3D11_USAGE_IMMUTABLE;
+    bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bd.StructureByteStride = sizeof(GaussianSplatGPU);
+
+    D3D11_SUBRESOURCE_DATA init = {};
+    init.pSysMem = splats;
+    HRESULT hr = g_dx.dev->CreateBuffer(&bd, &init, &r->buf);
+    if (FAILED(hr) || !r->buf) {
+        res_set_splat_err(r, "StructuredBuffer create failed for Gaussian splat.");
+        return false;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Format = DXGI_FORMAT_UNKNOWN;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+    sd.Buffer.NumElements = (UINT)splat_count;
+    hr = g_dx.dev->CreateShaderResourceView(r->buf, &sd, &r->srv);
+    if (FAILED(hr) || !r->srv) {
+        res_set_splat_err(r, "SRV create failed for Gaussian splat.");
+        return false;
+    }
+
+    r->compiled_ok = true;
+    r->using_fallback = false;
+    r->compile_err[0] = '\0';
+    ResHandle handle = (ResHandle)((r - g_resources) + 1);
+    res_sync_size_resource(handle);
+    return true;
+}
+
+static bool res_load_gaussian_splat_file_into(Resource* r, const char* path) {
+    if (!r || !path || !path[0])
+        return false;
+
+    void* bytes_v = nullptr;
+    size_t byte_count = 0;
+    if (!lt_read_file(path, &bytes_v, &byte_count)) {
+        char msg[512] = {};
+        snprintf(msg, sizeof(msg), "file not found: %s", path);
+        res_set_splat_err(r, msg);
+        return false;
+    }
+    const unsigned char* bytes = (const unsigned char*)bytes_v;
+
+    char err[512] = {};
+    PlyHeaderInfo hdr = {};
+    if (!res_ply_parse_header(bytes, byte_count, &hdr, err, sizeof(err))) {
+        lt_free_file(bytes_v);
+        res_set_splat_err(r, err);
+        return false;
+    }
+
+    int ix = res_ply_find_prop(hdr, "x");
+    int iy = res_ply_find_prop(hdr, "y");
+    int iz = res_ply_find_prop(hdr, "z");
+    if (ix < 0 || iy < 0 || iz < 0) {
+        lt_free_file(bytes_v);
+        res_set_splat_err(r, "PLY is missing x/y/z vertex properties.");
+        return false;
+    }
+
+    int is0 = res_ply_find_prop(hdr, "scale_0");
+    int is1 = res_ply_find_prop(hdr, "scale_1");
+    int is2 = res_ply_find_prop(hdr, "scale_2");
+    int ir0 = res_ply_find_prop(hdr, "rot_0");
+    int ir1 = res_ply_find_prop(hdr, "rot_1");
+    int ir2 = res_ply_find_prop(hdr, "rot_2");
+    int ir3 = res_ply_find_prop(hdr, "rot_3");
+    int io = res_ply_find_prop(hdr, "opacity");
+    int idc0 = res_ply_find_prop(hdr, "f_dc_0");
+    int idc1 = res_ply_find_prop(hdr, "f_dc_1");
+    int idc2 = res_ply_find_prop(hdr, "f_dc_2");
+
+    GaussianSplatGPU* splats = (GaussianSplatGPU*)malloc(sizeof(GaussianSplatGPU) * (size_t)hdr.vertex_count);
+    if (!splats) {
+        lt_free_file(bytes_v);
+        res_set_splat_err(r, "out of memory while loading Gaussian splat.");
+        return false;
+    }
+
+    int stride = 0;
+    for (int i = 0; i < hdr.prop_count; i++)
+        stride += hdr.props[i].size;
+
+    if (hdr.binary_little) {
+        unsigned long long needed = (unsigned long long)hdr.data_offset +
+                                    (unsigned long long)stride * (unsigned long long)hdr.vertex_count;
+        if (needed > (unsigned long long)byte_count) {
+            free(splats);
+            lt_free_file(bytes_v);
+            res_set_splat_err(r, "PLY binary vertex data is truncated.");
+            return false;
+        }
+    }
+
+    float bounds_min[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
+    float bounds_max[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+    double scale_sum = 0.0;
+    const float sh_c0 = 0.28209479177387814f;
+
+    const unsigned char* binary_row = bytes + hdr.data_offset;
+    const char* ascii_cursor = (const char*)(bytes + hdr.data_offset);
+    float vals[128] = {};
+
+    for (int vi = 0; vi < hdr.vertex_count; vi++) {
+        if (hdr.binary_little) {
+            const unsigned char* pcur = binary_row + (size_t)vi * (size_t)stride;
+            for (int pi = 0; pi < hdr.prop_count; pi++) {
+                vals[pi] = res_ply_read_binary_scalar(pcur, hdr.props[pi].type);
+                pcur += hdr.props[pi].size;
+            }
+        } else {
+            for (int pi = 0; pi < hdr.prop_count; pi++) {
+                while (*ascii_cursor && isspace((unsigned char)*ascii_cursor)) ascii_cursor++;
+                char* endp = nullptr;
+                double v = strtod(ascii_cursor, &endp);
+                if (endp == ascii_cursor) {
+                    free(splats);
+                    lt_free_file(bytes_v);
+                    res_set_splat_err(r, "PLY ASCII vertex data is truncated or invalid.");
+                    return false;
+                }
+                vals[pi] = (float)v;
+                ascii_cursor = endp;
+            }
+        }
+
+        GaussianSplatGPU& s = splats[vi];
+        memset(&s, 0, sizeof(s));
+        float x = vals[ix], y = vals[iy], z = vals[iz];
+        s.pos_opacity[0] = x;
+        s.pos_opacity[1] = y;
+        s.pos_opacity[2] = z;
+        s.pos_opacity[3] = io >= 0 ? clampf(res_sigmoid_stable(vals[io]), 0.0f, 1.0f) : 1.0f;
+
+        float sx = is0 >= 0 ? expf(vals[is0]) : 0.01f;
+        float sy = is1 >= 0 ? expf(vals[is1]) : sx;
+        float sz = is2 >= 0 ? expf(vals[is2]) : sx;
+        s.scale[0] = sx;
+        s.scale[1] = sy;
+        s.scale[2] = sz;
+        s.scale[3] = 0.0f;
+        float max_scale = sx;
+        if (sy > max_scale) max_scale = sy;
+        if (sz > max_scale) max_scale = sz;
+        scale_sum += (double)max_scale;
+
+        // Common 3DGS PLY stores rot_0..3 as WXYZ.  Store XYZW for HLSL helpers.
+        float q[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        if (ir0 >= 0 && ir1 >= 0 && ir2 >= 0 && ir3 >= 0) {
+            q[0] = vals[ir1];
+            q[1] = vals[ir2];
+            q[2] = vals[ir3];
+            q[3] = vals[ir0];
+        }
+        res_normalize_quat_xyzw(q);
+        s.quat[0] = q[0];
+        s.quat[1] = q[1];
+        s.quat[2] = q[2];
+        s.quat[3] = q[3];
+
+        if (idc0 >= 0 && idc1 >= 0 && idc2 >= 0) {
+            s.color[0] = clampf(0.5f + sh_c0 * vals[idc0], 0.0f, 1.0f);
+            s.color[1] = clampf(0.5f + sh_c0 * vals[idc1], 0.0f, 1.0f);
+            s.color[2] = clampf(0.5f + sh_c0 * vals[idc2], 0.0f, 1.0f);
+        } else {
+            s.color[0] = 1.0f;
+            s.color[1] = 1.0f;
+            s.color[2] = 1.0f;
+        }
+        s.color[3] = s.pos_opacity[3];
+
+        if (x < bounds_min[0]) bounds_min[0] = x;
+        if (y < bounds_min[1]) bounds_min[1] = y;
+        if (z < bounds_min[2]) bounds_min[2] = z;
+        if (x > bounds_max[0]) bounds_max[0] = x;
+        if (y > bounds_max[1]) bounds_max[1] = y;
+        if (z > bounds_max[2]) bounds_max[2] = z;
+    }
+
+    float avg_scale = hdr.vertex_count > 0 ? (float)(scale_sum / (double)hdr.vertex_count) : 0.0f;
+    bool ok = res_upload_gaussian_splat_buffer(r, splats, hdr.vertex_count, path, hdr.rest_count,
+                                               avg_scale, bounds_min, bounds_max);
+    free(splats);
+    lt_free_file(bytes_v);
+    if (ok) {
+        log_info("GaussianSplat loaded: %s (%d splats, %d bytes/elem)",
+                 r->name, r->elem_count, r->elem_size);
+    }
+    return ok;
+}
+
+bool res_reload_gaussian_splat(Resource* r, const char* path) {
+    if (!r || r->type != RES_GAUSSIAN_SPLAT || !path || !path[0])
+        return false;
+    return res_load_gaussian_splat_file_into(r, path);
+}
+
+ResHandle res_load_gaussian_splat(const char* name, const char* path) {
+    ResHandle handle = res_alloc(name, RES_GAUSSIAN_SPLAT);
+    if (handle == INVALID_HANDLE) return INVALID_HANDLE;
+    Resource* r = res_get(handle);
+    if (!path || !path[0] || strcmp(path, "-") == 0) {
+        if (r) {
+            r->compiled_ok = false;
+            r->compile_err[0] = '\0';
+        }
+        return handle;
+    }
+    if (!res_load_gaussian_splat_file_into(r, path)) {
+        // Keep the requested path visible so it can be fixed from the inspector.
+        res_store_path(r->path, MAX_PATH_LEN, path);
+    }
     return handle;
 }
 

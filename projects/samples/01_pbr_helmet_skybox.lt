@@ -35,7 +35,6 @@ command clear clear_scene 1
   indirect_args - 0
   repeat 1 1
   parent -
-  textures 0
   srvs 0
   uavs 0
   params 0
@@ -58,8 +57,7 @@ command draw_mesh draw_skybox 1
   indirect_args - 0
   repeat 1 1
   parent -
-  textures 1 venice_env|texture2d 5
-  srvs 0
+  srvs 1 venice_env|texture2d 5
   uavs 0
   params 0
 end_command
@@ -81,8 +79,7 @@ command draw_mesh draw_ground 1
   indirect_args - 0
   repeat 1 1
   parent -
-  textures 2 venice_env|texture2d 5 shadow_map|builtin_shadow_map 7
-  srvs 0
+  srvs 2 venice_env|texture2d 5 shadow_map|builtin_shadow_map 7
   uavs 0
   params 2
   param GroundColor float4 1 - 0 0 0 0 0.62 0.63 0.68 1
@@ -106,8 +103,7 @@ command draw_mesh draw_damaged_helmet 1
   indirect_args - 0
   repeat 1 1
   parent -
-  textures 2 venice_env|texture2d 5 shadow_map|builtin_shadow_map 7
-  srvs 0
+  srvs 2 venice_env|texture2d 5 shadow_map|builtin_shadow_map 7
   uavs 0
   params 2
   param BaseColorFactor float4 1 - 0 0 0 0 1 1 1 1

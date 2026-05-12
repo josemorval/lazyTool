@@ -1,5 +1,3 @@
-// Shadow-only pass for procedural primitives. It transforms geometry into the
-// selected shadow cascade and writes depth without a material pixel shader.
 #include "scene_common.hlsl"
 
 /*

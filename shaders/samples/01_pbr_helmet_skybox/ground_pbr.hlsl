@@ -1,5 +1,3 @@
-// Sample ground shader for the glTF helmet scene. Demonstrates PBR lighting,
-// shadow receiving, and optional UserCB parameters on imported assets.
 /*
 Sample 01: thin cube ground using the same lighting vocabulary as the helmet.
 

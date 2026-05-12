@@ -23,14 +23,6 @@
 // golfing. The generated .exe can be passed through UPX afterwards, so the C source
 // remains didactic and heavily commented where the architecture matters.
 
-// Exporter phases:
-//   1. parse the normal .lt project into a compact intermediate Project.
-//   2. resolve only procedural-safe resources: shaders, primitives, render
-//      textures, built-ins, UserCB values, and timeline tracks.
-//   3. inline shader includes, optionally minify HLSL, and emit static C arrays.
-//   4. emit a tiny Win32/D3D11 runtime that recreates the render graph directly
-//      from those arrays without shipping external assets.
-
 #include <algorithm>
 #include <cctype>
 #include <cstdarg>
@@ -286,9 +278,6 @@ static std::string compact_hlsl_line(const std::string& line) {
     return o;
 }
 
-// Optional HLSL minifier for the 64k path. It keeps preprocessor lines intact
-// and performs conservative whitespace removal so generated sources stay valid
-// across D3DCompile versions.
 static std::string minify_hlsl_for_64k(const std::string& src) {
     std::string no_comments = strip_hlsl_comments(src);
     std::istringstream in(no_comments);
@@ -334,7 +323,8 @@ enum ResKind {
     RK_TEXTURE,
     RK_RT,
     RK_RT3D,
-    RK_BUFFER
+    RK_BUFFER,
+    RK_GAUSSIAN_SPLAT
 };
 
 enum ValType {
@@ -621,9 +611,6 @@ static void store_q(float out[4], Q4 q) {
 // This parser is intentionally forgiving: it accepts the editor format, ignores
 // fields the procedural player does not need yet, and preserves enough data so
 // future renderer paths can be added without changing the .lt syntax again.
-// Parse the editor project into the procedural export subset. Unsupported data
-// is not fatal unless it is required by an enabled command; this lets artists keep
-// editor-only experiments in a scene while exporting the procedural core.
 static Project parse_lt(const std::string& lt_path) {
     std::string text = read_text_file(lt_path);
     if (text.empty()) die("cannot read lt: %s", lt_path.c_str());
@@ -661,6 +648,8 @@ static Project parse_lt(const std::string& lt_path) {
                 r.kind = RK_SHADER_CS; r.name = t[2]; r.path = t.size() > 3 ? t[3] : "";
             } else if (kind == "texture2d") {
                 r.kind = RK_TEXTURE; r.name = t[2]; r.path = t.size() > 3 ? t[3] : "";
+            } else if (kind == "gaussian_splat") {
+                r.kind = RK_GAUSSIAN_SPLAT; r.name = t[2]; r.path = t.size() > 3 ? t[3] : "";
             } else if (kind == "render_texture") {
                 r.kind = RK_RT; r.name = t[2];
                 r.ival[0] = toki(t,3,0); // width, 0 = scene width
@@ -905,8 +894,6 @@ static int clear_source_user_var_index(const Project& p, const std::string& sour
     return first_linked;
 }
 
-// Dependency resolution keeps clear colors/depth values connected to exported
-// UserCB variables when the normal editor project references them by name.
 static void resolve_clear_sources_for_64k(const Project& p, CommandDef& c, int* clear_color_user, int* clear_depth_user) {
     if (clear_color_user) *clear_color_user = clear_source_user_var_index(p, c.clear_color_source, VT_FLOAT4);
     if (clear_depth_user) *clear_depth_user = clear_source_user_var_index(p, c.clear_depth_source, VT_FLOAT);
@@ -1191,9 +1178,6 @@ static std::string builtin_primitive_shadow_hlsl() {
 //   3. Convert resource references to small integer codes.
 //   4. Flatten command parameters and timeline keys into compact arrays.
 //   5. Leave D3D11 object creation to the generated runtime.
-// Emit the final single-file C runtime. The generated file is intentionally not
-// a general engine; it is a compact replay program for the already-validated
-// procedural subset of the lazyTool graph.
 static void emit_generated_c(const Project& p, const std::string& lt_path, const std::string& out_c) {
     std::string lt_dir = path_dir(lt_path);
     std::vector<std::string> roots;
@@ -1234,7 +1218,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
             rt_res_indices.push_back((int)i);
         } else if (r.kind == RK_RT3D) {
             warnf("resource '%s': render_texture3d is parsed, but the current 64k VS/PS player only instantiates 2D render targets", r.name.c_str());
-        } else if (r.kind == RK_TEXTURE || r.kind == RK_MESH_FILE) {
+        } else if (r.kind == RK_TEXTURE || r.kind == RK_MESH_FILE || r.kind == RK_GAUSSIAN_SPLAT) {
             warnf("resource '%s' is not part of the 64k path (%s)", r.name.c_str(), r.path.c_str());
         }
     }

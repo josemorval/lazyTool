@@ -42,6 +42,7 @@ typedef enum {
     RES_RENDER_TEXTURE2D,
     RES_RENDER_TEXTURE3D,
     RES_STRUCTURED_BUFFER,
+    RES_GAUSSIAN_SPLAT,
     RES_MESH,
     RES_SHADER,
     RES_BUILTIN_TIME,
@@ -83,6 +84,12 @@ typedef enum {
     SHADER_BIND_SAMPLER
 } ShaderBindingKind;
 
+typedef enum {
+    SHADER_PROGRAM_UNKNOWN = 0,
+    SHADER_PROGRAM_VSPS,
+    SHADER_PROGRAM_CS
+} ShaderProgramKind;
+
 enum {
     SHADER_STAGE_VERTEX  = 1 << 0,
     SHADER_STAGE_PIXEL   = 1 << 1,
@@ -101,8 +108,6 @@ typedef enum {
     USER_CB_SOURCE_DIRLIGHT_TARGET
 } UserCBSourceKind;
 
-// Reflection data for the shader-owned editable cbuffer. Offsets and sizes come
-// from D3D reflection, so CPU packing follows HLSL layout instead of guessing.
 struct ShaderCBVar {
     char     name[MAX_NAME];
     ResType  type;
@@ -159,9 +164,6 @@ struct MeshPart {
 };
 
 // ── resource ─────────────────────────────────────────────────────────────
-// Resource is a tagged union of editor values and GPU objects. Only fields that
-// match `type` are meaningful, but keeping one flat struct makes handles stable,
-// serialization simple, and ImGui inspectors straightforward.
 struct Resource {
     char     name[MAX_NAME];
     ResType  type;
@@ -195,6 +197,11 @@ struct Resource {
     ResHandle   size_handle;
 
     int  elem_size, elem_count;
+    int  splat_sh_degree;
+    int  splat_rest_count;
+    float splat_bounds_min[3];
+    float splat_bounds_max[3];
+    float splat_avg_scale;
     int  vert_count, idx_count, vert_stride;
     MeshPart     mesh_parts[MAX_MESH_PARTS];
     int          mesh_part_count;
@@ -203,6 +210,10 @@ struct Resource {
     int  mesh_primitive_type;
 
     char path[MAX_PATH_LEN];
+    // Explicit shader program kind used by UI, project serialization, and
+    // recompilation. It stays valid even when a path is missing and the
+    // runtime shader pointer contains only a fallback object.
+    ShaderProgramKind shader_kind;
     bool compiled_ok;
     bool using_fallback;
     char compile_err[512];
@@ -232,9 +243,6 @@ struct Resource {
 };
 
 // ── command ──────────────────────────────────────────────────────────────
-// Command is the serialized form of a render-graph step. It intentionally stores
-// all possible command fields in one POD block; unused fields are harmless but
-// make copy, undo-like moves, project save/load, and 64k export much simpler.
 struct Command {
     char    name[MAX_NAME];
     CmdType type;
@@ -308,9 +316,6 @@ struct Command {
 };
 
 // ── user cbuffer entry ────────────────────────────────────────────────────
-// UserCB entries are global editor variables packed into float4-sized slots. A
-// source can be a resource, a command transform component, the camera, or the
-// directional light, allowing shaders to follow live editor state.
 struct UserCBEntry {
     char      name[MAX_NAME];
     ResType   type;
@@ -323,9 +328,6 @@ struct UserCBEntry {
 
 // ── scene cbuffer (b0, must match shaders/scene.hlsl) ────────────────────
 #pragma pack(push, 16)
-// SceneCBData is uploaded to b0 every frame. It contains current/previous camera
-// matrices, light data, shadow atlas metadata, and temporal values used by
-// post-processing and procedural animation. Keep this in sync with HLSL SceneCB.
 struct SceneCBData {
     float view_proj[16];
     float time_vec[4];

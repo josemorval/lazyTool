@@ -18,19 +18,13 @@
 #include <psapi.h>
 #include <float.h>
 #include <stdlib.h>
+#include <direct.h>
 #include <vector>
+#include <string>
 #pragma comment(lib, "psapi.lib")
 
 // The UI module is the editor shell. It presents resources, commands,
 // inspectors, logs, and the live scene view on top of the runtime state.
-
-// UI implementation notes:
-//   - most widgets edit POD data owned by resources.cpp, commands.cpp, timeline.cpp,
-//     or user_cb.cpp instead of duplicating state inside the UI layer.
-//   - popups, drag/drop state, code editor buffers, viewport gizmo state, and
-//     timeline selection stay here because they are immediate-mode interaction data.
-//   - expensive runtime work is requested through app_request_scene_render()/restart
-//     so editing panels can stay responsive.
 
 ResHandle g_sel_res = INVALID_HANDLE;
 CmdHandle g_sel_cmd = INVALID_HANDLE;
@@ -211,12 +205,269 @@ static bool ui_ext_allowed(const char* name, const char* filter) {
     return false;
 }
 
+
+static const char k_ui_path_sep = '/';
+
+// The editor uses forward slashes in every visible and serialized path.
+// Win32/DX file APIs still receive normal strings and accept both separators,
+// but keeping the UI canonical prevents mixed \\ and / segments while browsing.
+static bool ui_path_is_sep(char c) {
+    return c == '/' || c == '\\';
+}
+
+static void ui_canonicalize_path_separators(char* path, int path_sz) {
+    if (!path || path_sz <= 0)
+        return;
+    for (int i = 0; i < path_sz && path[i]; i++) {
+        if (path[i] == '\\')
+            path[i] = k_ui_path_sep;
+    }
+}
+
+static void ui_path_to_win32_pattern(const char* in, char* out, int out_sz) {
+    if (!out || out_sz <= 0)
+        return;
+    out[0] = '\0';
+    if (!in)
+        return;
+
+    int oi = 0;
+    for (int i = 0; in[i] && oi < out_sz - 1; i++)
+        out[oi++] = in[i] == '/' ? '\\' : in[i];
+    out[oi] = '\0';
+}
+
+static void ui_normalize_path_text(const char* in, char* out, int out_sz) {
+    if (!out || out_sz <= 0) return;
+    out[0] = '\0';
+    if (!in || !in[0]) return;
+
+    char sep = k_ui_path_sep;
+    int len = (int)strlen(in);
+    bool trailing_sep = len > 0 && ui_path_is_sep(in[len - 1]);
+
+    char prefix[MAX_PATH_LEN] = {};
+    int pos = 0;
+    bool rooted = false;
+
+    if (len >= 2 && in[1] == ':') {
+        prefix[0] = in[0];
+        prefix[1] = ':';
+        prefix[2] = '\0';
+        pos = 2;
+        if (ui_path_is_sep(in[pos])) {
+            prefix[2] = sep;
+            prefix[3] = '\0';
+            rooted = true;
+            while (ui_path_is_sep(in[pos])) pos++;
+        }
+    } else if (len >= 2 && ui_path_is_sep(in[0]) && ui_path_is_sep(in[1])) {
+        // Keep UNC-style paths rooted while still collapsing later . and .. segments.
+        prefix[0] = sep;
+        prefix[1] = sep;
+        prefix[2] = '\0';
+        pos = 2;
+        rooted = true;
+        while (ui_path_is_sep(in[pos])) pos++;
+    } else if (ui_path_is_sep(in[0])) {
+        prefix[0] = sep;
+        prefix[1] = '\0';
+        pos = 1;
+        rooted = true;
+        while (ui_path_is_sep(in[pos])) pos++;
+    }
+
+    std::vector<std::string> parts;
+    while (pos < len) {
+        while (pos < len && ui_path_is_sep(in[pos])) pos++;
+        int start = pos;
+        while (pos < len && !ui_path_is_sep(in[pos])) pos++;
+        int part_len = pos - start;
+        if (part_len <= 0) continue;
+
+        std::string part(in + start, in + start + part_len);
+        if (part == ".") {
+            continue;
+        } else if (part == "..") {
+            if (!parts.empty() && parts.back() != "..") {
+                parts.pop_back();
+            } else if (!rooted) {
+                parts.push_back(part);
+            }
+        } else {
+            parts.push_back(part);
+        }
+    }
+
+    char tmp[MAX_PATH_LEN] = {};
+    int written = 0;
+    auto append_char = [&](char c) {
+        if (written < MAX_PATH_LEN - 1)
+            tmp[written++] = c;
+    };
+    auto append_str = [&](const char* text) {
+        if (!text) return;
+        while (*text && written < MAX_PATH_LEN - 1)
+            tmp[written++] = *text++;
+    };
+
+    append_str(prefix);
+    bool need_sep = prefix[0] && !ui_path_is_sep(prefix[(int)strlen(prefix) - 1]) && !parts.empty();
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (need_sep || (i > 0)) append_char(sep);
+        append_str(parts[i].c_str());
+        need_sep = false;
+    }
+
+    if (trailing_sep && (!parts.empty() || prefix[0])) {
+        if (written > 0 && !ui_path_is_sep(tmp[written - 1]))
+            append_char(sep);
+    }
+
+    tmp[written] = '\0';
+
+    // For relative paths that collapse to the working directory (e.g. "foo/../"),
+    // keep the input field clean and empty instead of showing "." or "./".
+    strncpy(out, tmp, out_sz - 1);
+    out[out_sz - 1] = '\0';
+}
+
+static void ui_normalize_path_text_inplace(char* path, int path_sz) {
+    if (!path || path_sz <= 0) return;
+    char normalized[MAX_PATH_LEN] = {};
+    ui_normalize_path_text(path, normalized, MAX_PATH_LEN);
+    strncpy(path, normalized, path_sz - 1);
+    path[path_sz - 1] = '\0';
+}
+
+static bool ui_path_has_extension_ci(const char* path, const char* ext) {
+    if (!path || !ext || !path[0] || !ext[0])
+        return false;
+
+    const char* dot = strrchr(path, '.');
+    return dot && _stricmp(dot, ext) == 0;
+}
+
+static bool ui_file_exists(const char* path) {
+    if (!path || !path[0])
+        return false;
+
+    char win32_path[MAX_PATH_LEN] = {};
+    ui_path_to_win32_pattern(path, win32_path, MAX_PATH_LEN);
+    DWORD attrs = GetFileAttributesA(win32_path);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+static bool ui_dir_exists(const char* path) {
+    if (!path || !path[0])
+        return false;
+
+    char win32_path[MAX_PATH_LEN] = {};
+    ui_path_to_win32_pattern(path, win32_path, MAX_PATH_LEN);
+    DWORD attrs = GetFileAttributesA(win32_path);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static void ui_path_parent_dir(const char* path, char* out, int out_sz) {
+    if (!out || out_sz <= 0)
+        return;
+    out[0] = '\0';
+    if (!path || !path[0])
+        return;
+
+    const char* slash1 = strrchr(path, '/');
+    const char* slash2 = strrchr(path, '\\');
+    const char* slash = slash1 > slash2 ? slash1 : slash2;
+    if (!slash)
+        return;
+
+    int len = (int)(slash - path);
+    if (len <= 0)
+        return;
+    if (len >= out_sz)
+        len = out_sz - 1;
+    memcpy(out, path, len);
+    out[len] = '\0';
+    ui_normalize_path_text_inplace(out, out_sz);
+}
+
+static bool ui_ensure_directory_tree(const char* dir) {
+    if (!dir || !dir[0] || strcmp(dir, ".") == 0)
+        return true;
+
+    char clean[MAX_PATH_LEN] = {};
+    ui_normalize_path_text(dir, clean, MAX_PATH_LEN);
+    if (!clean[0])
+        return true;
+    if (ui_dir_exists(clean))
+        return true;
+
+    // Create every missing segment in order. The editor stores paths with '/',
+    // but _mkdir receives the platform form so nested shader folders can be
+    // created from a relative path such as shaders/tests/example.hlsl.
+    char walk[MAX_PATH_LEN] = {};
+    int wi = 0;
+    int start = 0;
+    int len = (int)strlen(clean);
+
+    if (len >= 2 && clean[1] == ':') {
+        walk[0] = clean[0];
+        walk[1] = ':';
+        walk[2] = '\0';
+        wi = 2;
+        start = 2;
+        if (clean[start] == '/') {
+            walk[wi++] = '/';
+            walk[wi] = '\0';
+            start++;
+        }
+    } else if (clean[0] == '/') {
+        walk[wi++] = '/';
+        walk[wi] = '\0';
+        start = 1;
+    }
+
+    for (int i = start; i <= len; i++) {
+        if (clean[i] != '/' && clean[i] != '\0')
+            continue;
+
+        int prev_wi = wi;
+        for (int j = start; j < i && wi < MAX_PATH_LEN - 1; j++)
+            walk[wi++] = clean[j];
+        walk[wi] = '\0';
+        start = i + 1;
+
+        if (wi == prev_wi || strcmp(walk, ".") == 0 || strcmp(walk, "..") == 0)
+            continue;
+
+        if (!ui_dir_exists(walk)) {
+            char win32_dir[MAX_PATH_LEN] = {};
+            ui_path_to_win32_pattern(walk, win32_dir, MAX_PATH_LEN);
+            if (_mkdir(win32_dir) != 0 && !ui_dir_exists(walk))
+                return false;
+        }
+
+        if (i < len && wi < MAX_PATH_LEN - 1 && walk[wi - 1] != '/') {
+            walk[wi++] = '/';
+            walk[wi] = '\0';
+        }
+    }
+
+    return ui_dir_exists(clean);
+}
+
+static bool ui_ensure_parent_directory(const char* path) {
+    char dir[MAX_PATH_LEN] = {};
+    ui_path_parent_dir(path, dir, MAX_PATH_LEN);
+    return ui_ensure_directory_tree(dir);
+}
+
 static void ui_split_path_for_completion(const char* path, char* dir, int dir_sz,
                                          char* base, int base_sz, char* prefix, int prefix_sz,
                                          char* sep)
 {
     dir[0] = base[0] = prefix[0] = '\0';
-    *sep = '\\';
+    *sep = k_ui_path_sep;
     if (!path || !path[0]) {
         strncpy(dir, ".", dir_sz - 1);
         dir[dir_sz - 1] = '\0';
@@ -225,8 +476,8 @@ static void ui_split_path_for_completion(const char* path, char* dir, int dir_sz
 
     int len = (int)strlen(path);
     if (len == 2 && path[1] == ':') {
-        snprintf(dir, dir_sz, "%s\\", path);
-        snprintf(base, base_sz, "%s\\", path);
+        snprintf(dir, dir_sz, "%s/", path);
+        snprintf(base, base_sz, "%s/", path);
         return;
     }
 
@@ -241,7 +492,7 @@ static void ui_split_path_for_completion(const char* path, char* dir, int dir_sz
         return;
     }
 
-    *sep = *slash;
+    *sep = k_ui_path_sep;
     int base_len = (int)(slash - path) + 1;
     if (base_len >= base_sz) base_len = base_sz - 1;
     memcpy(base, path, base_len);
@@ -266,7 +517,7 @@ static int ui_collect_path_candidates(const char* path, const char* ext_filter,
     char dir[MAX_PATH_LEN] = {};
     char base[MAX_PATH_LEN] = {};
     char prefix[MAX_PATH_LEN] = {};
-    char sep = '\\';
+    char sep = k_ui_path_sep;
     ui_split_path_for_completion(path, dir, MAX_PATH_LEN, base, MAX_PATH_LEN,
                                  prefix, MAX_PATH_LEN, &sep);
 
@@ -274,16 +525,18 @@ static int ui_collect_path_candidates(const char* path, const char* ext_filter,
     int dir_len = (int)strlen(dir);
     if (strcmp(dir, ".") == 0) {
         strncpy(pattern, "*", MAX_PATH_LEN - 1);
-    } else if (dir_len > 0 && (dir[dir_len - 1] == '\\' || dir[dir_len - 1] == '/')) {
+    } else if (dir_len > 0 && ui_path_is_sep(dir[dir_len - 1])) {
         snprintf(pattern, MAX_PATH_LEN, "%s*", dir);
     } else {
-        snprintf(pattern, MAX_PATH_LEN, "%s\\*", dir);
+        snprintf(pattern, MAX_PATH_LEN, "%s/*", dir);
     }
     pattern[MAX_PATH_LEN - 1] = '\0';
 
     int count = 0;
     WIN32_FIND_DATAA fd = {};
-    HANDLE find = FindFirstFileA(pattern, &fd);
+    char win32_pattern[MAX_PATH_LEN] = {};
+    ui_path_to_win32_pattern(pattern, win32_pattern, MAX_PATH_LEN);
+    HANDLE find = FindFirstFileA(win32_pattern, &fd);
     if (find == INVALID_HANDLE_VALUE)
         return 0;
 
@@ -298,9 +551,10 @@ static int ui_collect_path_candidates(const char* path, const char* ext_filter,
         PathCandidate& c = out[count++];
         c.is_dir = is_dir;
         snprintf(c.display, MAX_PATH_LEN, "%s%s", name, is_dir ? "/" : "");
-        snprintf(c.value, MAX_PATH_LEN, "%s%s%s", base, name, is_dir ? (sep == '/' ? "/" : "\\") : "");
+        snprintf(c.value, MAX_PATH_LEN, "%s%s%s", base, name, is_dir ? "/" : "");
         c.display[MAX_PATH_LEN - 1] = '\0';
         c.value[MAX_PATH_LEN - 1] = '\0';
+        ui_normalize_path_text_inplace(c.value, MAX_PATH_LEN);
     } while (FindNextFileA(find, &fd));
 
     FindClose(find);
@@ -310,8 +564,7 @@ static int ui_collect_path_candidates(const char* path, const char* ext_filter,
 static void ui_apply_path_candidate(const PathCandidate& c, char* buf, int buf_sz,
                                     PathInputResult* result)
 {
-    strncpy(buf, c.value, buf_sz - 1);
-    buf[buf_sz - 1] = '\0';
+    ui_normalize_path_text(c.value, buf, buf_sz);
     result->changed = true;
     result->dir_selected = c.is_dir;
     result->file_selected = !c.is_dir;
@@ -319,6 +572,8 @@ static void ui_apply_path_candidate(const PathCandidate& c, char* buf, int buf_s
 
 static PathInputResult ui_path_input_ex(const char* label, char* buf, int buf_sz, const char* ext_filter,
                                         ImGuiInputTextFlags extra_flags = 0) {
+    ui_canonicalize_path_separators(buf, buf_sz);
+
     static ImGuiID s_refocus_id = 0;
     static ImGuiID s_open_id = 0;
     static int s_nav_index = 0;
@@ -341,6 +596,8 @@ static PathInputResult ui_path_input_ex(const char* label, char* buf, int buf_sz
     ImGui::SetItemKeyOwner(ImGuiKey_Enter);
     ImGui::SetItemKeyOwner(ImGuiKey_KeypadEnter);
     result.changed = ImGui::IsItemEdited();
+    if (result.changed)
+        ui_canonicalize_path_separators(buf, buf_sz);
     bool activated = ImGui::IsItemActivated();
     bool active = ImGui::IsItemActive();
     ImVec2 input_min = ImGui::GetItemRectMin();
@@ -450,14 +707,24 @@ static void ui_sync_commands_for_shader(ResHandle shader_h) {
     }
 }
 
+static bool ui_shader_resource_is_compute(const Resource* r) {
+    if (!r || r->type != RES_SHADER)
+        return false;
+    if (r->shader_kind == SHADER_PROGRAM_CS)
+        return true;
+    if (r->shader_kind == SHADER_PROGRAM_VSPS)
+        return false;
+    return r->cs != nullptr && r->vs == nullptr && r->ps == nullptr;
+}
+
 static bool ui_recompile_shader_resource(ResHandle h, Resource* r, const char* path) {
     if (!r || r->type != RES_SHADER) return false;
-    bool was_cs = r->cs != nullptr;
+    bool is_compute = ui_shader_resource_is_compute(r);
     char local_path[MAX_PATH_LEN] = {};
     strncpy(local_path, path ? path : r->path, MAX_PATH_LEN - 1);
     local_path[MAX_PATH_LEN - 1] = '\0';
 
-    bool ok = was_cs
+    bool ok = is_compute
         ? shader_compile_cs(r, local_path, "CSMain")
         : shader_compile_vs_ps(r, local_path, "VSMain", "PSMain");
     ui_sync_commands_for_shader(h);
@@ -490,7 +757,7 @@ static bool ui_reload_mesh_resource(Resource* r, const char* path) {
         res_free_generated_children(owner_h);
         res_reassign_generated_children(tmp, owner_h);
 
-        strncpy(r->path, local_path, MAX_PATH_LEN - 1);
+        strncpy(r->path, src->path, MAX_PATH_LEN - 1);
         r->path[MAX_PATH_LEN - 1] = '\0';
         res_release_gpu(r);
 
@@ -773,6 +1040,7 @@ static bool ui_resource_has_implicit_size_source(const Resource& r) {
     case RES_RENDER_TEXTURE2D:
     case RES_RENDER_TEXTURE3D:
     case RES_STRUCTURED_BUFFER:
+    case RES_GAUSSIAN_SPLAT:
     case RES_BUILTIN_SCENE_COLOR:
     case RES_BUILTIN_SCENE_DEPTH:
     case RES_BUILTIN_SHADOW_MAP:
@@ -821,7 +1089,7 @@ static void ui_resource_display_name_buf(const Resource& r, char* out, int out_s
     Resource* owner = nullptr;
     if (ui_resource_is_implicit_size_resource(r, &owner)) {
         const char* owner_name = ui_resource_base_display_name(*owner);
-        if (owner->type == RES_STRUCTURED_BUFFER)
+        if (owner->type == RES_STRUCTURED_BUFFER || owner->type == RES_GAUSSIAN_SPLAT)
             snprintf(out, out_sz, "%s Count", owner_name);
         else
             snprintf(out, out_sz, "%s Size", owner_name);
@@ -847,10 +1115,31 @@ static const char* ui_resource_display_type(const Resource& r) {
     case RES_BUILTIN_TIME:        return "float";
     case RES_BUILTIN_SCENE_COLOR: return "RenderTexture2D";
     case RES_BUILTIN_SCENE_DEPTH: return "DepthTexture2D";
+    case RES_GAUSSIAN_SPLAT:      return "GaussianSplat";
     case RES_BUILTIN_SHADOW_MAP:  return "DepthTexture2D";
     case RES_BUILTIN_DIRLIGHT:    return "DirectionalLight";
     default:                      return res_type_str(r.type);
     }
+}
+
+static bool ui_resource_size_source_matches_type(const Resource& owner, ResType type) {
+    if (!ui_resource_has_implicit_size_source(owner) || owner.size_handle == INVALID_HANDLE)
+        return false;
+    Resource* size_res = res_get(owner.size_handle);
+    return size_res && size_res->type == type;
+}
+
+static bool ui_resource_is_size_source_resource(const Resource& r) {
+    return ui_resource_is_implicit_size_resource(r);
+}
+
+static void ui_resource_size_source_label(const Resource& owner, const Resource& size_res,
+                                          char* out, int out_sz) {
+    (void)owner;
+    if (!out || out_sz <= 0)
+        return;
+    snprintf(out, out_sz, "%s (%s)", ui_resource_display_name(size_res), size_res.name);
+    out[out_sz - 1] = '\0';
 }
 
 static void res_combo(const char* label, ResHandle* h, ResType filter, bool allow_invalid = true,
@@ -1415,7 +1704,7 @@ static void ui_command_param_source_combo(CommandParam* p) {
         ImGui::TextDisabled("Resources");
         for (int i = 0; i < MAX_RESOURCES; i++) {
             Resource& r = g_resources[i];
-            if (!r.active || r.is_builtin || r.type != p->type) continue;
+            if (!r.active || r.is_builtin || ui_resource_is_size_source_resource(r) || r.type != p->type) continue;
             ResHandle h = (ResHandle)(i + 1);
             bool sel = source_kind == USER_CB_SOURCE_RESOURCE && p->source == h;
             ImGui::PushID(i);
@@ -1426,6 +1715,30 @@ static void ui_command_param_source_combo(CommandParam* p) {
                 command_param_copy_from_resource(p, &r);
             }
             ImGui::PopID();
+        }
+        if (p->type == RES_INT || p->type == RES_INT2 || p->type == RES_INT3) {
+            ImGui::Separator();
+            ImGui::TextDisabled("Resource sizes");
+            for (int i = 0; i < MAX_RESOURCES; i++) {
+                Resource& owner = g_resources[i];
+                if (!owner.active || owner.is_generated || !ui_resource_size_source_matches_type(owner, p->type))
+                    continue;
+                Resource* size_res = res_get(owner.size_handle);
+                if (!size_res)
+                    continue;
+                ResHandle h = owner.size_handle;
+                bool sel = source_kind == USER_CB_SOURCE_RESOURCE && p->source == h;
+                char item[192] = {};
+                ui_resource_size_source_label(owner, *size_res, item, sizeof(item));
+                ImGui::PushID(20000 + i);
+                if (ImGui::Selectable(item, sel)) {
+                    p->source = h;
+                    p->source_kind = USER_CB_SOURCE_RESOURCE;
+                    p->source_target[0] = '\0';
+                    command_param_copy_from_resource(p, size_res);
+                }
+                ImGui::PopID();
+            }
         }
         if (p->type == RES_FLOAT3 || p->type == RES_FLOAT4) {
             ImGui::Separator();
@@ -2548,6 +2861,9 @@ static bool ui_shader_editor_load(UiShaderSourceEditor* ed, ResHandle h, const c
 static bool ui_write_text_file_atomic(const char* path, const char* text) {
     if (!path || !path[0] || !text)
         return false;
+    if (!ui_ensure_parent_directory(path))
+        return false;
+
     char tmp_path[MAX_PATH_LEN + 16] = {};
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
 
@@ -2567,6 +2883,358 @@ static bool ui_write_text_file_atomic(const char* path, const char* text) {
         return false;
     }
     return true;
+}
+
+static const char* k_shader_template_common_scene_cb = R"HLSL(// Built-in scene constants supplied by the editor in register(b0).
+// These names and order match the CPU SceneCB layout. You can delete unused
+// fields from your shader; D3D reflection only keeps constants that are read.
+cbuffer SceneCB : register(b0)
+{
+    float4x4 ViewProj;
+    float4 TimeVec;              // x=time seconds, y=delta seconds, z=frame index, w=reserved.
+    float4 LightDir;             // xyz=main light direction, w=intensity.
+    float4 LightColor;           // rgb=color, a=reserved.
+    float4 CamPos;               // xyz=camera position.
+    float4x4 ShadowViewProj;
+    float4x4 InvViewProj;
+    float4x4 PrevViewProj;
+    float4x4 PrevInvViewProj;
+    float4x4 PrevShadowViewProj;
+    float4 CamDir;               // xyz=camera forward direction.
+    float4 ShadowCascadeSplits;
+    float4 ShadowParams;
+    float4 ShadowCascadeRects[4];
+    float4x4 ShadowCascadeViewProj[4];
+};
+
+)HLSL";
+
+static const char* k_shader_template_object_cb = R"HLSL(// Per-object transform supplied by draw commands in register(b1).
+// Mesh shaders normally multiply POSITION by World and then ViewProj.
+cbuffer ObjectCB : register(b1)
+{
+    float4x4 World;
+};
+
+)HLSL";
+
+static const char* k_shader_template_vsps_color_cb = R"HLSL(// User parameters supplied by the command in register(b2).
+// Color tints the UV visualizer. Leave it at 0,0,0,0 for neutral white,
+// or set it to a non-zero value from Shader Parameters to choose a color.
+cbuffer UserCB : register(b2)
+{
+    float4 Color;
+};
+
+float4 ResolveUserColor()
+{
+    return dot(abs(Color), float4(1.0, 1.0, 1.0, 1.0)) > 0.0 ? Color : float4(1.0, 1.0, 1.0, 1.0);
+}
+
+)HLSL";
+
+static const char* k_shader_template_compute_uv = R"HLSL(
+// Compute template: write normalized UV coordinates into a RWTexture2D.
+//
+// Editor setup:
+//   1. Create or select a RenderTexture2D with UAV enabled.
+//   2. Bind that texture to UAV slot u0 on a Dispatch command.
+//   3. Set Dispatch From to the same texture and Divisor XYZ to 8,8,1.
+//   4. In Shader Parameters, bind TargetSize to the texture size
+//      (for example scene_color.size or your_render_target.size).
+//
+// The shader is intentionally simple: each 8x8 group writes one pixel per
+// thread. TargetSize keeps the border safe when the texture size is not a
+// multiple of 8.
+cbuffer UserCB : register(b2)
+{
+    int2 TargetSize;             // Usually sourced from a RenderTexture2D size.
+};
+
+RWTexture2D<float4> Output : register(u0);
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)TargetSize.x || id.y >= (uint)TargetSize.y)
+        return;
+
+    float2 target_size = float2((float)TargetSize.x, (float)TargetSize.y);
+    float2 safe_size = max(target_size, float2(1.0, 1.0));
+    float2 uv = (float2(id.xy) + 0.5) / safe_size;
+    Output[id.xy] = float4(uv, 0.0, 1.0);
+}
+)HLSL";
+
+static const char* k_shader_template_compute_indirect_args = R"HLSL(
+// Compute template: fill an indirect argument buffer.
+//
+// Editor setup:
+//   1. Create a StructuredBuffer with UAV enabled and Indirect Args enabled.
+//      A stride of 4 bytes is enough because the buffer stores uint DWORDs.
+//   2. Bind that buffer to UAV slot u0 on a Dispatch command.
+//   3. Dispatch this shader with 1,1,1 groups.
+//   4. Use the same buffer as the Indirect Buffer of an Indirect Draw or
+//      Indirect Dispatch command.
+//
+// Mode selects how the first DWORDs are written:
+//   Mode = 0: DispatchIndirect      -> x, y, z group counts.
+//   Mode = 1: DrawInstancedIndirect -> vertex count, instance count,
+//                                      start vertex, start instance.
+//   Mode = 2: DrawIndexedInstancedIndirect -> index count, instance count,
+//                                             start index, base vertex,
+//                                             start instance.
+//
+// The editor reads the argument layout according to the command that consumes
+// the buffer, so unused DWORDs are harmless. Keep Byte Offset on both commands
+// aligned to 4 bytes.
+//
+// Instancing notes:
+//   - For DrawInstancedIndirect, InstanceCount is the number of instances the
+//     draw shader will receive through SV_InstanceID.
+//   - InstanceCount can be hardcoded here, driven from a StructuredBuffer count,
+//     or driven from a Gaussian Splat count through Shader Parameters.
+//   - For procedural quad instances, set DrawVertexOrIndexCount to 6 and use
+//     InstanceCount to choose how many quads to draw.
+cbuffer UserCB : register(b2)
+{
+    int  Mode;
+    int3 DispatchGroups;
+
+    int  DrawVertexOrIndexCount;
+    int  InstanceCount;
+    int  StartVertexOrIndex;
+    int  BaseVertex;
+
+    int  StartInstance;
+};
+
+RWStructuredBuffer<uint> IndirectArgs : register(u0);
+
+uint positive_or_one(int v)
+{
+    return (v > 0) ? (uint)v : 1u;
+}
+
+uint positive_or_zero(int v)
+{
+    return (v > 0) ? (uint)v : 0u;
+}
+
+[numthreads(1, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x != 0 || id.y != 0 || id.z != 0)
+        return;
+
+    if (Mode == 0)
+    {
+        IndirectArgs[0] = positive_or_one(DispatchGroups.x);
+        IndirectArgs[1] = positive_or_one(DispatchGroups.y);
+        IndirectArgs[2] = positive_or_one(DispatchGroups.z);
+        return;
+    }
+
+    IndirectArgs[0] = positive_or_one(DrawVertexOrIndexCount);
+    IndirectArgs[1] = positive_or_one(InstanceCount);
+    IndirectArgs[2] = positive_or_zero(StartVertexOrIndex);
+
+    if (Mode == 2)
+    {
+        IndirectArgs[3] = (uint)BaseVertex;
+        IndirectArgs[4] = positive_or_zero(StartInstance);
+    }
+    else
+    {
+        IndirectArgs[3] = positive_or_zero(StartInstance);
+    }
+}
+)HLSL";
+
+static const char* k_shader_template_vsps_mesh_uv = R"HLSL(// VS/PS template: display mesh UVs as a tinted color.
+//
+// Editor setup:
+//   1. Use a Draw Mesh command with any mesh that has TEXCOORD0 data.
+//   2. Assign this shader to the command.
+//   3. In Shader Parameters, edit Color to tint the result. A zero color is
+//      treated as neutral white so the first compile is immediately visible.
+//
+// Instancing notes:
+//   - The shader accepts SV_InstanceID, so it can be used in Draw Instanced
+//     and Indirect Draw commands without changing the entry point.
+//   - For per-instance transforms or colors, create a StructuredBuffer with
+//     SRV enabled, bind it to an SRV slot, and index it with instance_id.
+//   - For indirect instancing, pair this shader with an indirect-args buffer
+//     whose InstanceCount DWORD is filled by a compute shader.
+//
+// This is useful for checking imported glTF UVs, seams, mirroring, and tiling.
+// Values are wrapped with frac() so UVs outside 0..1 repeat visibly.
+struct VSIn
+{
+    float3 pos : POSITION;
+    float3 nor : NORMAL;
+    float2 uv  : TEXCOORD0;
+};
+
+struct VSOut
+{
+    float4 pos : SV_POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VSOut VSMain(VSIn v, uint instance_id : SV_InstanceID)
+{
+    VSOut o;
+    float4 world_pos = mul(World, float4(v.pos, 1.0));
+    o.pos = mul(ViewProj, world_pos);
+    o.uv = v.uv;
+    return o;
+}
+
+float4 PSMain(VSOut i) : SV_Target
+{
+    float2 uv = frac(i.uv);
+    float4 uv_color = float4(uv, 0.0, 1.0);
+    return uv_color * ResolveUserColor();
+}
+)HLSL";
+
+static const char* k_shader_template_vsps_procedural_quad = R"HLSL(// VS/PS template: procedural fullscreen quad with tinted UV color.
+//
+// Editor setup:
+//   1. Use a Draw Mesh, Draw Instanced, or Indirect Draw command.
+//   2. Change Source to Procedural.
+//   3. Set Topology to Triangle List and Vertex Count to 6.
+//   4. Assign this shader to the command.
+//   5. In Shader Parameters, edit Color to tint the result. A zero color is
+//      treated as neutral white so the first compile is immediately visible.
+//
+// Instancing notes:
+//   - SV_InstanceID is available in VSMain. The sample does not move each
+//     instance, but you can bind a StructuredBuffer as SRV and use instance_id
+//     to read per-instance transforms, colors, or rectangles.
+//   - For indirect procedural draws, generate DrawInstancedIndirect arguments
+//     with the indirect-args compute template and set VertexCount to 6.
+//
+// The vertex shader only uses SV_VertexID and SV_InstanceID, so no mesh or
+// input layout is required. The quad fills clip space and paints red=U, green=V.
+struct VSOut
+{
+    float4 pos : SV_POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VSOut VSMain(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID)
+{
+    uint i = min(vertex_id, 5u);
+    float2 pos = float2(-1.0, -1.0);
+    float2 uv = float2(0.0, 1.0);
+
+    if (i == 1u) { pos = float2(-1.0,  1.0); uv = float2(0.0, 0.0); }
+    if (i == 2u) { pos = float2( 1.0,  1.0); uv = float2(1.0, 0.0); }
+    if (i == 3u) { pos = float2(-1.0, -1.0); uv = float2(0.0, 1.0); }
+    if (i == 4u) { pos = float2( 1.0,  1.0); uv = float2(1.0, 0.0); }
+    if (i == 5u) { pos = float2( 1.0, -1.0); uv = float2(1.0, 1.0); }
+
+    VSOut o;
+    o.pos = float4(pos, 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+
+float4 PSMain(VSOut i) : SV_Target
+{
+    return float4(i.uv, 0.0, 1.0) * ResolveUserColor();
+}
+)HLSL";
+
+static void ui_build_shader_template(bool compute_shader, int template_kind, char* out, int out_sz) {
+    if (!out || out_sz <= 0)
+        return;
+    out[0] = '\0';
+
+    // Templates are generated as complete, readable files. Built-in cbuffers
+    // are emitted only when the sample actually uses them, which keeps shader
+    // reflection focused on the resources the command needs to bind.
+    if (compute_shader) {
+        snprintf(out, out_sz, "%s%s",
+            k_shader_template_common_scene_cb,
+            template_kind == 1 ? k_shader_template_compute_indirect_args
+                               : k_shader_template_compute_uv);
+    } else if (template_kind == 1) {
+        snprintf(out, out_sz, "%s%s",
+            k_shader_template_vsps_color_cb,
+            k_shader_template_vsps_procedural_quad);
+    } else {
+        snprintf(out, out_sz, "%s%s%s%s",
+            k_shader_template_common_scene_cb,
+            k_shader_template_object_cb,
+            k_shader_template_vsps_color_cb,
+            k_shader_template_vsps_mesh_uv);
+    }
+    out[out_sz - 1] = '\0';
+}
+
+static bool ui_create_shader_template_file(ResHandle h, Resource* r, const char* path,
+                                           bool compute_shader, int template_kind) {
+    if (!r || r->type != RES_SHADER || !path || !path[0])
+        return false;
+    if (!ui_path_has_extension_ci(path, ".hlsl")) {
+        log_warn("Shader template path must end in .hlsl: %s", path);
+        return false;
+    }
+    if (ui_file_exists(path)) {
+        log_warn("Shader template target already exists: %s", path);
+        return false;
+    }
+
+    char source[32768] = {};
+    ui_build_shader_template(compute_shader, template_kind, source, sizeof(source));
+    if (!source[0])
+        return false;
+
+    if (!ui_write_text_file_atomic(path, source)) {
+        log_error("Shader template create failed: %s", path);
+        return false;
+    }
+
+    strncpy(r->path, path, MAX_PATH_LEN - 1);
+    r->path[MAX_PATH_LEN - 1] = '\0';
+    ui_normalize_path_text_inplace(r->path, MAX_PATH_LEN);
+    ui_recompile_shader_resource(h, r, r->path);
+    log_info("Shader template created: %s", r->path);
+    return true;
+}
+
+static void ui_shader_template_buttons(ResHandle h, Resource* r, const char* path) {
+    if (!r || r->type != RES_SHADER || !path || !path[0])
+        return;
+
+    char clean_path[MAX_PATH_LEN] = {};
+    ui_normalize_path_text(path, clean_path, MAX_PATH_LEN);
+    if (ui_file_exists(clean_path))
+        return;
+    if (!ui_path_has_extension_ci(clean_path, ".hlsl")) {
+        ImGui::TextDisabled("Template creation is available for missing .hlsl paths.");
+        return;
+    }
+
+    bool compute_shader = ui_shader_resource_is_compute(r);
+    ImGui::Separator();
+    ImGui::TextWrapped("File does not exist: %s", clean_path);
+    ImGui::TextDisabled("Create a documented starter shader at this path.");
+
+    if (compute_shader) {
+        if (ImGui::Button("Create Compute: UVs to UAV", ImVec2(-1.0f, 0.0f)))
+            ui_create_shader_template_file(h, r, clean_path, true, 0);
+        if (ImGui::Button("Create Compute: Indirect Args", ImVec2(-1.0f, 0.0f)))
+            ui_create_shader_template_file(h, r, clean_path, true, 1);
+    } else {
+        if (ImGui::Button("Create VS/PS: Mesh UV Color", ImVec2(-1.0f, 0.0f)))
+            ui_create_shader_template_file(h, r, clean_path, false, 0);
+        if (ImGui::Button("Create VS/PS: Procedural Quad UV", ImVec2(-1.0f, 0.0f)))
+            ui_create_shader_template_file(h, r, clean_path, false, 1);
+    }
 }
 
 static bool ui_shader_editor_save(UiShaderSourceEditor* ed, ResHandle h, Resource* r, bool compile_after) {
@@ -2794,6 +3462,7 @@ static ImVec4 ui_type_color(ResType type) {
     case RES_BUILTIN_SCENE_COLOR:
     case RES_BUILTIN_SHADOW_MAP:  return ImVec4(0.72f, 0.58f, 0.42f, 1.0f);
     case RES_STRUCTURED_BUFFER:
+    case RES_GAUSSIAN_SPLAT:
     case RES_BUILTIN_SCENE_DEPTH: return ImVec4(0.46f, 0.66f, 0.61f, 1.0f);
     case RES_INT:
     case RES_INT2:
@@ -2845,7 +3514,8 @@ static bool ui_rt_scene_scale_combo(const char* label, int* divisor) {
 
 static bool ui_resource_has_warning(const Resource& r) {
     return (r.type == RES_SHADER && !r.compiled_ok) ||
-           (r.type == RES_MESH && r.using_fallback);
+           (r.type == RES_MESH && r.using_fallback) ||
+           (r.type == RES_GAUSSIAN_SPLAT && r.path[0] && !r.compiled_ok);
 }
 
 static bool ui_resource_filter_match(const Resource& r, int filter) {
@@ -2855,7 +3525,8 @@ static bool ui_resource_filter_match(const Resource& r, int filter) {
     case 3: return r.type == RES_TEXTURE2D || r.type == RES_RENDER_TEXTURE2D ||
                    r.type == RES_RENDER_TEXTURE3D ||
                    r.type == RES_BUILTIN_SCENE_COLOR || r.type == RES_BUILTIN_SHADOW_MAP;
-    case 4: return r.type == RES_STRUCTURED_BUFFER || r.type == RES_BUILTIN_SCENE_DEPTH;
+    case 4: return r.type == RES_STRUCTURED_BUFFER || r.type == RES_GAUSSIAN_SPLAT ||
+                   r.type == RES_BUILTIN_SCENE_DEPTH;
     case 5: return r.type == RES_INT || r.type == RES_INT2 || r.type == RES_INT3 || r.type == RES_FLOAT ||
                    r.type == RES_FLOAT2 || r.type == RES_FLOAT3 || r.type == RES_FLOAT4 ||
                    r.type == RES_BUILTIN_TIME;
@@ -3593,9 +4264,6 @@ static int ui_find_visible_command_index(const CmdHandle* items, int count, CmdH
     return -1;
 }
 
-// Resources panel: creation, filtering, selection, context menus, and resource
-// lifetime actions. The panel never touches raw DX11 objects directly; it calls
-// resource APIs so generated children and command references stay synchronized.
 static void ui_panel_resources(bool embedded = false) {
     if (!embedded) ImGui::Begin("Resources");
 
@@ -3682,7 +4350,7 @@ static void ui_panel_resources(bool embedded = false) {
             ImGui::Separator();
             if (ImGui::MenuItem("Shader (VS+PS)")) {
                 res_make_unique_name("shader_0", uname, MAX_NAME);
-                g_sel_res = res_create_shader(uname, "shaders/scene.hlsl", "VSMain", "PSMain");
+                g_sel_res = res_create_shader(uname, "", "VSMain", "PSMain");
                 g_sel_cmd = INVALID_HANDLE;
             }
             if (ImGui::MenuItem("Shader (CS)")) {
@@ -3699,6 +4367,11 @@ static void ui_panel_resources(bool embedded = false) {
             if (ImGui::MenuItem("Load Mesh glTF... (set path in Inspector)")) {
                 res_make_unique_name("mesh_0", uname, MAX_NAME);
                 g_sel_res = res_alloc(uname, RES_MESH);
+                g_sel_cmd = INVALID_HANDLE;
+            }
+            if (ImGui::MenuItem("Load Gaussian Splat PLY... (set path in Inspector)")) {
+                res_make_unique_name("splat_0", uname, MAX_NAME);
+                g_sel_res = res_load_gaussian_splat(uname, "");
                 g_sel_cmd = INVALID_HANDLE;
             }
             if (ImGui::BeginMenu("Mesh Primitive")) {
@@ -3746,7 +4419,6 @@ static void ui_panel_resources(bool embedded = false) {
         ImGui::OpenPopup("Create StructuredBuffer");
         s_open_sb_create = false;
     }
-
     if (ImGui::BeginPopupModal("Create RenderTexture2D", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::InputText("Name", s_rt_name, MAX_NAME);
         ui_rt_scene_scale_combo("Resolution", &s_rt_scene_div);
@@ -4023,9 +4695,6 @@ static void ui_draw_command_tree(CmdHandle parent, int depth) {
     }
 }
 
-// Command pipeline panel: tree display, group hierarchy, drag/drop reordering,
-// enable toggles, and per-command profiling display. Selection is kept as a
-// command handle so other panels can inspect the same object.
 static void ui_panel_commands(bool embedded = false) {
     if (!embedded) ImGui::Begin("Commands");
 
@@ -4451,6 +5120,75 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         break;
     }
 
+    case RES_GAUSSIAN_SPLAT: {
+        static ResHandle gs_edit = INVALID_HANDLE;
+        static char gs_path[MAX_PATH_LEN] = {};
+        if (gs_edit != h) {
+            gs_edit = h;
+            strncpy(gs_path, r->path, MAX_PATH_LEN - 1);
+            gs_path[MAX_PATH_LEN - 1] = '\0';
+        }
+
+        if (r->srv && r->compiled_ok) {
+            ImGui::TextColored({0.35f, 1, 0.45f, 1}, "Status: OK");
+        } else if (r->path[0]) {
+            ImGui::TextColored({1, 0.35f, 0.3f, 1}, "Status: ERROR");
+        } else {
+            ImGui::TextDisabled("Status: no file loaded");
+        }
+        if (r->compile_err[0])
+            ImGui::TextWrapped("%s", r->compile_err);
+
+        ImGui::TextWrapped("Path: %s", r->path[0] ? r->path : "(none)");
+        PathInputResult gs_path_result = ui_path_input_ex("Path##gs", gs_path, MAX_PATH_LEN, ".ply");
+        if (gs_path_result.file_selected) {
+            if (res_reload_gaussian_splat(r, gs_path)) {
+                strncpy(gs_path, r->path, MAX_PATH_LEN - 1);
+                gs_path[MAX_PATH_LEN - 1] = '\0';
+            }
+        }
+        if (ImGui::Button(r->srv ? "Reload PLY" : "Load PLY")) {
+            if (res_reload_gaussian_splat(r, gs_path)) {
+                strncpy(gs_path, r->path, MAX_PATH_LEN - 1);
+                gs_path[MAX_PATH_LEN - 1] = '\0';
+            }
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Splats: %d", r->elem_count);
+        ImGui::Text("Stride: %d bytes", r->elem_size);
+        ImGui::Text("GPU: %.3f MB", (double)res_estimate_gpu_bytes(*r) / (1024.0 * 1024.0));
+        ImGui::Text("SRV:%s UAV:%s", r->has_srv ? "Y" : "N", r->has_uav ? "Y" : "N");
+        ImGui::TextDisabled("Read-only StructuredBuffer SRV; bind it in SRV slots for draw/compute shaders.");
+        ImGui::TextDisabled("GPU layout: float4 pos_opacity, float4 quat_xyzw, float4 scale, float4 color.");
+
+        ImGui::Separator();
+        ImGui::Text("Bounds min: %.4g %.4g %.4g",
+            r->splat_bounds_min[0], r->splat_bounds_min[1], r->splat_bounds_min[2]);
+        ImGui::Text("Bounds max: %.4g %.4g %.4g",
+            r->splat_bounds_max[0], r->splat_bounds_max[1], r->splat_bounds_max[2]);
+        ImGui::Text("Average max scale: %.6g", r->splat_avg_scale);
+        ImGui::Text("f_rest coeffs: %d", r->splat_rest_count);
+        if (r->splat_sh_degree > 0)
+            ImGui::Text("Detected SH degree: %d", r->splat_sh_degree);
+        else
+            ImGui::TextDisabled("Detected SH degree: none/DC only");
+
+        if (r->size_handle != INVALID_HANDLE) {
+            if (Resource* sr = res_get(r->size_handle)) {
+                ImGui::Separator();
+                char label[MAX_NAME + 64];
+                snprintf(label, sizeof(label), "Size variable: %s = %d##gs_size", sr->name, sr->ival[0]);
+                if (ImGui::Selectable(label, false)) {
+                    g_sel_res = r->size_handle;
+                    g_sel_cmd = INVALID_HANDLE;
+                }
+                ImGui::TextDisabled("Use this int resource for cbuffer params or dispatch counts.");
+            }
+        }
+        break;
+    }
+
     case RES_MESH: {
         ImGui::Text("Vertices: %d", r->vert_count);
         ImGui::Text("Indices:  %d", r->idx_count);
@@ -4582,8 +5320,12 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         if (shader_path_result.file_selected) {
             strncpy(r->path, shader_path, MAX_PATH_LEN - 1);
             r->path[MAX_PATH_LEN - 1] = '\0';
+            ui_normalize_path_text_inplace(r->path, MAX_PATH_LEN);
+            strncpy(shader_path, r->path, MAX_PATH_LEN - 1);
+            shader_path[MAX_PATH_LEN - 1] = '\0';
             ui_recompile_shader_resource(h, r, r->path);
         }
+        ui_shader_template_buttons(h, r, shader_path);
 
         ui_inspector_section("SOURCE");
         ui_shader_source_viewer(h, r);
@@ -4926,9 +5668,6 @@ static bool ui_clear_source_valid(const char* source_name, ResType type) {
 }
 
 
-// Command inspector: edits draw/dispatch/clear/repeat fields and binding tables.
-// Most widgets write directly into Command POD fields, then request a scene
-// render/restart when the edit changes execution semantics.
 static void ui_inspector_command(Command* c) {
     if (ImGui::Checkbox("Enabled", &c->enabled)) {
         timeline_capture_if_tracked(TIMELINE_TRACK_COMMAND_ENABLED, c->name, RES_NONE);
@@ -5092,32 +5831,17 @@ static void ui_inspector_command(Command* c) {
         if (c->type == CMD_DRAW_INSTANCED)
             ImGui::InputInt("Instance Count", &c->instance_count);
 
-        ui_inspector_section("TEXTURE BINDINGS");
-        ImGui::TextDisabled("Reserved PS t# slots:");
-        ImGui::TextDisabled("t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion");
-        ImGui::TextDisabled("t5 env map, t7 shadow map. Manual bindings override mesh materials on the same slot.");
+        ui_inspector_section("SRV BINDINGS");
+        ImGui::TextDisabled("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
+        ImGui::TextDisabled("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
         if (ImGui::TreeNodeEx("Slot Reference##draw_slots", ImGuiTreeNodeFlags_None)) {
             ui_draw_texture_slot_reference("##draw_slot_reference");
             ImGui::TreePop();
         }
-        ImGui::Text("Texture Slots (%d / %d):", c->tex_count, MAX_TEX_SLOTS);
-        for (int t = 0; t < c->tex_count; t++) {
-            ImGui::PushID(t);
-            char lbl[32]; snprintf(lbl, sizeof(lbl), "t%d tex", (int)c->tex_slots[t]);
-            res_combo(lbl, &c->tex_handles[t], RES_NONE);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(48.f);
-            ImGui::InputScalar("##slot", ImGuiDataType_U32, &c->tex_slots[t]);
-            ImGui::PopID();
-        }
-        if (c->tex_count < MAX_TEX_SLOTS && ImGui::SmallButton("+##t")) c->tex_count++;
-        if (c->tex_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##t")) c->tex_count--; }
-
-        ImGui::Spacing();
         ImGui::Text("SRV Slots (%d / %d):", c->srv_count, MAX_SRV_SLOTS);
         for (int s = 0; s < c->srv_count; s++) {
             ImGui::PushID(100 + s);
-            char lbl[32]; snprintf(lbl, sizeof(lbl), "s%d srv", (int)c->srv_slots[s]);
+            char lbl[32]; snprintf(lbl, sizeof(lbl), "t%d srv", (int)c->srv_slots[s]);
             res_combo(lbl, &c->srv_handles[s], RES_NONE);
             ImGui::SameLine();
             ImGui::SetNextItemWidth(48.f);
@@ -5163,7 +5887,7 @@ static void ui_inspector_command(Command* c) {
         ui_command_shader_params(c, res_get(c->shader));
 
         ui_inspector_section("BINDINGS");
-        ImGui::Text("Texture/SRV Slots t# (%d / %d):", c->srv_count, MAX_SRV_SLOTS);
+        ImGui::Text("SRV Slots t# (%d / %d):", c->srv_count, MAX_SRV_SLOTS);
         for (int s = 0; s < c->srv_count; s++) {
             ImGui::PushID(200 + s);
             char lbl[32]; snprintf(lbl, sizeof(lbl), "t%d srv", (int)c->srv_slots[s]);
@@ -5239,32 +5963,17 @@ static void ui_inspector_command(Command* c) {
         if (c->shadow_cast)
             res_combo("Shadow Shader##id", &c->shadow_shader, RES_SHADER);
 
-        ui_inspector_section("TEXTURE BINDINGS");
-        ImGui::TextDisabled("Reserved PS t# slots:");
-        ImGui::TextDisabled("t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion");
-        ImGui::TextDisabled("t5 env map, t7 shadow map. Manual bindings override mesh materials on the same slot.");
+        ui_inspector_section("SRV BINDINGS");
+        ImGui::TextDisabled("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
+        ImGui::TextDisabled("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
         if (ImGui::TreeNodeEx("Slot Reference##indirect_draw_slots", ImGuiTreeNodeFlags_None)) {
             ui_draw_texture_slot_reference("##indirect_draw_slot_reference");
             ImGui::TreePop();
         }
-        ImGui::Text("Texture Slots (%d / %d):", c->tex_count, MAX_TEX_SLOTS);
-        for (int t = 0; t < c->tex_count; t++) {
-            ImGui::PushID(900 + t);
-            char lbl[32]; snprintf(lbl, sizeof(lbl), "t%d tex", (int)c->tex_slots[t]);
-            res_combo(lbl, &c->tex_handles[t], RES_NONE);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(48.f);
-            ImGui::InputScalar("##idslot", ImGuiDataType_U32, &c->tex_slots[t]);
-            ImGui::PopID();
-        }
-        if (c->tex_count < MAX_TEX_SLOTS && ImGui::SmallButton("+##id_t")) c->tex_count++;
-        if (c->tex_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##id_t")) c->tex_count--; }
-
-        ImGui::Spacing();
         ImGui::Text("SRV Slots (%d / %d):", c->srv_count, MAX_SRV_SLOTS);
         for (int s = 0; s < c->srv_count; s++) {
             ImGui::PushID(1000 + s);
-            char lbl[32]; snprintf(lbl, sizeof(lbl), "s%d srv", (int)c->srv_slots[s]);
+            char lbl[32]; snprintf(lbl, sizeof(lbl), "t%d srv", (int)c->srv_slots[s]);
             res_combo(lbl, &c->srv_handles[s], RES_NONE);
             ImGui::SameLine();
             ImGui::SetNextItemWidth(48.f);
@@ -5404,12 +6113,10 @@ static void ui_panel_bindings(bool embedded = false) {
                 ui_binding_row("Depth Buffer", "OM", -1, c->depth);
                 for (int i = 0; i < c->uav_count; i++)
                     ui_binding_row("UAV", "OM/PS", (int)c->uav_slots[i], c->uav_handles[i]);
-                if (c->tex_count > 0 || c->srv_count > 0)
+                if (c->srv_count > 0)
                     ui_inspector_section("SHADER RESOURCES");
-                for (int i = 0; i < c->tex_count; i++)
-                    ui_binding_row("Texture", "PS", (int)c->tex_slots[i], c->tex_handles[i]);
                 for (int i = 0; i < c->srv_count; i++)
-                    ui_binding_row("SRV", "VS", (int)c->srv_slots[i], c->srv_handles[i]);
+                    ui_binding_row("SRV", "VS/PS", (int)c->srv_slots[i], c->srv_handles[i]);
                 break;
             case CMD_DISPATCH:
                 ui_inspector_section("COMPUTE");
@@ -5442,12 +6149,10 @@ static void ui_panel_bindings(bool embedded = false) {
                 ui_binding_row("Depth Buffer", "OM", -1, c->depth);
                 for (int i = 0; i < c->uav_count; i++)
                     ui_binding_row("UAV", "OM/PS", (int)c->uav_slots[i], c->uav_handles[i]);
-                if (c->tex_count > 0 || c->srv_count > 0)
+                if (c->srv_count > 0)
                     ui_inspector_section("SHADER RESOURCES");
-                for (int i = 0; i < c->tex_count; i++)
-                    ui_binding_row("Texture", "PS", (int)c->tex_slots[i], c->tex_handles[i]);
                 for (int i = 0; i < c->srv_count; i++)
-                    ui_binding_row("SRV", "VS", (int)c->srv_slots[i], c->srv_handles[i]);
+                    ui_binding_row("SRV", "VS/PS", (int)c->srv_slots[i], c->srv_handles[i]);
                 ui_inspector_section("ARGUMENTS");
                 ui_binding_row("Indirect Buffer", "ARG", -1, c->indirect_buf);
                 break;
@@ -5585,9 +6290,6 @@ static void ui_panel_selection_state(bool embedded = false) {
     if (!embedded) ImGui::End();
 }
 
-// UserCB panel: exposes global shader variables and live links to resources,
-// commands, camera and light data. The generated HLSL snippet mirrors the exact
-// slot packing used by user_cb.cpp.
 static void ui_panel_user_cb() {
     ImGui::Begin("User CB (b2)");
     user_cb_enforce_unique_names();
@@ -5672,7 +6374,7 @@ static void ui_panel_user_cb() {
                 ImGui::TextDisabled("Resources");
                 for (int r_i = 0; r_i < MAX_RESOURCES; r_i++) {
                     Resource& r = g_resources[r_i];
-                    if (!r.active || r.is_builtin || r.type != e.type) continue;
+                    if (!r.active || r.is_builtin || ui_resource_is_size_source_resource(r) || r.type != e.type) continue;
                     ResHandle h = (ResHandle)(r_i + 1);
                     bool sel = (e.source_kind == USER_CB_SOURCE_RESOURCE && e.source == h);
                     ImGui::PushID(r_i);
@@ -5681,6 +6383,30 @@ static void ui_panel_user_cb() {
                         user_changed = true;
                     }
                     ImGui::PopID();
+                }
+                if (e.type == RES_INT || e.type == RES_INT2 || e.type == RES_INT3) {
+                    // Integral variables can be driven by resource dimensions:
+                    // int = count, int2 = width/height, int3 = width/height/depth.
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Resource sizes");
+                    for (int r_i = 0; r_i < MAX_RESOURCES; r_i++) {
+                        Resource& owner = g_resources[r_i];
+                        if (!owner.active || owner.is_generated || !ui_resource_size_source_matches_type(owner, e.type))
+                            continue;
+                        Resource* size_res = res_get(owner.size_handle);
+                        if (!size_res)
+                            continue;
+                        ResHandle h = owner.size_handle;
+                        bool sel = e.source_kind == USER_CB_SOURCE_RESOURCE && e.source == h;
+                        char item[192] = {};
+                        ui_resource_size_source_label(owner, *size_res, item, sizeof(item));
+                        ImGui::PushID(20000 + r_i);
+                        if (ImGui::Selectable(item, sel)) {
+                            user_cb_set_source(i, h);
+                            user_changed = true;
+                        }
+                        ImGui::PopID();
+                    }
                 }
                 if (e.type == RES_FLOAT3 || e.type == RES_FLOAT4) {
                     ImGui::Separator();
@@ -6293,9 +7019,6 @@ static void ui_handle_viewport_gizmo_hotkeys(bool hovered) {
         ui_set_viewport_gizmo_mode(UI_GIZMO_SCALE);
 }
 
-// Viewport transform gizmo. It is drawn in screen space from the selected
-// command's world transform, but edits the command's numeric transform fields so
-// save/load and timeline tracks keep using the same source of truth.
 static void ui_draw_viewport_gizmo(ImVec2 rect_min, ImVec2 rect_max, bool hovered) {
     Command* c = ui_selected_gizmo_command();
     Mat4 view_proj = {};
@@ -7314,10 +8037,10 @@ static void ui_draw_shortcuts_popup() {
             ImGui::EndTable();
         }
 
-        ui_inspector_section("DRAW TEXTURE SLOTS");
-        ImGui::TextDisabled("Common pixel shader t# convention used by mesh materials and PBR shaders.");
+        ui_inspector_section("DRAW SRV SLOTS");
+        ImGui::TextDisabled("Common shader t# convention used by mesh materials and PBR shaders.");
         ui_draw_texture_slot_reference("##shortcuts_draw_slots");
-        ImGui::TextDisabled("Manual Texture Bindings in a draw command override mesh material textures on the same slot.");
+        ImGui::TextDisabled("Manual SRV bindings in a draw command override mesh material textures on the same slot.");
 
         ImGui::PopStyleVar();
     }
@@ -7775,9 +8498,6 @@ static bool ui_timeline_scrollbar(const char* id, int* first_frame, int max_firs
     return changed;
 }
 
-// Timeline window: track management, slot selection, key capture, copy/paste and
-// playback controls. It talks to timeline.cpp through a compact API so the same
-// tracks can be serialized and exported to the 64k player.
 static void ui_draw_timeline_window() {
     if (!s_timeline_window_open) {
         s_timeline_keyboard_focus = false;
@@ -8231,9 +8951,6 @@ static void ui_draw_timeline_window() {
     ImGui::End();
 }
 
-// Top toolbar aggregates project actions, shader compile, export, play/pause,
-// profiler status, timeline access, and frameless-window controls. Keeping it in
-// one place avoids hidden shortcuts for state-changing actions.
 static void ui_top_bar() {
     for (int i = 0; i < 3; i++)
         s_ui_window_control_screen_rects_valid[i] = false;

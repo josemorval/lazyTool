@@ -4,12 +4,6 @@
 #include "user_cb.h"
 #include "ui.h"
 #include <string.h>
-
-// timeline.cpp implements a small deterministic keyframe system. Tracks target
-// editor objects by name (commands, UserCB variables, camera and dirlight), then
-// apply interpolated values each frame before command execution. The data stays
-// compact and line-oriented so project files and the 64k exporter can preserve
-// animation without embedding a separate timeline asset format.
 #include <stdlib.h>
 #include <math.h>
 
@@ -238,8 +232,6 @@ void timeline_set_play_dir(int dir) {
     (void)dir;
 }
 
-// Convert scene time to the active timeline frame. When looping is enabled, the
-// frame wraps through the project length; otherwise playback clamps at the ends.
 void timeline_update(float scene_time_seconds) {
     if (s_timeline_fps <= 0 || scene_time_seconds < 0.0f)
         return;
@@ -780,9 +772,6 @@ static void timeline_apply_dirlight(const TimelineKey& key) {
     dl->light_intensity = key.fval[9];
 }
 
-// Apply one track by resolving its target name at runtime. That makes rename and
-// delete maintenance explicit in the command/UserCB/resource modules rather than
-// hiding stale handles inside timeline keys.
 void timeline_apply_current() {
     for (int i = 0; i < g_timeline_track_count; i++) {
         TimelineTrack& track = g_timeline_tracks[i];
@@ -802,8 +791,6 @@ void timeline_apply_current() {
     }
 }
 
-// Emit only active tracks and their keys. The reader accepts absent timeline
-// blocks, so old projects load as static scenes with timeline disabled.
 void timeline_write_project(FILE* f) {
     if (!f)
         return;

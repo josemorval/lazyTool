@@ -1,6 +1,3 @@
-// Shared math and scene helpers for the procedural PBR/post-processing sample.
-// Includes fullscreen vertex generation, tonemapping, depth reconstruction,
-// shadow-cascade selection, and common BRDF utility functions.
 #ifndef PROCEDURAL_SPHERES_PBR_POST_COMMON_HLSL
 #define PROCEDURAL_SPHERES_PBR_POST_COMMON_HLSL
 

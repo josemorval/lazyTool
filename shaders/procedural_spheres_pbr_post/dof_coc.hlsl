@@ -1,5 +1,3 @@
-// Circle-of-confusion pass. It converts depth into a signed CoC mask so the
-// later gather can distinguish foreground/background blur.
 #include "common.hlsl"
 
 /*

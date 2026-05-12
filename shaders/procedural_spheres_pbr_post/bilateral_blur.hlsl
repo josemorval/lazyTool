@@ -1,5 +1,3 @@
-// Depth-aware blur used to clean SSAO while preserving edges. The axis/radius
-// are controlled by UserCB so one shader handles horizontal and vertical passes.
 #include "common.hlsl"
 
 /*

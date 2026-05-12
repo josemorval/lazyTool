@@ -15,15 +15,28 @@
 // project.cpp owns the text project format used to save and restore the full
 // editor state in a way that remains readable and diff-friendly.
 
-// Project format notes:
-//   - the format is line-oriented, stable, and easy to diff.
-//   - references are serialized by name plus optional type hints, then resolved
-//     back to handles during load.
-//   - load is intentionally more permissive than save so older files can survive
-//     new command/resource fields.
-
 static const char* bool_str(bool v) { return v ? "1" : "0"; }
 static char s_project_current_path[MAX_PATH_LEN] = {};
+
+// Project text uses forward slashes for file paths. The loader still accepts
+// either separator, while every saved path is written in the editor convention.
+static void project_canonicalize_path_text(const char* in, char* out, int out_sz) {
+    if (!out || out_sz <= 0)
+        return;
+    out[0] = '\0';
+    if (!in)
+        return;
+
+    int oi = 0;
+    for (int i = 0; in[i] && oi < out_sz - 1; i++)
+        out[oi++] = in[i] == '\\' ? '/' : in[i];
+    out[oi] = '\0';
+}
+
+static const char* project_path_token(const char* path, char* out, int out_sz) {
+    project_canonicalize_path_text(path, out, out_sz);
+    return out && out[0] ? out : "-";
+}
 
 struct ProjectViewDefaults {
     float camera_pos[3];
@@ -70,9 +83,7 @@ static const ProjectViewDefaults k_project_view_defaults = {
 };
 
 static void project_set_current_path(const char* path) {
-    if (!path) path = "";
-    strncpy(s_project_current_path, path, MAX_PATH_LEN - 1);
-    s_project_current_path[MAX_PATH_LEN - 1] = '\0';
+    project_canonicalize_path_text(path ? path : "", s_project_current_path, MAX_PATH_LEN);
 }
 
 const char* project_current_path() {
@@ -101,6 +112,7 @@ static const char* res_type_token(ResType t) {
     case RES_RENDER_TEXTURE2D:    return "render_texture2d";
     case RES_RENDER_TEXTURE3D:    return "render_texture3d";
     case RES_STRUCTURED_BUFFER:   return "structured_buffer";
+    case RES_GAUSSIAN_SPLAT:      return "gaussian_splat";
     case RES_MESH:                return "mesh";
     case RES_SHADER:              return "shader";
     case RES_BUILTIN_TIME:        return "builtin_time";
@@ -125,6 +137,7 @@ static ResType res_type_from_token(const char* name) {
     if (strcmp(name, "render_texture2d") == 0 || strcmp(name, "RenderTexture2D") == 0) return RES_RENDER_TEXTURE2D;
     if (strcmp(name, "render_texture3d") == 0 || strcmp(name, "RenderTexture3D") == 0) return RES_RENDER_TEXTURE3D;
     if (strcmp(name, "structured_buffer") == 0 || strcmp(name, "StructuredBuffer") == 0) return RES_STRUCTURED_BUFFER;
+    if (strcmp(name, "gaussian_splat") == 0 || strcmp(name, "GaussianSplat") == 0) return RES_GAUSSIAN_SPLAT;
     if (strcmp(name, "mesh") == 0 || strcmp(name, "Mesh") == 0) return RES_MESH;
     if (strcmp(name, "shader") == 0 || strcmp(name, "Shader") == 0) return RES_SHADER;
     if (strcmp(name, "builtin_time") == 0) return RES_BUILTIN_TIME;
@@ -284,9 +297,6 @@ void project_reset_view_defaults() {
     project_reset_dirlight_defaults();
 }
 
-// References are serialized as name|type when possible. The type suffix makes
-// project files more robust against duplicate names and helps future tools read
-// the file without having to execute the whole loader.
 static void res_ref(ResHandle h, char* out, int out_sz) {
     if (!out || out_sz <= 0) return;
     Resource* r = res_get(h);
@@ -545,9 +555,6 @@ static void project_clear_user_data() {
 }
 
 // Create a minimal scene so the editor always opens with valid content.
-// Build the editor's minimal boot scene. This guarantees the viewport has a
-// renderable surface, depth buffer, default mesh, shader, and command pipeline
-// even before the user creates or loads a project.
 void project_new_default() {
     project_clear_user_data();
     project_reset_camera_defaults();
@@ -586,10 +593,44 @@ void project_new_default() {
     log_info("New project: cube colored by normal.");
 }
 
+
+// Command shader inputs are serialized as SRV/UAV bindings. Texture2D
+// resources bind through SRV slots, so t# assignment is represented once.
+static bool project_command_has_srv_slot(const Command& c, uint32_t slot) {
+    for (int i = 0; i < c.srv_count; i++) {
+        if (res_get(c.srv_handles[i]) && c.srv_slots[i] == slot)
+            return true;
+    }
+    return false;
+}
+
+static void project_command_append_srv(Command* c, ResHandle h, uint32_t slot) {
+    if (!c || h == INVALID_HANDLE || !res_get(h))
+        return;
+    if (project_command_has_srv_slot(*c, slot))
+        return;
+    if (c->srv_count >= MAX_SRV_SLOTS) {
+        log_warn("Command '%s': dropping texture binding at t%u; SRV slots are full", c->name, slot);
+        return;
+    }
+    c->srv_handles[c->srv_count] = h;
+    c->srv_slots[c->srv_count] = slot;
+    c->srv_count++;
+}
+
+static void project_command_fold_texture_slots_into_srvs(Command* c) {
+    if (!c || c->tex_count <= 0)
+        return;
+    for (int i = 0; i < c->tex_count; i++)
+        project_command_append_srv(c, c->tex_handles[i], c->tex_slots[i]);
+    for (int i = 0; i < MAX_TEX_SLOTS; i++) {
+        c->tex_handles[i] = INVALID_HANDLE;
+        c->tex_slots[i] = 0;
+    }
+    c->tex_count = 0;
+}
+
 // Serialize the current scene/editor state into the custom text format.
-// Save is deliberately verbose. Most command fields are written even when they
-// carry defaults, because stable output makes project diffs easier to inspect
-// and keeps the 64k exporter parser straightforward.
 bool project_save_text(const char* path) {
     user_cb_enforce_unique_names();
     ensure_parent_dir(path);
@@ -647,16 +688,28 @@ bool project_save_text(const char* path) {
             fprintf(f, "resource structured_buffer %s %d %d %s %s %s\n",
                 r.name, r.elem_size, r.elem_count,
                 bool_str(r.has_srv), bool_str(r.has_uav), bool_str(r.indirect_args));
+        } else if (r.type == RES_GAUSSIAN_SPLAT) {
+            char path_ref[MAX_PATH_LEN] = {};
+            fprintf(f, "resource gaussian_splat %s %s\n", r.name, project_path_token(r.path, path_ref, MAX_PATH_LEN));
         } else if (r.type == RES_MESH) {
             if (r.path[0]) {
-                fprintf(f, "resource mesh_gltf %s %s\n", r.name, r.path);
+                char path_ref[MAX_PATH_LEN] = {};
+                fprintf(f, "resource mesh_gltf %s %s\n", r.name, project_path_token(r.path, path_ref, MAX_PATH_LEN));
             } else {
                 fprintf(f, "resource mesh_primitive %s %s\n", r.name, mesh_prim_name(r.mesh_primitive_type));
             }
         } else if (r.type == RES_SHADER) {
-            fprintf(f, "resource %s %s %s\n", r.cs ? "shader_cs" : "shader_vsps", r.name, r.path[0] ? r.path : "-");
+            char path_ref[MAX_PATH_LEN] = {};
+            // The serialized shader kind is the editor intent, not the current
+            // GPU pointer. Missing files and fallback shaders still round-trip
+            // as the program kind the user created.
+            bool is_compute = r.shader_kind == SHADER_PROGRAM_CS ||
+                              (r.shader_kind == SHADER_PROGRAM_UNKNOWN && r.cs != nullptr);
+            fprintf(f, "resource %s %s %s\n", is_compute ? "shader_cs" : "shader_vsps",
+                r.name, project_path_token(r.path, path_ref, MAX_PATH_LEN));
         } else if (r.type == RES_TEXTURE2D) {
-            fprintf(f, "resource texture2d %s %s\n", r.name, r.path[0] ? r.path : "-");
+            char path_ref[MAX_PATH_LEN] = {};
+            fprintf(f, "resource texture2d %s %s\n", r.name, project_path_token(r.path, path_ref, MAX_PATH_LEN));
         }
     }
 
@@ -694,6 +747,7 @@ bool project_save_text(const char* path) {
     for (int i = 0; i < MAX_COMMANDS; i++) {
         Command& c = g_commands[i];
         if (!c.active) continue;
+        project_command_fold_texture_slots_into_srvs(&c);
 
         char rt_ref[MAX_PATH_LEN] = {};
         char depth_ref[MAX_PATH_LEN] = {};
@@ -748,17 +802,6 @@ bool project_save_text(const char* path) {
         fprintf(f, "  repeat %d %s\n", c.repeat_count, bool_str(c.repeat_expanded));
         Command* parent_cmd = cmd_get(c.parent);
         fprintf(f, "  parent %s\n", parent_cmd ? parent_cmd->name : "-");
-
-        int tex_count = 0;
-        for (int t = 0; t < c.tex_count; t++) if (res_get(c.tex_handles[t])) tex_count++;
-        fprintf(f, "  textures %d", tex_count);
-        for (int t = 0; t < c.tex_count; t++) {
-            if (!res_get(c.tex_handles[t])) continue;
-            char ref[MAX_PATH_LEN] = {};
-            res_ref(c.tex_handles[t], ref, MAX_PATH_LEN);
-            fprintf(f, " %s %u", ref, c.tex_slots[t]);
-        }
-        fprintf(f, "\n");
 
         int srv_count = 0;
         for (int s = 0; s < c.srv_count; s++) if (res_get(c.srv_handles[s])) srv_count++;
@@ -869,9 +912,6 @@ static bool project_read_line(const char*& cursor, const char* end, char* out, i
 // Parse a saved project file and rebuild the in-memory editor state. The text
 // format is append-friendly: older files may omit newer fields, and unknown
 // lines are ignored so experimental commands can survive round-trips.
-// Load is more permissive than save. Unknown lines are skipped, and missing
-// newer fields fall back to defaults, so older projects remain useful while the
-// editor's command/resource model evolves.
 bool project_load_text(const char* path) {
     void* project_bytes = nullptr;
     size_t project_size = 0;
@@ -1103,6 +1143,9 @@ bool project_load_text(const char* path) {
                 char* indirect_tok = strtok(nullptr, " \t\r\n");
                 bool indirect_args = indirect_tok ? atoi(indirect_tok) != 0 : false;
                 res_create_structured_buffer(name, stride, count, srv, uav, indirect_args);
+            } else if (strcmp(kind, "gaussian_splat") == 0) {
+                char* p = strtok(nullptr, " \t\r\n");
+                res_load_gaussian_splat(name, p && strcmp(p, "-") != 0 ? p : "");
             } else if (strcmp(kind, "mesh_primitive") == 0) {
                 char* prim = strtok(nullptr, " \t\r\n");
                 res_create_mesh_primitive(name, mesh_prim_from_name(prim ? prim : "cube"));
@@ -1272,6 +1315,7 @@ bool project_load_text(const char* path) {
                     pending_parent_count++;
                 }
             } else if (strcmp(tag, "textures") == 0) {
+                // The text format accepts texture slot lists as SRV-compatible t# bindings.
                 parse_slots(line, cur->tex_handles, cur->tex_slots, &cur->tex_count, MAX_TEX_SLOTS, res_lookup_srv());
             } else if (strcmp(tag, "srvs") == 0) {
                 parse_slots(line, cur->srv_handles, cur->srv_slots, &cur->srv_count, MAX_SRV_SLOTS, res_lookup_srv());
@@ -1321,6 +1365,11 @@ bool project_load_text(const char* path) {
         CmdHandle parent = cmd_find_by_name(pending_parent_names[i]);
         if (child && parent != INVALID_HANDLE && parent != pending_parent_cmds[i])
             child->parent = parent;
+    }
+
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        if (g_commands[i].active)
+            project_command_fold_texture_slots_into_srvs(&g_commands[i]);
     }
 
     lt_free_file(project_bytes);

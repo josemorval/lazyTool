@@ -51,7 +51,6 @@ command clear clear_hdr_and_depth 1
   indirect_args - 0
   repeat 1 1
   parent -
-  textures 0
   srvs 0
   uavs 0
   params 0
@@ -75,7 +74,6 @@ command group scene_geometry 1
   indirect_args - 0
   repeat 1 1
   parent -
-  textures 0
   srvs 0
   uavs 0
   params 0
@@ -99,8 +97,7 @@ command draw_mesh draw_checker_ground 1
   indirect_args - 0
   repeat 1 1
   parent scene_geometry
-  textures 1 shadow_map|builtin_shadow_map 7
-  srvs 0
+  srvs 1 shadow_map|builtin_shadow_map 7
   uavs 0
   params 5
   param MaterialA float4 1 - 0 0 0 0 0.0350000001 0.0379999988 0.0419999994 1
@@ -128,8 +125,7 @@ command draw_instanced draw_procedural_spheres 1
   indirect_args - 0
   repeat 1 1
   parent scene_geometry
-  textures 1 shadow_map|builtin_shadow_map 7
-  srvs 0
+  srvs 1 shadow_map|builtin_shadow_map 7
   uavs 0
   params 5
   param MaterialA float4 1 - 0 0 0 0 0.100000001 0.25 0.340000004 1
@@ -157,7 +153,6 @@ command group postprocess_chain 1
   indirect_args - 0
   repeat 1 1
   parent -
-  textures 0
   srvs 0
   uavs 0
   params 0
@@ -181,8 +176,7 @@ command draw_mesh ssao_raw 1
   indirect_args - 0
   repeat 1 1
   parent postprocess_chain
-  textures 1 scene_depth|builtin_scene_depth 0
-  srvs 0
+  srvs 1 scene_depth|builtin_scene_depth 0
   uavs 0
   params 2
   param SSAOParams float4 1 - 0 0 0 0 0.819999993 1.54999995 0.0179999992 0.920000017
@@ -207,8 +201,7 @@ command draw_mesh ssao_bilateral_h 1
   indirect_args - 0
   repeat 1 1
   parent postprocess_chain
-  textures 2 rt_ssao_raw|render_texture2d 0 scene_depth|builtin_scene_depth 1
-  srvs 0
+  srvs 2 rt_ssao_raw|render_texture2d 0 scene_depth|builtin_scene_depth 1
   uavs 0
   params 1
   param BlurParams float4 1 - 0 0 0 0 1 1 2.20000005 0
@@ -232,8 +225,7 @@ command draw_mesh ssao_bilateral_v 1
   indirect_args - 0
   repeat 1 1
   parent postprocess_chain
-  textures 2 rt_ssao_tmp|render_texture2d 0 scene_depth|builtin_scene_depth 1
-  srvs 0
+  srvs 2 rt_ssao_tmp|render_texture2d 0 scene_depth|builtin_scene_depth 1
   uavs 0
   params 1
   param BlurParams float4 1 - 0 0 0 0 0 1 2.20000005 0
@@ -257,8 +249,7 @@ command draw_mesh bloom_prefilter 1
   indirect_args - 0
   repeat 1 1
   parent postprocess_chain
-  textures 1 rt_hdr_scene|render_texture2d 0
-  srvs 0
+  srvs 1 rt_hdr_scene|render_texture2d 0
   uavs 0
   params 1
   param BloomParams float4 1 - 0 0 0 0 1.35000002 0.349999994 0.850000024 12
@@ -282,7 +273,6 @@ command repeat bloom_blur_polish 1
   indirect_args - 0
   repeat 2 1
   parent postprocess_chain
-  textures 0
   srvs 0
   uavs 0
   params 0
@@ -306,8 +296,7 @@ command draw_mesh bloom_blur_h 1
   indirect_args - 0
   repeat 1 1
   parent bloom_blur_polish
-  textures 1 rt_bloom_a|render_texture2d 0
-  srvs 0
+  srvs 1 rt_bloom_a|render_texture2d 0
   uavs 0
   params 1
   param BlurParams float4 1 - 0 0 0 0 1 1.35000002 0 0
@@ -331,8 +320,7 @@ command draw_mesh bloom_blur_v 1
   indirect_args - 0
   repeat 1 1
   parent bloom_blur_polish
-  textures 1 rt_bloom_b|render_texture2d 0
-  srvs 0
+  srvs 1 rt_bloom_b|render_texture2d 0
   uavs 0
   params 1
   param BlurParams float4 1 - 0 0 0 0 0 1.35000002 0 0
@@ -356,8 +344,7 @@ command draw_mesh dof_coc 1
   indirect_args - 0
   repeat 1 1
   parent postprocess_chain
-  textures 1 scene_depth|builtin_scene_depth 0
-  srvs 0
+  srvs 1 scene_depth|builtin_scene_depth 0
   uavs 0
   params 1
   param FocusParams float4 1 - 0 0 0 0 7.19999981 2.79999995 1.60000002 1.14999998
@@ -381,8 +368,7 @@ command draw_mesh dof_gather 1
   indirect_args - 0
   repeat 1 1
   parent postprocess_chain
-  textures 3 rt_hdr_scene|render_texture2d 0 rt_coc|render_texture2d 1 scene_depth|builtin_scene_depth 2
-  srvs 0
+  srvs 3 rt_hdr_scene|render_texture2d 0 rt_coc|render_texture2d 1 scene_depth|builtin_scene_depth 2
   uavs 0
   params 1
   param DoFParams float4 1 - 0 0 0 0 13.5 0.5 1.10000002 0
@@ -406,8 +392,7 @@ command draw_mesh lensflare_ghosts 1
   indirect_args - 0
   repeat 1 1
   parent postprocess_chain
-  textures 2 rt_bloom_a|render_texture2d 0 rt_hdr_scene|render_texture2d 1
-  srvs 0
+  srvs 2 rt_bloom_a|render_texture2d 0 rt_hdr_scene|render_texture2d 1
   uavs 0
   params 1
   param LensParams float4 1 - 0 0 0 0 1.25 1.54999995 0.419999987 0.0179999992
@@ -431,8 +416,7 @@ command draw_mesh final_composite 1
   indirect_args - 0
   repeat 1 1
   parent postprocess_chain
-  textures 4 rt_dof|render_texture2d 0 rt_bloom_a|render_texture2d 1 rt_ssao|render_texture2d 2 rt_lensflare|render_texture2d 3
-  srvs 0
+  srvs 4 rt_dof|render_texture2d 0 rt_bloom_a|render_texture2d 1 rt_ssao|render_texture2d 2 rt_lensflare|render_texture2d 3
   uavs 0
   params 1
   param CompositeParams float4 1 - 0 0 0 0 1.12 0.560000002 0.850000024 0.720000029
