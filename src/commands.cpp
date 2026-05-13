@@ -1322,6 +1322,10 @@ static void clear_compute_bindings() {
     g_dx.ctx->CSSetUnorderedAccessViews(0, MAX_UAV_SLOTS, null_uavs, nullptr);
 }
 
+// Compute commands expose the same resource binding lists for direct and
+// indirect dispatch. DispatchIndirect only reads the argument buffer for the
+// group counts; every SRV/UAV declared by the compute shader is still bound
+// explicitly through the command's t#/u# slot arrays.
 static void bind_compute_resources(Command& c) {
     for (int s = 0; s < c.srv_count; s++) {
         Resource* sr = res_get(c.srv_handles[s]);

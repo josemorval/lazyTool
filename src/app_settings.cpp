@@ -21,6 +21,7 @@ static void app_settings_apply_defaults() {
     g_dx.d3d11_validation_supported = true;
     g_dx.shader_validation_warnings = true;
     g_dx.scene_grid_enabled = true;
+    g_dx.scene_orientation_gizmo_enabled = true;
     g_dx.scene_grid_color[0] = 1.00f;
     g_dx.scene_grid_color[1] = 0.50f;
     g_dx.scene_grid_color[2] = 0.01f;
@@ -54,6 +55,7 @@ void app_settings_save() {
     fprintf(f, "code_font_size %.9g\n", ui_code_font_size());
     fprintf(f, "shader_auto_save_compile %d\n", ui_shader_auto_save_compile() ? 1 : 0);
     fprintf(f, "scene_grid_enabled %d\n", g_dx.scene_grid_enabled ? 1 : 0);
+    fprintf(f, "scene_orientation_gizmo_enabled %d\n", g_dx.scene_orientation_gizmo_enabled ? 1 : 0);
     fprintf(f, "scene_grid_color_r %.9g\n", g_dx.scene_grid_color[0]);
     fprintf(f, "scene_grid_color_g %.9g\n", g_dx.scene_grid_color[1]);
     fprintf(f, "scene_grid_color_b %.9g\n", g_dx.scene_grid_color[2]);
@@ -93,6 +95,7 @@ void app_settings_load_or_create() {
         else if (strcmp(key, "code_font_size") == 0) ui_set_code_font_size((float)atof(value));
         else if (strcmp(key, "shader_auto_save_compile") == 0) ui_set_shader_auto_save_compile(atoi(value) != 0);
         else if (strcmp(key, "scene_grid_enabled") == 0) g_dx.scene_grid_enabled = atoi(value) != 0;
+        else if (strcmp(key, "scene_orientation_gizmo_enabled") == 0) g_dx.scene_orientation_gizmo_enabled = atoi(value) != 0;
         else if (strcmp(key, "scene_grid_color_r") == 0) g_dx.scene_grid_color[0] = (float)atof(value);
         else if (strcmp(key, "scene_grid_color_g") == 0) g_dx.scene_grid_color[1] = (float)atof(value);
         else if (strcmp(key, "scene_grid_color_b") == 0) g_dx.scene_grid_color[2] = (float)atof(value);

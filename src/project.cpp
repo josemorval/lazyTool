@@ -238,6 +238,7 @@ void project_apply_default_camera(Camera* camera) {
     camera->position[1] = k_project_view_defaults.camera_pos[1];
     camera->position[2] = k_project_view_defaults.camera_pos[2];
     project_angles_from_direction(k_project_view_defaults.view_dir, &camera->yaw, &camera->pitch);
+    camera->roll = 0.0f;
     camera->fov_y = k_project_view_defaults.camera_fov_y;
     camera->near_z = k_project_view_defaults.camera_near_z;
     camera->far_z = k_project_view_defaults.camera_far_z;
@@ -512,6 +513,7 @@ static void project_apply_legacy_camera(float azimuth, float elevation, float di
     g_camera.position[2] = target[2] + distance * ce * ca;
     g_camera.yaw = azimuth + 3.14159265358979323846f;
     g_camera.pitch = -elevation;
+    g_camera.roll = 0.0f;
 }
 
 static CmdType cmd_type_from_name(const char* name) {
@@ -641,10 +643,10 @@ bool project_save_text(const char* path) {
     }
 
     fprintf(f, "lazyTool_project 1\n\n");
-    fprintf(f, "camera_fps %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n\n",
+    fprintf(f, "camera_fps %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n\n",
         g_camera.position[0], g_camera.position[1], g_camera.position[2],
         g_camera.yaw, g_camera.pitch,
-        g_camera.fov_y, g_camera.near_z, g_camera.far_z);
+        g_camera.fov_y, g_camera.near_z, g_camera.far_z, g_camera.roll);
 
     if (Resource* dl = res_get(g_builtin_dirlight)) {
         fprintf(f, "dirlight %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d %d %.9g %.9g %.9g %.9g %d %.9g %.9g",
@@ -1057,6 +1059,8 @@ bool project_load_text(const char* path) {
             g_camera.fov_y = (float)atof(strtok(nullptr, " \t\r\n"));
             g_camera.near_z = (float)atof(strtok(nullptr, " \t\r\n"));
             g_camera.far_z = (float)atof(strtok(nullptr, " \t\r\n"));
+            char* roll_tok = strtok(nullptr, " \t\r\n");
+            g_camera.roll = roll_tok ? (float)atof(roll_tok) : 0.0f;
         } else if (strcmp(tag, "dirlight") == 0) {
             Resource* dl = res_get(g_builtin_dirlight);
             if (!dl) continue;

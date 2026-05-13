@@ -48,6 +48,7 @@ struct DX11Ctx {
     ID3D11RasterizerState*   rs_wire_cull_none;
     bool                     scene_wireframe;
     bool                     scene_grid_enabled;
+    bool                     scene_orientation_gizmo_enabled;
     float                    scene_grid_color[4];
     ID3D11DepthStencilState* dss_default;
     ID3D11DepthStencilState* dss_depth_read;

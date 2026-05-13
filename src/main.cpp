@@ -354,11 +354,23 @@ static Vec3 camera_forward(const Camera& c) {
         cosf(c.yaw) * cp));
 }
 
-static Vec3 camera_right(const Camera& c) {
+static Vec3 camera_base_right(const Camera& c) {
     Vec3 right = v3_norm(v3_cross(v3(0.0f, 1.0f, 0.0f), camera_forward(c)));
     if (v3_dot(right, right) < 0.0001f)
         right = v3(1.0f, 0.0f, 0.0f);
     return right;
+}
+
+static Vec3 camera_base_up(const Camera& c) {
+    return v3_norm(v3_cross(camera_forward(c), camera_base_right(c)));
+}
+
+static Vec3 camera_right(const Camera& c) {
+    Vec3 right = camera_base_right(c);
+    Vec3 up = camera_base_up(c);
+    float cr = cosf(c.roll);
+    float sr = sinf(c.roll);
+    return v3_norm(v3_add(v3_scale(right, cr), v3_scale(up, sr)));
 }
 
 static Vec3 camera_up(const Camera& c) {
@@ -507,6 +519,7 @@ static bool     g_scene_render_requested = false;
 static bool     g_scene_reset_execution_pending = true;
 static CmdHandle g_default_pixelize_cmd = INVALID_HANDLE;
 static bool     g_player_mode = false;
+static ULONGLONG g_last_editor_present_ms = 0;
 
 void app_request_scene_restart() {
     g_restart_scene_requested = true;
@@ -641,6 +654,18 @@ static void end_viewport_mouse_gesture(ViewportMouseGesture* gesture) {
     gesture->active = false;
 }
 
+static bool cursor_over_editor_scene_view() {
+#ifdef LAZYTOOL_PLAYER_ONLY
+    return true;
+#else
+    if (!ImGui::GetCurrentContext())
+        return false;
+    POINT p = {};
+    GetCursorPos(&p);
+    return ui_scene_view_contains_screen_point((int)p.x, (int)p.y);
+#endif
+}
+
 // Camera look and light orbit both want the same interaction model:
 // keep the cursor hidden, capture the window, read deltas from the viewport
 // center, then recenter every frame. Sharing the gesture code keeps both tools
@@ -691,7 +716,7 @@ static void update_camera_mouse() {
     bool active = begin_or_update_viewport_mouse_gesture(
         &s_camera_mouse_gesture,
         key_down(VK_RBUTTON),
-        g_scene_view_hovered,
+        g_scene_view_hovered || cursor_over_editor_scene_view(),
         g_camera_controls.enabled && g_camera_controls.mouse_look && !imgui_keyboard_capture_requested(),
         &dx, &dy);
     if (!active)
@@ -765,11 +790,22 @@ static void update_camera_keyboard(float dt) {
     if (!g_camera_controls.enabled)
         return;
 
-    if (!g_scene_view_hovered && !key_down(VK_RBUTTON))
+    bool viewport_active = g_scene_view_hovered || cursor_over_editor_scene_view() || key_down(VK_RBUTTON);
+    if (!viewport_active)
         return;
 
     if (imgui_keyboard_capture_requested())
         return;
+
+    float roll_dir = 0.0f;
+    if (key_down('R')) roll_dir -= 1.0f;
+    if (key_down('T')) roll_dir += 1.0f;
+    if (roll_dir != 0.0f) {
+        float roll_speed = 1.35f;
+        if (key_down(VK_SHIFT))   roll_speed *= g_camera_controls.fast_mult;
+        if (key_down(VK_CONTROL)) roll_speed *= g_camera_controls.slow_mult;
+        g_camera.roll += roll_dir * roll_speed * dt;
+    }
 
     float x = 0.0f;
     float y = 0.0f;
@@ -809,6 +845,58 @@ static void update_camera_controls(float dt) {
 
     update_camera_mouse();
     update_camera_keyboard(dt);
+}
+
+
+static bool editor_any_navigation_key_down() {
+    return key_down(VK_LBUTTON) || key_down(VK_RBUTTON) || key_down(VK_MBUTTON) ||
+           key_down('W') || key_down('A') || key_down('S') || key_down('D') ||
+           key_down('Q') || key_down('E') || key_down('R') || key_down('T') ||
+           key_down('L') || key_down(VK_SHIFT) || key_down(VK_CONTROL);
+}
+
+static bool editor_imgui_wants_continuous_redraw() {
+#ifdef LAZYTOOL_PLAYER_ONLY
+    return false;
+#else
+    if (!ImGui::GetCurrentContext())
+        return false;
+    ImGuiIO& io = ImGui::GetIO();
+    return io.WantTextInput || ImGui::IsAnyItemActive();
+#endif
+}
+
+static bool editor_wait_when_paused_idle(bool had_messages) {
+#ifdef LAZYTOOL_PLAYER_ONLY
+    (void)had_messages;
+    return false;
+#else
+    if (g_player_mode || had_messages)
+        return false;
+    if (!g_scene_paused)
+        return false;
+    if (g_pending_resize || g_pending_scene_surface_resize || g_restart_scene_requested || g_scene_render_requested)
+        return false;
+    if (editor_any_navigation_key_down() || editor_imgui_wants_continuous_redraw())
+        return false;
+
+    DWORD interval_ms = 50; // Automatic paused-idle redraw cap, not a user-facing mode.
+    if (GetForegroundWindow() != g_dx.hwnd)
+        interval_ms = 250;
+    if (IsIconic(g_dx.hwnd))
+        interval_ms = 500;
+
+    ULONGLONG now_ms = GetTickCount64();
+    if (g_last_editor_present_ms == 0)
+        g_last_editor_present_ms = now_ms;
+    ULONGLONG elapsed_ms = now_ms - g_last_editor_present_ms;
+    if (elapsed_ms >= interval_ms)
+        return false;
+
+    DWORD wait_ms = (DWORD)(interval_ms - elapsed_ms);
+    MsgWaitForMultipleObjectsEx(0, nullptr, wait_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    return true;
+#endif
 }
 
 // Win32
@@ -972,7 +1060,7 @@ static void update_builtins_and_scene_cb() {
     Vec3  at     = v3_add(eye, camera_forward(g_camera));
     float aspect = g_dx.scene_height > 0 ? (float)g_dx.scene_width / g_dx.scene_height : 1.f;
 
-    Mat4 view = mat4_lookat(eye, at, {0.f, 1.f, 0.f});
+    Mat4 view = mat4_lookat(eye, at, camera_up(g_camera));
     Mat4 proj = mat4_perspective(g_camera.fov_y, aspect, g_camera.near_z, g_camera.far_z);
     Mat4 vp   = mat4_mul(view, proj);
     Mat4 inv_vp = mat4_inverse(vp);
@@ -1323,12 +1411,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     MSG msg = {};
     while (g_running) {
+        bool had_messages = false;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            had_messages = true;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
             if (msg.message == WM_QUIT) g_running = false;
         }
         if (!g_running) break;
+
+        if (editor_wait_when_paused_idle(had_messages))
+            continue;
 
         bool force_scene_render = g_scene_render_requested;
         g_scene_render_requested = false;
@@ -1382,11 +1475,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
         // Pause freezes the scene texture by default. Explicit editor actions
         // can still request one render so reset, scrubbing and key edits stay
-        // visible without advancing runtime time.
+        // visible without advancing runtime time. While paused and idle we do
+        // not update SceneCB/UserCB or execute draw/dispatch commands.
         bool light_orbit_active = false;
         if (g_player_mode)
             g_scene_view_hovered = true;
-        if (timeline_enabled()) {
+        bool scene_will_render = !g_scene_paused || force_scene_render;
+        if (timeline_enabled() && scene_will_render) {
             timeline_update(g_time);
             if (app_timeline_has_keys())
                 timeline_apply_current();
@@ -1405,10 +1500,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         }
         if (force_scene_render)
             g_scene_render_requested = false;
-        update_builtins_and_scene_cb();
-        update_default_example_commands();
+        scene_will_render = !g_scene_paused || force_scene_render;
 
-        if (!g_scene_paused || force_scene_render) {
+        if (scene_will_render) {
+            update_builtins_and_scene_cb();
+            update_default_example_commands();
             // User cbuffer: pack editor defaults before any draw/dispatch.
             user_cb_update();
 
@@ -1448,6 +1544,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 #endif
 
         g_dx.sc->Present(g_dx.vsync ? 1 : 0, 0);
+#ifndef LAZYTOOL_PLAYER_ONLY
+        if (!g_player_mode)
+            g_last_editor_present_ms = GetTickCount64();
+#endif
         dx_debug_log_messages();
     }
 
