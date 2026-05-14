@@ -462,6 +462,8 @@ struct ParamDef {
     std::string name;
     ValType type = VT_NONE;
     bool enabled = true;
+    SourceKind source_kind = SRC_NONE;
+    std::string source_target;
     int ival[4] = {};
     float fval[4] = {};
 };
@@ -766,10 +768,22 @@ static Project parse_lt(const std::string& lt_path) {
                 }
             } else if (tag == "param" && t.size() >= 5) {
                 ParamDef pd;
-                pd.name = t[1]; pd.type = parse_val_type(t[2]); pd.enabled = toki(t,3,1) != 0;
+                pd.name = t[1];
+                pd.type = parse_val_type(t[2]);
+                pd.enabled = toki(t,3,1) != 0;
+                pd.source_target = t[4] == "-" ? std::string() : ref_name(t[4]);
+                if (!pd.source_target.empty()) pd.source_kind = SRC_RESOURCE;
                 for (int i = 0; i < 4; i++) pd.ival[i] = toki(t, (size_t)5 + i, 0);
                 for (int i = 0; i < 4; i++) pd.fval[i] = tokf(t, (size_t)9 + i, 0.0f);
                 cur->params.push_back(pd);
+            } else if (tag == "param_source" && t.size() >= 3) {
+                for (size_t i = 0; i < cur->params.size(); i++) {
+                    ParamDef& pd = cur->params[i];
+                    if (pd.name != t[1]) continue;
+                    pd.source_kind = parse_source_kind(t[2]);
+                    pd.source_target = (t.size() >= 4 && t[3] != "-") ? t[3] : std::string();
+                    break;
+                }
             }
         } else if (tag == "timeline_settings") {
             p.timeline_fps = toki(t,1,24);
@@ -1441,7 +1455,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
 
     // Command parameters are stored sequentially and referenced by each command.
     // The shader reads them through UserCB slots 0..N, matching the editor model.
-    struct FlatParam { int type, enabled; int iv[4]; float fv[4]; };
+    struct FlatParam { int type, enabled, source_kind, source_cmd; int iv[4]; float fv[4]; };
     std::vector<FlatParam> flat_params;
     std::vector<int> cmd_param_start(out_cmds.size(), 0);
     std::vector<int> cmd_param_count(out_cmds.size(), 0);
@@ -1453,20 +1467,36 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
             FlatParam fp = {};
             fp.type = (int)pp.type;
             fp.enabled = pp.enabled ? 1 : 0;
+            fp.source_kind = (int)pp.source_kind;
+            fp.source_cmd = -1;
             for (int k = 0; k < 4; k++) { fp.iv[k] = pp.ival[k]; fp.fv[k] = pp.fval[k]; }
+            if (pp.source_kind == SRC_RESOURCE && !pp.source_target.empty()) {
+                int ri = find_res(p, pp.source_target);
+                if (ri >= 0 && p.resources[(size_t)ri].kind == RK_VALUE && p.resources[(size_t)ri].value_type == pp.type) {
+                    for (int k = 0; k < 4; k++) { fp.iv[k] = p.resources[(size_t)ri].ival[k]; fp.fv[k] = p.resources[(size_t)ri].fval[k]; }
+                    fp.source_kind = SRC_NONE;
+                } else {
+                    warnf("param '%s' on draw '%s': resource source '%s' is not a matching value resource; using baked value", pp.name.c_str(), out_cmds[ci].name.c_str(), pp.source_target.c_str());
+                    fp.source_kind = SRC_NONE;
+                }
+            } else if (pp.source_kind == SRC_CMD_POS || pp.source_kind == SRC_CMD_ROT || pp.source_kind == SRC_CMD_SCALE) {
+                if (pp.source_kind == SRC_CMD_ROT && pp.type != VT_FLOAT4) {
+                    warnf("param '%s' on draw '%s': cmd_rot source exports as float4 quaternion in 64k; using baked value", pp.name.c_str(), out_cmds[ci].name.c_str());
+                    fp.source_kind = SRC_NONE;
+                } else {
+                    std::map<std::string,int>::iterator it = cmd_out_index.find(pp.source_target);
+                    if (it != cmd_out_index.end()) fp.source_cmd = it->second;
+                    else {
+                        warnf("param '%s' on draw '%s': source command '%s' is not exported to 64k; using baked value", pp.name.c_str(), out_cmds[ci].name.c_str(), pp.source_target.c_str());
+                        fp.source_kind = SRC_NONE;
+                    }
+                }
+            }
             flat_params.push_back(fp);
         }
         cmd_param_count[ci] = (int)flat_params.size() - cmd_param_start[ci];
     }
 
-    bool direct_backbuffer_depth_scene = false;
-    for (const CommandDef& c : p.commands) {
-        if (!c.enabled) continue;
-        if (builtin_scene_color(c.rt) && builtin_scene_depth(c.depth) && (c.depth_test || c.depth_write || c.type == CT_CLEAR)) {
-            direct_backbuffer_depth_scene = true;
-            break;
-        }
-    }
 
     FILE* f = std::fopen(out_c.c_str(), "wb");
     if (!f) die("cannot write %s", out_c.c_str());
@@ -1476,7 +1506,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     fprintf(f, "// This file is a procedural-only standalone player. It contains no model files,\n");
     fprintf(f, "// no texture files and no editor UI. Geometry is either produced by the shader\n");
     fprintf(f, "// from SV_VertexID or by the tiny built-in primitive vertex buffers below.\n");
-    fprintf(f, "// Shadows, render targets, command parameters and timeline animation are kept.\n\n");
+    fprintf(f, "// Shadows, render targets, value-backed parameters, scene-source parameters and timeline animation are kept.\n\n");
     fprintf(f, "#define WIN32_LEAN_AND_MEAN\n#define COBJMACROS\n#include <windows.h>\n#include <stddef.h>\n#include <d3d11.h>\n#include <d3dcompiler.h>\n\n");
     fprintf(f, "#define LT_WNDCLS \"lt64k_window\"\n#define LT_PI 3.14159265358979323846f\n");
     int shadow_tex_w = (int)(p.dirlight[10] > 16.0f ? p.dirlight[10] : 16.0f);
@@ -1569,12 +1599,12 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     }
     fprintf(f, "};\n");
 
-    fprintf(f, "typedef struct { int type,enabled; int iv[4]; float fv[4]; } Par;\n");
+    fprintf(f, "typedef struct { int type,enabled,src,src_cmd; int iv[4]; float fv[4]; } Par;\n");
     fprintf(f, "static Par par[%u] = {\n", (unsigned)(flat_params.empty() ? 1 : flat_params.size()));
-    if (flat_params.empty()) fprintf(f, " {0,0,{0,0,0,0},{0.0f,0.0f,0.0f,0.0f}},\n");
+    if (flat_params.empty()) fprintf(f, " {0,0,0,-1,{0,0,0,0},{0.0f,0.0f,0.0f,0.0f}},\n");
     for (size_t i = 0; i < flat_params.size(); i++) {
         const FlatParam& pp = flat_params[i];
-        fprintf(f, " {%d,%d,{", pp.type, pp.enabled); emit_int_array(f, pp.iv, 4); fprintf(f, "},{"); emit_float_array(f, pp.fv, 4); fprintf(f, "}},\n");
+        fprintf(f, " {%d,%d,%d,%d,{", pp.type, pp.enabled, pp.source_kind, pp.source_cmd); emit_int_array(f, pp.iv, 4); fprintf(f, "},{"); emit_float_array(f, pp.fv, 4); fprintf(f, "}},\n");
     }
     fprintf(f, "};\n");
 
@@ -1583,12 +1613,22 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     if (p.user_vars.empty()) fprintf(f, " {0,0,-1,{0,0,0,0},{0.0f,0.0f,0.0f,0.0f}},\n");
     for (size_t i = 0; i < p.user_vars.size(); i++) {
         const UserVarDef& u = p.user_vars[i];
+        int source_kind = (int)u.source_kind;
         int src_cmd = -1;
         if (u.source_kind == SRC_CMD_POS || u.source_kind == SRC_CMD_ROT || u.source_kind == SRC_CMD_SCALE) {
-            std::map<std::string,int>::iterator it = cmd_out_index.find(u.source_target);
-            if (it != cmd_out_index.end()) src_cmd = it->second;
+            if (u.source_kind == SRC_CMD_ROT && u.type != VT_FLOAT4) {
+                warnf("user_var '%s': cmd_rot source exports as float4 quaternion in 64k; using baked value", u.name.c_str());
+                source_kind = SRC_NONE;
+            } else {
+                std::map<std::string,int>::iterator it = cmd_out_index.find(u.source_target);
+                if (it != cmd_out_index.end()) src_cmd = it->second;
+                else {
+                    warnf("user_var '%s': source command '%s' is not exported to 64k; using baked value", u.name.c_str(), u.source_target.c_str());
+                    source_kind = SRC_NONE;
+                }
+            }
         }
-        fprintf(f, " {%d,%d,%d,{", (int)u.type, (int)u.source_kind, src_cmd); emit_int_array(f, u.ival, 4); fprintf(f, "},{"); emit_float_array(f, u.fval, 4); fprintf(f, "}},\n");
+        fprintf(f, " {%d,%d,%d,{", (int)u.type, source_kind, src_cmd); emit_int_array(f, u.ival, 4); fprintf(f, "},{"); emit_float_array(f, u.fval, 4); fprintf(f, "}},\n");
     }
     fprintf(f, "};\n");
 
@@ -1769,8 +1809,9 @@ static void timeline(float sec){
 static int invm(M4* a,M4* o){ float* m=a->m; float v[16],d; v[0]=m[5]*m[10]*m[15]-m[5]*m[11]*m[14]-m[9]*m[6]*m[15]+m[9]*m[7]*m[14]+m[13]*m[6]*m[11]-m[13]*m[7]*m[10]; v[4]=-m[4]*m[10]*m[15]+m[4]*m[11]*m[14]+m[8]*m[6]*m[15]-m[8]*m[7]*m[14]-m[12]*m[6]*m[11]+m[12]*m[7]*m[10]; v[8]=m[4]*m[9]*m[15]-m[4]*m[11]*m[13]-m[8]*m[5]*m[15]+m[8]*m[7]*m[13]+m[12]*m[5]*m[11]-m[12]*m[7]*m[9]; v[12]=-m[4]*m[9]*m[14]+m[4]*m[10]*m[13]+m[8]*m[5]*m[14]-m[8]*m[6]*m[13]-m[12]*m[5]*m[10]+m[12]*m[6]*m[9]; v[1]=-m[1]*m[10]*m[15]+m[1]*m[11]*m[14]+m[9]*m[2]*m[15]-m[9]*m[3]*m[14]-m[13]*m[2]*m[11]+m[13]*m[3]*m[10]; v[5]=m[0]*m[10]*m[15]-m[0]*m[11]*m[14]-m[8]*m[2]*m[15]+m[8]*m[3]*m[14]+m[12]*m[2]*m[11]-m[12]*m[3]*m[10]; v[9]=-m[0]*m[9]*m[15]+m[0]*m[11]*m[13]+m[8]*m[1]*m[15]-m[8]*m[3]*m[13]-m[12]*m[1]*m[11]+m[12]*m[3]*m[9]; v[13]=m[0]*m[9]*m[14]-m[0]*m[10]*m[13]-m[8]*m[1]*m[14]+m[8]*m[2]*m[13]+m[12]*m[1]*m[10]-m[12]*m[2]*m[9]; v[2]=m[1]*m[6]*m[15]-m[1]*m[7]*m[14]-m[5]*m[2]*m[15]+m[5]*m[3]*m[14]+m[13]*m[2]*m[7]-m[13]*m[3]*m[6]; v[6]=-m[0]*m[6]*m[15]+m[0]*m[7]*m[14]+m[4]*m[2]*m[15]-m[4]*m[3]*m[14]-m[12]*m[2]*m[7]+m[12]*m[3]*m[6]; v[10]=m[0]*m[5]*m[15]-m[0]*m[7]*m[13]-m[4]*m[1]*m[15]+m[4]*m[3]*m[13]+m[12]*m[1]*m[7]-m[12]*m[3]*m[5]; v[14]=-m[0]*m[5]*m[14]+m[0]*m[6]*m[13]+m[4]*m[1]*m[14]-m[4]*m[2]*m[13]-m[12]*m[1]*m[6]+m[12]*m[2]*m[5]; v[3]=-m[1]*m[6]*m[11]+m[1]*m[7]*m[10]+m[5]*m[2]*m[11]-m[5]*m[3]*m[10]-m[9]*m[2]*m[7]+m[9]*m[3]*m[6]; v[7]=m[0]*m[6]*m[11]-m[0]*m[7]*m[10]-m[4]*m[2]*m[11]+m[4]*m[3]*m[10]+m[8]*m[2]*m[7]-m[8]*m[3]*m[6]; v[11]=-m[0]*m[5]*m[11]+m[0]*m[7]*m[9]+m[4]*m[1]*m[11]-m[4]*m[3]*m[9]-m[8]*m[1]*m[7]+m[8]*m[3]*m[5]; v[15]=m[0]*m[5]*m[10]-m[0]*m[6]*m[9]-m[4]*m[1]*m[10]+m[4]*m[2]*m[9]+m[8]*m[1]*m[6]-m[8]*m[2]*m[5]; d=m[0]*v[0]+m[1]*v[4]+m[2]*v[8]+m[3]*v[12]; if(d==0){mid(o);return 0;} d=1.0f/d; for(int i=0;i<16;i++)o->m[i]=v[i]*d; return 1; }
 // UserCB is rebuilt for each draw. Global user variables are written first;
 // command parameters can then override the first slots for material data.
-static void fill_user_base(UserCB* u){ int i,j; zmem(u,sizeof(*u)); for(i=0;i<UVN&&i<64;i++){ if(isint(uv[i].type)) cpy(u->i[i],uv[i].iv,comps(uv[i].type)*4); else for(j=0;j<comps(uv[i].type);j++)u->f[i][j]=uv[i].fv[j]; } }
-static void fill_user_cmd(UserCB* u, Cmd* c){ int i,j,pi; fill_user_base(u); for(i=0;i<c->pc&&i<64;i++){ pi=c->pst+i; if(pi<0||pi>=PN)continue; if(isint(par[pi].type)) cpy(u->i[i],par[pi].iv,comps(par[pi].type)*4); else for(j=0;j<comps(par[pi].type);j++)u->f[i][j]=par[pi].fv[j]; } }
+static void scene_src(float* o,int src,int src_cmd,int ty){ o[0]=o[1]=o[2]=0;o[3]=0; if((src==2||src==3||src==4)&&src_cmd>=0&&src_cmd<CMDN){ Cmd* c=cmd+src_cmd; if(src==2){o[0]=c->pos[0];o[1]=c->pos[1];o[2]=c->pos[2];o[3]=1;} else if(src==4){o[0]=c->scl[0];o[1]=c->scl[1];o[2]=c->scl[2];o[3]=1;} else if(ty==7){o[0]=c->q[0];o[1]=c->q[1];o[2]=c->q[2];o[3]=c->q[3];} } else if(src==5){o[0]=cam[0];o[1]=cam[1];o[2]=cam[2];o[3]=1;} else if(src==6){o[0]=cam[3];o[1]=cam[4];o[2]=cam[5];o[3]=0;} else if(src==7){o[0]=dl[0];o[1]=dl[1];o[2]=dl[2];o[3]=1;} else if(src==8){o[0]=dl[3];o[1]=dl[4];o[2]=dl[5];o[3]=1;} }
+static void fill_user_base(UserCB* u){ int i,j; float sf[4]; zmem(u,sizeof(*u)); for(i=0;i<UVN&&i<64;i++){ if(isint(uv[i].type)) cpy(u->i[i],uv[i].iv,comps(uv[i].type)*4); else { if(uv[i].src>1){scene_src(sf,uv[i].src,uv[i].src_cmd,uv[i].type); for(j=0;j<comps(uv[i].type);j++)u->f[i][j]=sf[j];} else for(j=0;j<comps(uv[i].type);j++)u->f[i][j]=uv[i].fv[j]; } } }
+static void fill_user_cmd(UserCB* u, Cmd* c){ int i,j,pi; float sf[4]; fill_user_base(u); for(i=0;i<c->pc&&i<64;i++){ pi=c->pst+i; if(pi<0||pi>=PN||!par[pi].enabled)continue; if(isint(par[pi].type)) cpy(u->i[i],par[pi].iv,comps(par[pi].type)*4); else { if(par[pi].src>1){scene_src(sf,par[pi].src,par[pi].src_cmd,par[pi].type); for(j=0;j<comps(par[pi].type);j++)u->f[i][j]=sf[j];} else for(j=0;j<comps(par[pi].type);j++)u->f[i][j]=par[pi].fv[j]; } } }
 static void clear_vals(Cmd* c,float* cc,float* dc){ int i; for(i=0;i<4;i++)cc[i]=c->cc[i]; *dc=c->dc; if(c->ccs>=0&&c->ccs<UVN&&uv[c->ccs].type==7)for(i=0;i<4;i++)cc[i]=uv[c->ccs].fv[i]; if(c->dcs>=0&&c->dcs<UVN&&uv[c->dcs].type==4)*dc=cl(uv[c->dcs].fv[0],0,1); }
 )LT64K", f);
     fputs(R"LT64K(static HRESULT compile(const char* src, unsigned int len, const char* e, const char* m, ID3DBlob** b){ ID3DBlob* er=0; HRESULT hr=D3DCompile(src,len,0,0,0,e,m,D3DCOMPILE_OPTIMIZATION_LEVEL3,0,b,&er); if(er)ID3D10Blob_Release(er); return hr; }
