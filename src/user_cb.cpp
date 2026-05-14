@@ -6,6 +6,7 @@
 #include "ui.h"
 #include "timeline.h"
 #include <string.h>
+#include <stdint.h>
 
 // user_cb.cpp manages the user-defined constant buffer bound at b1. It lets
 // editor variables flow into shaders every frame without manual packing.
@@ -24,7 +25,7 @@ void user_cb_sync_command_params(Command* c, const Resource*) {
     if (c)
         c->param_count = 0;
 }
-void user_cb_bind_for_command(Command*, const Resource*, bool, bool, bool) {}
+void user_cb_bind_for_command(Command*, ResHandle, const Resource*, bool, bool, bool) {}
 void user_cb_enforce_unique_names() {}
 bool user_cb_type_supported(ResType) { return false; }
 bool user_cb_add_var(const char*, ResType) { return false; }
@@ -54,6 +55,53 @@ static ID3D11Buffer*  s_uploaded_command_user_cb_buffer = nullptr;
 static bool           s_uploaded_global_user_cb_valid = false;
 static bool           s_uploaded_command_user_cb_valid = false;
 
+enum UserCBPlanSource : uint8_t {
+    USER_CB_PLAN_GLOBAL = 0,
+    USER_CB_PLAN_PARAM  = 1,
+};
+
+struct UserCBPackOp {
+    UserCBPlanSource source;
+    int              index;
+    ResType          type;
+    uint32_t         offset;
+    uint32_t         size;
+};
+
+static const int MAX_USER_CB_PLAN_OPS = MAX_SHADER_CB_VARS * 2;
+
+struct UserCBCommandPackPlan {
+    bool            valid;
+    const Resource* shader;
+    uint32_t        shader_layout_version;
+    uint64_t        command_version;
+    uint64_t        global_layout_revision;
+    int             param_count;
+    int             op_count;
+    UserCBPackOp    ops[MAX_USER_CB_PLAN_OPS];
+};
+
+static UserCBCommandPackPlan s_command_pack_plans[MAX_COMMANDS] = {};
+static uint64_t              s_user_cb_layout_revision = 1;
+
+static void user_cb_invalidate_command_pack_plans() {
+    for (int i = 0; i < MAX_COMMANDS; i++)
+        s_command_pack_plans[i].valid = false;
+}
+
+static void user_cb_bump_layout_revision() {
+    ++s_user_cb_layout_revision;
+    user_cb_invalidate_command_pack_plans();
+}
+
+static int user_cb_command_index(const Command* c) {
+    if (!c)
+        return -1;
+    if (c < g_commands || c >= g_commands + MAX_COMMANDS)
+        return -1;
+    return (int)(c - g_commands);
+}
+
 static bool user_cb_name_exists_except(const char* name, int except_idx) {
     if (!name || !name[0])
         return false;
@@ -82,16 +130,21 @@ static bool user_cb_name_exists(const char* name) {
     return user_cb_name_exists_except(name, -1);
 }
 
-static UserCBEntry* user_cb_find_global_entry(const char* name, ResType type) {
+static int user_cb_find_global_index(const char* name, ResType type) {
     if (!name)
-        return nullptr;
+        return -1;
     for (int i = 0; i < g_user_cb_count; i++) {
         if (g_user_cb_entries[i].type != type)
             continue;
         if (strcmp(g_user_cb_entries[i].name, name) == 0)
-            return &g_user_cb_entries[i];
+            return i;
     }
-    return nullptr;
+    return -1;
+}
+
+static UserCBEntry* user_cb_find_global_entry(const char* name, ResType type) {
+    int idx = user_cb_find_global_index(name, type);
+    return idx >= 0 ? &g_user_cb_entries[idx] : nullptr;
 }
 
 static void user_cb_make_unique_name_except(const char* base, char* out, int out_sz, int except_idx) {
@@ -346,6 +399,8 @@ void user_cb_refresh_entry(int idx) {
 void user_cb_init() {
     memset(g_user_cb_entries, 0, sizeof(g_user_cb_entries));
     g_user_cb_count = 0;
+    s_user_cb_layout_revision = 1;
+    user_cb_invalidate_command_pack_plans();
 
     D3D11_BUFFER_DESC bd = {};
     bd.ByteWidth      = sizeof(UserCBData);
@@ -368,6 +423,7 @@ void user_cb_shutdown() {
     s_uploaded_command_user_cb_valid = false;
     s_uploaded_global_user_cb_buffer = nullptr;
     s_uploaded_command_user_cb_buffer = nullptr;
+    user_cb_invalidate_command_pack_plans();
 }
 
 void user_cb_clear() {
@@ -375,6 +431,7 @@ void user_cb_clear() {
     g_user_cb_count = 0;
     s_uploaded_global_user_cb_valid = false;
     s_uploaded_command_user_cb_valid = false;
+    user_cb_bump_layout_revision();
 }
 
 void user_cb_enforce_unique_names() {
@@ -398,6 +455,7 @@ void user_cb_enforce_unique_names() {
         if (old_name[0] && !user_cb_name_exists_before(old_name, i))
             user_cb_rename_variable_references(old_name, e.name);
 
+        user_cb_bump_layout_revision();
         log_warn("UserCB: renamed duplicate variable '%s' -> '%s'",
                  old_name[0] ? old_name : "(empty)", e.name);
         app_request_scene_render();
@@ -506,12 +564,13 @@ void user_cb_sync_command_params(Command* c, const Resource* shader) {
     c->synced_shader_handle = c->shader;
 }
 
-static void pack_value_bytes(ResType type, const int* ival, const float* fval,
-                             const ShaderCBVar* v, unsigned char* bytes, int byte_count) {
-    if (!v || !bytes) return;
-    if ((int)v->offset >= byte_count) return;
+static void pack_value_bytes_direct(ResType type, const int* ival, const float* fval,
+                                    uint32_t offset, uint32_t reflected_size,
+                                    unsigned char* bytes, int byte_count) {
+    if (!bytes) return;
+    if ((int)offset >= byte_count) return;
 
-    int max_copy = byte_count - (int)v->offset;
+    int max_copy = byte_count - (int)offset;
     if (max_copy <= 0) return;
 
     int bytes_to_copy = 0;
@@ -528,13 +587,20 @@ static void pack_value_bytes(ResType type, const int* ival, const float* fval,
     }
 
     if (!src_data || bytes_to_copy <= 0) return;
-    if (bytes_to_copy > (int)v->size) bytes_to_copy = (int)v->size;
+    if (bytes_to_copy > (int)reflected_size) bytes_to_copy = (int)reflected_size;
     if (bytes_to_copy > max_copy) bytes_to_copy = max_copy;
-    memcpy(bytes + v->offset, src_data, bytes_to_copy);
+    memcpy(bytes + offset, src_data, bytes_to_copy);
 }
 
-static void pack_command_param_bytes(const CommandParam* p, const ShaderCBVar* v, unsigned char* bytes, int byte_count) {
-    if (!p || !v || !bytes || !p->enabled) return;
+static void pack_value_bytes(ResType type, const int* ival, const float* fval,
+                             const ShaderCBVar* v, unsigned char* bytes, int byte_count) {
+    if (!v) return;
+    pack_value_bytes_direct(type, ival, fval, v->offset, v->size, bytes, byte_count);
+}
+
+static void pack_command_param_bytes_direct(const CommandParam* p, uint32_t offset, uint32_t reflected_size,
+                                            unsigned char* bytes, int byte_count) {
+    if (!p || !bytes || !p->enabled) return;
 
     const int* ival = p->ival;
     const float* fval = p->fval;
@@ -551,10 +617,107 @@ static void pack_command_param_bytes(const CommandParam* p, const ShaderCBVar* v
         fval = scene_fval;
     }
 
-    pack_value_bytes(p->type, ival, fval, v, bytes, byte_count);
+    pack_value_bytes_direct(p->type, ival, fval, offset, reflected_size, bytes, byte_count);
 }
 
-void user_cb_bind_for_command(Command* c, const Resource* shader, bool bind_vs, bool bind_ps, bool bind_cs) {
+static void pack_command_param_bytes(const CommandParam* p, const ShaderCBVar* v, unsigned char* bytes, int byte_count) {
+    if (!v) return;
+    pack_command_param_bytes_direct(p, v->offset, v->size, bytes, byte_count);
+}
+
+static void user_cb_pack_command_fallback(Command* c, const Resource* shader, unsigned char* bytes, int cb_size) {
+    if (!shader || !shader->shader_cb.active || !bytes)
+        return;
+
+    for (int i = 0; i < shader->shader_cb.var_count; i++) {
+        const ShaderCBVar& v = shader->shader_cb.vars[i];
+        UserCBEntry* global = user_cb_find_global_entry(v.name, v.type);
+        if (global) {
+            user_cb_refresh_source(global);
+            pack_value_bytes(global->type, global->ival, global->fval, &v, bytes, cb_size);
+        }
+        int p_i = command_param_find(c, v.name);
+        if (p_i < 0) continue;
+        pack_command_param_bytes(&c->params[p_i], &v, bytes, cb_size);
+    }
+}
+
+static void user_cb_build_command_pack_plan(UserCBCommandPackPlan* plan, Command* c, const Resource* shader) {
+    if (!plan)
+        return;
+
+    memset(plan, 0, sizeof(*plan));
+    if (!c || !shader || !shader->shader_cb.active)
+        return;
+
+    plan->valid = true;
+    plan->shader = shader;
+    plan->shader_layout_version = shader->shader_cb.layout_version;
+    plan->command_version = c->version;
+    plan->global_layout_revision = s_user_cb_layout_revision;
+    plan->param_count = c->param_count;
+
+    for (int i = 0; i < shader->shader_cb.var_count; i++) {
+        const ShaderCBVar& v = shader->shader_cb.vars[i];
+        int global_i = user_cb_find_global_index(v.name, v.type);
+        if (global_i >= 0 && plan->op_count < MAX_USER_CB_PLAN_OPS) {
+            UserCBPackOp& op = plan->ops[plan->op_count++];
+            op.source = USER_CB_PLAN_GLOBAL;
+            op.index  = global_i;
+            op.type   = v.type;
+            op.offset = v.offset;
+            op.size   = v.size;
+        }
+
+        int param_i = command_param_find(c, v.name);
+        if (param_i >= 0 && param_i < c->param_count &&
+            c->params[param_i].type == v.type && plan->op_count < MAX_USER_CB_PLAN_OPS) {
+            UserCBPackOp& op = plan->ops[plan->op_count++];
+            op.source = USER_CB_PLAN_PARAM;
+            op.index  = param_i;
+            op.type   = v.type;
+            op.offset = v.offset;
+            op.size   = v.size;
+        }
+    }
+}
+
+static bool user_cb_command_pack_plan_matches(const UserCBCommandPackPlan* plan, const Command* c, const Resource* shader) {
+    if (!plan || !plan->valid || !c || !shader)
+        return false;
+    return plan->shader == shader &&
+           plan->shader_layout_version == shader->shader_cb.layout_version &&
+           plan->command_version == c->version &&
+           plan->global_layout_revision == s_user_cb_layout_revision &&
+           plan->param_count == c->param_count;
+}
+
+static void user_cb_pack_from_plan(const UserCBCommandPackPlan* plan, Command* c, unsigned char* bytes, int cb_size) {
+    if (!plan || !c || !bytes)
+        return;
+
+    for (int i = 0; i < plan->op_count; i++) {
+        const UserCBPackOp& op = plan->ops[i];
+        if (op.source == USER_CB_PLAN_GLOBAL) {
+            if (op.index < 0 || op.index >= g_user_cb_count)
+                continue;
+            UserCBEntry* e = &g_user_cb_entries[op.index];
+            if (e->type != op.type)
+                continue;
+            user_cb_refresh_source(e);
+            pack_value_bytes_direct(e->type, e->ival, e->fval, op.offset, op.size, bytes, cb_size);
+        } else {
+            if (op.index < 0 || op.index >= c->param_count)
+                continue;
+            CommandParam* p = &c->params[op.index];
+            if (p->type != op.type)
+                continue;
+            pack_command_param_bytes_direct(p, op.offset, op.size, bytes, cb_size);
+        }
+    }
+}
+
+void user_cb_bind_for_command(Command* c, ResHandle shader_handle, const Resource* shader, bool bind_vs, bool bind_ps, bool bind_cs) {
     if (!shader || !shader->shader_cb.active) {
         return;
     }
@@ -562,38 +725,31 @@ void user_cb_bind_for_command(Command* c, const Resource* shader, bool bind_vs, 
     if (!s_command_cb_buf)
         return;
 
-    // Heavy fix: the previous version re-ran user_cb_sync_command_params on
-    // every single draw/dispatch every frame. For a project like fluid_ninja
-    // that's ~56 invocations per frame of ~6.5 KB memcpy + ~6.5 KB memset +
-    // up to 1024 string comparisons each. That steady CPU drain is what made
-    // the editor feel like it had a "memory leak" (the heap was fine, but the
-    // CPU was thrashing more every passing minute as ImGui also kept drawing
-    // the complex command tree).
-    //
-    // The sync is only actually needed when the shader's reflected layout
-    // changes (compile / hot-reload) or when the command is first bound to a
-    // new shader. Skip it otherwise.
+    // Sync only when the reflected layout changes. Per-frame packing below uses
+    // a cached plan of byte copies, so the hot path no longer searches UserCB
+    // globals/command params by string for every reflected variable.
     bool need_sync = !c ||
                      c->synced_shader_cb_version != shader->shader_cb.layout_version ||
-                     c->synced_shader_handle != c->shader;
-    if (need_sync)
+                     c->synced_shader_handle != shader_handle;
+    if (need_sync) {
         user_cb_sync_command_params(c, shader);
+        if (c)
+            c->synced_shader_handle = shader_handle;
+    }
 
     UserCBData data = {};
     int cb_size = (int)shader->shader_cb.size;
     if (cb_size <= 0) cb_size = sizeof(data);
     if (cb_size > (int)sizeof(data)) cb_size = sizeof(data);
 
-    for (int i = 0; i < shader->shader_cb.var_count; i++) {
-        const ShaderCBVar& v = shader->shader_cb.vars[i];
-        UserCBEntry* global = user_cb_find_global_entry(v.name, v.type);
-        if (global) {
-            user_cb_refresh_source(global);
-            pack_value_bytes(global->type, global->ival, global->fval, &v, (unsigned char*)&data, cb_size);
-        }
-        int p_i = command_param_find(c, v.name);
-        if (p_i < 0) continue;
-        pack_command_param_bytes(&c->params[p_i], &v, (unsigned char*)&data, cb_size);
+    int plan_idx = user_cb_command_index(c);
+    if (plan_idx >= 0) {
+        UserCBCommandPackPlan* plan = &s_command_pack_plans[plan_idx];
+        if (!user_cb_command_pack_plan_matches(plan, c, shader))
+            user_cb_build_command_pack_plan(plan, c, shader);
+        user_cb_pack_from_plan(plan, c, (unsigned char*)&data, cb_size);
+    } else {
+        user_cb_pack_command_fallback(c, shader, (unsigned char*)&data, cb_size);
     }
 
     bool same_buffer = s_uploaded_command_user_cb_buffer == s_command_cb_buf;
@@ -729,6 +885,7 @@ bool user_cb_rename(int idx, const char* name) {
     strncpy(e.name, next_name, MAX_NAME - 1);
     e.name[MAX_NAME - 1] = '\0';
     user_cb_rename_variable_references(old_name, e.name);
+    user_cb_bump_layout_revision();
     log_info("UserCB: renamed '%s' -> '%s'", old_name, e.name);
     app_request_scene_render();
     return true;
@@ -766,6 +923,7 @@ bool user_cb_add_var(const char* name, ResType type) {
     e->type   = type;
     e->source = INVALID_HANDLE;
     e->source_kind = USER_CB_SOURCE_NONE;
+    user_cb_bump_layout_revision();
 
     log_info("UserCB: created '%s' at slot %d (preferred b2, offset %d bytes)",
              e->name, slot, slot * 16);
@@ -796,6 +954,7 @@ bool user_cb_add_from_resource(ResHandle h) {
     e->source = h;
     e->source_kind = USER_CB_SOURCE_RESOURCE;
     user_cb_copy_from_resource(e, r);
+    user_cb_bump_layout_revision();
 
     log_info("UserCB: added '%s' linked to resource '%s' at slot %d (preferred b2, offset %d bytes)",
              e->name, r->name, slot, slot * 16);
@@ -931,6 +1090,7 @@ void user_cb_remove(int idx) {
     for (int i = idx; i < g_user_cb_count - 1; i++)
         g_user_cb_entries[i] = g_user_cb_entries[i + 1];
     memset(&g_user_cb_entries[--g_user_cb_count], 0, sizeof(UserCBEntry));
+    user_cb_bump_layout_revision();
     app_request_scene_render();
 }
 
@@ -943,6 +1103,7 @@ void user_cb_move(int from, int to) {
     for (int i = from; i != to; i += dir)
         g_user_cb_entries[i] = g_user_cb_entries[i + dir];
     g_user_cb_entries[to] = tmp;
+    user_cb_bump_layout_revision();
     app_request_scene_render();
 }
 

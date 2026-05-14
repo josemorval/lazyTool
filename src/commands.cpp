@@ -1603,7 +1603,7 @@ static void execute_shadow_prepass_command(CmdHandle h) {
     if (shadow_shader && shadow_shader->vs && (procedural || shadow_shader->il)) {
         shadow_vs = shadow_shader->vs;
         shadow_il = shadow_shader->il;
-        user_cb_bind_for_command(&c, shadow_shader, true, false, false);
+        user_cb_bind_for_command(&c, c.shadow_shader, shadow_shader, true, false, false);
     } else {
         if (procedural)
             return;
@@ -1819,7 +1819,7 @@ static void execute_dispatch_command(Command& c) {
     g_dx.ctx->OMSetRenderTargets(0, nullptr, nullptr);
     clear_compute_bindings();
     g_dx.ctx->CSSetShader(shader->cs, nullptr, 0);
-    user_cb_bind_for_command(&c, shader, false, false, true);
+    user_cb_bind_for_command(&c, c.shader, shader, false, false, true);
     bind_compute_resources(c);
 
     UINT dispatch_x = 1, dispatch_y = 1, dispatch_z = 1;
@@ -1839,7 +1839,7 @@ static void execute_indirect_dispatch_command(Command& c) {
     g_dx.ctx->OMSetRenderTargets(0, nullptr, nullptr);
     clear_compute_bindings();
     g_dx.ctx->CSSetShader(shader->cs, nullptr, 0);
-    user_cb_bind_for_command(&c, shader, false, false, true);
+    user_cb_bind_for_command(&c, c.shader, shader, false, false, true);
     bind_compute_resources(c);
     g_dx.ctx->DispatchIndirect(ibuf->buf, c.indirect_offset);
     clear_compute_bindings();
@@ -1911,7 +1911,7 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         g_dx.ctx->VSSetShader(shader->vs, nullptr, 0);
         g_dx.ctx->PSSetShader(shader->ps, nullptr, 0);
         g_dx.ctx->IASetInputLayout(procedural ? nullptr : shader->il);
-        user_cb_bind_for_command(&c, shader, true, true, false);
+        user_cb_bind_for_command(&c, c.shader, shader, true, true, false);
 
         ID3D11RenderTargetView* rtvs[MAX_DRAW_RENDER_TARGETS] = {};
         UINT rtv_count = collect_draw_rtvs(c, rtvs, MAX_DRAW_RENDER_TARGETS);
@@ -1986,7 +1986,7 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         g_dx.ctx->VSSetShader(shader->vs, nullptr, 0);
         g_dx.ctx->PSSetShader(shader->ps, nullptr, 0);
         g_dx.ctx->IASetInputLayout(procedural ? nullptr : shader->il);
-        user_cb_bind_for_command(&c, shader, true, true, false);
+        user_cb_bind_for_command(&c, c.shader, shader, true, true, false);
 
         ID3D11RenderTargetView* rtvs[MAX_DRAW_RENDER_TARGETS] = {};
         UINT rtv_count = collect_draw_rtvs(c, rtvs, MAX_DRAW_RENDER_TARGETS);
