@@ -171,6 +171,9 @@ static void res_init_mesh_part(MeshPart* part) {
     memset(part, 0, sizeof(*part));
     part->material_index = -1;
     part->enabled = true;
+    part->bounds_valid = false;
+    part->bounds_min[0] = part->bounds_min[1] = part->bounds_min[2] = -0.5f;
+    part->bounds_max[0] = part->bounds_max[1] = part->bounds_max[2] =  0.5f;
     res_mesh_identity(part->local_transform);
 }
 
@@ -179,6 +182,9 @@ static void res_reset_mesh_asset(Resource* r) {
 
     r->mesh_part_count = 0;
     r->mesh_material_count = 0;
+    r->mesh_bounds_valid = false;
+    r->mesh_bounds_min[0] = r->mesh_bounds_min[1] = r->mesh_bounds_min[2] = -0.5f;
+    r->mesh_bounds_max[0] = r->mesh_bounds_max[1] = r->mesh_bounds_max[2] =  0.5f;
     for (int i = 0; i < MAX_MESH_PARTS; i++)
         res_init_mesh_part(&r->mesh_parts[i]);
     for (int i = 0; i < MAX_MESH_MATERIALS; i++)
@@ -208,6 +214,133 @@ static void res_set_vertex(Vertex* v, Vec3 p, Vec3 n, float u, float vv) {
     v->pos[0] = p.x; v->pos[1] = p.y; v->pos[2] = p.z;
     v->nor[0] = n.x; v->nor[1] = n.y; v->nor[2] = n.z;
     v->uv[0]  = u;   v->uv[1]  = vv;
+}
+
+static void res_bounds_reset(float out_min[3], float out_max[3]) {
+    out_min[0] = out_min[1] = out_min[2] =  FLT_MAX;
+    out_max[0] = out_max[1] = out_max[2] = -FLT_MAX;
+}
+
+static void res_bounds_include_point(float out_min[3], float out_max[3], Vec3 p) {
+    if (p.x < out_min[0]) out_min[0] = p.x;
+    if (p.y < out_min[1]) out_min[1] = p.y;
+    if (p.z < out_min[2]) out_min[2] = p.z;
+    if (p.x > out_max[0]) out_max[0] = p.x;
+    if (p.y > out_max[1]) out_max[1] = p.y;
+    if (p.z > out_max[2]) out_max[2] = p.z;
+}
+
+static Vec3 res_transform_point_raw(const float m[16], Vec3 p) {
+    if (!m)
+        return p;
+    float x = p.x * m[0] + p.y * m[4] + p.z * m[8]  + m[12];
+    float y = p.x * m[1] + p.y * m[5] + p.z * m[9]  + m[13];
+    float z = p.x * m[2] + p.y * m[6] + p.z * m[10] + m[14];
+    float w = p.x * m[3] + p.y * m[7] + p.z * m[11] + m[15];
+    if (fabsf(w) > 1e-6f) {
+        float inv_w = 1.0f / w;
+        x *= inv_w; y *= inv_w; z *= inv_w;
+    }
+    return v3(x, y, z);
+}
+
+static bool res_compute_vertex_bounds(const Vertex* verts, int vert_count, float out_min[3], float out_max[3]) {
+    if (!verts || vert_count <= 0 || !out_min || !out_max)
+        return false;
+    res_bounds_reset(out_min, out_max);
+    for (int i = 0; i < vert_count; i++)
+        res_bounds_include_point(out_min, out_max, v3(verts[i].pos[0], verts[i].pos[1], verts[i].pos[2]));
+    return out_min[0] <= out_max[0] && out_min[1] <= out_max[1] && out_min[2] <= out_max[2];
+}
+
+static void res_bounds_include_box_corners(float out_min[3], float out_max[3],
+                                           const float box_min[3], const float box_max[3],
+                                           const float transform[16])
+{
+    if (!box_min || !box_max)
+        return;
+    for (int z = 0; z <= 1; z++) {
+        for (int y = 0; y <= 1; y++) {
+            for (int x = 0; x <= 1; x++) {
+                Vec3 p = v3(x ? box_max[0] : box_min[0],
+                            y ? box_max[1] : box_min[1],
+                            z ? box_max[2] : box_min[2]);
+                res_bounds_include_point(out_min, out_max, res_transform_point_raw(transform, p));
+            }
+        }
+    }
+}
+
+static void res_compute_part_bounds_from_arrays(MeshPart* part, const Vertex* verts, int vert_count,
+                                                const uint32_t* indices, int idx_count)
+{
+    if (!part || !verts || vert_count <= 0)
+        return;
+
+    float bmin[3] = {};
+    float bmax[3] = {};
+    res_bounds_reset(bmin, bmax);
+    bool any = false;
+    int start = part->start_index;
+    int count = part->index_count;
+    if (start < 0) start = 0;
+    if (count < 0) count = 0;
+
+    if (indices && idx_count > 0) {
+        if (start > idx_count) start = idx_count;
+        if (start + count > idx_count) count = idx_count - start;
+        for (int i = 0; i < count; i++) {
+            uint32_t vi = indices[start + i];
+            if (vi >= (uint32_t)vert_count)
+                continue;
+            res_bounds_include_point(bmin, bmax, v3(verts[vi].pos[0], verts[vi].pos[1], verts[vi].pos[2]));
+            any = true;
+        }
+    } else {
+        if (start > vert_count) start = vert_count;
+        if (start + count > vert_count) count = vert_count - start;
+        for (int i = 0; i < count; i++) {
+            const Vertex& v = verts[start + i];
+            res_bounds_include_point(bmin, bmax, v3(v.pos[0], v.pos[1], v.pos[2]));
+            any = true;
+        }
+    }
+
+    if (any) {
+        memcpy(part->bounds_min, bmin, sizeof(part->bounds_min));
+        memcpy(part->bounds_max, bmax, sizeof(part->bounds_max));
+        part->bounds_valid = true;
+    }
+}
+
+static void res_compute_mesh_bounds_from_parts(Resource* r, const Vertex* verts, int vert_count,
+                                               const uint32_t* indices, int idx_count)
+{
+    if (!r)
+        return;
+    float agg_min[3] = {};
+    float agg_max[3] = {};
+    res_bounds_reset(agg_min, agg_max);
+    bool any = false;
+
+    for (int pi = 0; pi < r->mesh_part_count; pi++) {
+        MeshPart& part = r->mesh_parts[pi];
+        if (!part.bounds_valid)
+            res_compute_part_bounds_from_arrays(&part, verts, vert_count, indices, idx_count);
+        if (!part.bounds_valid)
+            continue;
+        res_bounds_include_box_corners(agg_min, agg_max, part.bounds_min, part.bounds_max, part.local_transform);
+        any = true;
+    }
+
+    if (!any && res_compute_vertex_bounds(verts, vert_count, agg_min, agg_max))
+        any = true;
+
+    if (any) {
+        memcpy(r->mesh_bounds_min, agg_min, sizeof(r->mesh_bounds_min));
+        memcpy(r->mesh_bounds_max, agg_max, sizeof(r->mesh_bounds_max));
+        r->mesh_bounds_valid = true;
+    }
 }
 
 static void res_add_quad_face(Vertex* verts, uint32_t* idx, int* vert_cursor, int* index_cursor,
@@ -253,6 +386,7 @@ static bool res_upload_mesh(Resource* r, const Vertex* verts, int vert_count,
     r->idx_count = idx_count;
     r->vert_stride = sizeof(Vertex);
     res_set_default_mesh_layout(r);
+    res_compute_mesh_bounds_from_parts(r, verts, vert_count, indices, idx_count);
 
     D3D11_BUFFER_DESC vbd = {};
     vbd.ByteWidth = (UINT)(sizeof(Vertex) * vert_count);
@@ -1989,6 +2123,7 @@ ResHandle res_load_mesh(const char* name, const char* path) {
     r->mesh_part_count = imported_part_count;
     memcpy(r->mesh_materials, imported_materials, sizeof(imported_materials));
     memcpy(r->mesh_parts, imported_parts, sizeof(imported_parts));
+    res_compute_mesh_bounds_from_parts(r, verts.items, verts.count, indices.items, indices.count);
 
     cgltf_free(data);
     res_vertex_array_free(&verts);

@@ -239,6 +239,7 @@ void project_apply_default_camera(Camera* camera) {
     camera->position[2] = k_project_view_defaults.camera_pos[2];
     project_angles_from_direction(k_project_view_defaults.view_dir, &camera->yaw, &camera->pitch);
     camera->roll = 0.0f;
+    camera_set_euler(camera, camera->yaw, camera->pitch, camera->roll);
     camera->fov_y = k_project_view_defaults.camera_fov_y;
     camera->near_z = k_project_view_defaults.camera_near_z;
     camera->far_z = k_project_view_defaults.camera_far_z;
@@ -511,9 +512,7 @@ static void project_apply_legacy_camera(float azimuth, float elevation, float di
     g_camera.position[0] = target[0] + distance * ce * sa;
     g_camera.position[1] = target[1] + distance * se;
     g_camera.position[2] = target[2] + distance * ce * ca;
-    g_camera.yaw = azimuth + 3.14159265358979323846f;
-    g_camera.pitch = -elevation;
-    g_camera.roll = 0.0f;
+    camera_set_euler(&g_camera, azimuth + 3.14159265358979323846f, -elevation, 0.0f);
 }
 
 static CmdType cmd_type_from_name(const char* name) {
@@ -643,6 +642,7 @@ bool project_save_text(const char* path) {
     }
 
     fprintf(f, "lazyTool_project 1\n\n");
+    camera_sync_euler_from_quat(&g_camera);
     fprintf(f, "camera_fps %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n\n",
         g_camera.position[0], g_camera.position[1], g_camera.position[2],
         g_camera.yaw, g_camera.pitch,
@@ -1050,6 +1050,7 @@ bool project_load_text(const char* path) {
             g_camera.fov_y = (float)atof(strtok(nullptr, " \t\r\n"));
             g_camera.near_z = (float)atof(strtok(nullptr, " \t\r\n"));
             g_camera.far_z = (float)atof(strtok(nullptr, " \t\r\n"));
+            camera_set_euler(&g_camera, g_camera.yaw, g_camera.pitch, g_camera.roll);
         } else if (strcmp(tag, "camera_fps") == 0) {
             g_camera.position[0] = (float)atof(strtok(nullptr, " \t\r\n"));
             g_camera.position[1] = (float)atof(strtok(nullptr, " \t\r\n"));
@@ -1061,6 +1062,7 @@ bool project_load_text(const char* path) {
             g_camera.far_z = (float)atof(strtok(nullptr, " \t\r\n"));
             char* roll_tok = strtok(nullptr, " \t\r\n");
             g_camera.roll = roll_tok ? (float)atof(roll_tok) : 0.0f;
+            camera_set_euler(&g_camera, g_camera.yaw, g_camera.pitch, g_camera.roll);
         } else if (strcmp(tag, "dirlight") == 0) {
             Resource* dl = res_get(g_builtin_dirlight);
             if (!dl) continue;
@@ -1375,6 +1377,7 @@ bool project_load_text(const char* path) {
         if (g_commands[i].active)
             project_command_fold_texture_slots_into_srvs(&g_commands[i]);
     }
+    cmd_mark_all_dirty();
 
     lt_free_file(project_bytes);
     project_set_current_path(path);

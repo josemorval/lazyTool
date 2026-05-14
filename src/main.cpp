@@ -247,6 +247,34 @@ Quat quat_from_euler_xyz(Vec3 r) {
     return quat_from_mat4(mat4_rotation_xyz(r));
 }
 
+Quat quat_mul(Quat a, Quat b) {
+    return {
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+    };
+}
+
+Quat quat_from_axis_angle(Vec3 axis, float angle) {
+    axis = v3_norm(axis);
+    float half = angle * 0.5f;
+    float s = sinf(half);
+    return quat_normalize({axis.x * s, axis.y * s, axis.z * s, cosf(half)});
+}
+
+static Quat quat_conjugate(Quat q) {
+    q = quat_normalize(q);
+    return {-q.x, -q.y, -q.z, q.w};
+}
+
+Vec3 quat_rotate_vec3(Quat q, Vec3 v) {
+    q = quat_normalize(q);
+    Quat p = {v.x, v.y, v.z, 0.0f};
+    Quat r = quat_mul(quat_mul(q, p), quat_conjugate(q));
+    return v3(r.x, r.y, r.z);
+}
+
 Quat quat_slerp(Quat a, Quat b, float t) {
     a = quat_normalize(a);
     b = quat_normalize(b);
@@ -346,35 +374,254 @@ Vec3 camera_eye(const Camera& c) {
     return v3(c.position[0], c.position[1], c.position[2]);
 }
 
-static Vec3 camera_forward(const Camera& c) {
-    float cp = cosf(c.pitch);
-    return v3_norm(v3(
-        sinf(c.yaw) * cp,
-        sinf(c.pitch),
-        cosf(c.yaw) * cp));
+static bool camera_has_valid_quat(const Camera& c) {
+    float l2 = c.rotq[0] * c.rotq[0] + c.rotq[1] * c.rotq[1] +
+               c.rotq[2] * c.rotq[2] + c.rotq[3] * c.rotq[3];
+    return l2 > 1e-8f;
 }
 
-static Vec3 camera_base_right(const Camera& c) {
-    Vec3 right = v3_norm(v3_cross(v3(0.0f, 1.0f, 0.0f), camera_forward(c)));
-    if (v3_dot(right, right) < 0.0001f)
-        right = v3(1.0f, 0.0f, 0.0f);
-    return right;
+static Quat camera_quat_from_euler(float yaw, float pitch, float roll) {
+    // Local camera basis is +X right, +Y up, +Z forward. Positive pitch looks up,
+    // so it is a negative right-handed rotation around local X.
+    Quat q_yaw   = quat_from_axis_angle(v3(0.0f, 1.0f, 0.0f), yaw);
+    Quat q_pitch = quat_from_axis_angle(v3(1.0f, 0.0f, 0.0f), -pitch);
+    Quat q_roll  = quat_from_axis_angle(v3(0.0f, 0.0f, 1.0f), roll);
+    return quat_normalize(quat_mul(q_yaw, quat_mul(q_pitch, q_roll)));
 }
 
-static Vec3 camera_base_up(const Camera& c) {
-    return v3_norm(v3_cross(camera_forward(c), camera_base_right(c)));
+void camera_set_euler(Camera* c, float yaw, float pitch, float roll) {
+    if (!c)
+        return;
+    c->yaw = yaw;
+    c->pitch = pitch;
+    c->roll = roll;
+    quat_to_array(camera_quat_from_euler(yaw, pitch, roll), c->rotq);
 }
 
-static Vec3 camera_right(const Camera& c) {
-    Vec3 right = camera_base_right(c);
-    Vec3 up = camera_base_up(c);
-    float cr = cosf(c.roll);
-    float sr = sinf(c.roll);
-    return v3_norm(v3_add(v3_scale(right, cr), v3_scale(up, sr)));
+void camera_sync_euler_from_quat(Camera* c) {
+    if (!c)
+        return;
+    Quat q = camera_has_valid_quat(*c) ? quat_from_array(c->rotq)
+                                       : camera_quat_from_euler(c->yaw, c->pitch, c->roll);
+    quat_to_array(q, c->rotq);
+
+    Vec3 forward = v3_norm(quat_rotate_vec3(q, v3(0.0f, 0.0f, 1.0f)));
+    Vec3 right   = v3_norm(quat_rotate_vec3(q, v3(1.0f, 0.0f, 0.0f)));
+
+    float planar = sqrtf(forward.x * forward.x + forward.z * forward.z);
+    if (planar > 1e-5f)
+        c->yaw = atan2f(forward.x, forward.z);
+    c->pitch = asinf(clampf(forward.y, -1.0f, 1.0f));
+
+    Vec3 base_right = planar > 1e-5f ? v3(cosf(c->yaw), 0.0f, -sinf(c->yaw))
+                                     : v3_norm(v3_cross(v3(0.0f, 1.0f, 0.0f), forward));
+    if (v3_dot(base_right, base_right) < 0.0001f)
+        base_right = right;
+    Vec3 base_up = v3_norm(v3_cross(forward, base_right));
+    c->roll = atan2f(v3_dot(right, base_up), v3_dot(right, base_right));
 }
 
-static Vec3 camera_up(const Camera& c) {
-    return v3_norm(v3_cross(camera_forward(c), camera_right(c)));
+void camera_ensure_orientation(Camera* c) {
+    if (!c)
+        return;
+    if (!camera_has_valid_quat(*c))
+        camera_set_euler(c, c->yaw, c->pitch, c->roll);
+    else
+        quat_to_array(quat_from_array(c->rotq), c->rotq);
+}
+
+Vec3 camera_forward(const Camera& c) {
+    Quat q = camera_has_valid_quat(c) ? quat_from_array(c.rotq)
+                                      : camera_quat_from_euler(c.yaw, c.pitch, c.roll);
+    return v3_norm(quat_rotate_vec3(q, v3(0.0f, 0.0f, 1.0f)));
+}
+
+Vec3 camera_right(const Camera& c) {
+    Quat q = camera_has_valid_quat(c) ? quat_from_array(c.rotq)
+                                      : camera_quat_from_euler(c.yaw, c.pitch, c.roll);
+    return v3_norm(quat_rotate_vec3(q, v3(1.0f, 0.0f, 0.0f)));
+}
+
+Vec3 camera_up(const Camera& c) {
+    Quat q = camera_has_valid_quat(c) ? quat_from_array(c.rotq)
+                                      : camera_quat_from_euler(c.yaw, c.pitch, c.roll);
+    return v3_norm(quat_rotate_vec3(q, v3(0.0f, 1.0f, 0.0f)));
+}
+
+static void camera_look_at(Camera* c, Vec3 target, Vec3 preferred_up) {
+    if (!c)
+        return;
+    Vec3 eye = camera_eye(*c);
+    Vec3 forward = v3_norm(v3_sub(target, eye));
+    if (v3_dot(forward, forward) < 0.0001f)
+        forward = camera_forward(*c);
+    preferred_up = v3_norm(preferred_up);
+    if (fabsf(v3_dot(preferred_up, forward)) > 0.985f)
+        preferred_up = fabsf(forward.y) < 0.985f ? v3(0.0f, 1.0f, 0.0f) : v3(1.0f, 0.0f, 0.0f);
+
+    Vec3 right = v3_norm(v3_cross(preferred_up, forward));
+    Vec3 up = v3_norm(v3_cross(forward, right));
+    Mat4 basis = mat4_identity();
+    basis.m[0] = right.x;   basis.m[1] = right.y;   basis.m[2] = right.z;
+    basis.m[4] = up.x;      basis.m[5] = up.y;      basis.m[6] = up.z;
+    basis.m[8] = forward.x; basis.m[9] = forward.y; basis.m[10] = forward.z;
+    quat_to_array(quat_from_mat4(basis), c->rotq);
+    camera_sync_euler_from_quat(c);
+}
+
+static void camera_apply_horizon_lock(Camera* c) {
+    if (!c)
+        return;
+    // Horizon Locked constrains yaw/pitch navigation but preserves the roll
+    // chosen by the user. This gives a stable editor-style camera while still
+    // allowing an intentional canted horizon with Q/E or the inspector.
+    camera_sync_euler_from_quat(c);
+    float fixed_roll = c->roll;
+    c->pitch = clampf(c->pitch, -1.55334f, 1.55334f);
+    camera_set_euler(c, c->yaw, c->pitch, fixed_roll);
+}
+
+static Vec3 bounds_center(const float bmin[3], const float bmax[3]) {
+    return v3((bmin[0] + bmax[0]) * 0.5f,
+              (bmin[1] + bmax[1]) * 0.5f,
+              (bmin[2] + bmax[2]) * 0.5f);
+}
+
+static float bounds_radius(const float bmin[3], const float bmax[3]) {
+    Vec3 e = v3((bmax[0] - bmin[0]) * 0.5f,
+                (bmax[1] - bmin[1]) * 0.5f,
+                (bmax[2] - bmin[2]) * 0.5f);
+    float r = sqrtf(v3_dot(e, e));
+    return r > 0.001f ? r : 0.75f;
+}
+
+static bool selected_or_default_focus_bounds(float out_min[3], float out_max[3]) {
+    if (!out_min || !out_max)
+        return false;
+
+    if (g_sel_cmd != INVALID_HANDLE) {
+        Command* sel = cmd_get(g_sel_cmd);
+        if (sel && (sel->type == CMD_DRAW_MESH || sel->type == CMD_DRAW_INSTANCED || sel->type == CMD_INDIRECT_DRAW) &&
+            cmd_compute_world_bounds(g_sel_cmd, out_min, out_max))
+            return true;
+    }
+
+    Resource* selected_res = res_get(g_sel_res);
+    if (selected_res && selected_res->type == RES_MESH && selected_res->mesh_bounds_valid) {
+        memcpy(out_min, selected_res->mesh_bounds_min, sizeof(float) * 3);
+        memcpy(out_max, selected_res->mesh_bounds_max, sizeof(float) * 3);
+        return true;
+    }
+
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        CmdHandle h = (CmdHandle)(i + 1);
+        Command* c = cmd_get(h);
+        if (!c || !c->enabled)
+            continue;
+        if (c->type != CMD_DRAW_MESH && c->type != CMD_DRAW_INSTANCED && c->type != CMD_INDIRECT_DRAW)
+            continue;
+        if (cmd_compute_world_bounds(h, out_min, out_max))
+            return true;
+    }
+
+    out_min[0] = out_min[1] = out_min[2] = -0.5f;
+    out_max[0] = out_max[1] = out_max[2] =  0.5f;
+    return true;
+}
+
+struct CameraViewPivot {
+    bool  valid;
+    Vec3  target;
+    float distance;
+};
+
+static CameraViewPivot s_camera_view_pivot = {};
+
+static float camera_default_orbit_distance() {
+    float d = 6.0f;
+    if (g_camera.near_z > 0.0f)
+        d = fmaxf(d, g_camera.near_z * 12.0f);
+    return d;
+}
+
+static void camera_set_view_pivot(Vec3 target) {
+    s_camera_view_pivot.target = target;
+    Vec3 offset = v3_sub(target, camera_eye(g_camera));
+    s_camera_view_pivot.distance = sqrtf(v3_dot(offset, offset));
+    if (s_camera_view_pivot.distance < 0.05f)
+        s_camera_view_pivot.distance = camera_default_orbit_distance();
+    s_camera_view_pivot.valid = true;
+}
+
+static void camera_rebuild_view_pivot_from_view() {
+    float d = s_camera_view_pivot.valid && s_camera_view_pivot.distance > 0.05f
+        ? s_camera_view_pivot.distance : camera_default_orbit_distance();
+    Vec3 target = v3_add(camera_eye(g_camera), v3_scale(camera_forward(g_camera), d));
+    camera_set_view_pivot(target);
+}
+
+static void camera_translate_view_pivot(Vec3 delta) {
+    if (!s_camera_view_pivot.valid) {
+        camera_rebuild_view_pivot_from_view();
+        return;
+    }
+    s_camera_view_pivot.target = v3_add(s_camera_view_pivot.target, delta);
+}
+
+static Vec3 camera_orbit_target() {
+    if (!s_camera_view_pivot.valid) {
+        float bmin[3] = {};
+        float bmax[3] = {};
+        if (selected_or_default_focus_bounds(bmin, bmax))
+            camera_set_view_pivot(bounds_center(bmin, bmax));
+        else
+            camera_rebuild_view_pivot_from_view();
+    }
+    return s_camera_view_pivot.target;
+}
+
+static bool camera_frame_bounds(const float bmin[3], const float bmax[3], bool use_current_view) {
+    if (!bmin || !bmax)
+        return false;
+
+    Vec3 center = bounds_center(bmin, bmax);
+    float radius = bounds_radius(bmin, bmax);
+    float half_fov = g_camera.fov_y * 0.5f;
+    if (half_fov < 0.05f) half_fov = 0.05f;
+    float distance = (radius / sinf(half_fov)) * 1.35f;
+    if (distance < radius + 0.5f)
+        distance = radius + 0.5f;
+
+    Vec3 forward = use_current_view ? camera_forward(g_camera) : v3_norm(v3(-0.70f, -0.45f, -0.70f));
+    if (v3_dot(forward, forward) < 0.0001f)
+        forward = v3_norm(v3(-0.70f, -0.45f, -0.70f));
+
+    float fixed_roll = 0.0f;
+    if (g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED) {
+        camera_sync_euler_from_quat(&g_camera);
+        fixed_roll = g_camera.roll;
+    }
+
+    Vec3 new_eye = v3_sub(center, v3_scale(forward, distance));
+    g_camera.position[0] = new_eye.x;
+    g_camera.position[1] = new_eye.y;
+    g_camera.position[2] = new_eye.z;
+    camera_look_at(&g_camera, center,
+        g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED ? v3(0.0f, 1.0f, 0.0f) : camera_up(g_camera));
+    if (g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED) {
+        camera_set_euler(&g_camera, g_camera.yaw, g_camera.pitch, fixed_roll);
+        camera_apply_horizon_lock(&g_camera);
+    }
+    camera_set_view_pivot(center);
+    return true;
+}
+
+static bool camera_frame_selection(bool use_current_view) {
+    float bmin[3] = {};
+    float bmax[3] = {};
+    if (!selected_or_default_focus_bounds(bmin, bmax))
+        return false;
+    return camera_frame_bounds(bmin, bmax, use_current_view);
 }
 
 static Vec3 v3_lerp(Vec3 a, Vec3 b, float t) {
@@ -596,6 +843,7 @@ CameraControls g_camera_controls = {
     /* enabled           */ true,
     /* mouse_look        */ true,
     /* invert_y          */ false,
+    /* mode              */ CAMERA_MODE_HORIZON_LOCKED,
     /* move_speed        */ 6.0f,
     /* fast_mult         */ 4.0f,
     /* slow_mult         */ 0.25f,
@@ -619,6 +867,14 @@ static void set_cursor_hidden(bool hidden) {
 }
 
 static POINT scene_view_center_screen() {
+#ifndef LAZYTOOL_PLAYER_ONLY
+    RECT scene_rc = {};
+    if (ui_scene_view_screen_rect(&scene_rc)) {
+        POINT center = { (scene_rc.left + scene_rc.right) / 2,
+                         (scene_rc.top + scene_rc.bottom) / 2 };
+        return center;
+    }
+#endif
     RECT rc = {};
     GetClientRect(g_dx.hwnd, &rc);
     POINT center = { (rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2 };
@@ -632,7 +888,16 @@ struct ViewportMouseGesture {
 };
 
 static ViewportMouseGesture s_camera_mouse_gesture = {};
+static ViewportMouseGesture s_camera_orbit_gesture = {};
 static ViewportMouseGesture s_light_orbit_gesture = {};
+
+struct CameraOrbitState {
+    bool active;
+    Vec3 target;
+    float distance;
+};
+
+static CameraOrbitState s_camera_orbit_state = {};
 
 static bool imgui_keyboard_capture_requested() {
 #ifdef LAZYTOOL_PLAYER_ONLY
@@ -727,9 +992,111 @@ static void update_camera_mouse() {
 
     float sens = g_camera_controls.mouse_sensitivity;
     if (sens < 0.0001f) sens = 0.0001f;
-    g_camera.yaw += dx * sens;
-    g_camera.pitch += (g_camera_controls.invert_y ? -dy : dy) * sens;
-    g_camera.pitch = clampf(g_camera.pitch, -1.50f, 1.50f);
+
+    camera_ensure_orientation(&g_camera);
+
+    float yaw_delta = dx * sens;
+    // Screen Y grows downward; without inversion, dragging upward pitches the nose up.
+    float pitch_delta = (g_camera_controls.invert_y ? dy : -dy) * sens;
+
+    if (g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED) {
+        camera_sync_euler_from_quat(&g_camera);
+        float fixed_roll = g_camera.roll;
+        g_camera.yaw += yaw_delta;
+        g_camera.pitch = clampf(g_camera.pitch + pitch_delta, -1.55334f, 1.55334f);
+        camera_set_euler(&g_camera, g_camera.yaw, g_camera.pitch, fixed_roll);
+        camera_rebuild_view_pivot_from_view();
+        return;
+    }
+
+    Quat q = quat_from_array(g_camera.rotq);
+    Quat q_yaw   = quat_from_axis_angle(v3(0.0f, 1.0f, 0.0f), yaw_delta);
+    Quat q_pitch = quat_from_axis_angle(v3(1.0f, 0.0f, 0.0f), -pitch_delta);
+    Quat q_delta = quat_mul(q_yaw, q_pitch);
+    quat_to_array(quat_normalize(quat_mul(q, q_delta)), g_camera.rotq);
+    camera_sync_euler_from_quat(&g_camera);
+    camera_rebuild_view_pivot_from_view();
+}
+
+
+static bool update_camera_orbit() {
+    float dx = 0.0f;
+    float dy = 0.0f;
+    bool was_active = s_camera_orbit_gesture.active;
+    bool trigger = key_down(VK_MENU) && key_down(VK_LBUTTON);
+    bool active = begin_or_update_viewport_mouse_gesture(
+        &s_camera_orbit_gesture,
+        trigger,
+        g_scene_view_hovered || cursor_over_editor_scene_view(),
+        g_camera_controls.enabled && !imgui_keyboard_capture_requested(),
+        &dx, &dy);
+    if (!active) {
+        s_camera_orbit_state.active = false;
+        return false;
+    }
+
+    end_viewport_mouse_gesture(&s_camera_mouse_gesture);
+
+    if (!was_active || !s_camera_orbit_state.active) {
+        s_camera_orbit_state.target = camera_orbit_target();
+        Vec3 offset = v3_sub(camera_eye(g_camera), s_camera_orbit_state.target);
+        s_camera_orbit_state.distance = sqrtf(v3_dot(offset, offset));
+        if (s_camera_orbit_state.distance < 0.05f) {
+            s_camera_orbit_state.distance = camera_default_orbit_distance();
+            s_camera_orbit_state.target = v3_add(camera_eye(g_camera),
+                v3_scale(camera_forward(g_camera), s_camera_orbit_state.distance));
+            camera_set_view_pivot(s_camera_orbit_state.target);
+        }
+        s_camera_orbit_state.active = true;
+    }
+
+    if (dx == 0.0f && dy == 0.0f)
+        return true;
+
+    float sens = g_camera_controls.mouse_sensitivity;
+    if (sens < 0.0001f) sens = 0.0001f;
+
+    Vec3 target = s_camera_orbit_state.target;
+    Vec3 offset = v3_sub(camera_eye(g_camera), target);
+    float dist = sqrtf(v3_dot(offset, offset));
+    if (dist < 0.001f)
+        dist = s_camera_orbit_state.distance > 0.001f ? s_camera_orbit_state.distance : 1.0f;
+
+    if (g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED) {
+        camera_sync_euler_from_quat(&g_camera);
+        float fixed_roll = g_camera.roll;
+        float planar = sqrtf(offset.x * offset.x + offset.z * offset.z);
+        float yaw = atan2f(offset.x, offset.z);
+        float pitch = atan2f(offset.y, planar);
+        yaw += dx * sens;
+        pitch = clampf(pitch - dy * sens, -1.55334f, 1.55334f);
+        float cp = cosf(pitch);
+        Vec3 new_offset = v3(sinf(yaw) * cp * dist, sinf(pitch) * dist, cosf(yaw) * cp * dist);
+        Vec3 new_eye = v3_add(target, new_offset);
+        g_camera.position[0] = new_eye.x;
+        g_camera.position[1] = new_eye.y;
+        g_camera.position[2] = new_eye.z;
+        camera_look_at(&g_camera, target, v3(0.0f, 1.0f, 0.0f));
+        camera_set_euler(&g_camera, g_camera.yaw, g_camera.pitch, fixed_roll);
+        camera_apply_horizon_lock(&g_camera);
+        camera_set_view_pivot(target);
+        return true;
+    }
+
+    Vec3 up_axis = camera_up(g_camera);
+    Vec3 right_axis = camera_right(g_camera);
+    Quat q_yaw = quat_from_axis_angle(up_axis, dx * sens);
+    Quat q_pitch = quat_from_axis_angle(right_axis, dy * sens);
+    Vec3 new_offset = quat_rotate_vec3(q_pitch, quat_rotate_vec3(q_yaw, offset));
+    if (sqrtf(v3_dot(new_offset, new_offset)) < 0.001f)
+        new_offset = offset;
+    Vec3 new_eye = v3_add(target, new_offset);
+    g_camera.position[0] = new_eye.x;
+    g_camera.position[1] = new_eye.y;
+    g_camera.position[2] = new_eye.z;
+    camera_look_at(&g_camera, target, up_axis);
+    camera_set_view_pivot(target);
+    return true;
 }
 
 // Holding L rotates the built-in directional light around its target. The edit
@@ -797,14 +1164,33 @@ static void update_camera_keyboard(float dt) {
     if (imgui_keyboard_capture_requested())
         return;
 
+    static bool s_f_was_down = false;
+    bool f_down = key_down('F');
+    if (f_down && !s_f_was_down) {
+        if (camera_frame_selection(true))
+            app_request_scene_render();
+    }
+    s_f_was_down = f_down;
+
     float roll_dir = 0.0f;
-    if (key_down('R')) roll_dir -= 1.0f;
-    if (key_down('T')) roll_dir += 1.0f;
+    if (key_down('Q')) roll_dir += 1.0f;
+    if (key_down('E')) roll_dir -= 1.0f;
     if (roll_dir != 0.0f) {
         float roll_speed = 1.35f;
         if (key_down(VK_SHIFT))   roll_speed *= g_camera_controls.fast_mult;
         if (key_down(VK_CONTROL)) roll_speed *= g_camera_controls.slow_mult;
-        g_camera.roll += roll_dir * roll_speed * dt;
+        camera_ensure_orientation(&g_camera);
+        if (g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED) {
+            camera_sync_euler_from_quat(&g_camera);
+            g_camera.roll += roll_dir * roll_speed * dt;
+            camera_set_euler(&g_camera, g_camera.yaw, g_camera.pitch, g_camera.roll);
+            camera_rebuild_view_pivot_from_view();
+        } else {
+            Quat q = quat_from_array(g_camera.rotq);
+            Quat q_roll = quat_from_axis_angle(v3(0.0f, 0.0f, 1.0f), roll_dir * roll_speed * dt);
+            quat_to_array(quat_normalize(quat_mul(q, q_roll)), g_camera.rotq);
+            camera_sync_euler_from_quat(&g_camera);
+        }
     }
 
     float x = 0.0f;
@@ -814,8 +1200,8 @@ static void update_camera_keyboard(float dt) {
     if (key_down('S')) z -= 1.0f;
     if (key_down('D')) x += 1.0f;
     if (key_down('A')) x -= 1.0f;
-    if (key_down('E')) y += 1.0f;
-    if (key_down('Q')) y -= 1.0f;
+    if (key_down('R')) y += 1.0f;
+    if (key_down('T')) y -= 1.0f;
     if (x == 0.0f && y == 0.0f && z == 0.0f)
         return;
 
@@ -826,7 +1212,7 @@ static void update_camera_keyboard(float dt) {
 
     Vec3 forward = camera_forward(g_camera);
     Vec3 right   = camera_right(g_camera);
-    Vec3 up      = v3(0.0f, 1.0f, 0.0f);
+    Vec3 up      = camera_up(g_camera);
     Vec3 move    = v3_add(v3_add(v3_scale(forward, z), v3_scale(right, x)), v3_scale(up, y));
 
     float speed = g_camera_controls.move_speed;
@@ -834,16 +1220,20 @@ static void update_camera_keyboard(float dt) {
     if (key_down(VK_SHIFT))   speed *= g_camera_controls.fast_mult;
     if (key_down(VK_CONTROL)) speed *= g_camera_controls.slow_mult;
 
-    g_camera.position[0] += move.x * speed * dt;
-    g_camera.position[1] += move.y * speed * dt;
-    g_camera.position[2] += move.z * speed * dt;
+    Vec3 delta = v3_scale(move, speed * dt);
+    g_camera.position[0] += delta.x;
+    g_camera.position[1] += delta.y;
+    g_camera.position[2] += delta.z;
+    camera_translate_view_pivot(delta);
 }
 
 static void update_camera_controls(float dt) {
     if (GetForegroundWindow() != g_dx.hwnd)
         return;
 
-    update_camera_mouse();
+    bool orbiting = update_camera_orbit();
+    if (!orbiting)
+        update_camera_mouse();
     update_camera_keyboard(dt);
 }
 
@@ -852,7 +1242,8 @@ static bool editor_any_navigation_key_down() {
     return key_down(VK_LBUTTON) || key_down(VK_RBUTTON) || key_down(VK_MBUTTON) ||
            key_down('W') || key_down('A') || key_down('S') || key_down('D') ||
            key_down('Q') || key_down('E') || key_down('R') || key_down('T') ||
-           key_down('L') || key_down(VK_SHIFT) || key_down(VK_CONTROL);
+           key_down('F') || key_down('L') || (key_down(VK_MENU) && key_down(VK_LBUTTON)) ||
+           key_down(VK_SHIFT) || key_down(VK_CONTROL);
 }
 
 static bool editor_imgui_wants_continuous_redraw() {
@@ -880,11 +1271,11 @@ static bool editor_wait_when_paused_idle(bool had_messages) {
     if (editor_any_navigation_key_down() || editor_imgui_wants_continuous_redraw())
         return false;
 
-    DWORD interval_ms = 50; // Automatic paused-idle redraw cap, not a user-facing mode.
+    DWORD interval_ms = 200; // Automatic paused-idle redraw cap, not a user-facing mode.
     if (GetForegroundWindow() != g_dx.hwnd)
-        interval_ms = 250;
+        interval_ms = 400;
     if (IsIconic(g_dx.hwnd))
-        interval_ms = 500;
+        interval_ms = 1000;
 
     ULONGLONG now_ms = GetTickCount64();
     if (g_last_editor_present_ms == 0)
@@ -1088,8 +1479,13 @@ static void update_builtins_and_scene_cb() {
     cb.cam_dir[1] = cam_dir.y;
     cb.cam_dir[2] = cam_dir.z;
 
-    Resource default_dl = {};
-    project_apply_default_dirlight(&default_dl);
+    static Resource s_default_dirlight = {};
+    static bool s_default_dirlight_ready = false;
+    if (!s_default_dirlight_ready) {
+        project_apply_default_dirlight(&s_default_dirlight);
+        s_default_dirlight_ready = true;
+    }
+    const Resource& default_dl = s_default_dirlight;
     Resource* dl = res_get(g_builtin_dirlight);
     Vec3 light_dir = v3(default_dl.light_dir[0], default_dl.light_dir[1], default_dl.light_dir[2]);
     Vec3 light_pos = v3(default_dl.light_pos[0], default_dl.light_pos[1], default_dl.light_pos[2]);
@@ -1201,8 +1597,15 @@ static void update_builtins_and_scene_cb() {
 // ── entry point ───────────────────────────────────────────────────────────
 
 static void update_default_example_commands() {
+    static uint64_t s_pixelize_lookup_revision = 0;
+
     Command* c = cmd_get(g_default_pixelize_cmd);
     if (!c || !strstr(c->name, "pixelize_to_scene")) {
+        uint64_t rev = cmd_revision();
+        if (s_pixelize_lookup_revision == rev)
+            return;
+
+        s_pixelize_lookup_revision = rev;
         g_default_pixelize_cmd = INVALID_HANDLE;
         c = nullptr;
         for (int i = 0; i < MAX_COMMANDS; i++) {
@@ -1393,6 +1796,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     } else {
         project_new_default();
     }
+
+    if (!g_player_mode && g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED)
+        camera_apply_horizon_lock(&g_camera);
 
     if (g_player_mode) {
         log_info("lazyTool player ready.");

@@ -77,6 +77,11 @@ typedef enum {
 } DrawTopologyType;
 
 typedef enum {
+    CAMERA_MODE_HORIZON_LOCKED = 0,
+    CAMERA_MODE_FREE
+} CameraMode;
+
+typedef enum {
     SHADER_BIND_NONE = 0,
     SHADER_BIND_CBUFFER,
     SHADER_BIND_SRV,
@@ -160,6 +165,9 @@ struct MeshPart {
     int   index_count;
     int   material_index;
     bool  enabled;
+    bool  bounds_valid;
+    float bounds_min[3];
+    float bounds_max[3];
     float local_transform[16];
 };
 
@@ -207,6 +215,9 @@ struct Resource {
     int          mesh_part_count;
     MeshMaterial mesh_materials[MAX_MESH_MATERIALS];
     int          mesh_material_count;
+    bool         mesh_bounds_valid;
+    float        mesh_bounds_min[3];
+    float        mesh_bounds_max[3];
     int  mesh_primitive_type;
 
     char path[MAX_PATH_LEN];
@@ -271,6 +282,10 @@ struct Command {
     float     pos[3];
     float     rotq[4];
     float     scale[3];
+    bool      bbox_valid;
+    bool      bbox_identity;
+    float     bbox_min[3];
+    float     bbox_max[3];
 
     ResHandle tex_handles[MAX_TEX_SLOTS];
     uint32_t  tex_slots[MAX_TEX_SLOTS];
@@ -306,6 +321,11 @@ struct Command {
 
     CommandParam params[MAX_COMMAND_PARAMS];
     int          param_count;
+
+    // Monotonic edit revision. This is bumped whenever an inspector/project
+    // edit changes the command. Render-side caches use it to know when a
+    // command-derived packet/list entry needs to be rebuilt.
+    uint64_t     version;
 
     // Version of the shader's cbuffer layout that params[] is synced against.
     // When the shader's layout_version differs, sync needs to run once.
@@ -358,8 +378,12 @@ struct ObjectCBData {
 // ── camera ────────────────────────────────────────────────────────────────
 struct Camera {
     float position[3];
+    // yaw/pitch/roll are kept for UI, save files, and timeline tracks.
+    // rotq is the canonical viewport orientation (local +X right, +Y up, +Z forward).
     float yaw;
     float pitch;
+    float roll;
+    float rotq[4];
     float fov_y;
     float near_z, far_z;
 };
@@ -368,6 +392,7 @@ struct CameraControls {
     bool  enabled;
     bool  mouse_look;
     bool  invert_y;
+    int   mode;
     float move_speed;
     float fast_mult;
     float slow_mult;
@@ -409,6 +434,15 @@ Quat quat_from_array(const float q[4]);
 void quat_to_array(Quat q, float out[4]);
 Quat quat_from_mat4(const Mat4& m);
 Quat quat_from_euler_xyz(Vec3 r);
+Quat quat_mul(Quat a, Quat b);
+Quat quat_from_axis_angle(Vec3 axis, float angle);
+Vec3 quat_rotate_vec3(Quat q, Vec3 v);
 Quat quat_slerp(Quat a, Quat b, float t);
 void quat_to_euler_xyz(Quat q, const float* reference, float out[3]);
 Vec3 camera_eye(const Camera& c);
+Vec3 camera_forward(const Camera& c);
+Vec3 camera_right(const Camera& c);
+Vec3 camera_up(const Camera& c);
+void camera_set_euler(Camera* c, float yaw, float pitch, float roll);
+void camera_sync_euler_from_quat(Camera* c);
+void camera_ensure_orientation(Camera* c);

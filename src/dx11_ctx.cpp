@@ -64,6 +64,13 @@ static ID3D11VertexShader* s_editor_grid_vs = nullptr;
 static ID3D11PixelShader*  s_editor_grid_ps = nullptr;
 static ID3D11Buffer*       s_editor_grid_cb = nullptr;
 
+static SceneCBData   s_uploaded_scene_cb = {};
+static ObjectCBData  s_uploaded_object_cb = {};
+static ID3D11Buffer* s_uploaded_scene_cb_buffer = nullptr;
+static ID3D11Buffer* s_uploaded_object_cb_buffer = nullptr;
+static bool          s_uploaded_scene_cb_valid = false;
+static bool          s_uploaded_object_cb_valid = false;
+
 static const char* s_editor_grid_vs_src = R"HLSL(
 struct VSOut {
     float4 pos : SV_POSITION;
@@ -533,35 +540,61 @@ void dx_resize(int w, int h) {
 void dx_invalidate_scene_history() {
     memset(&g_dx.scene_cb_data, 0, sizeof(g_dx.scene_cb_data));
     g_dx.scene_cb_history_valid = false;
+    s_uploaded_scene_cb_valid = false;
+    s_uploaded_object_cb_valid = false;
+    s_uploaded_scene_cb_buffer = nullptr;
+    s_uploaded_object_cb_buffer = nullptr;
 }
 
 void dx_update_scene_cb(const SceneCBData& d) {
     g_dx.scene_cb_data = d;
     g_dx.scene_cb_history_valid = true;
+    if (!g_dx.scene_cb)
+        return;
+
+    bool same_buffer = s_uploaded_scene_cb_buffer == g_dx.scene_cb;
+    bool same_bytes = s_uploaded_scene_cb_valid && same_buffer &&
+                      memcmp(&s_uploaded_scene_cb, &d, sizeof(d)) == 0;
+    if (same_bytes)
+        return;
+
     D3D11_MAPPED_SUBRESOURCE ms = {};
     g_dx.ctx->Map(g_dx.scene_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
     memcpy(ms.pData, &d, sizeof(d));
     g_dx.ctx->Unmap(g_dx.scene_cb, 0);
+
+    s_uploaded_scene_cb = d;
+    s_uploaded_scene_cb_buffer = g_dx.scene_cb;
+    s_uploaded_scene_cb_valid = true;
 }
 
 void dx_update_object_cb(const ObjectCBData& d) {
     g_dx.object_cb_data = d;
     if (!g_dx.object_cb) return;
+
+    bool same_buffer = s_uploaded_object_cb_buffer == g_dx.object_cb;
+    bool same_bytes = s_uploaded_object_cb_valid && same_buffer &&
+                      memcmp(&s_uploaded_object_cb, &d, sizeof(d)) == 0;
+    if (same_bytes)
+        return;
+
     D3D11_MAPPED_SUBRESOURCE ms = {};
     g_dx.ctx->Map(g_dx.object_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
     memcpy(ms.pData, &d, sizeof(d));
     g_dx.ctx->Unmap(g_dx.object_cb, 0);
+
+    s_uploaded_object_cb = d;
+    s_uploaded_object_cb_buffer = g_dx.object_cb;
+    s_uploaded_object_cb_valid = true;
 }
 
 // Bind the off-screen scene surface and shared render state so command
 // execution can render a complete frame for the editor viewport.
 void dx_begin_scene() {
     float clear[4] = { 0.05f, 0.05f, 0.08f, 1.0f };
-    ID3D11ShaderResourceView* null_srv = nullptr;
-    for (int i = 0; i < 8; i++) {
-        g_dx.ctx->PSSetShaderResources(i, 1, &null_srv);
-        g_dx.ctx->CSSetShaderResources(i, 1, &null_srv);
-    }
+    ID3D11ShaderResourceView* null_srvs[8] = {};
+    g_dx.ctx->PSSetShaderResources(0, 8, null_srvs);
+    g_dx.ctx->CSSetShaderResources(0, 8, null_srvs);
     g_dx.ctx->OMSetRenderTargets(1, &g_dx.scene_rtv, g_dx.depth_dsv);
     g_dx.ctx->ClearRenderTargetView(g_dx.scene_rtv, clear);
     g_dx.ctx->ClearDepthStencilView(g_dx.depth_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
@@ -587,8 +620,8 @@ void dx_begin_scene() {
 void dx_end_scene() {
     ID3D11RenderTargetView* null_rtv = nullptr;
     g_dx.ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
-    ID3D11ShaderResourceView* null_srv = nullptr;
-    for (int i = 0; i < 8; i++) g_dx.ctx->PSSetShaderResources(i, 1, &null_srv);
+    ID3D11ShaderResourceView* null_srvs[8] = {};
+    g_dx.ctx->PSSetShaderResources(0, 8, null_srvs);
 }
 
 void dx_render_scene_grid_overlay() {

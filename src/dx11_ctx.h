@@ -49,6 +49,7 @@ struct DX11Ctx {
     bool                     scene_wireframe;
     bool                     scene_grid_enabled;
     bool                     scene_orientation_gizmo_enabled;
+    bool                     scene_bounds_debug_enabled;
     float                    scene_grid_color[4];
     ID3D11DepthStencilState* dss_default;
     ID3D11DepthStencilState* dss_depth_read;

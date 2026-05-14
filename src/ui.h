@@ -36,6 +36,8 @@ float ui_code_font_size();
 void ui_set_shader_auto_save_compile(bool enabled);
 bool ui_shader_auto_save_compile();
 int ui_top_toolbar_height_px();
+bool ui_scene_view_contains_screen_point(int x, int y);
+bool ui_scene_view_screen_rect(RECT* out_rect);
 bool ui_hit_test_client_area_screen(int x, int y);
 UiWindowControlHit ui_hit_test_window_control_screen(int x, int y);
 UiWindowControlHit ui_hit_test_window_control_client(int x, int y, int client_w);

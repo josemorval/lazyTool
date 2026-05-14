@@ -60,10 +60,11 @@ static void timeline_sample_camera(const TimelineKey& a, const TimelineKey& b,
     for (int i = 0; i < 3; i++)
         out->fval[i] = timeline_lerp(a.fval[i], b.fval[i], t);
     out->fval[3] = timeline_lerp_angle(a.fval[3], b.fval[3], t); // yaw wraps.
-    out->fval[4] = timeline_lerp(a.fval[4], b.fval[4], t);       // pitch is clamped, not wrapped.
+    out->fval[4] = timeline_lerp(a.fval[4], b.fval[4], t);       // pitch is not clamped: camera can loop.
     out->fval[5] = timeline_lerp(a.fval[5], b.fval[5], t);
     out->fval[6] = timeline_lerp(a.fval[6], b.fval[6], t);
     out->fval[7] = timeline_lerp(a.fval[7], b.fval[7], t);
+    out->fval[8] = timeline_lerp_angle(a.fval[8], b.fval[8], t); // roll wraps.
 }
 
 static int timeline_clamp_frame(int frame) {
@@ -114,7 +115,7 @@ int timeline_track_value_count(const TimelineTrack& track) {
     case TIMELINE_TRACK_COMMAND_ENABLED:
         return 1;
     case TIMELINE_TRACK_CAMERA:
-        return 8;
+        return 9;
     case TIMELINE_TRACK_DIRLIGHT:
         return 10;
     default:
@@ -478,12 +479,14 @@ static bool timeline_capture_command_enabled(TimelineTrack& track, TimelineKey& 
 }
 
 static bool timeline_capture_camera(TimelineKey& key) {
+    camera_sync_euler_from_quat(&g_camera);
     for (int i = 0; i < 3; i++) key.fval[i] = g_camera.position[i];
     key.fval[3] = timeline_wrap_angle(g_camera.yaw);
     key.fval[4] = g_camera.pitch;
     key.fval[5] = g_camera.fov_y;
     key.fval[6] = g_camera.near_z;
     key.fval[7] = g_camera.far_z;
+    key.fval[8] = timeline_wrap_angle(g_camera.roll);
     return true;
 }
 
@@ -697,8 +700,10 @@ static void timeline_apply_user_var_to_source(UserCBEntry& e, const TimelineKey&
     }
 
     if (source_kind == USER_CB_SOURCE_CAMERA_ROTATION) {
-        g_camera.yaw = timeline_wrap_angle(key.fval[0]);
-        g_camera.pitch = clampf(key.fval[1], -1.50f, 1.50f);
+        camera_set_euler(&g_camera,
+                         timeline_wrap_angle(key.fval[0]),
+                         key.fval[1],
+                         timeline_wrap_angle(key.fval[2]));
         return;
     }
 
@@ -753,8 +758,10 @@ static void timeline_apply_command_enabled(const TimelineTrack& track, const Tim
 
 static void timeline_apply_camera(const TimelineKey& key) {
     for (int i = 0; i < 3; i++) g_camera.position[i] = key.fval[i];
-    g_camera.yaw = timeline_wrap_angle(key.fval[3]);
-    g_camera.pitch = clampf(key.fval[4], -1.50f, 1.50f);
+    camera_set_euler(&g_camera,
+                     timeline_wrap_angle(key.fval[3]),
+                     key.fval[4],
+                     timeline_wrap_angle(key.fval[8]));
     g_camera.fov_y = clampf(key.fval[5], 0.10f, 2.80f);
     g_camera.near_z = key.fval[6] < 0.0001f ? 0.0001f : key.fval[6];
     g_camera.far_z = key.fval[7];

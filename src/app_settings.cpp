@@ -22,6 +22,7 @@ static void app_settings_apply_defaults() {
     g_dx.shader_validation_warnings = true;
     g_dx.scene_grid_enabled = true;
     g_dx.scene_orientation_gizmo_enabled = true;
+    g_dx.scene_bounds_debug_enabled = false;
     g_dx.scene_grid_color[0] = 1.00f;
     g_dx.scene_grid_color[1] = 0.50f;
     g_dx.scene_grid_color[2] = 0.01f;
@@ -31,6 +32,7 @@ static void app_settings_apply_defaults() {
     g_camera_controls.enabled = true;
     g_camera_controls.mouse_look = true;
     g_camera_controls.invert_y = false;
+    g_camera_controls.mode = CAMERA_MODE_HORIZON_LOCKED;
     g_camera_controls.move_speed = 6.0f;
     g_camera_controls.fast_mult = 4.0f;
     g_camera_controls.slow_mult = 0.25f;
@@ -56,6 +58,7 @@ void app_settings_save() {
     fprintf(f, "shader_auto_save_compile %d\n", ui_shader_auto_save_compile() ? 1 : 0);
     fprintf(f, "scene_grid_enabled %d\n", g_dx.scene_grid_enabled ? 1 : 0);
     fprintf(f, "scene_orientation_gizmo_enabled %d\n", g_dx.scene_orientation_gizmo_enabled ? 1 : 0);
+    fprintf(f, "scene_bounds_debug_enabled %d\n", g_dx.scene_bounds_debug_enabled ? 1 : 0);
     fprintf(f, "scene_grid_color_r %.9g\n", g_dx.scene_grid_color[0]);
     fprintf(f, "scene_grid_color_g %.9g\n", g_dx.scene_grid_color[1]);
     fprintf(f, "scene_grid_color_b %.9g\n", g_dx.scene_grid_color[2]);
@@ -63,6 +66,7 @@ void app_settings_save() {
     fprintf(f, "camera_enabled %d\n", g_camera_controls.enabled ? 1 : 0);
     fprintf(f, "camera_mouse_look %d\n", g_camera_controls.mouse_look ? 1 : 0);
     fprintf(f, "camera_invert_y %d\n", g_camera_controls.invert_y ? 1 : 0);
+    fprintf(f, "camera_mode %d\n", g_camera_controls.mode);
     fprintf(f, "camera_move_speed %.9g\n", g_camera_controls.move_speed);
     fprintf(f, "camera_fast_mult %.9g\n", g_camera_controls.fast_mult);
     fprintf(f, "camera_slow_mult %.9g\n", g_camera_controls.slow_mult);
@@ -96,6 +100,7 @@ void app_settings_load_or_create() {
         else if (strcmp(key, "shader_auto_save_compile") == 0) ui_set_shader_auto_save_compile(atoi(value) != 0);
         else if (strcmp(key, "scene_grid_enabled") == 0) g_dx.scene_grid_enabled = atoi(value) != 0;
         else if (strcmp(key, "scene_orientation_gizmo_enabled") == 0) g_dx.scene_orientation_gizmo_enabled = atoi(value) != 0;
+        else if (strcmp(key, "scene_bounds_debug_enabled") == 0) g_dx.scene_bounds_debug_enabled = atoi(value) != 0;
         else if (strcmp(key, "scene_grid_color_r") == 0) g_dx.scene_grid_color[0] = (float)atof(value);
         else if (strcmp(key, "scene_grid_color_g") == 0) g_dx.scene_grid_color[1] = (float)atof(value);
         else if (strcmp(key, "scene_grid_color_b") == 0) g_dx.scene_grid_color[2] = (float)atof(value);
@@ -103,6 +108,7 @@ void app_settings_load_or_create() {
         else if (strcmp(key, "camera_enabled") == 0) g_camera_controls.enabled = atoi(value) != 0;
         else if (strcmp(key, "camera_mouse_look") == 0) g_camera_controls.mouse_look = atoi(value) != 0;
         else if (strcmp(key, "camera_invert_y") == 0) g_camera_controls.invert_y = atoi(value) != 0;
+        else if (strcmp(key, "camera_mode") == 0) g_camera_controls.mode = atoi(value);
         else if (strcmp(key, "camera_move_speed") == 0) g_camera_controls.move_speed = (float)atof(value);
         else if (strcmp(key, "camera_fast_mult") == 0) g_camera_controls.fast_mult = (float)atof(value);
         else if (strcmp(key, "camera_slow_mult") == 0) g_camera_controls.slow_mult = (float)atof(value);
@@ -116,6 +122,7 @@ void app_settings_load_or_create() {
     if (g_camera_controls.fast_mult < 1.0f) g_camera_controls.fast_mult = 1.0f;
     if (g_camera_controls.slow_mult < 0.01f) g_camera_controls.slow_mult = 0.01f;
     if (g_camera_controls.mouse_sensitivity < 0.0001f) g_camera_controls.mouse_sensitivity = 0.0001f;
+    if (g_camera_controls.mode != CAMERA_MODE_FREE) g_camera_controls.mode = CAMERA_MODE_HORIZON_LOCKED;
     g_dx.scene_grid_color[0] = clampf(g_dx.scene_grid_color[0], 0.0f, 1.0f);
     g_dx.scene_grid_color[1] = clampf(g_dx.scene_grid_color[1], 0.0f, 1.0f);
     g_dx.scene_grid_color[2] = clampf(g_dx.scene_grid_color[2], 0.0f, 1.0f);

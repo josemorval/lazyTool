@@ -47,6 +47,12 @@ void user_cb_move(int, int) {}
 int user_cb_slot_offset(int idx) { return idx * 16; }
 #else
 static ID3D11Buffer* s_command_cb_buf = nullptr;
+static UserCBData     s_uploaded_global_user_cb = {};
+static UserCBData     s_uploaded_command_user_cb = {};
+static ID3D11Buffer*  s_uploaded_global_user_cb_buffer = nullptr;
+static ID3D11Buffer*  s_uploaded_command_user_cb_buffer = nullptr;
+static bool           s_uploaded_global_user_cb_valid = false;
+static bool           s_uploaded_command_user_cb_valid = false;
 
 static bool user_cb_name_exists_except(const char* name, int except_idx) {
     if (!name || !name[0])
@@ -189,7 +195,7 @@ static void user_cb_assign_camera_rotation(UserCBEntry* e) {
         return;
     e->fval[0] = g_camera.yaw;
     e->fval[1] = g_camera.pitch;
-    e->fval[2] = 0.0f;
+    e->fval[2] = g_camera.roll;
     e->fval[3] = 0.0f;
 }
 
@@ -230,7 +236,7 @@ static bool user_cb_read_scene_source(UserCBSourceKind kind, const char* target,
     case USER_CB_SOURCE_CAMERA_ROTATION:
         out[0] = g_camera.yaw;
         out[1] = g_camera.pitch;
-        out[2] = 0.0f;
+        out[2] = g_camera.roll;
         out[3] = 0.0f;
         return true;
     case USER_CB_SOURCE_DIRLIGHT_POSITION: {
@@ -348,17 +354,27 @@ void user_cb_init() {
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     g_dx.dev->CreateBuffer(&bd, nullptr, &g_user_cb_buf);
     g_dx.dev->CreateBuffer(&bd, nullptr, &s_command_cb_buf);
+    s_uploaded_global_user_cb_valid = false;
+    s_uploaded_command_user_cb_valid = false;
+    s_uploaded_global_user_cb_buffer = nullptr;
+    s_uploaded_command_user_cb_buffer = nullptr;
     log_info("UserCB init (preferred UserCB = b2, %d slots x 16 bytes)", MAX_USER_CB_VARS);
 }
 
 void user_cb_shutdown() {
     if (g_user_cb_buf) { g_user_cb_buf->Release(); g_user_cb_buf = nullptr; }
     if (s_command_cb_buf) { s_command_cb_buf->Release(); s_command_cb_buf = nullptr; }
+    s_uploaded_global_user_cb_valid = false;
+    s_uploaded_command_user_cb_valid = false;
+    s_uploaded_global_user_cb_buffer = nullptr;
+    s_uploaded_command_user_cb_buffer = nullptr;
 }
 
 void user_cb_clear() {
     memset(g_user_cb_entries, 0, sizeof(g_user_cb_entries));
     g_user_cb_count = 0;
+    s_uploaded_global_user_cb_valid = false;
+    s_uploaded_command_user_cb_valid = false;
 }
 
 void user_cb_enforce_unique_names() {
@@ -400,10 +416,18 @@ void user_cb_update() {
         user_cb_pack_entry(e, data.slots[i]);
     }
 
-    D3D11_MAPPED_SUBRESOURCE ms = {};
-    g_dx.ctx->Map(g_user_cb_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
-    memcpy(ms.pData, &data, sizeof(data));
-    g_dx.ctx->Unmap(g_user_cb_buf, 0);
+    bool same_buffer = s_uploaded_global_user_cb_buffer == g_user_cb_buf;
+    bool same_bytes = s_uploaded_global_user_cb_valid && same_buffer &&
+                      memcmp(&s_uploaded_global_user_cb, &data, sizeof(data)) == 0;
+    if (!same_bytes) {
+        D3D11_MAPPED_SUBRESOURCE ms = {};
+        g_dx.ctx->Map(g_user_cb_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+        memcpy(ms.pData, &data, sizeof(data));
+        g_dx.ctx->Unmap(g_user_cb_buf, 0);
+        s_uploaded_global_user_cb = data;
+        s_uploaded_global_user_cb_buffer = g_user_cb_buf;
+        s_uploaded_global_user_cb_valid = true;
+    }
 }
 
 void user_cb_bind() {
@@ -572,10 +596,18 @@ void user_cb_bind_for_command(Command* c, const Resource* shader, bool bind_vs, 
         pack_command_param_bytes(&c->params[p_i], &v, (unsigned char*)&data, cb_size);
     }
 
-    D3D11_MAPPED_SUBRESOURCE ms = {};
-    g_dx.ctx->Map(s_command_cb_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
-    memcpy(ms.pData, &data, sizeof(data));
-    g_dx.ctx->Unmap(s_command_cb_buf, 0);
+    bool same_buffer = s_uploaded_command_user_cb_buffer == s_command_cb_buf;
+    bool same_bytes = s_uploaded_command_user_cb_valid && same_buffer &&
+                      memcmp(&s_uploaded_command_user_cb, &data, sizeof(data)) == 0;
+    if (!same_bytes) {
+        D3D11_MAPPED_SUBRESOURCE ms = {};
+        g_dx.ctx->Map(s_command_cb_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+        memcpy(ms.pData, &data, sizeof(data));
+        g_dx.ctx->Unmap(s_command_cb_buf, 0);
+        s_uploaded_command_user_cb = data;
+        s_uploaded_command_user_cb_buffer = s_command_cb_buf;
+        s_uploaded_command_user_cb_valid = true;
+    }
 
     UINT slot = shader->shader_cb.bind_slot;
     if (bind_vs) g_dx.ctx->VSSetConstantBuffers(slot, 1, &s_command_cb_buf);

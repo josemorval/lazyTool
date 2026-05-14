@@ -19,6 +19,13 @@ CmdHandle cmd_move(CmdHandle moving, CmdHandle target, bool after_target);
 
 void      cmd_execute_all();
 void      cmd_set_reset_execution(bool active);
+void      cmd_request_shader_recompute(ResHandle shader_h);
+bool      cmd_refresh_draw_bounds(CmdHandle h);
+bool      cmd_compute_world_bounds(CmdHandle h, float out_min[3], float out_max[3]);
+void      cmd_mark_dirty(CmdHandle h);
+void      cmd_mark_all_dirty();
+uint64_t  cmd_revision();
+uint64_t  cmd_graph_revision();
 
 const char* cmd_type_str(CmdType t);
 void        cmd_make_unique_name(const char* base, char* out, int out_sz);

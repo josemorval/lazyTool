@@ -6,6 +6,7 @@
 #include "timeline.h"
 #include <stdarg.h>
 #include <string.h>
+#include <float.h>
 
 // The command system is the runtime execution graph. Each command describes
 // one draw, dispatch, clear, or grouping step in the frame pipeline.
@@ -28,10 +29,97 @@ static uint64_t s_gpu_submit_frame = 0;
 static uint64_t s_gpu_last_ready_frame = 0;
 static bool    s_gpu_frame_capture_open = false;
 static bool    s_cmd_reset_execution = true;
+static bool    s_cmd_recompute_all_shaders = false;
+static ResHandle s_cmd_recompute_shaders[MAX_RESOURCES] = {};
+static int     s_cmd_recompute_shader_count = 0;
+static uint64_t s_cmd_revision = 1;
+static uint64_t s_cmd_graph_revision = 1;
+
+// Cached command hierarchy. Slot 0 is the root (INVALID_HANDLE); slots
+// 1..MAX_COMMANDS are children of that command handle. This avoids rescanning
+// the whole command array every time a group/repeat/shadow traversal needs
+// children. The cache is rebuilt only when command graph data changes.
+static CmdHandle s_plan_children[MAX_COMMANDS + 1][MAX_COMMANDS] = {};
+static int       s_plan_child_count[MAX_COMMANDS + 1] = {};
+static uint64_t  s_plan_revision = 0;
+
+static void cmd_clear_shader_recompute_requests();
 
 #define GPU_PROFILE_LATENCY 6
 #define GPU_PROFILE_MAX_EVENTS 512
 static const UINT k_shadow_map_ps_slot = 7;
+
+uint64_t cmd_revision() {
+    return s_cmd_revision;
+}
+
+uint64_t cmd_graph_revision() {
+    return s_cmd_graph_revision;
+}
+
+void cmd_mark_dirty(CmdHandle h) {
+    Command* c = cmd_get(h);
+    if (c)
+        c->version = ++s_cmd_revision;
+    else
+        ++s_cmd_revision;
+
+    // Conservative by design: command edits frequently affect parent/order,
+    // render targets, repeat expansion or bindings. Rebuilding the cached
+    // child lists on edit is cheap and keeps the frame path branch-free.
+    ++s_cmd_graph_revision;
+}
+
+void cmd_mark_all_dirty() {
+    uint64_t base = ++s_cmd_revision;
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        if (g_commands[i].active)
+            g_commands[i].version = base;
+    }
+    ++s_cmd_graph_revision;
+}
+
+static void cmd_rebuild_execution_plan_if_needed() {
+    if (s_plan_revision == s_cmd_graph_revision)
+        return;
+
+    // Only the child counts are authoritative; entries past count are never read.
+    // Avoid clearing the full children matrix on every graph rebuild.
+    memset(s_plan_child_count, 0, sizeof(s_plan_child_count));
+
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        Command& c = g_commands[i];
+        if (!c.active)
+            continue;
+
+        int parent_slot = 0;
+        if (c.parent != INVALID_HANDLE) {
+            if (c.parent > MAX_COMMANDS)
+                continue;
+            parent_slot = (int)c.parent;
+        }
+
+        int& count = s_plan_child_count[parent_slot];
+        if (count < MAX_COMMANDS)
+            s_plan_children[parent_slot][count++] = (CmdHandle)(i + 1);
+    }
+
+    s_plan_revision = s_cmd_graph_revision;
+}
+
+static int cmd_cached_child_count(CmdHandle parent_h) {
+    cmd_rebuild_execution_plan_if_needed();
+    int slot = (parent_h == INVALID_HANDLE || parent_h > MAX_COMMANDS) ? 0 : (int)parent_h;
+    return s_plan_child_count[slot];
+}
+
+static CmdHandle cmd_cached_child_at(CmdHandle parent_h, int index) {
+    cmd_rebuild_execution_plan_if_needed();
+    int slot = (parent_h == INVALID_HANDLE || parent_h > MAX_COMMANDS) ? 0 : (int)parent_h;
+    if (index < 0 || index >= s_plan_child_count[slot])
+        return INVALID_HANDLE;
+    return s_plan_children[slot][index];
+}
 
 static uint32_t validation_hash_text(const char* text) {
     uint32_t hash = 2166136261u;
@@ -127,6 +215,13 @@ void cmd_init() {
     memset(g_commands, 0, sizeof(g_commands));
     memset(s_cmd_profile_ms, 0, sizeof(s_cmd_profile_ms));
     memset(s_gpu_slots, 0, sizeof(s_gpu_slots));
+    // Only the child counts are authoritative; entries past count are never read.
+    // Avoid clearing the full children matrix on every graph rebuild.
+    memset(s_plan_child_count, 0, sizeof(s_plan_child_count));
+    s_cmd_revision = 1;
+    s_cmd_graph_revision = 1;
+    s_plan_revision = 0;
+    cmd_clear_shader_recompute_requests();
     g_command_count = 0;
 
     D3D11_QUERY_DESC timestamp_desc = {};
@@ -183,6 +278,38 @@ void cmd_shutdown() {
 
 void cmd_set_reset_execution(bool active) {
     s_cmd_reset_execution = active;
+}
+
+void cmd_request_shader_recompute(ResHandle shader_h) {
+    if (shader_h == INVALID_HANDLE) {
+        s_cmd_recompute_all_shaders = true;
+        s_cmd_recompute_shader_count = 0;
+        return;
+    }
+    if (s_cmd_recompute_all_shaders)
+        return;
+    for (int i = 0; i < s_cmd_recompute_shader_count; i++) {
+        if (s_cmd_recompute_shaders[i] == shader_h)
+            return;
+    }
+    if (s_cmd_recompute_shader_count < MAX_RESOURCES)
+        s_cmd_recompute_shaders[s_cmd_recompute_shader_count++] = shader_h;
+}
+
+static bool cmd_shader_recompute_requested(ResHandle shader_h) {
+    if (s_cmd_recompute_all_shaders)
+        return true;
+    for (int i = 0; i < s_cmd_recompute_shader_count; i++) {
+        if (s_cmd_recompute_shaders[i] == shader_h)
+            return true;
+    }
+    return false;
+}
+
+static void cmd_clear_shader_recompute_requests() {
+    s_cmd_recompute_all_shaders = false;
+    s_cmd_recompute_shader_count = 0;
+    memset(s_cmd_recompute_shaders, 0, sizeof(s_cmd_recompute_shaders));
 }
 
 float cmd_profile_ms(CmdHandle h) {
@@ -416,6 +543,14 @@ CmdHandle cmd_alloc(const char* name, CmdType type) {
             g_commands[i].scale[0]         = 1.0f;
             g_commands[i].scale[1]         = 1.0f;
             g_commands[i].scale[2]         = 1.0f;
+            g_commands[i].bbox_valid       = true;
+            g_commands[i].bbox_identity    = true;
+            g_commands[i].bbox_min[0]      = -0.5f;
+            g_commands[i].bbox_min[1]      = -0.5f;
+            g_commands[i].bbox_min[2]      = -0.5f;
+            g_commands[i].bbox_max[0]      =  0.5f;
+            g_commands[i].bbox_max[1]      =  0.5f;
+            g_commands[i].bbox_max[2]      =  0.5f;
             g_commands[i].indirect_buf     = INVALID_HANDLE;
             g_commands[i].clear_color[0]   = 0.05f;
             g_commands[i].clear_color[1]   = 0.05f;
@@ -435,6 +570,8 @@ CmdHandle cmd_alloc(const char* name, CmdType type) {
             for (int t = 0; t < MAX_TEX_SLOTS; t++) g_commands[i].tex_handles[t] = INVALID_HANDLE;
             for (int s = 0; s < MAX_SRV_SLOTS; s++) g_commands[i].srv_handles[s] = INVALID_HANDLE;
             for (int u = 0; u < MAX_UAV_SLOTS; u++) g_commands[i].uav_handles[u] = INVALID_HANDLE;
+            g_commands[i].version = ++s_cmd_revision;
+            ++s_cmd_graph_revision;
             g_command_count++;
             return (CmdHandle)(i + 1);
         }
@@ -455,6 +592,8 @@ void cmd_free(CmdHandle h) {
     timeline_delete_tracks_for_command(deleted_name);
     c->active = false;
     c->parent = INVALID_HANDLE;
+    ++s_cmd_revision;
+    ++s_cmd_graph_revision;
     g_command_count--;
 }
 
@@ -496,6 +635,7 @@ bool cmd_rename(CmdHandle h, const char* name) {
 
     timeline_rename_tracks_for_command(old_name, c->name);
     user_cb_rename_command_references(old_name, c->name);
+    cmd_mark_dirty(h);
     log_info("Command renamed: %s -> %s", old_name, c->name);
     return true;
 }
@@ -564,6 +704,7 @@ CmdHandle cmd_move(CmdHandle moving, CmdHandle target, bool after_target) {
     }
 
     memcpy(g_commands, s_cmd_move_new, sizeof(g_commands));
+    cmd_mark_all_dirty();
     return moved_handle;
 }
 
@@ -683,20 +824,158 @@ static ID3D11RasterizerState* rasterizer_state_for(const Command& c, const MeshM
     return cull_back ? g_dx.rs_solid : g_dx.rs_cull_none;
 }
 
+enum class SrvBindStage { VS, PS, CS };
+
+static void bind_srv_range(SrvBindStage stage, UINT start_slot, UINT count, ID3D11ShaderResourceView* const* srvs) {
+    if (!g_dx.ctx || count == 0)
+        return;
+
+    switch (stage) {
+    case SrvBindStage::VS: g_dx.ctx->VSSetShaderResources(start_slot, count, srvs); break;
+    case SrvBindStage::PS: g_dx.ctx->PSSetShaderResources(start_slot, count, srvs); break;
+    case SrvBindStage::CS: g_dx.ctx->CSSetShaderResources(start_slot, count, srvs); break;
+    }
+}
+
+static void bind_srv_slot_list(SrvBindStage stage, const ResHandle* handles, const uint32_t* slots, int count) {
+    if (!handles || !slots || count <= 0)
+        return;
+
+    ID3D11ShaderResourceView* srvs[MAX_SRV_SLOTS] = {};
+    bool present[MAX_SRV_SLOTS] = {};
+
+    // Last duplicate slot wins, matching the previous one-call-per-slot loop.
+    for (int i = 0; i < count; i++) {
+        uint32_t slot = slots[i];
+        if (slot >= MAX_SRV_SLOTS)
+            continue;
+        Resource* r = res_get(handles[i]);
+        srvs[slot] = r ? r->srv : nullptr;
+        present[slot] = true;
+    }
+
+    for (int slot = 0; slot < MAX_SRV_SLOTS; ) {
+        if (!present[slot]) {
+            slot++;
+            continue;
+        }
+        int start = slot;
+        while (slot < MAX_SRV_SLOTS && present[slot])
+            slot++;
+        bind_srv_range(stage, (UINT)start, (UINT)(slot - start), &srvs[start]);
+    }
+}
+
+static void clear_srv_slot_list(SrvBindStage stage, const uint32_t* slots, int count) {
+    if (!slots || count <= 0)
+        return;
+
+    ID3D11ShaderResourceView* null_srvs[MAX_SRV_SLOTS] = {};
+    bool present[MAX_SRV_SLOTS] = {};
+    for (int i = 0; i < count; i++) {
+        uint32_t slot = slots[i];
+        if (slot < MAX_SRV_SLOTS)
+            present[slot] = true;
+    }
+
+    for (int slot = 0; slot < MAX_SRV_SLOTS; ) {
+        if (!present[slot]) {
+            slot++;
+            continue;
+        }
+        int start = slot;
+        while (slot < MAX_SRV_SLOTS && present[slot])
+            slot++;
+        bind_srv_range(stage, (UINT)start, (UINT)(slot - start), &null_srvs[start]);
+    }
+}
+
+static void bind_compute_uav_slot_list(const ResHandle* handles, const uint32_t* slots, int count) {
+    if (!handles || !slots || count <= 0 || !g_dx.ctx)
+        return;
+
+    ID3D11UnorderedAccessView* uavs[MAX_UAV_SLOTS] = {};
+    bool present[MAX_UAV_SLOTS] = {};
+
+    for (int i = 0; i < count; i++) {
+        uint32_t slot = slots[i];
+        if (slot >= MAX_UAV_SLOTS)
+            continue;
+        Resource* r = res_get(handles[i]);
+        uavs[slot] = r ? r->uav : nullptr;
+        present[slot] = true;
+    }
+
+    for (int slot = 0; slot < MAX_UAV_SLOTS; ) {
+        if (!present[slot]) {
+            slot++;
+            continue;
+        }
+        int start = slot;
+        while (slot < MAX_UAV_SLOTS && present[slot])
+            slot++;
+        g_dx.ctx->CSSetUnorderedAccessViews((UINT)start, (UINT)(slot - start), &uavs[start], nullptr);
+    }
+}
+
+static ID3D11RasterizerState*   s_cached_rs = nullptr;
+static ID3D11DepthStencilState* s_cached_dss = nullptr;
+static ID3D11BlendState*        s_cached_bs = nullptr;
+static bool                     s_cached_blend_factor_valid = false;
+static float                    s_cached_blend_factor[4] = {};
+static UINT                     s_cached_sample_mask = 0xFFFFFFFF;
+
+static void command_state_cache_reset() {
+    s_cached_rs = nullptr;
+    s_cached_dss = nullptr;
+    s_cached_bs = nullptr;
+    s_cached_blend_factor_valid = false;
+    s_cached_blend_factor[0] = s_cached_blend_factor[1] = s_cached_blend_factor[2] = s_cached_blend_factor[3] = 0.0f;
+    s_cached_sample_mask = 0xFFFFFFFF;
+}
+
+static void set_cached_rasterizer_state(ID3D11RasterizerState* rs) {
+    if (s_cached_rs == rs)
+        return;
+    g_dx.ctx->RSSetState(rs);
+    s_cached_rs = rs;
+}
+
+static void set_cached_depth_state(ID3D11DepthStencilState* dss, UINT stencil_ref) {
+    // This renderer always uses stencil ref 0 for command draws.
+    (void)stencil_ref;
+    if (s_cached_dss == dss)
+        return;
+    g_dx.ctx->OMSetDepthStencilState(dss, 0);
+    s_cached_dss = dss;
+}
+
+static void set_cached_blend_state(ID3D11BlendState* bs, const float blend_factor[4], UINT sample_mask) {
+    bool same_factor = s_cached_blend_factor_valid &&
+                       memcmp(s_cached_blend_factor, blend_factor, sizeof(s_cached_blend_factor)) == 0;
+    if (s_cached_bs == bs && same_factor && s_cached_sample_mask == sample_mask)
+        return;
+    g_dx.ctx->OMSetBlendState(bs, blend_factor, sample_mask);
+    s_cached_bs = bs;
+    memcpy(s_cached_blend_factor, blend_factor, sizeof(s_cached_blend_factor));
+    s_cached_blend_factor_valid = true;
+    s_cached_sample_mask = sample_mask;
+}
+
 static void apply_draw_state(const Command& c, const MeshMaterial* material) {
     ID3D11RasterizerState* rs = rasterizer_state_for(c, material, g_dx.scene_wireframe);
-    g_dx.ctx->RSSetState(rs ? rs : g_dx.rs_solid);
+    set_cached_rasterizer_state(rs ? rs : g_dx.rs_solid);
 
     ID3D11DepthStencilState* dss = g_dx.dss_default;
     if (!c.depth_test) dss = g_dx.dss_depth_off;
     else if (!c.depth_write) dss = g_dx.dss_depth_read;
     if (!dss) dss = g_dx.dss_default;
-    g_dx.ctx->OMSetDepthStencilState(dss, 0);
+    set_cached_depth_state(dss, 0);
 
     float bf[4] = {};
     bool alpha_blend = c.alpha_blend || (material && material->alpha_blend);
     ID3D11BlendState* bs = alpha_blend ? g_dx.bs_alpha : g_dx.bs_opaque;
-    g_dx.ctx->OMSetBlendState(bs ? bs : g_dx.bs_opaque, bf, 0xFFFFFFFF);
+    set_cached_blend_state(bs ? bs : g_dx.bs_opaque, bf, 0xFFFFFFFF);
 }
 
 static bool is_draw_command(CmdType type) {
@@ -777,6 +1056,128 @@ static Mat4 command_world_matrix(const Command& c) {
     return mat4_mul(mat4_mul(s, r), t);
 }
 
+static void command_bounds_set_identity(Command* c) {
+    if (!c)
+        return;
+    c->bbox_valid = true;
+    c->bbox_identity = true;
+    c->bbox_min[0] = c->bbox_min[1] = c->bbox_min[2] = -0.5f;
+    c->bbox_max[0] = c->bbox_max[1] = c->bbox_max[2] =  0.5f;
+}
+
+static void command_bounds_reset(float out_min[3], float out_max[3]) {
+    out_min[0] = out_min[1] = out_min[2] =  FLT_MAX;
+    out_max[0] = out_max[1] = out_max[2] = -FLT_MAX;
+}
+
+static void command_bounds_include_point(float out_min[3], float out_max[3], Vec3 p) {
+    if (p.x < out_min[0]) out_min[0] = p.x;
+    if (p.y < out_min[1]) out_min[1] = p.y;
+    if (p.z < out_min[2]) out_min[2] = p.z;
+    if (p.x > out_max[0]) out_max[0] = p.x;
+    if (p.y > out_max[1]) out_max[1] = p.y;
+    if (p.z > out_max[2]) out_max[2] = p.z;
+}
+
+static Vec3 command_transform_point(const Mat4& m, Vec3 p) {
+    float x = p.x * m.m[0] + p.y * m.m[4] + p.z * m.m[8]  + m.m[12];
+    float y = p.x * m.m[1] + p.y * m.m[5] + p.z * m.m[9]  + m.m[13];
+    float z = p.x * m.m[2] + p.y * m.m[6] + p.z * m.m[10] + m.m[14];
+    float w = p.x * m.m[3] + p.y * m.m[7] + p.z * m.m[11] + m.m[15];
+    if (fabsf(w) > 1e-6f) {
+        float inv_w = 1.0f / w;
+        x *= inv_w; y *= inv_w; z *= inv_w;
+    }
+    return v3(x, y, z);
+}
+
+static void command_bounds_include_box(float out_min[3], float out_max[3],
+                                       const float box_min[3], const float box_max[3],
+                                       const Mat4* transform)
+{
+    for (int z = 0; z <= 1; z++) {
+        for (int y = 0; y <= 1; y++) {
+            for (int x = 0; x <= 1; x++) {
+                Vec3 p = v3(x ? box_max[0] : box_min[0],
+                            y ? box_max[1] : box_min[1],
+                            z ? box_max[2] : box_min[2]);
+                if (transform)
+                    p = command_transform_point(*transform, p);
+                command_bounds_include_point(out_min, out_max, p);
+            }
+        }
+    }
+}
+
+static bool command_mesh_bounds_for_command_local(const Command& c, const Resource* mesh,
+                                                  float out_min[3], float out_max[3])
+{
+    if (!mesh || !out_min || !out_max)
+        return false;
+
+    command_bounds_reset(out_min, out_max);
+    bool any = false;
+    if (mesh->mesh_part_count > 0) {
+        for (int pi = 0; pi < mesh->mesh_part_count; pi++) {
+            const MeshPart& part = mesh->mesh_parts[pi];
+            if (!part.enabled || !part.bounds_valid)
+                continue;
+            Mat4 local = mat4_from_raw(part.local_transform);
+            command_bounds_include_box(out_min, out_max, part.bounds_min, part.bounds_max, &local);
+            any = true;
+        }
+    }
+
+    if (!any && mesh->mesh_bounds_valid) {
+        memcpy(out_min, mesh->mesh_bounds_min, sizeof(float) * 3);
+        memcpy(out_max, mesh->mesh_bounds_max, sizeof(float) * 3);
+        any = true;
+    }
+
+    (void)c;
+    return any;
+}
+
+bool cmd_refresh_draw_bounds(CmdHandle h) {
+    Command* c = cmd_get(h);
+    if (!c)
+        return false;
+
+    if (!is_draw_command(c->type) || command_uses_procedural_draw(*c)) {
+        command_bounds_set_identity(c);
+        return false;
+    }
+
+    Resource* mesh = res_get(c->mesh);
+    float bmin[3] = {};
+    float bmax[3] = {};
+    if (!command_mesh_bounds_for_command_local(*c, mesh, bmin, bmax)) {
+        command_bounds_set_identity(c);
+        return false;
+    }
+
+    memcpy(c->bbox_min, bmin, sizeof(c->bbox_min));
+    memcpy(c->bbox_max, bmax, sizeof(c->bbox_max));
+    c->bbox_valid = true;
+    c->bbox_identity = false;
+    return true;
+}
+
+bool cmd_compute_world_bounds(CmdHandle h, float out_min[3], float out_max[3]) {
+    Command* c = cmd_get(h);
+    if (!c || !out_min || !out_max)
+        return false;
+
+    cmd_refresh_draw_bounds(h);
+    if (!c->bbox_valid)
+        command_bounds_set_identity(c);
+
+    Mat4 world = command_world_matrix(*c);
+    command_bounds_reset(out_min, out_max);
+    command_bounds_include_box(out_min, out_max, c->bbox_min, c->bbox_max, &world);
+    return true;
+}
+
 static void bind_object_cb_for_shader(const Resource* shader, bool bind_vs, bool bind_ps) {
     if (!g_dx.object_cb)
         return;
@@ -843,12 +1244,13 @@ static void draw_command_geometry(const Command& c, Resource* mesh, const MeshPa
 
 static void bind_mesh_material_textures(const Resource* mesh, const MeshPart* part) {
     const MeshMaterial* material = mesh_material_for_part(mesh, part);
+    ID3D11ShaderResourceView* srvs[MAX_MESH_MATERIAL_TEXTURES] = {};
     for (int slot = 0; slot < MAX_MESH_MATERIAL_TEXTURES; slot++) {
         ResHandle tex_h = material ? material->textures[slot] : INVALID_HANDLE;
         Resource* tex = res_get(tex_h);
-        ID3D11ShaderResourceView* srv = tex ? tex->srv : nullptr;
-        g_dx.ctx->PSSetShaderResources((UINT)slot, 1, &srv);
+        srvs[slot] = tex ? tex->srv : nullptr;
     }
+    g_dx.ctx->PSSetShaderResources(0, MAX_MESH_MATERIAL_TEXTURES, srvs);
 }
 
 static bool command_has_bound_srv(const ResHandle* handles, const uint32_t* slots, int count, uint32_t slot) {
@@ -1168,22 +1570,18 @@ static void execute_shadow_prepass_command(CmdHandle h) {
 
     Command& c = *cp;
     if (c.type == CMD_GROUP) {
-        for (int i = 0; i < MAX_COMMANDS; i++) {
-            if (!g_commands[i].active || g_commands[i].parent != h)
-                continue;
-            execute_shadow_prepass_command((CmdHandle)(i + 1));
-        }
+        int child_count = cmd_cached_child_count(h);
+        for (int i = 0; i < child_count; i++)
+            execute_shadow_prepass_command(cmd_cached_child_at(h, i));
         return;
     }
 
     if (c.type == CMD_REPEAT) {
         int repeat_count = c.repeat_count > 0 ? c.repeat_count : 1;
+        int child_count = cmd_cached_child_count(h);
         for (int repeat_i = 0; repeat_i < repeat_count; repeat_i++) {
-            for (int i = 0; i < MAX_COMMANDS; i++) {
-                if (!g_commands[i].active || g_commands[i].parent != h)
-                    continue;
-                execute_shadow_prepass_command((CmdHandle)(i + 1));
-            }
+            for (int i = 0; i < child_count; i++)
+                execute_shadow_prepass_command(cmd_cached_child_at(h, i));
         }
         return;
     }
@@ -1215,11 +1613,7 @@ static void execute_shadow_prepass_command(CmdHandle h) {
     g_dx.ctx->VSSetShader(shadow_vs, nullptr, 0);
     g_dx.ctx->IASetInputLayout(procedural ? nullptr : shadow_il);
     bind_command_geometry(c, mesh);
-    for (int s = 0; s < c.srv_count; s++) {
-        Resource* sr = res_get(c.srv_handles[s]);
-        ID3D11ShaderResourceView* srv = sr ? sr->srv : nullptr;
-        g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &srv);
-    }
+    bind_srv_slot_list(SrvBindStage::VS, c.srv_handles, c.srv_slots, c.srv_count);
 
     if (c.type == CMD_INDIRECT_DRAW) {
         const MeshPart* draw_part = procedural ? nullptr : indirect_draw_part_context(mesh);
@@ -1237,10 +1631,7 @@ static void execute_shadow_prepass_command(CmdHandle h) {
             g_dx.ctx->DrawIndexedInstancedIndirect(indirect_buf->buf, c.indirect_offset);
         }
 
-        for (int s = 0; s < c.srv_count; s++) {
-            ID3D11ShaderResourceView* cleared_srv = nullptr;
-            g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &cleared_srv);
-        }
+        clear_srv_slot_list(SrvBindStage::VS, c.srv_slots, c.srv_count);
         return;
     }
 
@@ -1258,10 +1649,7 @@ static void execute_shadow_prepass_command(CmdHandle h) {
         draw_command_geometry(c, mesh, part);
     }
 
-    for (int s = 0; s < c.srv_count; s++) {
-        ID3D11ShaderResourceView* cleared_srv = nullptr;
-        g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &cleared_srv);
-    }
+    clear_srv_slot_list(SrvBindStage::VS, c.srv_slots, c.srv_count);
 }
 
 static void execute_shadow_prepass() {
@@ -1304,11 +1692,13 @@ static void execute_shadow_prepass() {
                sizeof(shadow_cb.shadow_view_proj));
         dx_update_scene_cb(shadow_cb);
 
-        for (int i = 0; i < MAX_COMMANDS; i++) {
-            Command& c = g_commands[i];
-            if (!c.active || !c.enabled || c.parent != INVALID_HANDLE)
+        int child_count = cmd_cached_child_count(INVALID_HANDLE);
+        for (int i = 0; i < child_count; i++) {
+            CmdHandle child_h = cmd_cached_child_at(INVALID_HANDLE, i);
+            Command* child = cmd_get(child_h);
+            if (!child || !child->enabled)
                 continue;
-            execute_shadow_prepass_command((CmdHandle)(i + 1));
+            execute_shadow_prepass_command(child_h);
         }
     }
 
@@ -1327,16 +1717,8 @@ static void clear_compute_bindings() {
 // group counts; every SRV/UAV declared by the compute shader is still bound
 // explicitly through the command's t#/u# slot arrays.
 static void bind_compute_resources(Command& c) {
-    for (int s = 0; s < c.srv_count; s++) {
-        Resource* sr = res_get(c.srv_handles[s]);
-        ID3D11ShaderResourceView* srv = sr ? sr->srv : nullptr;
-        g_dx.ctx->CSSetShaderResources(c.srv_slots[s], 1, &srv);
-    }
-    for (int u = 0; u < c.uav_count; u++) {
-        Resource* ur = res_get(c.uav_handles[u]);
-        ID3D11UnorderedAccessView* uav = ur ? ur->uav : nullptr;
-        g_dx.ctx->CSSetUnorderedAccessViews(c.uav_slots[u], 1, &uav, nullptr);
-    }
+    bind_srv_slot_list(SrvBindStage::CS, c.srv_handles, c.srv_slots, c.srv_count);
+    bind_compute_uav_slot_list(c.uav_handles, c.uav_slots, c.uav_count);
 }
 
 static void resolve_dispatch_counts(const Command& c, UINT* out_x, UINT* out_y, UINT* out_z) {
@@ -1431,7 +1813,8 @@ static void resolve_dispatch_counts(const Command& c, UINT* out_x, UINT* out_y, 
 
 static void execute_dispatch_command(Command& c) {
     Resource* shader = res_get(c.shader);
-    validate_dispatch_command(c, shader, false, nullptr);
+    if (g_dx.shader_validation_warnings)
+        validate_dispatch_command(c, shader, false, nullptr);
     if (!shader || !shader->cs) return;
     g_dx.ctx->OMSetRenderTargets(0, nullptr, nullptr);
     clear_compute_bindings();
@@ -1450,7 +1833,8 @@ static void execute_dispatch_command(Command& c) {
 static void execute_indirect_dispatch_command(Command& c) {
     Resource* ibuf   = res_get(c.indirect_buf);
     Resource* shader = res_get(c.shader);
-    validate_dispatch_command(c, shader, true, ibuf);
+    if (g_dx.shader_validation_warnings)
+        validate_dispatch_command(c, shader, true, ibuf);
     if (!is_valid_indirect_dispatch_call(c, ibuf) || !shader || !shader->cs) return;
     g_dx.ctx->OMSetRenderTargets(0, nullptr, nullptr);
     clear_compute_bindings();
@@ -1467,15 +1851,10 @@ static void execute_repeat_command(CmdHandle repeat_h, Command& repeat, bool& sh
     int count = repeat.repeat_count;
     if (count < 1) count = 1;
 
+    int child_count = cmd_cached_child_count(repeat_h);
     for (int pass = 0; pass < count; pass++) {
-        for (int i = 0; i < MAX_COMMANDS; i++) {
-            Command& child = g_commands[i];
-            if (!child.active || child.parent != repeat_h)
-                continue;
-
-            CmdHandle child_h = (CmdHandle)(i + 1);
-            execute_command_handle(child_h, shadow_prepass_done);
-        }
+        for (int i = 0; i < child_count; i++)
+            execute_command_handle(cmd_cached_child_at(repeat_h, i), shadow_prepass_done);
     }
 }
 
@@ -1487,7 +1866,8 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
 
     Command& c = *cp;
     if ((c.type == CMD_DISPATCH || c.type == CMD_INDIRECT_DISPATCH) &&
-        c.compute_on_reset && !s_cmd_reset_execution) {
+        c.compute_on_reset && !s_cmd_reset_execution &&
+        !cmd_shader_recompute_requested(c.shader)) {
         return;
     }
 
@@ -1517,13 +1897,15 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         bool procedural = command_uses_procedural_draw(c);
         Resource* mesh   = res_get(c.mesh);
         Resource* shader = res_get(c.shader);
-        validate_draw_command(c, mesh, shader, procedural, false, nullptr);
+        if (g_dx.shader_validation_warnings)
+            validate_draw_command(c, mesh, shader, procedural, false, nullptr);
         if (!shader || !shader->vs || !shader->ps)       break;
         if (!procedural && (!mesh || !mesh->vb))         break;
 
         if (c.shadow_receive && !shadow_prepass_done) {
             execute_shadow_prepass();
             shadow_prepass_done = true;
+            command_state_cache_reset();
         }
 
         g_dx.ctx->VSSetShader(shader->vs, nullptr, 0);
@@ -1549,11 +1931,7 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         set_viewport_for_draw_outputs(c);
         bind_command_geometry(c, mesh);
 
-        for (int s = 0; s < c.srv_count; s++) {
-            Resource* sr = res_get(c.srv_handles[s]);
-            ID3D11ShaderResourceView* srv = sr ? sr->srv : nullptr;
-            g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &srv);
-        }
+        bind_srv_slot_list(SrvBindStage::VS, c.srv_handles, c.srv_slots, c.srv_count);
 
         int part_count = procedural ? 1 : (mesh->mesh_part_count > 0 ? mesh->mesh_part_count : 1);
         for (int pi = 0; pi < part_count; pi++) {
@@ -1566,11 +1944,7 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
             update_object_cb_for_command(c, part);
             bind_object_cb_for_shader(shader, true, true);
             bind_mesh_material_textures(mesh, part);
-            for (int s = 0; s < c.srv_count; s++) {
-                Resource* sr = res_get(c.srv_handles[s]);
-                ID3D11ShaderResourceView* srv = sr ? sr->srv : nullptr;
-                g_dx.ctx->PSSetShaderResources(c.srv_slots[s], 1, &srv);
-            }
+            bind_srv_slot_list(SrvBindStage::PS, c.srv_handles, c.srv_slots, c.srv_count);
             if (c.shadow_receive) {
                 ID3D11ShaderResourceView* srv = g_dx.shadow_srv;
                 g_dx.ctx->PSSetShaderResources(k_shadow_map_ps_slot, 1, &srv);
@@ -1581,11 +1955,8 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
 
         ID3D11ShaderResourceView* null_ps_srvs[MAX_TEX_SLOTS] = {};
         g_dx.ctx->PSSetShaderResources(0, MAX_TEX_SLOTS, null_ps_srvs);
-        for (int s = 0; s < c.srv_count; s++) {
-            ID3D11ShaderResourceView* null_srv = nullptr;
-            g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &null_srv);
-            g_dx.ctx->PSSetShaderResources(c.srv_slots[s], 1, &null_srv);
-        }
+        clear_srv_slot_list(SrvBindStage::VS, c.srv_slots, c.srv_count);
+        clear_srv_slot_list(SrvBindStage::PS, c.srv_slots, c.srv_count);
         clear_draw_uavs(uav_start_slot, om_uav_count);
         break;
     }
@@ -1602,12 +1973,14 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         bool procedural = command_uses_procedural_draw(c);
         const MeshPart* draw_part = procedural ? nullptr : indirect_draw_part_context(mesh);
         const MeshMaterial* material = mesh_material_for_part(mesh, draw_part);
-        validate_draw_command(c, mesh, shader, procedural, true, ibuf);
+        if (g_dx.shader_validation_warnings)
+            validate_draw_command(c, mesh, shader, procedural, true, ibuf);
         if (!is_valid_indirect_draw_call(c, mesh, ibuf) || !shader || !shader->vs || !shader->ps) break;
         if (!procedural && (!mesh || !mesh->vb)) break;
         if (c.shadow_receive && !shadow_prepass_done) {
             execute_shadow_prepass();
             shadow_prepass_done = true;
+            command_state_cache_reset();
         }
 
         g_dx.ctx->VSSetShader(shader->vs, nullptr, 0);
@@ -1633,21 +2006,13 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         set_viewport_for_draw_outputs(c);
         bind_command_geometry(c, mesh);
 
-        for (int s = 0; s < c.srv_count; s++) {
-            Resource* sr = res_get(c.srv_handles[s]);
-            ID3D11ShaderResourceView* srv = sr ? sr->srv : nullptr;
-            g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &srv);
-        }
+        bind_srv_slot_list(SrvBindStage::VS, c.srv_handles, c.srv_slots, c.srv_count);
 
         apply_draw_state(c, material);
         update_object_cb_for_command(c, draw_part);
         bind_object_cb_for_shader(shader, true, true);
         bind_mesh_material_textures(mesh, draw_part);
-        for (int s = 0; s < c.srv_count; s++) {
-            Resource* sr = res_get(c.srv_handles[s]);
-            ID3D11ShaderResourceView* srv = sr ? sr->srv : nullptr;
-            g_dx.ctx->PSSetShaderResources(c.srv_slots[s], 1, &srv);
-        }
+        bind_srv_slot_list(SrvBindStage::PS, c.srv_handles, c.srv_slots, c.srv_count);
         if (c.shadow_receive) {
             ID3D11ShaderResourceView* srv = g_dx.shadow_srv;
             g_dx.ctx->PSSetShaderResources(k_shadow_map_ps_slot, 1, &srv);
@@ -1667,11 +2032,8 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
 
         ID3D11ShaderResourceView* null_ps_srvs[MAX_TEX_SLOTS] = {};
         g_dx.ctx->PSSetShaderResources(0, MAX_TEX_SLOTS, null_ps_srvs);
-        for (int s = 0; s < c.srv_count; s++) {
-            ID3D11ShaderResourceView* null_srv = nullptr;
-            g_dx.ctx->VSSetShaderResources(c.srv_slots[s], 1, &null_srv);
-            g_dx.ctx->PSSetShaderResources(c.srv_slots[s], 1, &null_srv);
-        }
+        clear_srv_slot_list(SrvBindStage::VS, c.srv_slots, c.srv_count);
+        clear_srv_slot_list(SrvBindStage::PS, c.srv_slots, c.srv_count);
         clear_draw_uavs(uav_start_slot, om_uav_count);
         break;
     }
@@ -1693,18 +2055,16 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
 }
 
 static void execute_command_children(CmdHandle parent_h, bool& shadow_prepass_done) {
-    for (int i = 0; i < MAX_COMMANDS; i++) {
-        Command& c = g_commands[i];
-        if (!c.active || c.parent != parent_h)
-            continue;
-        execute_command_handle((CmdHandle)(i + 1), shadow_prepass_done);
-    }
+    int child_count = cmd_cached_child_count(parent_h);
+    for (int i = 0; i < child_count; i++)
+        execute_command_handle(cmd_cached_child_at(parent_h, i), shadow_prepass_done);
 }
 
 // Execute the visible command list in editor order. Child/group commands are
 // expanded by the traversal helpers that feed this top-level entry point.
 void cmd_execute_all() {
     bool shadow_prepass_done = false;
+    command_state_cache_reset();
     cmd_profile_sync_enable_state();
 
     if (g_profiler_enabled && !s_gpu_active_slot)
@@ -1717,7 +2077,9 @@ void cmd_execute_all() {
         s_gpu_active_slot->command_range_issued = true;
     }
 
+    cmd_rebuild_execution_plan_if_needed();
     execute_command_children(INVALID_HANDLE, shadow_prepass_done);
+    cmd_clear_shader_recompute_requests();
 
     if (g_profiler_enabled)
         cmd_gpu_end_command_frame();
