@@ -826,14 +826,72 @@ static ID3D11RasterizerState* rasterizer_state_for(const Command& c, const MeshM
 
 enum class SrvBindStage { VS, PS, CS };
 
-static void bind_srv_range(SrvBindStage stage, UINT start_slot, UINT count, ID3D11ShaderResourceView* const* srvs) {
-    if (!g_dx.ctx || count == 0)
-        return;
+static ID3D11ShaderResourceView* s_cached_vs_srvs[MAX_SRV_SLOTS] = {};
+static ID3D11ShaderResourceView* s_cached_ps_srvs[MAX_SRV_SLOTS] = {};
+static ID3D11ShaderResourceView* s_cached_cs_srvs[MAX_SRV_SLOTS] = {};
+static bool s_cached_vs_srv_valid[MAX_SRV_SLOTS] = {};
+static bool s_cached_ps_srv_valid[MAX_SRV_SLOTS] = {};
+static bool s_cached_cs_srv_valid[MAX_SRV_SLOTS] = {};
 
+static ID3D11ShaderResourceView** cached_srv_values(SrvBindStage stage) {
+    switch (stage) {
+    case SrvBindStage::VS: return s_cached_vs_srvs;
+    case SrvBindStage::PS: return s_cached_ps_srvs;
+    case SrvBindStage::CS: return s_cached_cs_srvs;
+    }
+    return s_cached_ps_srvs;
+}
+
+static bool* cached_srv_valid(SrvBindStage stage) {
+    switch (stage) {
+    case SrvBindStage::VS: return s_cached_vs_srv_valid;
+    case SrvBindStage::PS: return s_cached_ps_srv_valid;
+    case SrvBindStage::CS: return s_cached_cs_srv_valid;
+    }
+    return s_cached_ps_srv_valid;
+}
+
+static void bind_srv_range_raw(SrvBindStage stage, UINT start_slot, UINT count, ID3D11ShaderResourceView* const* srvs) {
     switch (stage) {
     case SrvBindStage::VS: g_dx.ctx->VSSetShaderResources(start_slot, count, srvs); break;
     case SrvBindStage::PS: g_dx.ctx->PSSetShaderResources(start_slot, count, srvs); break;
     case SrvBindStage::CS: g_dx.ctx->CSSetShaderResources(start_slot, count, srvs); break;
+    }
+}
+
+static void bind_srv_range(SrvBindStage stage, UINT start_slot, UINT count, ID3D11ShaderResourceView* const* srvs) {
+    if (!g_dx.ctx || count == 0 || !srvs)
+        return;
+
+    ID3D11ShaderResourceView** cached = cached_srv_values(stage);
+    bool* valid = cached_srv_valid(stage);
+    UINT end_slot = start_slot + count;
+    if (end_slot > MAX_SRV_SLOTS)
+        end_slot = MAX_SRV_SLOTS;
+
+    UINT slot = start_slot;
+    while (slot < end_slot) {
+        UINT src_idx = slot - start_slot;
+        if (valid[slot] && cached[slot] == srvs[src_idx]) {
+            slot++;
+            continue;
+        }
+
+        UINT run_start = slot;
+        while (slot < end_slot) {
+            UINT run_src_idx = slot - start_slot;
+            if (valid[slot] && cached[slot] == srvs[run_src_idx])
+                break;
+            slot++;
+        }
+
+        UINT run_count = slot - run_start;
+        bind_srv_range_raw(stage, run_start, run_count, &srvs[run_start - start_slot]);
+        for (UINT i = 0; i < run_count; i++) {
+            UINT dst = run_start + i;
+            cached[dst] = srvs[(run_start - start_slot) + i];
+            valid[dst] = true;
+        }
     }
 }
 
@@ -924,6 +982,17 @@ static ID3D11BlendState*        s_cached_bs = nullptr;
 static bool                     s_cached_blend_factor_valid = false;
 static float                    s_cached_blend_factor[4] = {};
 static UINT                     s_cached_sample_mask = 0xFFFFFFFF;
+static ID3D11VertexShader*      s_cached_vs = nullptr;
+static ID3D11PixelShader*       s_cached_ps = nullptr;
+static ID3D11ComputeShader*     s_cached_cs = nullptr;
+static ID3D11InputLayout*       s_cached_il = nullptr;
+static D3D11_PRIMITIVE_TOPOLOGY s_cached_topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+static ID3D11Buffer*            s_cached_vb = nullptr;
+static UINT                     s_cached_vb_stride = 0;
+static UINT                     s_cached_vb_offset = 0;
+static ID3D11Buffer*            s_cached_ib = nullptr;
+static DXGI_FORMAT              s_cached_ib_format = DXGI_FORMAT_UNKNOWN;
+static UINT                     s_cached_ib_offset = 0;
 
 static void command_state_cache_reset() {
     s_cached_rs = nullptr;
@@ -932,6 +1001,20 @@ static void command_state_cache_reset() {
     s_cached_blend_factor_valid = false;
     s_cached_blend_factor[0] = s_cached_blend_factor[1] = s_cached_blend_factor[2] = s_cached_blend_factor[3] = 0.0f;
     s_cached_sample_mask = 0xFFFFFFFF;
+    s_cached_vs = nullptr;
+    s_cached_ps = nullptr;
+    s_cached_cs = nullptr;
+    s_cached_il = nullptr;
+    s_cached_topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    s_cached_vb = nullptr;
+    s_cached_vb_stride = 0;
+    s_cached_vb_offset = 0;
+    s_cached_ib = nullptr;
+    s_cached_ib_format = DXGI_FORMAT_UNKNOWN;
+    s_cached_ib_offset = 0;
+    memset(s_cached_vs_srv_valid, 0, sizeof(s_cached_vs_srv_valid));
+    memset(s_cached_ps_srv_valid, 0, sizeof(s_cached_ps_srv_valid));
+    memset(s_cached_cs_srv_valid, 0, sizeof(s_cached_cs_srv_valid));
 }
 
 static void set_cached_rasterizer_state(ID3D11RasterizerState* rs) {
@@ -960,6 +1043,63 @@ static void set_cached_blend_state(ID3D11BlendState* bs, const float blend_facto
     memcpy(s_cached_blend_factor, blend_factor, sizeof(s_cached_blend_factor));
     s_cached_blend_factor_valid = true;
     s_cached_sample_mask = sample_mask;
+}
+
+static void set_cached_vs_shader(ID3D11VertexShader* vs) {
+    if (s_cached_vs == vs)
+        return;
+    g_dx.ctx->VSSetShader(vs, nullptr, 0);
+    s_cached_vs = vs;
+}
+
+static void set_cached_ps_shader(ID3D11PixelShader* ps) {
+    if (s_cached_ps == ps)
+        return;
+    g_dx.ctx->PSSetShader(ps, nullptr, 0);
+    s_cached_ps = ps;
+}
+
+static void set_cached_cs_shader(ID3D11ComputeShader* cs) {
+    if (s_cached_cs == cs)
+        return;
+    g_dx.ctx->CSSetShader(cs, nullptr, 0);
+    s_cached_cs = cs;
+}
+
+static void set_cached_input_layout(ID3D11InputLayout* il) {
+    if (s_cached_il == il)
+        return;
+    g_dx.ctx->IASetInputLayout(il);
+    s_cached_il = il;
+}
+
+static void set_cached_topology(D3D11_PRIMITIVE_TOPOLOGY topology) {
+    if (s_cached_topology == topology)
+        return;
+    g_dx.ctx->IASetPrimitiveTopology(topology);
+    s_cached_topology = topology;
+}
+
+static void set_cached_vertex_buffer(ID3D11Buffer* vb, UINT stride, UINT offset) {
+    if (s_cached_vb == vb && s_cached_vb_stride == stride && s_cached_vb_offset == offset)
+        return;
+    if (vb) {
+        g_dx.ctx->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+    } else {
+        g_dx.ctx->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
+    }
+    s_cached_vb = vb;
+    s_cached_vb_stride = vb ? stride : 0;
+    s_cached_vb_offset = vb ? offset : 0;
+}
+
+static void set_cached_index_buffer(ID3D11Buffer* ib, DXGI_FORMAT format, UINT offset) {
+    if (s_cached_ib == ib && s_cached_ib_format == format && s_cached_ib_offset == offset)
+        return;
+    g_dx.ctx->IASetIndexBuffer(ib, format, offset);
+    s_cached_ib = ib;
+    s_cached_ib_format = ib ? format : DXGI_FORMAT_UNKNOWN;
+    s_cached_ib_offset = ib ? offset : 0;
 }
 
 static void apply_draw_state(const Command& c, const MeshMaterial* material) {
@@ -1207,17 +1347,17 @@ static void bind_mesh_geometry(Resource* mesh) {
     if (!mesh || !mesh->vb)
         return;
     UINT stride = (UINT)mesh->vert_stride, offset = 0;
-    g_dx.ctx->IASetVertexBuffers(0, 1, &mesh->vb, &stride, &offset);
-    g_dx.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    g_dx.ctx->IASetIndexBuffer(mesh->ib, DXGI_FORMAT_R32_UINT, 0);
+    set_cached_vertex_buffer(mesh->vb, stride, offset);
+    set_cached_topology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    set_cached_index_buffer(mesh->ib, DXGI_FORMAT_R32_UINT, 0);
 }
 
 static void bind_command_geometry(const Command& c, Resource* mesh) {
     if (command_uses_procedural_draw(c)) {
-        g_dx.ctx->IASetInputLayout(nullptr);
-        g_dx.ctx->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
-        g_dx.ctx->IASetIndexBuffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
-        g_dx.ctx->IASetPrimitiveTopology(command_draw_topology(c));
+        set_cached_input_layout(nullptr);
+        set_cached_vertex_buffer(nullptr, 0, 0);
+        set_cached_index_buffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
+        set_cached_topology(command_draw_topology(c));
         return;
     }
 
@@ -1250,7 +1390,7 @@ static void bind_mesh_material_textures(const Resource* mesh, const MeshPart* pa
         Resource* tex = res_get(tex_h);
         srvs[slot] = tex ? tex->srv : nullptr;
     }
-    g_dx.ctx->PSSetShaderResources(0, MAX_MESH_MATERIAL_TEXTURES, srvs);
+    bind_srv_range(SrvBindStage::PS, 0, MAX_MESH_MATERIAL_TEXTURES, srvs);
 }
 
 static bool command_has_bound_srv(const ResHandle* handles, const uint32_t* slots, int count, uint32_t slot) {
@@ -1610,8 +1750,8 @@ static void execute_shadow_prepass_command(CmdHandle h) {
         user_cb_bind();
     }
 
-    g_dx.ctx->VSSetShader(shadow_vs, nullptr, 0);
-    g_dx.ctx->IASetInputLayout(procedural ? nullptr : shadow_il);
+    set_cached_vs_shader(shadow_vs);
+    set_cached_input_layout(procedural ? nullptr : shadow_il);
     bind_command_geometry(c, mesh);
     bind_srv_slot_list(SrvBindStage::VS, c.srv_handles, c.srv_slots, c.srv_count);
 
@@ -1619,15 +1759,14 @@ static void execute_shadow_prepass_command(CmdHandle h) {
         const MeshPart* draw_part = procedural ? nullptr : indirect_draw_part_context(mesh);
         const MeshMaterial* material = mesh_material_for_part(mesh, draw_part);
         ID3D11RasterizerState* rs = rasterizer_state_for(c, material, false);
-        g_dx.ctx->RSSetState(rs ? rs : g_dx.rs_solid);
+        set_cached_rasterizer_state(rs ? rs : g_dx.rs_solid);
         update_object_cb_for_command(c, draw_part);
         bind_object_cb_for_shader(shadow_shader, true, false);
         if (procedural || !mesh || !mesh->ib) {
-            g_dx.ctx->IASetPrimitiveTopology(
-                procedural ? command_draw_topology(c) : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            set_cached_topology(procedural ? command_draw_topology(c) : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             g_dx.ctx->DrawInstancedIndirect(indirect_buf->buf, c.indirect_offset);
         } else {
-            g_dx.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            set_cached_topology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             g_dx.ctx->DrawIndexedInstancedIndirect(indirect_buf->buf, c.indirect_offset);
         }
 
@@ -1643,7 +1782,7 @@ static void execute_shadow_prepass_command(CmdHandle h) {
 
         const MeshMaterial* material = mesh_material_for_part(mesh, part);
         ID3D11RasterizerState* rs = rasterizer_state_for(c, material, false);
-        g_dx.ctx->RSSetState(rs ? rs : g_dx.rs_solid);
+        set_cached_rasterizer_state(rs ? rs : g_dx.rs_solid);
         update_object_cb_for_command(c, part);
         bind_object_cb_for_shader(shadow_shader, true, false);
         draw_command_geometry(c, mesh, part);
@@ -1657,13 +1796,13 @@ static void execute_shadow_prepass() {
         return;
 
     ID3D11ShaderResourceView* null_srv = nullptr;
-    g_dx.ctx->PSSetShaderResources(1, 1, &null_srv);
+    bind_srv_range(SrvBindStage::PS, 1, 1, &null_srv);
     g_dx.ctx->OMSetRenderTargets(0, nullptr, g_dx.shadow_dsv);
     g_dx.ctx->ClearDepthStencilView(g_dx.shadow_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
-    g_dx.ctx->OMSetDepthStencilState(g_dx.dss_default, 0);
+    set_cached_depth_state(g_dx.dss_default, 0);
     float bf[4] = {};
-    g_dx.ctx->OMSetBlendState(g_dx.bs_opaque, bf, 0xFFFFFFFF);
-    g_dx.ctx->PSSetShader(nullptr, nullptr, 0);
+    set_cached_blend_state(g_dx.bs_opaque, bf, 0xFFFFFFFF);
+    set_cached_ps_shader(nullptr);
 
     SceneCBData scene_cb_backup = g_dx.scene_cb_data;
     int cascade_count = (int)scene_cb_backup.shadow_params[0];
@@ -1708,7 +1847,7 @@ static void execute_shadow_prepass() {
 static void clear_compute_bindings() {
     ID3D11ShaderResourceView* null_srvs[MAX_SRV_SLOTS] = {};
     ID3D11UnorderedAccessView* null_uavs[MAX_UAV_SLOTS] = {};
-    g_dx.ctx->CSSetShaderResources(0, MAX_SRV_SLOTS, null_srvs);
+    bind_srv_range(SrvBindStage::CS, 0, MAX_SRV_SLOTS, null_srvs);
     g_dx.ctx->CSSetUnorderedAccessViews(0, MAX_UAV_SLOTS, null_uavs, nullptr);
 }
 
@@ -1818,7 +1957,7 @@ static void execute_dispatch_command(Command& c) {
     if (!shader || !shader->cs) return;
     g_dx.ctx->OMSetRenderTargets(0, nullptr, nullptr);
     clear_compute_bindings();
-    g_dx.ctx->CSSetShader(shader->cs, nullptr, 0);
+    set_cached_cs_shader(shader->cs);
     user_cb_bind_for_command(&c, c.shader, shader, false, false, true);
     bind_compute_resources(c);
 
@@ -1827,7 +1966,7 @@ static void execute_dispatch_command(Command& c) {
     g_dx.ctx->Dispatch(dispatch_x, dispatch_y, dispatch_z);
 
     clear_compute_bindings();
-    g_dx.ctx->CSSetShader(nullptr, nullptr, 0);
+    set_cached_cs_shader(nullptr);
 }
 
 static void execute_indirect_dispatch_command(Command& c) {
@@ -1838,12 +1977,12 @@ static void execute_indirect_dispatch_command(Command& c) {
     if (!is_valid_indirect_dispatch_call(c, ibuf) || !shader || !shader->cs) return;
     g_dx.ctx->OMSetRenderTargets(0, nullptr, nullptr);
     clear_compute_bindings();
-    g_dx.ctx->CSSetShader(shader->cs, nullptr, 0);
+    set_cached_cs_shader(shader->cs);
     user_cb_bind_for_command(&c, c.shader, shader, false, false, true);
     bind_compute_resources(c);
     g_dx.ctx->DispatchIndirect(ibuf->buf, c.indirect_offset);
     clear_compute_bindings();
-    g_dx.ctx->CSSetShader(nullptr, nullptr, 0);
+    set_cached_cs_shader(nullptr);
 }
 
 static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done);
@@ -1908,9 +2047,9 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
             command_state_cache_reset();
         }
 
-        g_dx.ctx->VSSetShader(shader->vs, nullptr, 0);
-        g_dx.ctx->PSSetShader(shader->ps, nullptr, 0);
-        g_dx.ctx->IASetInputLayout(procedural ? nullptr : shader->il);
+        set_cached_vs_shader(shader->vs);
+        set_cached_ps_shader(shader->ps);
+        set_cached_input_layout(procedural ? nullptr : shader->il);
         user_cb_bind_for_command(&c, c.shader, shader, true, true, false);
 
         ID3D11RenderTargetView* rtvs[MAX_DRAW_RENDER_TARGETS] = {};
@@ -1947,14 +2086,14 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
             bind_srv_slot_list(SrvBindStage::PS, c.srv_handles, c.srv_slots, c.srv_count);
             if (c.shadow_receive) {
                 ID3D11ShaderResourceView* srv = g_dx.shadow_srv;
-                g_dx.ctx->PSSetShaderResources(k_shadow_map_ps_slot, 1, &srv);
+                bind_srv_range(SrvBindStage::PS, k_shadow_map_ps_slot, 1, &srv);
             }
 
             draw_command_geometry(c, mesh, part);
         }
 
         ID3D11ShaderResourceView* null_ps_srvs[MAX_TEX_SLOTS] = {};
-        g_dx.ctx->PSSetShaderResources(0, MAX_TEX_SLOTS, null_ps_srvs);
+        bind_srv_range(SrvBindStage::PS, 0, MAX_TEX_SLOTS, null_ps_srvs);
         clear_srv_slot_list(SrvBindStage::VS, c.srv_slots, c.srv_count);
         clear_srv_slot_list(SrvBindStage::PS, c.srv_slots, c.srv_count);
         clear_draw_uavs(uav_start_slot, om_uav_count);
@@ -1983,9 +2122,9 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
             command_state_cache_reset();
         }
 
-        g_dx.ctx->VSSetShader(shader->vs, nullptr, 0);
-        g_dx.ctx->PSSetShader(shader->ps, nullptr, 0);
-        g_dx.ctx->IASetInputLayout(procedural ? nullptr : shader->il);
+        set_cached_vs_shader(shader->vs);
+        set_cached_ps_shader(shader->ps);
+        set_cached_input_layout(procedural ? nullptr : shader->il);
         user_cb_bind_for_command(&c, c.shader, shader, true, true, false);
 
         ID3D11RenderTargetView* rtvs[MAX_DRAW_RENDER_TARGETS] = {};
@@ -2015,23 +2154,23 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         bind_srv_slot_list(SrvBindStage::PS, c.srv_handles, c.srv_slots, c.srv_count);
         if (c.shadow_receive) {
             ID3D11ShaderResourceView* srv = g_dx.shadow_srv;
-            g_dx.ctx->PSSetShaderResources(k_shadow_map_ps_slot, 1, &srv);
+            bind_srv_range(SrvBindStage::PS, k_shadow_map_ps_slot, 1, &srv);
         }
 
         if (procedural || !mesh->ib) {
             if (procedural) {
-                g_dx.ctx->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
-                g_dx.ctx->IASetIndexBuffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
-                g_dx.ctx->IASetPrimitiveTopology(command_draw_topology(c));
+                set_cached_vertex_buffer(nullptr, 0, 0);
+                set_cached_index_buffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
+                set_cached_topology(command_draw_topology(c));
             }
             g_dx.ctx->DrawInstancedIndirect(ibuf->buf, c.indirect_offset);
         } else {
-            g_dx.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            set_cached_topology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             g_dx.ctx->DrawIndexedInstancedIndirect(ibuf->buf, c.indirect_offset);
         }
 
         ID3D11ShaderResourceView* null_ps_srvs[MAX_TEX_SLOTS] = {};
-        g_dx.ctx->PSSetShaderResources(0, MAX_TEX_SLOTS, null_ps_srvs);
+        bind_srv_range(SrvBindStage::PS, 0, MAX_TEX_SLOTS, null_ps_srvs);
         clear_srv_slot_list(SrvBindStage::VS, c.srv_slots, c.srv_count);
         clear_srv_slot_list(SrvBindStage::PS, c.srv_slots, c.srv_count);
         clear_draw_uavs(uav_start_slot, om_uav_count);
