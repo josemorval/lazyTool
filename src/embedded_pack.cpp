@@ -176,31 +176,17 @@ static bool read_disk_file(const char* path, void** out_data, size_t* out_size) 
     return true;
 }
 
-static bool disk_file_exists(const char* path) {
-    FILE* f = fopen(path, "rb");
-    if (!f)
-        return false;
-    fclose(f);
-    return true;
-}
-
-// Normal exports are requested from lazyTool.exe, but the player stub has a
-// smaller link surface than the editor. Prefer a sibling lazyPlayer.exe when it
-// exists and fall back to the requested executable for development builds.
+// Normal exports are requested from lazyTool.exe, but the exported base is
+// always the sibling player stub. The editor executable is not accepted as a
+// fallback because build.bat now produces the dedicated unity player directly.
 static void choose_normal_export_base_exe(const char* requested, char* out, int out_sz) {
     if (!out || out_sz <= 0)
         return;
-    strncpy(out, requested ? requested : "", out_sz - 1);
-    out[out_sz - 1] = '\0';
+    out[0] = '\0';
 
     char dir[MAX_PATH_LEN] = {};
     path_dirname(requested, dir, MAX_PATH_LEN);
-    char candidate[MAX_PATH_LEN] = {};
-    path_join(dir, "lazyPlayer.exe", candidate, MAX_PATH_LEN);
-    if (disk_file_exists(candidate)) {
-        strncpy(out, candidate, out_sz - 1);
-        out[out_sz - 1] = '\0';
-    }
+    path_join(dir, "lazyPlayer.exe", out, out_sz);
 }
 
 static LtPackFile* find_pack_file(const char* path) {
@@ -960,7 +946,7 @@ static bool lt_export_normal_exe_internal(const char* base_exe_path,
     FILE* base = fopen(actual_base_exe, "rb");
     if (!base) {
         lt_free_file(project_bytes);
-        set_err(err, err_sz, "Base executable not found.");
+        set_err(err, err_sz, "lazyPlayer.exe not found next to the editor. Run build.bat all or build.bat player before exporting.");
         return false;
     }
     unsigned long long base_file_size = 0;

@@ -1,17 +1,15 @@
 // unity_editor.cpp
 //
-// Single translation unit for the editor build. This is intentionally kept as
-// an include list instead of moving code around: normal multi-TU builds still
-// work, while `build.bat unity` can compile the editor in one cl.exe pass.
+// Unity translation unit for the editor build. build.bat intentionally compiles
+// through this file only; isolated multi-TU editor builds are no longer kept.
 //
 // Keep impl.cpp first so header-only library implementations are emitted once
 // and their implementation macros are undefined before the rest of the code is
 // included.
 
 // Dear ImGui's own .cpp files rely on the optional ImVec2/ImVec4 math
-// operators. In a normal multi-TU build imgui.cpp defines this before it
-// includes imgui_internal.h. In unity builds, editor files may include
-// imgui_internal.h first, so define it globally for the whole unity TU.
+// operators. In unity builds, editor files may include imgui_internal.h before
+// imgui.cpp, so define it globally for the whole unity TU.
 #ifndef IMGUI_DEFINE_MATH_OPERATORS
 #define IMGUI_DEFINE_MATH_OPERATORS
 #endif

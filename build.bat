@@ -1,20 +1,97 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 
-:: lazyTool build script
-::
-:: Usage (run from VS Developer Command Prompt so cl.exe is in PATH):
-::   build.bat             -> release build, normal multi-TU mode
-::   build.bat unity       -> release build, unity mode: one TU for editor + one TU for player
-::   build.bat run         -> build + run editor
-::   build.bat unity run   -> unity build + run editor
-::   build.bat copy        -> copy assets/projects/shaders to bin without compiling
+rem lazyTool unity-only build script.
+rem Run from a Visual Studio Developer Command Prompt.
+rem
+rem Usage:
+rem   build.bat                 -> dev unity build, editor + player
+rem   build.bat run             -> dev unity build, editor + player, then run editor
+rem   build.bat editor run      -> dev unity build, editor only, then run editor
+rem   build.bat player          -> dev unity build, player only
+rem   build.bat release         -> optimized unity build, editor + player
+rem   build.bat clean           -> remove bin
+rem   build.bat copy            -> copy projects/shaders/assets only
 
 set OUTDIR=bin
 set SRCDIR=src
 set EXTDIR=external
+set TARGET=all
+set CONFIG=dev
+set RUN_AFTER=0
+set COPY_ONLY=0
+set CLEAN_ONLY=0
 
-if not exist %OUTDIR% mkdir %OUTDIR%
+:parse_args
+if "%~1"=="" goto args_done
+if /I "%~1"=="all" (
+    set TARGET=all
+    shift
+    goto parse_args
+)
+if /I "%~1"=="editor" (
+    set TARGET=editor
+    shift
+    goto parse_args
+)
+if /I "%~1"=="player" (
+    set TARGET=player
+    shift
+    goto parse_args
+)
+if /I "%~1"=="dev" (
+    set CONFIG=dev
+    shift
+    goto parse_args
+)
+if /I "%~1"=="release" (
+    set CONFIG=release
+    shift
+    goto parse_args
+)
+if /I "%~1"=="run" (
+    set RUN_AFTER=1
+    shift
+    goto parse_args
+)
+if /I "%~1"=="copy" (
+    set COPY_ONLY=1
+    shift
+    goto parse_args
+)
+if /I "%~1"=="clean" (
+    set CLEAN_ONLY=1
+    shift
+    goto parse_args
+)
+
+echo [ERROR] Unknown argument: %~1
+echo Usage: build.bat [all^|editor^|player] [dev^|release] [run^|copy^|clean]
+exit /b 1
+
+:args_done
+if "%CLEAN_ONLY%"=="1" (
+    call :clean_bin
+    exit /b %ERRORLEVEL%
+)
+
+if not exist "%OUTDIR%" mkdir "%OUTDIR%"
+if not exist "%OUTDIR%" (
+    echo [ERROR] Could not create %OUTDIR%.
+    exit /b 1
+)
+
+if "%COPY_ONLY%"=="1" (
+    call :copy_folders
+    if errorlevel 1 goto failed
+    echo [OK] copied folders to %OUTDIR%
+    exit /b 0
+)
+
+if "%RUN_AFTER%"=="1" if /I "%TARGET%"=="player" (
+    echo [ERROR] run requires an editor build. Use build.bat editor run or build.bat all run.
+    exit /b 1
+)
 
 set INCLUDES=^
  /I%SRCDIR% ^
@@ -27,127 +104,26 @@ set INCLUDES=^
 set DEFINES=^
  /DWIN32 /D_WINDOWS ^
  /DUNICODE /D_UNICODE ^
- /D_CRT_SECURE_NO_WARNINGS
+ /D_CRT_SECURE_NO_WARNINGS ^
+ /DLAZYTOOL_UNITY_BUILD
 
-set RUN_AFTER=0
-set COPY_ONLY=0
-set UNITY_BUILD=0
-set BUILD_MODE=multi-tu
-set UNITY_DEFINES=
+set COMMON_CFLAGS=/nologo /std:c++17 /EHsc /W3 /MT /DNDEBUG
+set DEV_CFLAGS=/Od /Ob0
+set RELEASE_CFLAGS=/O2 /Ob2 /Gy /Gw /GF
+set COMMON_LINK=/SUBSYSTEM:WINDOWS
+set DEV_LINK=/INCREMENTAL:NO
+set RELEASE_LINK=/OPT:REF /OPT:ICF /INCREMENTAL:NO
 
-:parse_args
-if /I "%1"=="run" (
-    set RUN_AFTER=1
-    shift
-    goto parse_args
-)
-if /I "%1"=="copy" (
-    set COPY_ONLY=1
-    shift
-    goto parse_args
-)
-if /I "%1"=="unity" (
-    set UNITY_BUILD=1
-    set BUILD_MODE=unity
-    set UNITY_DEFINES=/DLAZYTOOL_UNITY_BUILD
-    shift
-    goto parse_args
-)
-if /I "%1"=="multi" (
-    set UNITY_BUILD=0
-    set BUILD_MODE=multi-tu
-    set UNITY_DEFINES=
-    shift
-    goto parse_args
-)
-if not "%1"=="" (
-    echo [WARN] Unknown argument: %1
-    shift
-    goto parse_args
+if /I "%CONFIG%"=="release" (
+    set EDITOR_CFLAGS=%COMMON_CFLAGS% %RELEASE_CFLAGS%
+    set PLAYER_CFLAGS=%COMMON_CFLAGS% %RELEASE_CFLAGS% /DLAZYTOOL_PLAYER_ONLY /DLAZYTOOL_NO_LOG
+    set LINK_FLAGS=%COMMON_LINK% %RELEASE_LINK%
+) else (
+    set EDITOR_CFLAGS=%COMMON_CFLAGS% %DEV_CFLAGS%
+    set PLAYER_CFLAGS=%COMMON_CFLAGS% %DEV_CFLAGS% /DLAZYTOOL_PLAYER_ONLY /DLAZYTOOL_NO_LOG
+    set LINK_FLAGS=%COMMON_LINK% %DEV_LINK%
 )
 
-if "%COPY_ONLY%"=="1" (
-    call :copy_folders
-    if errorlevel 1 (
-        echo.
-        echo [FAILED]
-        exit /b 1
-    )
-    echo.
-    echo [OK] copied folders to %OUTDIR%
-    if "%RUN_AFTER%"=="1" if exist %OUTDIR%\lazyTool.exe (
-        echo [RUN] %OUTDIR%\lazyTool.exe
-        start "" %OUTDIR%\lazyTool.exe
-    )
-    exit /b 0
-)
-
-call :reset_outdir
-if errorlevel 1 (
-    echo.
-    echo [FAILED]
-    exit /b 1
-)
-
-:: Two executables are built from the same repo:
-::   lazyTool.exe         editor + exporter
-::   lazyPlayer.exe       normal packed player for asset-heavy projects
-::
-:: `unity` mode compiles src/unity_editor.cpp and src/unity_player.cpp. This is
-:: usually faster for full release builds because Windows/D3D/imgui headers are
-:: parsed once per executable instead of once per .cpp. Use `multi` or omit
-:: `unity` when you want normal isolated translation units.
-set CFLAGS=/W3 /O2 /MT /EHsc /nologo /std:c++17 /DNDEBUG /Gy /Gw /GF
-set PLAYER_CFLAGS=/W3 /O1 /MT /EHsc /nologo /std:c++17 /DNDEBUG /DLAZYTOOL_PLAYER_ONLY /DLAZYTOOL_NO_LOG /Gy /Gw /GF
-
-echo [BUILD] release %BUILD_MODE%
-
-if "%UNITY_BUILD%"=="1" goto set_unity_sources
-goto set_multi_sources
-
-:set_unity_sources
-set EDITOR_SRCS=%SRCDIR%\unity_editor.cpp
-set PLAYER_SRCS=%SRCDIR%\unity_player.cpp
-goto after_sources
-
-:set_multi_sources
-set EDITOR_SRCS=^
- %SRCDIR%\main.cpp ^
- %SRCDIR%\log.cpp ^
- %SRCDIR%\dx11_ctx.cpp ^
- %SRCDIR%\shader.cpp ^
- %SRCDIR%\resources.cpp ^
- %SRCDIR%\commands.cpp ^
- %SRCDIR%\project.cpp ^
- %SRCDIR%\app_settings.cpp ^
- %SRCDIR%\embedded_pack.cpp ^
- %SRCDIR%\timeline.cpp ^
- %SRCDIR%\user_cb.cpp ^
- %SRCDIR%\ui.cpp ^
- %SRCDIR%\impl.cpp ^
- %EXTDIR%\imgui\imgui.cpp ^
- %EXTDIR%\imgui\imgui_draw.cpp ^
- %EXTDIR%\imgui\imgui_tables.cpp ^
- %EXTDIR%\imgui\imgui_widgets.cpp ^
- %EXTDIR%\imgui\backends\imgui_impl_win32.cpp ^
- %EXTDIR%\imgui\backends\imgui_impl_dx11.cpp
-
-set PLAYER_SRCS=^
- %SRCDIR%\main.cpp ^
- %SRCDIR%\log.cpp ^
- %SRCDIR%\dx11_ctx.cpp ^
- %SRCDIR%\shader.cpp ^
- %SRCDIR%\resources.cpp ^
- %SRCDIR%\commands.cpp ^
- %SRCDIR%\project.cpp ^
- %SRCDIR%\embedded_pack.cpp ^
- %SRCDIR%\timeline.cpp ^
- %SRCDIR%\user_cb.cpp ^
- %SRCDIR%\impl.cpp
-
-goto after_sources
-
-:after_sources
 set LIBS=^
  d3d11.lib ^
  dxgi.lib ^
@@ -159,83 +135,71 @@ set LIBS=^
 
 set RES=%OUTDIR%\lazyTool.res
 rc /nologo /fo%RES% app.rc
-if errorlevel 1 (
-    echo.
-    echo [FAILED]
-    exit /b 1
-)
+if errorlevel 1 goto failed
 
-cl %CFLAGS% %UNITY_DEFINES% %DEFINES% %INCLUDES% %EDITOR_SRCS% %RES% ^
+echo [BUILD] %CONFIG% unity %TARGET%
+
+if /I "%TARGET%"=="player" goto build_player
+
+:build_editor
+if not exist "%OUTDIR%\obj_editor" mkdir "%OUTDIR%\obj_editor"
+cl %EDITOR_CFLAGS% %DEFINES% %INCLUDES% %SRCDIR%\unity_editor.cpp %RES% ^
    /Fe:%OUTDIR%\lazyTool.exe ^
-   /Fo:%OUTDIR%\ ^
-   /Fd:%OUTDIR%\lazyTool.pdb ^
-   /link %LIBS% /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /INCREMENTAL:NO
+   /Fo:%OUTDIR%\obj_editor\ ^
+   /link %LIBS% %LINK_FLAGS%
+if errorlevel 1 goto failed
 
-if errorlevel 1 (
-    echo.
-    echo [FAILED]
-    exit /b 1
-)
-
-echo.
 echo [OK] %OUTDIR%\lazyTool.exe
+if /I "%TARGET%"=="editor" goto after_builds
 
-if not exist %OUTDIR%\player mkdir %OUTDIR%\player
-cl %PLAYER_CFLAGS% %UNITY_DEFINES% %DEFINES% %INCLUDES% %PLAYER_SRCS% %RES% ^
+:build_player
+if not exist "%OUTDIR%\obj_player" mkdir "%OUTDIR%\obj_player"
+cl %PLAYER_CFLAGS% %DEFINES% %INCLUDES% %SRCDIR%\unity_player.cpp %RES% ^
    /Fe:%OUTDIR%\lazyPlayer.exe ^
-   /Fo:%OUTDIR%\player\ ^
-   /Fd:%OUTDIR%\lazyPlayer.pdb ^
-   /link %LIBS% /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /INCREMENTAL:NO /MANIFEST:NO
-
-if errorlevel 1 (
-    echo.
-    echo [FAILED]
-    exit /b 1
-)
+   /Fo:%OUTDIR%\obj_player\ ^
+   /link %LIBS% %LINK_FLAGS% /MANIFEST:NO
+if errorlevel 1 goto failed
 
 echo [OK] %OUTDIR%\lazyPlayer.exe
 
+:after_builds
 call :copy_folders
-if errorlevel 1 (
-    echo.
-    echo [FAILED]
-    exit /b 1
-)
+if errorlevel 1 goto failed
 
 if "%RUN_AFTER%"=="1" (
-    echo [RUN] %OUTDIR%\lazyTool.exe
-    start "" %OUTDIR%\lazyTool.exe
+    if exist "%OUTDIR%\lazyTool.exe" (
+        echo [RUN] %OUTDIR%\lazyTool.exe
+        start "" "%OUTDIR%\lazyTool.exe"
+    ) else (
+        echo [ERROR] Cannot run editor because %OUTDIR%\lazyTool.exe was not built.
+        exit /b 1
+    )
 )
 
 endlocal
 exit /b 0
 
-:reset_outdir
-if exist %OUTDIR% (
-    rmdir /S /Q %OUTDIR%
-    if exist %OUTDIR% (
+:failed
+echo.
+echo [FAILED]
+exit /b 1
+
+:clean_bin
+if exist "%OUTDIR%" (
+    rmdir /S /Q "%OUTDIR%"
+    if exist "%OUTDIR%" (
         echo [ERROR] Could not clean %OUTDIR%. Check for locked files.
         exit /b 1
     )
 )
-mkdir %OUTDIR%
-if not exist %OUTDIR% (
-    echo [ERROR] Could not create %OUTDIR%.
-    exit /b 1
-)
+echo [OK] cleaned %OUTDIR%
 exit /b 0
 
 :copy_folders
-if exist assets\NUL (
-    xcopy assets %OUTDIR%\assets /E /I /Y >nul
-    if errorlevel 4 exit /b %ERRORLEVEL%
-)
-if exist projects\NUL (
-    xcopy projects %OUTDIR%\projects /E /I /Y >nul
-    if errorlevel 4 exit /b %ERRORLEVEL%
-)
-if exist shaders\NUL (
-    xcopy shaders %OUTDIR%\shaders /E /I /Y >nul
-    if errorlevel 4 exit /b %ERRORLEVEL%
-)
+if exist assets\NUL xcopy assets "%OUTDIR%\assets" /D /E /I /Y >nul
+if errorlevel 4 exit /b %ERRORLEVEL%
+if exist projects\NUL xcopy projects "%OUTDIR%\projects" /D /E /I /Y >nul
+if errorlevel 4 exit /b %ERRORLEVEL%
+if exist shaders\NUL xcopy shaders "%OUTDIR%\shaders" /D /E /I /Y >nul
+if errorlevel 4 exit /b %ERRORLEVEL%
 exit /b 0

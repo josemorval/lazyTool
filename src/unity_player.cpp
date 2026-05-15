@@ -1,6 +1,6 @@
 // unity_player.cpp
 //
-// Single translation unit for the standalone player build. Build with
+// Unity translation unit for the standalone player build. Build with
 // LAZYTOOL_PLAYER_ONLY so editor UI/app settings/imgui are not compiled into
 // lazyPlayer.exe.
 

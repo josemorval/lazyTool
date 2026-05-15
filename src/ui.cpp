@@ -7500,7 +7500,7 @@ static void ui_panel_general(bool embedded = false) {
         if (ImGui::Button("Reset##export_settings")) {
             g_export_settings = project_default_export_settings();
         }
-        ImGui::TextDisabled("Normal EXE copies lazyPlayer.exe when present; 64k turns these into compile-time defaults.");
+        ImGui::TextDisabled("Normal EXE uses the sibling lazyPlayer.exe; 64k turns these into compile-time defaults.");
     }
 
     if (ImGui::CollapsingHeader("Viewport", ImGuiTreeNodeFlags_DefaultOpen)) {
