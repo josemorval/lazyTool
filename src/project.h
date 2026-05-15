@@ -11,5 +11,9 @@ void project_apply_default_dirlight(Resource* dirlight);
 void project_reset_camera_defaults();
 void project_reset_dirlight_defaults();
 void project_reset_view_defaults();
+void project_reset_export_settings();
+const ExportSettings& project_default_export_settings();
 const char* project_current_path();
 const char* project_current_name();
+
+extern ExportSettings g_export_settings;

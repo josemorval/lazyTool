@@ -399,6 +399,19 @@ struct CameraControls {
     float mouse_sensitivity;
 };
 
+// Project-owned options used by standalone/exported players. These are kept
+// separate from editor preferences so an exported EXE can be deterministic and
+// cheap regardless of the machine's lazytool_general.ini.
+struct ExportSettings {
+    bool runtime_input_enabled;
+    bool escape_closes_player;
+    bool force_wireframe;
+    bool show_grid_overlay;
+    bool vsync;
+    bool profiler;
+    bool shader_binding_warnings;
+};
+
 // ── math ──────────────────────────────────────────────────────────────────
 inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 

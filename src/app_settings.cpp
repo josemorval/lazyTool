@@ -12,8 +12,8 @@
 
 static const char* s_settings_path = "lazytool_general.ini";
 
-// Editor-wide defaults live outside project files so opening an old project
-// cannot unexpectedly re-enable expensive runtime features like profiling.
+// Editor-wide defaults live outside project files so project-level export
+// settings cannot unexpectedly re-enable expensive runtime features like profiling.
 static void app_settings_apply_defaults() {
     g_dx.vsync = false;
     g_dx.d3d11_validation = false;

@@ -525,6 +525,15 @@ struct TimelineTrackDef {
     std::vector<TimelineKeyDef> keys;
 };
 
+struct TimelineClipDef {
+    std::string name = "Timeline_1";
+    int fps = 24;
+    int length = 240;
+    bool enabled = true;
+    bool interpolate = false;
+    std::vector<TimelineTrackDef> tracks;
+};
+
 // The in-memory project is intentionally small. It is an intermediate format
 // between the verbose editor .lt file and the emitted C arrays.
 struct Project {
@@ -533,12 +542,13 @@ struct Project {
     std::vector<ResourceDef> resources;
     std::vector<UserVarDef> user_vars;
     std::vector<CommandDef> commands;
-    int timeline_fps = 24;
-    int timeline_length = 240;
     bool timeline_loop = false;
     bool timeline_enabled = false;
-    bool timeline_interpolate = false;
-    std::vector<TimelineTrackDef> tracks;
+    bool export_runtime_input = true;
+    bool export_escape_close = true;
+    bool export_wireframe = false;
+    bool export_vsync = false;
+    std::vector<TimelineClipDef> timelines;
 };
 
 static int find_res(const Project& p, const std::string& name) {
@@ -572,37 +582,6 @@ static Q4 qnorm(Q4 q) {
     return {q.x * inv, q.y * inv, q.z * inv, q.w * inv};
 }
 
-static Q4 quat_from_euler_xyz(float x, float y, float z) {
-    float cx = std::cos(x), sx = std::sin(x);
-    float cy = std::cos(y), sy = std::sin(y);
-    float cz = std::cos(z), sz = std::sin(z);
-    float m00 = cy * cz;
-    float m01 = cy * sz;
-    float m02 = -sy;
-    float m10 = sx * sy * cz - cx * sz;
-    float m11 = sx * sy * sz + cx * cz;
-    float m12 = sx * cy;
-    float m20 = cx * sy * cz + sx * sz;
-    float m21 = cx * sy * sz - sx * cz;
-    float m22 = cx * cy;
-    Q4 q = {0,0,0,1};
-    float tr = m00 + m11 + m22;
-    if (tr > 0.0f) {
-        float s = std::sqrt(tr + 1.0f) * 2.0f;
-        q.w = 0.25f * s; q.x = (m12 - m21) / s; q.y = (m20 - m02) / s; q.z = (m01 - m10) / s;
-    } else if (m00 > m11 && m00 > m22) {
-        float s = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f;
-        q.w = (m12 - m21) / s; q.x = 0.25f * s; q.y = (m01 + m10) / s; q.z = (m20 + m02) / s;
-    } else if (m11 > m22) {
-        float s = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f;
-        q.w = (m20 - m02) / s; q.x = (m01 + m10) / s; q.y = 0.25f * s; q.z = (m12 + m21) / s;
-    } else {
-        float s = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f;
-        q.w = (m01 - m10) / s; q.x = (m20 + m02) / s; q.y = (m12 + m21) / s; q.z = 0.25f * s;
-    }
-    return qnorm(q);
-}
-
 static void store_q(float out[4], Q4 q) {
     q = qnorm(q);
     out[0] = q.x; out[1] = q.y; out[2] = q.z; out[3] = q.w;
@@ -610,15 +589,16 @@ static void store_q(float out[4], Q4 q) {
 
 // Parse the text .lt file.
 //
-// This parser is intentionally forgiving: it accepts the editor format, ignores
-// fields the procedural player does not need yet, and preserves enough data so
-// future renderer paths can be added without changing the .lt syntax again.
+// This parser accepts the current editor .lt format only.
 static Project parse_lt(const std::string& lt_path) {
     std::string text = read_text_file(lt_path);
     if (text.empty()) die("cannot read lt: %s", lt_path.c_str());
     Project p;
     CommandDef* cur = nullptr;
+    TimelineClipDef* cur_timeline = nullptr;
     TimelineTrackDef* cur_track = nullptr;
+    bool saw_export_settings = false;
+    bool saw_timeline_global = false;
     std::istringstream in(text);
     std::string line;
     while (std::getline(in, line)) {
@@ -627,7 +607,13 @@ static Project parse_lt(const std::string& lt_path) {
         std::vector<std::string> t = split_ws(raw);
         if (t.empty()) continue;
         const std::string& tag = t[0];
-        if (tag == "camera_fps") {
+        if (tag == "export_settings") {
+            saw_export_settings = true;
+            p.export_runtime_input = toki(t,1,1) != 0;
+            p.export_escape_close = toki(t,2,1) != 0;
+            p.export_wireframe = toki(t,3,0) != 0;
+            p.export_vsync = toki(t,5,0) != 0;
+        } else if (tag == "camera_fps") {
             for (int i = 0; i < 8; i++) p.camera[i] = tokf(t, (size_t)i + 1, p.camera[i]);
         } else if (tag == "dirlight") {
             for (int i = 0; i < 39; i++) p.dirlight[i] = tokf(t, (size_t)i + 1, p.dirlight[i]);
@@ -719,10 +705,6 @@ static Project parse_lt(const std::string& lt_path) {
                 cur->cull_back = toki(t,5,1) != 0;
                 cur->shadow_cast = toki(t,6,0) != 0;
                 cur->shadow_receive = toki(t,7,0) != 0;
-            } else if (tag == "transform" && t.size() >= 10) {
-                for (int i = 0; i < 3; i++) cur->pos[i] = tokf(t, (size_t)1 + i);
-                store_q(cur->rotq, quat_from_euler_xyz(tokf(t, 4), tokf(t, 5), tokf(t, 6)));
-                for (int i = 0; i < 3; i++) cur->scale[i] = tokf(t, (size_t)7 + i, 1.0f);
             } else if (tag == "transformq" && t.size() >= 11) {
                 for (int i = 0; i < 3; i++) cur->pos[i] = tokf(t, (size_t)1 + i);
                 Q4 q = {tokf(t,4), tokf(t,5), tokf(t,6), tokf(t,7,1.0f)};
@@ -785,20 +767,37 @@ static Project parse_lt(const std::string& lt_path) {
                     break;
                 }
             }
-        } else if (tag == "timeline_settings") {
-            p.timeline_fps = toki(t,1,24);
-            p.timeline_length = toki(t,2,240);
-            p.timeline_loop = toki(t,5,0) != 0;
-            p.timeline_enabled = toki(t,6,0) != 0;
-            p.timeline_interpolate = toki(t,7,0) != 0;
+        } else if (tag == "timeline_global") {
+            saw_timeline_global = true;
+            p.timeline_loop = toki(t,2,0) != 0;
+            p.timeline_enabled = toki(t,3,0) != 0;
+        } else if (tag == "timeline_clip") {
+            TimelineClipDef tl;
+            tl.name = t.size() > 1 ? t[1] : std::string("Timeline");
+            tl.fps = toki(t,2,24);
+            tl.length = toki(t,3,240);
+            tl.enabled = toki(t,5,1) != 0;
+            tl.interpolate = toki(t,6,0) != 0;
+            if (tl.fps < 1) tl.fps = 1;
+            if (tl.length < 1) tl.length = 1;
+            p.timelines.push_back(tl);
+            cur_timeline = &p.timelines.back();
+            cur_track = nullptr;
+        } else if (tag == "end_timeline_clip") {
+            cur_timeline = nullptr;
+            cur_track = nullptr;
         } else if (tag == "timeline_track" && t.size() >= 6) {
             TimelineTrackDef tr;
             tr.kind = parse_track_kind(t[1]);
             tr.target = t[2];
             tr.type = parse_val_type(t[3]);
             tr.enabled = toki(t,5,1) != 0;
-            p.tracks.push_back(tr);
-            cur_track = &p.tracks.back();
+            if (cur_timeline) {
+                cur_timeline->tracks.push_back(tr);
+                cur_track = &cur_timeline->tracks.back();
+            } else {
+                cur_track = nullptr;
+            }
         } else if (tag == "timeline_key" && cur_track && t.size() >= 2) {
             TimelineKeyDef k;
             k.frame = toki(t,1,0);
@@ -806,29 +805,29 @@ static Project parse_lt(const std::string& lt_path) {
             if (val_integral(cur_track->type) || cur_track->kind == TK_COMMAND_ENABLED) {
                 for (int i = 0; i < n && i < 4; i++) k.ival[i] = toki(t, (size_t)2 + i, 0);
             } else {
-                int value_count = (int)t.size() - 2;
-                if (cur_track->kind == TK_COMMAND_TRANSFORM && value_count == 9) {
-                    for (int i = 0; i < 3; i++) k.fval[i] = tokf(t, (size_t)2 + i, 0.0f);
-                    Q4 q = quat_from_euler_xyz(tokf(t,5), tokf(t,6), tokf(t,7));
+                for (int i = 0; i < n && i < 16; i++) k.fval[i] = tokf(t, (size_t)2 + i, 0.0f);
+                if (cur_track->kind == TK_COMMAND_TRANSFORM) {
+                    Q4 q = {k.fval[3], k.fval[4], k.fval[5], k.fval[6]};
+                    q = qnorm(q);
                     k.fval[3] = q.x; k.fval[4] = q.y; k.fval[5] = q.z; k.fval[6] = q.w;
-                    for (int i = 0; i < 3; i++) k.fval[7 + i] = tokf(t, (size_t)8 + i, 1.0f);
-                } else {
-                    for (int i = 0; i < n && i < 16; i++) k.fval[i] = tokf(t, (size_t)2 + i, 0.0f);
-                    if (cur_track->kind == TK_COMMAND_TRANSFORM) {
-                        Q4 q = {k.fval[3], k.fval[4], k.fval[5], k.fval[6]};
-                        q = qnorm(q);
-                        k.fval[3] = q.x; k.fval[4] = q.y; k.fval[5] = q.z; k.fval[6] = q.w;
-                    }
                 }
             }
             cur_track->keys.push_back(k);
         } else if (tag == "end_timeline") {
+            cur_timeline = nullptr;
             cur_track = nullptr;
         }
     }
 
-    for (size_t i = 0; i < p.tracks.size(); i++) {
-        std::sort(p.tracks[i].keys.begin(), p.tracks[i].keys.end(), [](const TimelineKeyDef& a, const TimelineKeyDef& b){ return a.frame < b.frame; });
+    if (!saw_export_settings)
+        die("lt is missing export_settings; save it with the current editor first");
+    if (!saw_timeline_global || p.timelines.empty())
+        die("lt is missing current timeline_global/timeline_clip data; save it with the current editor first");
+
+    for (size_t ti = 0; ti < p.timelines.size(); ti++) {
+        for (size_t i = 0; i < p.timelines[ti].tracks.size(); i++) {
+            std::sort(p.timelines[ti].tracks[i].keys.begin(), p.timelines[ti].tracks[i].keys.end(), [](const TimelineKeyDef& a, const TimelineKeyDef& b){ return a.frame < b.frame; });
+        }
     }
     return p;
 }
@@ -875,23 +874,20 @@ static int texture_source_code(const Project& p, const std::string& name, const 
 }
 
 static bool user_var_has_timeline_track(const Project& p, const std::string& user_name, ValType type) {
-    for (size_t i = 0; i < p.tracks.size(); i++) {
-        const TimelineTrackDef& tr = p.tracks[i];
-        if (tr.kind == TK_USER_VAR && tr.enabled && tr.target == user_name && tr.type == type && !tr.keys.empty())
-            return true;
+    for (size_t ti = 0; ti < p.timelines.size(); ti++) {
+        const TimelineClipDef& tl = p.timelines[ti];
+        if (!tl.enabled) continue;
+        for (size_t i = 0; i < tl.tracks.size(); i++) {
+            const TimelineTrackDef& tr = tl.tracks[i];
+            if (tr.kind == TK_USER_VAR && tr.enabled && tr.target == user_name && tr.type == type && !tr.keys.empty())
+                return true;
+        }
     }
     return false;
 }
 
 static int clear_source_user_var_index(const Project& p, const std::string& source, ValType type) {
     if (source.empty() || source == "-") return -1;
-
-    // Legacy compatibility: older editor builds could store a UserCB variable
-    // name directly in clear_sources.  In that case the generated player can read
-    // the timeline-updated uv[] slot directly.
-    int named_user = find_user_var(p, source);
-    if (named_user >= 0 && p.user_vars[(size_t)named_user].type == type)
-        return named_user;
 
     // Current editor format stores value resources in clear_sources.  A timeline
     // animates those resources through a UserCB variable linked to that resource,
@@ -1414,45 +1410,58 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     // int[4] and float[16] even when a track is a single float. Instead, each track
     // records how many components it owns and points into one of two typed streams.
     // This preserves all useful timeline features while avoiding the worst bloat.
-    struct FlatTrack { int kind, target, type, integral, frame_start, data_start, count, comp, enabled; };
+    struct FlatTimeline { int fps, length, enabled, interpolate; };
+    struct FlatTrack { int timeline, kind, target, type, integral, frame_start, data_start, count, comp, enabled; };
+    std::vector<FlatTimeline> flat_timelines;
     std::vector<FlatTrack> flat_tracks;
     std::vector<int> flat_key_frames;
     std::vector<int> flat_key_ints;
     std::vector<float> flat_key_floats;
-    for (size_t i = 0; i < p.tracks.size(); i++) {
-        const TimelineTrackDef& tr = p.tracks[i];
-        if (!tr.enabled || tr.keys.empty()) continue;
-        FlatTrack ft = {};
-        ft.kind = (int)tr.kind;
-        ft.type = (int)tr.type;
-        ft.integral = (val_integral(tr.type) || tr.kind == TK_COMMAND_ENABLED) ? 1 : 0;
-        ft.frame_start = (int)flat_key_frames.size();
-        ft.count = (int)tr.keys.size();
-        ft.enabled = tr.enabled ? 1 : 0;
-        ft.comp = timeline_value_count(tr.kind, tr.type);
-        if (ft.comp <= 0) continue;
-        ft.target = -1;
-        if (tr.kind == TK_COMMAND_TRANSFORM || tr.kind == TK_COMMAND_ENABLED) {
-            std::map<std::string,int>::iterator it = cmd_out_index.find(tr.target);
-            if (it == cmd_out_index.end()) continue;
-            ft.target = it->second;
-        } else if (tr.kind == TK_USER_VAR) {
-            ft.target = find_user_var(p, tr.target);
-            if (ft.target < 0) continue;
-        }
-        ft.data_start = ft.integral ? (int)flat_key_ints.size() : (int)flat_key_floats.size();
-        for (size_t k = 0; k < tr.keys.size(); k++) {
-            const TimelineKeyDef& tk = tr.keys[k];
-            flat_key_frames.push_back(tk.frame);
-            if (ft.integral) {
-                for (int c = 0; c < ft.comp; c++) flat_key_ints.push_back(c < 4 ? tk.ival[c] : 0);
-            } else {
-                for (int c = 0; c < ft.comp; c++) flat_key_floats.push_back(c < 16 ? tk.fval[c] : 0.0f);
-            }
-        }
-        flat_tracks.push_back(ft);
-    }
+    for (size_t ti = 0; ti < p.timelines.size(); ti++) {
+        const TimelineClipDef& tl = p.timelines[ti];
+        FlatTimeline ftl = {};
+        ftl.fps = tl.fps < 1 ? 1 : tl.fps;
+        ftl.length = tl.length < 1 ? 1 : tl.length;
+        ftl.enabled = tl.enabled ? 1 : 0;
+        ftl.interpolate = tl.interpolate ? 1 : 0;
+        flat_timelines.push_back(ftl);
 
+        if (!tl.enabled) continue;
+        for (size_t i = 0; i < tl.tracks.size(); i++) {
+            const TimelineTrackDef& tr = tl.tracks[i];
+            if (!tr.enabled || tr.keys.empty()) continue;
+            FlatTrack ft = {};
+            ft.timeline = (int)ti;
+            ft.kind = (int)tr.kind;
+            ft.type = (int)tr.type;
+            ft.integral = (val_integral(tr.type) || tr.kind == TK_COMMAND_ENABLED) ? 1 : 0;
+            ft.frame_start = (int)flat_key_frames.size();
+            ft.count = (int)tr.keys.size();
+            ft.enabled = tr.enabled ? 1 : 0;
+            ft.comp = timeline_value_count(tr.kind, tr.type);
+            if (ft.comp <= 0) continue;
+            ft.target = -1;
+            if (tr.kind == TK_COMMAND_TRANSFORM || tr.kind == TK_COMMAND_ENABLED) {
+                std::map<std::string,int>::iterator it = cmd_out_index.find(tr.target);
+                if (it == cmd_out_index.end()) continue;
+                ft.target = it->second;
+            } else if (tr.kind == TK_USER_VAR) {
+                ft.target = find_user_var(p, tr.target);
+                if (ft.target < 0) continue;
+            }
+            ft.data_start = ft.integral ? (int)flat_key_ints.size() : (int)flat_key_floats.size();
+            for (size_t k = 0; k < tr.keys.size(); k++) {
+                const TimelineKeyDef& tk = tr.keys[k];
+                flat_key_frames.push_back(tk.frame);
+                if (ft.integral) {
+                    for (int c = 0; c < ft.comp; c++) flat_key_ints.push_back(c < 4 ? tk.ival[c] : 0);
+                } else {
+                    for (int c = 0; c < ft.comp; c++) flat_key_floats.push_back(c < 16 ? tk.fval[c] : 0.0f);
+                }
+            }
+            flat_tracks.push_back(ft);
+        }
+    }
     // Command parameters are stored sequentially and referenced by each command.
     // The shader reads them through UserCB slots 0..N, matching the editor model.
     struct FlatParam { int type, enabled, source_kind, source_cmd; int iv[4]; float fv[4]; };
@@ -1534,10 +1543,13 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     fprintf(f, "// authored in the .lt file when scene_scale_divisor == 0.\n");
     fprintf(f, "//\n");
     fprintf(f, "// Useful overrides through LT64K_CFLAGS:\n");
-    fprintf(f, "//   /DLT_VSYNC=1                        Present with VSync for smoother pacing.\n");
+    fprintf(f, "//   /DLT_VSYNC=1                        Override project VSync default.\n");
+    fprintf(f, "//   /DLT_INPUT=0                        Remove runtime key toggles.\n");
+    fprintf(f, "//   /DLT_ESC_CLOSE=0                    Do not close on Escape.\n");
+    fprintf(f, "//   /DLT_WIREFRAME=1                    Force wireframe rasterizer state.\n");
     fprintf(f, "//   /DLT_DEBUG_FPS=1                    Compile the tiny GDI FPS overlay.\n");
     fprintf(f, "// -----------------------------------------------------------------------------\n");
-    fprintf(f, "#define LT_PROJECT_W %d\n#define LT_PROJECT_H %d\n#define LT_SHADOW_W %d\n#define LT_SHADOW_H %d\n#ifndef LT_VSYNC\n#define LT_VSYNC 0\n#endif\n#ifndef LT_DEBUG_FPS\n#define LT_DEBUG_FPS 0\n#endif\n", project_w, project_h, shadow_tex_w, shadow_tex_h);
+    fprintf(f, "#define LT_PROJECT_W %d\n#define LT_PROJECT_H %d\n#define LT_SHADOW_W %d\n#define LT_SHADOW_H %d\n#ifndef LT_VSYNC\n#define LT_VSYNC %d\n#endif\n#ifndef LT_INPUT\n#define LT_INPUT %d\n#endif\n#ifndef LT_ESC_CLOSE\n#define LT_ESC_CLOSE %d\n#endif\n#ifndef LT_WIREFRAME\n#define LT_WIREFRAME %d\n#endif\n#ifndef LT_DEBUG_FPS\n#define LT_DEBUG_FPS 0\n#endif\n", project_w, project_h, shadow_tex_w, shadow_tex_h, p.export_vsync ? 1 : 0, p.export_runtime_input ? 1 : 0, p.export_escape_close ? 1 : 0, p.export_wireframe ? 1 : 0);
     fprintf(f, "// Minimal CRT replacements and tiny math types. /NODEFAULTLIB builds need these.\n");
     fprintf(f, "int _fltused=0; typedef unsigned int u32; typedef struct { float m[16]; } M4;\n");
     fprintf(f, "void* __cdecl memset(void* d,int c,size_t n){ unsigned char* p=(unsigned char*)d; while(n--)*p++=(unsigned char)c; return d; }\n");
@@ -1634,7 +1646,14 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
 
     fprintf(f, "// Timeline data. Frames are separate from values, and values are split into\n");
     fprintf(f, "// int and float streams so a float track does not carry unused int/quaternion data.\n");
-    fprintf(f, "typedef struct { int kind,target,type,integral,fs,ds,count,comp,enabled; } Tr;\n");
+    fprintf(f, "typedef struct { int fps,len,enabled,lerp; } Tl; typedef struct { int tl,kind,target,type,integral,fs,ds,count,comp,enabled; } Tr;\n");
+    fprintf(f, "static Tl tls[%u]={\n", (unsigned)(flat_timelines.empty() ? 1 : flat_timelines.size()));
+    if (flat_timelines.empty()) fprintf(f, " {24,240,1,0},\n");
+    for (size_t i = 0; i < flat_timelines.size(); i++) {
+        const FlatTimeline& tl = flat_timelines[i];
+        fprintf(f, " {%d,%d,%d,%d},\n", tl.fps, tl.length, tl.enabled, tl.interpolate);
+    }
+    fprintf(f, "};\n");
     fprintf(f, "static int kfr[%u]={", (unsigned)(flat_key_frames.empty() ? 1 : flat_key_frames.size()));
     if (flat_key_frames.empty()) fprintf(f, "0");
     for (size_t i = 0; i < flat_key_frames.size(); i++) { if (i) fprintf(f, ","); fprintf(f, "%d", flat_key_frames[i]); }
@@ -1645,15 +1664,15 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     if (flat_key_floats.empty()) fprintf(f, "0.0f");
     for (size_t i = 0; i < flat_key_floats.size(); i++) { if (i) fprintf(f, ","); emit_float_literal(f, flat_key_floats[i]); }
     fprintf(f, "};\nstatic Tr tr[%u] = {\n", (unsigned)(flat_tracks.empty() ? 1 : flat_tracks.size()));
-    if (flat_tracks.empty()) fprintf(f, " {0,-1,0,0,0,0,0,0,0},\n");
+    if (flat_tracks.empty()) fprintf(f, " {0,0,-1,0,0,0,0,0,0,0},\n");
     for (size_t i = 0; i < flat_tracks.size(); i++) {
         const FlatTrack& t = flat_tracks[i];
-        fprintf(f, " {%d,%d,%d,%d,%d,%d,%d,%d,%d},\n", t.kind,t.target,t.type,t.integral,t.frame_start,t.data_start,t.count,t.comp,t.enabled);
+        fprintf(f, " {%d,%d,%d,%d,%d,%d,%d,%d,%d,%d},\n", t.timeline,t.kind,t.target,t.type,t.integral,t.frame_start,t.data_start,t.count,t.comp,t.enabled);
     }
     fprintf(f, "};\n");
     fprintf(f, "static float cam0[8]={"); emit_float_array(f, p.camera, 8); fprintf(f, "}; static float dl0[39]={"); emit_float_array(f, p.dirlight, 39); fprintf(f, "}; static float cam[8],dl[39];\n");
-    fprintf(f, "enum{ CMDN=%u, SHN=%u, RTN=%u, UVN=%u, PN=%u, TRN=%u, KEYN=%u, TL_FPS=%d, TL_LEN=%d, TL_LOOP=%d, TL_ON=%d, TL_LERP=%d };\n",
-            (unsigned)out_cmds.size(), (unsigned)shader_sources.size(), (unsigned)rt_res_indices.size(), (unsigned)p.user_vars.size(), (unsigned)flat_params.size(), (unsigned)flat_tracks.size(), (unsigned)flat_key_frames.size(), p.timeline_fps, p.timeline_length, p.timeline_loop?1:0, p.timeline_enabled?1:0, p.timeline_interpolate?1:0);
+    fprintf(f, "enum{ CMDN=%u, SHN=%u, RTN=%u, UVN=%u, PN=%u, TLN=%u, TRN=%u, KEYN=%u, TL_LOOP=%d, TL_ON=%d };\n",
+            (unsigned)out_cmds.size(), (unsigned)shader_sources.size(), (unsigned)rt_res_indices.size(), (unsigned)p.user_vars.size(), (unsigned)flat_params.size(), (unsigned)flat_timelines.size(), (unsigned)flat_tracks.size(), (unsigned)flat_key_frames.size(), p.timeline_loop?1:0, p.timeline_enabled?1:0);
 
     // Runtime support. Written as plain C and deliberately compact.
     fputs(R"LT64K(
@@ -1704,11 +1723,8 @@ static float tr_f(Tr* r,int k,int c){ return kf[r->ds+k*r->comp+c]; }
 // Evaluate one timeline track at the sampled frame and write the result directly
 // into the live command, camera, light or user-variable array.
 //
-// Important editor-compatibility detail:
-//   TL_LERP does NOT mean "hold the previous key until the next key".
-//   The editor always interpolates numeric values between surrounding keys.
-//   The option only decides whether the sampled frame is fractional (smooth)
-//   or rounded down to an integer timeline frame (stepped at timeline FPS).
+// TL_LERP samples fractional frames for smooth timeline playback; disabled
+// interpolation floors to integer frames at the timeline FPS.
 static void apply_track(Tr* r, float fr){
     int a=-1,b=-1,i,n=r->count;
     int oi[4]={0,0,0,0};
@@ -1792,19 +1808,29 @@ static void apply_track(Tr* r, float fr){
     }
 }
 
+static float tldur(Tl* t){ if(!t->enabled||t->fps<=0||t->len<=0)return 0; return (float)t->len/(float)t->fps; }
 static void timeline(float sec){
-    if(!TL_ON||TL_LEN<1||TL_FPS<=0)return;
-    // FPS is baked from timeline_settings.
-    // TL_LERP=1: evaluate at fractional frame positions for smooth playback.
-    // TL_LERP=0: quantize to integer frames before sampling. This gives a
-    // visible step every timeline frame, while still interpolating between
-    // key values exactly like the editor does.
-    float end=(float)(TL_LEN-1),fr=sec*(float)TL_FPS;
+    if(!TL_ON||TLN<1)return;
+    float total=0,acc=0,local=0,fr=0,d; int i,ci=-1,last=-1;
+    for(i=0;i<TLN;i++)total+=tldur(tls+i);
+    if(total<=0)return;
+    if(sec<0)sec=0;
+    if(TL_LOOP)while(sec>=total)sec-=total; else if(sec>total)sec=total;
+    for(i=0;i<TLN;i++){
+        if(!tls[i].enabled)continue;
+        last=i; d=tldur(tls+i);
+        if(d<=0){ if(ci<0&&sec<=acc){ci=i;local=0;break;} continue; }
+        if(ci<0&&sec<acc+d){ci=i;local=sec-acc;if(local<0)local=0;break;}
+        acc+=d;
+    }
+    if(ci<0&&last>=0){ci=last;local=tldur(tls+ci);}
+    if(ci<0||tls[ci].fps<=0)return;
+    fr=local*(float)tls[ci].fps;
     if(fr<0)fr=0;
-    if(TL_LOOP&&end>0)while(fr>end)fr-=end;
-    else if(fr>end)fr=end;
-    if(!TL_LERP)fr=(float)((int)(fr+0.0001f));
-    for(int i=0;i<TRN;i++)if(tr[i].enabled)apply_track(tr+i,fr);
+    d=(float)(tls[ci].len-1);
+    if(fr>d)fr=d;
+    if(!tls[ci].lerp)fr=(float)((int)(fr+0.0001f));
+    for(i=0;i<TRN;i++)if(tr[i].enabled&&tr[i].tl==ci)apply_track(tr+i,fr);
 }
 static int invm(M4* a,M4* o){ float* m=a->m; float v[16],d; v[0]=m[5]*m[10]*m[15]-m[5]*m[11]*m[14]-m[9]*m[6]*m[15]+m[9]*m[7]*m[14]+m[13]*m[6]*m[11]-m[13]*m[7]*m[10]; v[4]=-m[4]*m[10]*m[15]+m[4]*m[11]*m[14]+m[8]*m[6]*m[15]-m[8]*m[7]*m[14]-m[12]*m[6]*m[11]+m[12]*m[7]*m[10]; v[8]=m[4]*m[9]*m[15]-m[4]*m[11]*m[13]-m[8]*m[5]*m[15]+m[8]*m[7]*m[13]+m[12]*m[5]*m[11]-m[12]*m[7]*m[9]; v[12]=-m[4]*m[9]*m[14]+m[4]*m[10]*m[13]+m[8]*m[5]*m[14]-m[8]*m[6]*m[13]-m[12]*m[5]*m[10]+m[12]*m[6]*m[9]; v[1]=-m[1]*m[10]*m[15]+m[1]*m[11]*m[14]+m[9]*m[2]*m[15]-m[9]*m[3]*m[14]-m[13]*m[2]*m[11]+m[13]*m[3]*m[10]; v[5]=m[0]*m[10]*m[15]-m[0]*m[11]*m[14]-m[8]*m[2]*m[15]+m[8]*m[3]*m[14]+m[12]*m[2]*m[11]-m[12]*m[3]*m[10]; v[9]=-m[0]*m[9]*m[15]+m[0]*m[11]*m[13]+m[8]*m[1]*m[15]-m[8]*m[3]*m[13]-m[12]*m[1]*m[11]+m[12]*m[3]*m[9]; v[13]=m[0]*m[9]*m[14]-m[0]*m[10]*m[13]-m[8]*m[1]*m[14]+m[8]*m[2]*m[13]+m[12]*m[1]*m[10]-m[12]*m[2]*m[9]; v[2]=m[1]*m[6]*m[15]-m[1]*m[7]*m[14]-m[5]*m[2]*m[15]+m[5]*m[3]*m[14]+m[13]*m[2]*m[7]-m[13]*m[3]*m[6]; v[6]=-m[0]*m[6]*m[15]+m[0]*m[7]*m[14]+m[4]*m[2]*m[15]-m[4]*m[3]*m[14]-m[12]*m[2]*m[7]+m[12]*m[3]*m[6]; v[10]=m[0]*m[5]*m[15]-m[0]*m[7]*m[13]-m[4]*m[1]*m[15]+m[4]*m[3]*m[13]+m[12]*m[1]*m[7]-m[12]*m[3]*m[5]; v[14]=-m[0]*m[5]*m[14]+m[0]*m[6]*m[13]+m[4]*m[1]*m[14]-m[4]*m[2]*m[13]-m[12]*m[1]*m[6]+m[12]*m[2]*m[5]; v[3]=-m[1]*m[6]*m[11]+m[1]*m[7]*m[10]+m[5]*m[2]*m[11]-m[5]*m[3]*m[10]-m[9]*m[2]*m[7]+m[9]*m[3]*m[6]; v[7]=m[0]*m[6]*m[11]-m[0]*m[7]*m[10]-m[4]*m[2]*m[11]+m[4]*m[3]*m[10]+m[8]*m[2]*m[7]-m[8]*m[3]*m[6]; v[11]=-m[0]*m[5]*m[11]+m[0]*m[7]*m[9]+m[4]*m[1]*m[11]-m[4]*m[3]*m[9]-m[8]*m[1]*m[7]+m[8]*m[3]*m[5]; v[15]=m[0]*m[5]*m[10]-m[0]*m[6]*m[9]-m[4]*m[1]*m[10]+m[4]*m[2]*m[9]+m[8]*m[1]*m[6]-m[8]*m[2]*m[5]; d=m[0]*v[0]+m[1]*v[4]+m[2]*v[8]+m[3]*v[12]; if(d==0){mid(o);return 0;} d=1.0f/d; for(int i=0;i<16;i++)o->m[i]=v[i]*d; return 1; }
 // UserCB is rebuilt for each draw. Global user variables are written first;
@@ -1856,7 +1882,7 @@ static void init_states(){ D3D11_SAMPLER_DESC sp; zmem(&sp,sizeof(sp)); sp.Filte
            The editor uses LESS for the interactive viewport, but this standalone path also
            uses generated primitive shadow shaders and very small procedural meshes; LEQUAL
            is more robust for the shadow/color depth state and fixes the black test2 output
-           introduced in v7. */ dd.DepthFunc=D3D11_COMPARISON_LESS_EQUAL; ID3D11Device_CreateDepthStencilState(dev,&dd,&ds[i]); D3D11_BLEND_DESC bd; zmem(&bd,sizeof(bd)); bd.RenderTarget[0].BlendEnable=(i&1)!=0; bd.RenderTarget[0].SrcBlend=D3D11_BLEND_SRC_ALPHA; bd.RenderTarget[0].DestBlend=D3D11_BLEND_INV_SRC_ALPHA; bd.RenderTarget[0].BlendOp=D3D11_BLEND_OP_ADD; bd.RenderTarget[0].SrcBlendAlpha=D3D11_BLEND_ONE; bd.RenderTarget[0].DestBlendAlpha=D3D11_BLEND_INV_SRC_ALPHA; bd.RenderTarget[0].BlendOpAlpha=D3D11_BLEND_OP_ADD; bd.RenderTarget[0].RenderTargetWriteMask=(i&2)?D3D11_COLOR_WRITE_ENABLE_ALL:0; ID3D11Device_CreateBlendState(dev,&bd,&bs[i]); } for(int i=0;i<2;i++){ D3D11_RASTERIZER_DESC rd; zmem(&rd,sizeof(rd)); rd.FillMode=D3D11_FILL_SOLID; rd.CullMode=i?D3D11_CULL_BACK:D3D11_CULL_NONE; rd.DepthClipEnable=TRUE; ID3D11Device_CreateRasterizerState(dev,&rd,&rs[i]); } }
+           introduced in v7. */ dd.DepthFunc=D3D11_COMPARISON_LESS_EQUAL; ID3D11Device_CreateDepthStencilState(dev,&dd,&ds[i]); D3D11_BLEND_DESC bd; zmem(&bd,sizeof(bd)); bd.RenderTarget[0].BlendEnable=(i&1)!=0; bd.RenderTarget[0].SrcBlend=D3D11_BLEND_SRC_ALPHA; bd.RenderTarget[0].DestBlend=D3D11_BLEND_INV_SRC_ALPHA; bd.RenderTarget[0].BlendOp=D3D11_BLEND_OP_ADD; bd.RenderTarget[0].SrcBlendAlpha=D3D11_BLEND_ONE; bd.RenderTarget[0].DestBlendAlpha=D3D11_BLEND_INV_SRC_ALPHA; bd.RenderTarget[0].BlendOpAlpha=D3D11_BLEND_OP_ADD; bd.RenderTarget[0].RenderTargetWriteMask=(i&2)?D3D11_COLOR_WRITE_ENABLE_ALL:0; ID3D11Device_CreateBlendState(dev,&bd,&bs[i]); } for(int i=0;i<2;i++){ D3D11_RASTERIZER_DESC rd; zmem(&rd,sizeof(rd)); rd.FillMode=LT_WIREFRAME?D3D11_FILL_WIREFRAME:D3D11_FILL_SOLID; rd.CullMode=i?D3D11_CULL_BACK:D3D11_CULL_NONE; rd.DepthClipEnable=TRUE; ID3D11Device_CreateRasterizerState(dev,&rd,&rs[i]); } }
 static void cb_make(ID3D11Buffer** b, unsigned int sz){ D3D11_BUFFER_DESC d; zmem(&d,sizeof(d)); d.ByteWidth=(sz+15)&~15; d.Usage=D3D11_USAGE_DYNAMIC; d.BindFlags=D3D11_BIND_CONSTANT_BUFFER; d.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE; ID3D11Device_CreateBuffer(dev,&d,0,b); }
 static void cb_up(ID3D11Buffer* b, void* data, unsigned int sz){ D3D11_MAPPED_SUBRESOURCE m; if(SUCCEEDED(ID3D11DeviceContext_Map(ctx,(ID3D11Resource*)b,0,D3D11_MAP_WRITE_DISCARD,0,&m))){ cpy(m.pData,data,sz); ID3D11DeviceContext_Unmap(ctx,(ID3D11Resource*)b,0); } }
 static ID3D11ShaderResourceView* srvof(int s){ if(s>=0&&s<RTN)return rt_srv[s]; if(s==-2)return depth_srv; if(s==-3)return shadow_srv; return 0; }
@@ -1909,10 +1935,10 @@ static void dbg_fps(void){}
 #endif
 static void render(float sec){ cpy(cam,cam0,sizeof(cam));cpy(dl,dl0,sizeof(dl)); timeline(sec); float clr[4]={0,0,0,1},bf[4]={0,0,0,0}; SceneCB sc; ObjectCB oc; M4 vp,ivp; zmem(&sc,sizeof(sc)); viewproj(&vp,sec); invm(&vp,&ivp); cpy(sc.view_proj,vp.m,64); cpy(sc.prev_view_proj,vp.m,64); cpy(sc.inv_view_proj,ivp.m,64); cpy(sc.prev_inv_view_proj,ivp.m,64); shadowvp(&sc); sc.time_vec[0]=sec; sc.time_vec[2]=sec*60.0f; sc.cam_pos[0]=cam[0];sc.cam_pos[1]=cam[1];sc.cam_pos[2]=cam[2]; float cp=cs(cam[4]); sc.cam_dir[0]=sn(cam[3])*cp;sc.cam_dir[1]=sn(cam[4]);sc.cam_dir[2]=cs(cam[3])*cp; float ldx=dl[3]-dl[0],ldy=dl[4]-dl[1],ldz=dl[5]-dl[2],li=rsq(ldx*ldx+ldy*ldy+ldz*ldz); sc.light_dir[0]=ldx*li;sc.light_dir[1]=ldy*li;sc.light_dir[2]=ldz*li;sc.light_dir[3]=dl[9]; sc.light_color[0]=dl[6];sc.light_color[1]=dl[7];sc.light_color[2]=dl[8]; shadowpass(&sc); cb_up(scene_cb,&sc,sizeof(sc)); ID3D11DeviceContext_ClearRenderTargetView(ctx,rtv,clr); if(dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,1,0); for(int i=0;i<CMDN;i++){ Cmd* c=cmd+i; if(!c->enabled)continue; set_target(c); if(c->type==1){ ID3D11RenderTargetView* rv=rtvof(c->rt); float cc[4],dc; clear_vals(c,cc,&dc); if(c->ccen&&rv)ID3D11DeviceContext_ClearRenderTargetView(ctx,rv,cc); if(c->cden&&c->dep==-2&&dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,dc,0); } else if(c->type==2 && c->shader>=0&&c->shader<SHN&&sh[c->shader].vs&&sh[c->shader].ps){ UserCB uc; M4 w; world(c,&w); cpy(oc.world,w.m,64); fill_user_cmd(&uc,c); cb_up(object_cb,&oc,sizeof(oc)); cb_up(user_cb,&uc,sizeof(uc)); ID3D11DeviceContext_OMSetDepthStencilState(ctx,ds[(c->dt?1:0)|(c->dw?2:0)],0); ID3D11DeviceContext_RSSetState(ctx,rs[c->cb?1:0]); ID3D11DeviceContext_OMSetBlendState(ctx,bs[(c->ab?1:0)|(c->cw?2:0)],bf,0xffffffff); ID3D11DeviceContext_VSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetSamplers(ctx,0,1,&smp_lin); ID3D11DeviceContext_PSSetSamplers(ctx,1,1,&smp_cmp); for(int t=0;t<c->tc;t++){ ID3D11ShaderResourceView* sv=srvof(c->tex[t]); ID3D11DeviceContext_PSSetShaderResources(ctx,c->tsl[t],1,&sv); } if(c->srecv){ ID3D11ShaderResourceView* sv=shadow_srv; ID3D11DeviceContext_PSSetShaderResources(ctx,7,1,&sv); } for(int t=0;t<c->sc;t++){ ID3D11ShaderResourceView* sv=srvof(c->srv[t]); ID3D11DeviceContext_VSSetShaderResources(ctx,c->ssl[t],1,&sv); } if(c->mk>0&&c->mk<6&&prim_vb[c->mk]){ unsigned int st=32,off=0; ID3D11DeviceContext_IASetInputLayout(ctx,sh[c->shader].il); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,1,&prim_vb[c->mk],&st,&off); } else { ID3D11DeviceContext_IASetInputLayout(ctx,0); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,0,0,0,0); } ID3D11DeviceContext_IASetIndexBuffer(ctx,0,DXGI_FORMAT_R32_UINT,0); ID3D11DeviceContext_IASetPrimitiveTopology(ctx,c->topology?D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST:D3D11_PRIMITIVE_TOPOLOGY_POINTLIST); ID3D11DeviceContext_VSSetShader(ctx,sh[c->shader].vs,0,0); ID3D11DeviceContext_PSSetShader(ctx,sh[c->shader].ps,0,0); ID3D11DeviceContext_DrawInstanced(ctx,c->vc,c->ic,0,0); } } IDXGISwapChain_Present(swp,LT_VSYNC?1:0,0); dbg_fps(); }
 static LRESULT CALLBACK wp(HWND h,UINT m,WPARAM w,LPARAM l){
-    if(m==WM_KEYDOWN&&w==VK_ESCAPE)PostQuitMessage(0);
-#if LT_DEBUG_FPS
-    // F1 is a runtime toggle for the optional FPS overlay. In release mode
-    // LT_DEBUG_FPS is 0, this branch is removed by the preprocessor.
+    if(LT_ESC_CLOSE&&m==WM_KEYDOWN&&w==VK_ESCAPE)PostQuitMessage(0);
+#if LT_DEBUG_FPS && LT_INPUT
+    // F1 is a runtime toggle for the optional FPS overlay. In release mode,
+    // or when exported runtime input is disabled, this branch is removed.
     if(m==WM_KEYDOWN&&w==VK_F1){dbg_on=!dbg_on;return 0;}
 #endif
     if(m==WM_CLOSE||m==WM_DESTROY){PostQuitMessage(0);return 0;}
@@ -1945,9 +1971,14 @@ W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); RW=W; RH=H; HW
     size_t param_bytes = flat_params.size() * sizeof(FlatParam);
     size_t key_bytes = flat_key_frames.size() * sizeof(int) + flat_key_ints.size() * sizeof(int) + flat_key_floats.size() * sizeof(float);
     size_t rt_bytes = rt_res_indices.size() * sizeof(ResourceDef);
+    float timeline_total_seconds_for_report = 0.0f;
+    for (size_t i = 0; i < flat_timelines.size(); i++) {
+        if (flat_timelines[i].enabled && flat_timelines[i].fps > 0 && flat_timelines[i].length > 0)
+            timeline_total_seconds_for_report += (float)flat_timelines[i].length / (float)flat_timelines[i].fps;
+    }
     fprintf(stderr, "generated %s\n", out_c.c_str());
-    fprintf(stderr, "commands: %u, shaders: %u, user vars: %u, timeline tracks: %u\n", (unsigned)out_cmds.size(), (unsigned)shader_sources.size(), (unsigned)p.user_vars.size(), (unsigned)flat_tracks.size());
-    fprintf(stderr, "timeline: fps=%d length=%d loop=%s enabled=%s interpolation=%s%s\n", p.timeline_fps, p.timeline_length, p.timeline_loop?"on":"off", p.timeline_enabled?"on":"off", p.timeline_interpolate?"linear":"step", (p.timeline_loop && p.timeline_length>1)?" (loop period = length-1 frames, editor-compatible)":"");
+    fprintf(stderr, "commands: %u, shaders: %u, user vars: %u, timelines: %u, timeline tracks: %u\n", (unsigned)out_cmds.size(), (unsigned)shader_sources.size(), (unsigned)p.user_vars.size(), (unsigned)flat_timelines.size(), (unsigned)flat_tracks.size());
+    fprintf(stderr, "timeline sequence: loop=%s enabled=%s duration=%.3fs\n", p.timeline_loop?"on":"off", p.timeline_enabled?"on":"off", timeline_total_seconds_for_report);
     fprintf(stderr, "\n64k exporter size report (source-side, before MSVC/linker packing):\n");
     if (out_bytes >= 0) fprintf(stderr, "  out64k.c:                 %lld bytes\n", out_bytes);
     fprintf(stderr, "  HLSL expanded raw:        %u bytes\n", (unsigned)raw_hlsl);

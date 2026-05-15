@@ -5,9 +5,11 @@
 // header-only third-party libraries used by the project.
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+#undef STB_IMAGE_IMPLEMENTATION
 
 #define CGLTF_IMPLEMENTATION
 #include "cgltf.h"
+#undef CGLTF_IMPLEMENTATION
 
 #ifndef LAZYTOOL_PLAYER_ONLY
 #ifdef _MSC_VER
@@ -16,6 +18,7 @@
 #endif
 #define NANOSVG_IMPLEMENTATION
 #include "nanosvg/nanosvg.h"
+#undef NANOSVG_IMPLEMENTATION
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif

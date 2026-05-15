@@ -4,6 +4,8 @@ camera_fps 5 5 5 -2.3561945 -0.615479767 1.04700005 0.00100000005 100
 
 dirlight 5 5 5 0 0 0 1 0.949999988 0.899999976 1 1024 1204 0.00999999978 10 8 8 1 5 0.649999976 0.443228424 8 8 0.00999999978 10 0.921136975 8 8 0.00999999978 10 1.69907975 8 8 0.00999999978 10 5 8 8 0.00999999978 10
 
+export_settings 1 1 0 0 0 0 0
+
 resources
 resource mesh_primitive normal_cube cube
 resource shader_vsps normal_color shaders/default.hlsl
@@ -17,11 +19,12 @@ command clear clear_scene 1
   topology triangle_list
   shadow_shader -
   render_state 1 1 1 0 1 0 0
-  transform 0 0 0 0 0 0 1 1 1
+  transformq 0 0 0 0 0 0 1 1 1 1
   clear 1 0.0399999991 0.0199999996 0 1 1 1
   vertex_count 3
   instance 1
   threads 1 1 1
+  compute_on_reset 0
   dispatch_from -
   indirect_args - 0
   repeat 1 1
@@ -38,11 +41,12 @@ command draw_mesh draw_normal_cube 1
   topology triangle_list
   shadow_shader -
   render_state 1 1 1 0 1 1 1
-  transform 0 0 0 0 0 0 1 1 1
+  transformq 0 0 0 0 0 0 1 1 1 1
   clear 1 0.0500000007 0.0500000007 0.0799999982 1 1 1
   vertex_count 3
   instance 1
   threads 1 1 1
+  compute_on_reset 0
   dispatch_from -
   indirect_args - 0
   repeat 1 1
@@ -51,3 +55,9 @@ command draw_mesh draw_normal_cube 1
   uavs 0
   params 0
 end_command
+
+timeline
+timeline_global 0 0 0
+timeline_clip Timeline_1 24 240 0 1 0
+end_timeline_clip
+end_timeline

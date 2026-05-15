@@ -18,6 +18,26 @@
 static const char* bool_str(bool v) { return v ? "1" : "0"; }
 static char s_project_current_path[MAX_PATH_LEN] = {};
 
+static const ExportSettings k_project_export_defaults = {
+    /* runtime_input_enabled  */ true,
+    /* escape_closes_player   */ true,
+    /* force_wireframe        */ false,
+    /* show_grid_overlay      */ false,
+    /* vsync                  */ false,
+    /* profiler               */ false,
+    /* shader_binding_warnings*/ false
+};
+
+ExportSettings g_export_settings = k_project_export_defaults;
+
+void project_reset_export_settings() {
+    g_export_settings = k_project_export_defaults;
+}
+
+const ExportSettings& project_default_export_settings() {
+    return k_project_export_defaults;
+}
+
 // Project text uses forward slashes for file paths. The loader still accepts
 // either separator, while every saved path is written in the editor convention.
 static void project_canonicalize_path_text(const char* in, char* out, int out_sz) {
@@ -83,7 +103,13 @@ static const ProjectViewDefaults k_project_view_defaults = {
 };
 
 static void project_set_current_path(const char* path) {
-    project_canonicalize_path_text(path ? path : "", s_project_current_path, MAX_PATH_LEN);
+    // `path` is sometimes project_current_path(), which points at
+    // s_project_current_path itself. Canonicalize through a temporary buffer so
+    // setting the current path is safe even when input and output alias.
+    char clean[MAX_PATH_LEN] = {};
+    project_canonicalize_path_text(path ? path : "", clean, MAX_PATH_LEN);
+    strncpy(s_project_current_path, clean, MAX_PATH_LEN - 1);
+    s_project_current_path[MAX_PATH_LEN - 1] = '\0';
 }
 
 const char* project_current_path() {
@@ -133,13 +159,13 @@ static ResType res_type_from_token(const char* name) {
     if (strcmp(name, "float2") == 0) return RES_FLOAT2;
     if (strcmp(name, "float3") == 0) return RES_FLOAT3;
     if (strcmp(name, "float4") == 0) return RES_FLOAT4;
-    if (strcmp(name, "texture2d") == 0 || strcmp(name, "Texture2D") == 0) return RES_TEXTURE2D;
-    if (strcmp(name, "render_texture2d") == 0 || strcmp(name, "RenderTexture2D") == 0) return RES_RENDER_TEXTURE2D;
-    if (strcmp(name, "render_texture3d") == 0 || strcmp(name, "RenderTexture3D") == 0) return RES_RENDER_TEXTURE3D;
-    if (strcmp(name, "structured_buffer") == 0 || strcmp(name, "StructuredBuffer") == 0) return RES_STRUCTURED_BUFFER;
-    if (strcmp(name, "gaussian_splat") == 0 || strcmp(name, "GaussianSplat") == 0) return RES_GAUSSIAN_SPLAT;
-    if (strcmp(name, "mesh") == 0 || strcmp(name, "Mesh") == 0) return RES_MESH;
-    if (strcmp(name, "shader") == 0 || strcmp(name, "Shader") == 0) return RES_SHADER;
+    if (strcmp(name, "texture2d") == 0) return RES_TEXTURE2D;
+    if (strcmp(name, "render_texture2d") == 0) return RES_RENDER_TEXTURE2D;
+    if (strcmp(name, "render_texture3d") == 0) return RES_RENDER_TEXTURE3D;
+    if (strcmp(name, "structured_buffer") == 0) return RES_STRUCTURED_BUFFER;
+    if (strcmp(name, "gaussian_splat") == 0) return RES_GAUSSIAN_SPLAT;
+    if (strcmp(name, "mesh") == 0) return RES_MESH;
+    if (strcmp(name, "shader") == 0) return RES_SHADER;
     if (strcmp(name, "builtin_time") == 0) return RES_BUILTIN_TIME;
     if (strcmp(name, "builtin_scene_color") == 0) return RES_BUILTIN_SCENE_COLOR;
     if (strcmp(name, "builtin_scene_depth") == 0) return RES_BUILTIN_SCENE_DEPTH;
@@ -148,7 +174,7 @@ static ResType res_type_from_token(const char* name) {
     return RES_NONE;
 }
 
-static void project_compute_legacy_cascade_splits(float near_z, float far_z, int cascade_count,
+static void project_compute_default_cascade_splits(float near_z, float far_z, int cascade_count,
                                                   float lambda, float out_splits[MAX_SHADOW_CASCADES]) {
     if (!out_splits)
         return;
@@ -179,7 +205,7 @@ static void project_seed_manual_shadow_cascades(Resource* dl, float camera_near_
         return;
 
     float seeded_splits[MAX_SHADOW_CASCADES] = {};
-    project_compute_legacy_cascade_splits(camera_near_z, dl->shadow_distance,
+    project_compute_default_cascade_splits(camera_near_z, dl->shadow_distance,
                                           MAX_SHADOW_CASCADES, dl->shadow_split_lambda,
                                           seeded_splits);
 
@@ -504,17 +530,6 @@ static DrawTopologyType draw_topology_from_name(const char* name) {
     return DRAW_TOPOLOGY_TRIANGLE_LIST;
 }
 
-static void project_apply_legacy_camera(float azimuth, float elevation, float distance, const float target[3]) {
-    float ce = cosf(elevation);
-    float se = sinf(elevation);
-    float ca = cosf(azimuth);
-    float sa = sinf(azimuth);
-    g_camera.position[0] = target[0] + distance * ce * sa;
-    g_camera.position[1] = target[1] + distance * se;
-    g_camera.position[2] = target[2] + distance * ce * ca;
-    camera_set_euler(&g_camera, azimuth + 3.14159265358979323846f, -elevation, 0.0f);
-}
-
 static CmdType cmd_type_from_name(const char* name) {
     if (strcmp(name, "clear") == 0) return CMD_CLEAR;
     if (strcmp(name, "group") == 0) return CMD_GROUP;
@@ -543,6 +558,7 @@ static const char* cmd_type_name(CmdType type) {
 static void project_clear_user_data() {
     timeline_reset();
     user_cb_clear();
+    project_reset_export_settings();
 
     for (int i = 0; i < MAX_COMMANDS; i++) {
         if (g_commands[i].active)
@@ -665,6 +681,15 @@ bool project_save_text(const char* path) {
         }
         fprintf(f, "\n\n");
     }
+
+    fprintf(f, "export_settings %s %s %s %s %s %s %s\n\n",
+        bool_str(g_export_settings.runtime_input_enabled),
+        bool_str(g_export_settings.escape_closes_player),
+        bool_str(g_export_settings.force_wireframe),
+        bool_str(g_export_settings.show_grid_overlay),
+        bool_str(g_export_settings.vsync),
+        bool_str(g_export_settings.profiler),
+        bool_str(g_export_settings.shader_binding_warnings));
 
     fprintf(f, "resources\n");
     for (int i = 0; i < MAX_RESOURCES; i++) {
@@ -911,15 +936,38 @@ static bool project_read_line(const char*& cursor, const char* end, char* out, i
     return true;
 }
 
-// Parse a saved project file and rebuild the in-memory editor state. The text
-// format is append-friendly: older files may omit newer fields, and unknown
-// lines are ignored so experimental commands can survive round-trips.
+// Parse a saved project file and rebuild the in-memory editor state. Only the
+// current project text format is accepted by the runtime loader.
 bool project_load_text(const char* path) {
     void* project_bytes = nullptr;
     size_t project_size = 0;
     if (!lt_read_file(path, &project_bytes, &project_size)) {
         log_error("Project load failed: %s", path);
         return false;
+    }
+
+    {
+        bool has_export_settings = false;
+        bool has_timeline_global = false;
+        bool has_timeline_clip = false;
+        char scan_line[1024] = {};
+        const char* scan = (const char*)project_bytes;
+        const char* scan_end = scan + project_size;
+        while (project_read_line(scan, scan_end, scan_line, sizeof(scan_line))) {
+            char tmp[1024] = {};
+            strncpy(tmp, scan_line, sizeof(tmp) - 1);
+            char* tag = strtok(tmp, " \t\r\n");
+            if (!tag || tag[0] == '#')
+                continue;
+            if (strcmp(tag, "export_settings") == 0) has_export_settings = true;
+            else if (strcmp(tag, "timeline_global") == 0) has_timeline_global = true;
+            else if (strcmp(tag, "timeline_clip") == 0) has_timeline_clip = true;
+        }
+        if (!has_export_settings || !has_timeline_global || !has_timeline_clip) {
+            lt_free_file(project_bytes);
+            log_error("Project load failed: project is not saved in the current .lt format.");
+            return false;
+        }
     }
 
     project_clear_user_data();
@@ -963,6 +1011,14 @@ bool project_load_text(const char* path) {
         return name;
     };
     int timeline_load_track = -1;
+    int timeline_clip_count = 0;
+    int timeline_current_clip = -1;
+    int timeline_global_current = 0;
+    bool timeline_global_loop = false;
+    bool timeline_global_enabled = false;
+    bool timeline_clip_enabled_load[MAX_TIMELINES] = {};
+    bool saw_export_settings = false;
+    bool saw_timeline_global = false;
     const char* cursor = (const char*)project_bytes;
     const char* end = cursor + project_size;
     while (project_read_line(cursor, end, line, sizeof(line))) {
@@ -972,32 +1028,86 @@ bool project_load_text(const char* path) {
         char* tag = strtok(tmp, " \t\r\n");
         if (!tag || tag[0] == '#') continue;
 
-        if (strcmp(tag, "timeline") == 0) {
+        if (strcmp(tag, "export_settings") == 0) {
+            saw_export_settings = true;
+            char* runtime_input = strtok(nullptr, " \t\r\n");
+            char* esc_close = strtok(nullptr, " \t\r\n");
+            char* wireframe = strtok(nullptr, " \t\r\n");
+            char* grid = strtok(nullptr, " \t\r\n");
+            char* vsync = strtok(nullptr, " \t\r\n");
+            char* profiler = strtok(nullptr, " \t\r\n");
+            char* shader_warnings = strtok(nullptr, " \t\r\n");
+            if (runtime_input) g_export_settings.runtime_input_enabled = atoi(runtime_input) != 0;
+            if (esc_close) g_export_settings.escape_closes_player = atoi(esc_close) != 0;
+            if (wireframe) g_export_settings.force_wireframe = atoi(wireframe) != 0;
+            if (grid) g_export_settings.show_grid_overlay = atoi(grid) != 0;
+            if (vsync) g_export_settings.vsync = atoi(vsync) != 0;
+            if (profiler) g_export_settings.profiler = atoi(profiler) != 0;
+            if (shader_warnings) g_export_settings.shader_binding_warnings = atoi(shader_warnings) != 0;
+        } else if (strcmp(tag, "timeline") == 0) {
             timeline_reset();
             timeline_load_track = -1;
+            timeline_current_clip = -1;
+            timeline_clip_count = 0;
+            timeline_global_current = 0;
+            timeline_global_loop = false;
+            timeline_global_enabled = false;
+            saw_timeline_global = false;
+            memset(timeline_clip_enabled_load, 0, sizeof(timeline_clip_enabled_load));
         } else if (strcmp(tag, "end_timeline") == 0) {
             timeline_load_track = -1;
-        } else if (strcmp(tag, "timeline_settings") == 0) {
+            timeline_current_clip = -1;
+            for (int i = 0; i < timeline_clip_count && i < timeline_count(); i++)
+                timeline_set_timeline_enabled(i, timeline_clip_enabled_load[i]);
+            timeline_set_loop(timeline_global_loop);
+            timeline_set_enabled(timeline_global_enabled);
+            timeline_set_current_index(timeline_global_current);
+        } else if (strcmp(tag, "end_timeline_clip") == 0) {
+            timeline_load_track = -1;
+            timeline_current_clip = -1;
+        } else if (strcmp(tag, "timeline_global") == 0) {
+            char* current = strtok(nullptr, " \t\r\n");
+            char* loop = strtok(nullptr, " \t\r\n");
+            char* enabled = strtok(nullptr, " \t\r\n");
+            saw_timeline_global = true;
+            if (current) timeline_global_current = atoi(current);
+            if (loop) timeline_global_loop = atoi(loop) != 0;
+            if (enabled) timeline_global_enabled = atoi(enabled) != 0;
+        } else if (strcmp(tag, "timeline_clip") == 0) {
+            char* name = strtok(nullptr, " \t\r\n");
             char* fps = strtok(nullptr, " \t\r\n");
             char* length = strtok(nullptr, " \t\r\n");
             char* frame = strtok(nullptr, " \t\r\n");
-            char* play_dir = strtok(nullptr, " \t\r\n");
-            char* loop = strtok(nullptr, " \t\r\n");
             char* enabled = strtok(nullptr, " \t\r\n");
             char* interpolate = strtok(nullptr, " \t\r\n");
-            if (fps) timeline_set_fps(atoi(fps));
-            if (length) timeline_set_length_frames(atoi(length));
-            if (frame) timeline_set_current_frame(atoi(frame));
-            if (play_dir) timeline_set_play_dir(atoi(play_dir));
-            if (loop) timeline_set_loop(atoi(loop) != 0);
-            if (enabled) timeline_set_enabled(atoi(enabled) != 0);
-            if (interpolate) timeline_set_interpolate_frames(atoi(interpolate) != 0);
+            int clip_index = timeline_clip_count;
+            if (clip_index == 0)
+                timeline_set_current_index(0);
+            else
+                clip_index = timeline_add(name ? name : nullptr);
+            if (clip_index >= 0) {
+                timeline_set_current_index(clip_index);
+                if (name) timeline_set_name(clip_index, name);
+                if (fps) timeline_set_fps(atoi(fps));
+                if (length) timeline_set_length_frames(atoi(length));
+                if (frame) timeline_set_current_frame(atoi(frame));
+                if (interpolate) timeline_set_interpolate_frames(atoi(interpolate) != 0);
+                if (clip_index < MAX_TIMELINES)
+                    timeline_clip_enabled_load[clip_index] = enabled ? (atoi(enabled) != 0) : true;
+                timeline_current_clip = clip_index;
+                timeline_clip_count++;
+            }
+            timeline_load_track = -1;
         } else if (strcmp(tag, "timeline_track") == 0) {
             char* kind = strtok(nullptr, " \t\r\n");
             char* target = strtok(nullptr, " \t\r\n");
             char* type = strtok(nullptr, " \t\r\n");
             strtok(nullptr, " \t\r\n"); // key_count, kept for readability in the text format.
             char* enabled = strtok(nullptr, " \t\r\n");
+            if (timeline_current_clip < 0) {
+                timeline_load_track = -1;
+                continue;
+            }
             TimelineTrackKind track_kind = timeline_track_kind_from_token(kind);
             ResType track_type = res_type_from_token(type);
             const char* remapped_target = track_kind == TIMELINE_TRACK_USER_VAR ?
@@ -1028,29 +1138,12 @@ bool project_load_text(const char* path) {
                         values[value_count++] = (float)atof(v);
                     }
 
-                    if (track.kind == TIMELINE_TRACK_COMMAND_TRANSFORM && value_count == 9) {
-                        for (int i = 0; i < 3; i++) key->fval[i] = values[i];
-                        quat_to_array(quat_from_euler_xyz(v3(values[3], values[4], values[5])), &key->fval[3]);
-                        for (int i = 0; i < 3; i++) key->fval[7 + i] = values[6 + i];
-                    } else {
-                        for (int i = 0; i < n && i < value_count; i++)
-                            key->fval[i] = values[i];
-                        if (track.kind == TIMELINE_TRACK_COMMAND_TRANSFORM)
-                            quat_to_array(quat_from_array(&key->fval[3]), &key->fval[3]);
-                    }
+                    for (int i = 0; i < n && i < value_count; i++)
+                        key->fval[i] = values[i];
+                    if (track.kind == TIMELINE_TRACK_COMMAND_TRANSFORM)
+                        quat_to_array(quat_from_array(&key->fval[3]), &key->fval[3]);
                 }
             }
-        } else if (strcmp(tag, "camera") == 0) {
-            float azimuth = (float)atof(strtok(nullptr, " \t\r\n"));
-            float elevation = (float)atof(strtok(nullptr, " \t\r\n"));
-            float distance = (float)atof(strtok(nullptr, " \t\r\n"));
-            float target[3] = {};
-            for (int i = 0; i < 3; i++) target[i] = (float)atof(strtok(nullptr, " \t\r\n"));
-            project_apply_legacy_camera(azimuth, elevation, distance, target);
-            g_camera.fov_y = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.near_z = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.far_z = (float)atof(strtok(nullptr, " \t\r\n"));
-            camera_set_euler(&g_camera, g_camera.yaw, g_camera.pitch, g_camera.roll);
         } else if (strcmp(tag, "camera_fps") == 0) {
             g_camera.position[0] = (float)atof(strtok(nullptr, " \t\r\n"));
             g_camera.position[1] = (float)atof(strtok(nullptr, " \t\r\n"));
@@ -1086,7 +1179,6 @@ bool project_load_text(const char* path) {
             if (dl->shadow_cascade_count > MAX_SHADOW_CASCADES) dl->shadow_cascade_count = MAX_SHADOW_CASCADES;
             if (dl->shadow_distance < 0.1f) dl->shadow_distance = 0.1f;
             dl->shadow_split_lambda = clampf(dl->shadow_split_lambda, 0.0f, 1.0f);
-            project_seed_manual_shadow_cascades(dl, g_camera.near_z);
             for (int i = 0; i < MAX_SHADOW_CASCADES; i++) {
                 char* split_tok = strtok(nullptr, " \t\r\n");
                 char* extent_x_tok = strtok(nullptr, " \t\r\n");
@@ -1248,12 +1340,6 @@ bool project_load_text(const char* path) {
                 cur->cull_back = atoi(strtok(nullptr, " \t\r\n")) != 0;
                 cur->shadow_cast = atoi(strtok(nullptr, " \t\r\n")) != 0;
                 cur->shadow_receive = atoi(strtok(nullptr, " \t\r\n")) != 0;
-            } else if (strcmp(tag, "transform") == 0) {
-                for (int i = 0; i < 3; i++) cur->pos[i] = (float)atof(strtok(nullptr, " \t\r\n"));
-                float euler[3] = {};
-                for (int i = 0; i < 3; i++) euler[i] = (float)atof(strtok(nullptr, " \t\r\n"));
-                quat_to_array(quat_from_euler_xyz(v3(euler[0], euler[1], euler[2])), cur->rotq);
-                for (int i = 0; i < 3; i++) cur->scale[i] = (float)atof(strtok(nullptr, " \t\r\n"));
             } else if (strcmp(tag, "transformq") == 0) {
                 for (int i = 0; i < 3; i++) cur->pos[i] = (float)atof(strtok(nullptr, " \t\r\n"));
                 float q[4] = {};
@@ -1271,22 +1357,18 @@ bool project_load_text(const char* path) {
                 if (color_src && strcmp(color_src, "-") != 0) {
                     ResHandle h = res_by_ref(color_src, res_lookup_types(RES_FLOAT4));
                     Resource* r = res_get(h);
-                    char fallback_name[MAX_NAME] = {};
-                    ref_base_name(color_src, fallback_name, MAX_NAME);
-                    strncpy(cur->clear_color_source,
-                            r ? r->name : remap_user_var_name(fallback_name, RES_NONE),
-                            MAX_NAME - 1);
-                    cur->clear_color_source[MAX_NAME - 1] = '\0';
+                    if (r) {
+                        strncpy(cur->clear_color_source, r->name, MAX_NAME - 1);
+                        cur->clear_color_source[MAX_NAME - 1] = '\0';
+                    }
                 }
                 if (depth_src && strcmp(depth_src, "-") != 0) {
                     ResHandle h = res_by_ref(depth_src, res_lookup_types(RES_FLOAT));
                     Resource* r = res_get(h);
-                    char fallback_name[MAX_NAME] = {};
-                    ref_base_name(depth_src, fallback_name, MAX_NAME);
-                    strncpy(cur->clear_depth_source,
-                            r ? r->name : remap_user_var_name(fallback_name, RES_NONE),
-                            MAX_NAME - 1);
-                    cur->clear_depth_source[MAX_NAME - 1] = '\0';
+                    if (r) {
+                        strncpy(cur->clear_depth_source, r->name, MAX_NAME - 1);
+                        cur->clear_depth_source[MAX_NAME - 1] = '\0';
+                    }
                 }
             } else if (strcmp(tag, "vertex_count") == 0) {
                 cur->vertex_count = atoi(strtok(nullptr, " \t\r\n"));
@@ -1378,6 +1460,17 @@ bool project_load_text(const char* path) {
             project_command_fold_texture_slots_into_srvs(&g_commands[i]);
     }
     cmd_mark_all_dirty();
+
+    if (!saw_export_settings) {
+        lt_free_file(project_bytes);
+        log_error("Project load failed: missing export_settings in current .lt format.");
+        return false;
+    }
+    if (!saw_timeline_global || timeline_clip_count <= 0) {
+        lt_free_file(project_bytes);
+        log_error("Project load failed: missing current timeline_global/timeline_clip block.");
+        return false;
+    }
 
     lt_free_file(project_bytes);
     project_set_current_path(path);

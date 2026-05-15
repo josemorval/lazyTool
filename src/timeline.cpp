@@ -6,19 +6,31 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <stdio.h>
 
-TimelineTrack g_timeline_tracks[MAX_TIMELINE_TRACKS] = {};
-int           g_timeline_track_count = 0;
+struct TimelineState {
+    bool active;
+    bool enabled;
+    char name[MAX_NAME];
+    int fps;
+    int length_frames;
+    int current_frame;
+    float sample_frame;
+    bool interpolate_frames;
+    int track_count;
+    TimelineTrack tracks[MAX_TIMELINE_TRACKS];
+};
 
-static int   s_timeline_fps = 24;
-static int   s_timeline_length_frames = 240;
-static int   s_timeline_current_frame = 0;
-static float s_timeline_sample_frame = 0.0f;
+static TimelineState s_timelines[MAX_TIMELINES] = {};
+static int   s_timeline_count = 0;
+static int   s_timeline_current_index = 0; // editor-selected timeline.
+static int   s_timeline_playback_index = 0; // timeline currently sampled by sequence playback.
 static bool  s_timeline_setting_scene_time = false;
-static bool  s_timeline_enabled = false;
-static bool  s_timeline_loop = false;
-static bool  s_timeline_interpolate_frames = false;
+static bool  s_timeline_enabled = false; // global runtime enable.
+static bool  s_timeline_loop = false;    // global sequence loop.
 
+TimelineTrack* g_timeline_tracks = nullptr;
+int            g_timeline_track_count = 0;
 
 static const float TIMELINE_PI     = 3.14159265358979323846f;
 static const float TIMELINE_TWO_PI = 6.28318530717958647692f;
@@ -37,41 +49,111 @@ static float timeline_lerp_angle(float a, float b, float t) {
     return a + timeline_wrap_angle(b - a) * t;
 }
 
-static void timeline_sample_command_transform(const TimelineKey& a, const TimelineKey& b,
-                                              float t, TimelineKey* out) {
-    if (!out)
-        return;
-
-    for (int i = 0; i < 3; i++)
-        out->fval[i] = timeline_lerp(a.fval[i], b.fval[i], t);
-
-    Quat q = quat_slerp(quat_from_array(&a.fval[3]), quat_from_array(&b.fval[3]), t);
-    quat_to_array(q, &out->fval[3]);
-
-    for (int i = 7; i < 10; i++)
-        out->fval[i] = timeline_lerp(a.fval[i], b.fval[i], t);
+static void timeline_init_state(TimelineState& tl, int index, const char* name) {
+    memset(&tl, 0, sizeof(tl));
+    tl.active = true;
+    tl.enabled = true;
+    tl.fps = 24;
+    tl.length_frames = 240;
+    tl.current_frame = 0;
+    tl.sample_frame = 0.0f;
+    tl.interpolate_frames = false;
+    tl.track_count = 0;
+    if (name && name[0]) {
+        strncpy(tl.name, name, MAX_NAME - 1);
+        tl.name[MAX_NAME - 1] = '\0';
+    } else {
+        snprintf(tl.name, sizeof(tl.name), "Timeline_%d", index + 1);
+    }
+    for (int i = 0; tl.name[i]; i++) {
+        if (tl.name[i] == ' ' || tl.name[i] == '\t')
+            tl.name[i] = '_';
+    }
 }
 
-static void timeline_sample_camera(const TimelineKey& a, const TimelineKey& b,
-                                   float t, TimelineKey* out) {
-    if (!out)
+static void timeline_sync_public_tracks() {
+    if (s_timeline_count <= 0 || s_timeline_current_index < 0 || s_timeline_current_index >= s_timeline_count) {
+        g_timeline_tracks = nullptr;
+        g_timeline_track_count = 0;
         return;
-
-    for (int i = 0; i < 3; i++)
-        out->fval[i] = timeline_lerp(a.fval[i], b.fval[i], t);
-    out->fval[3] = timeline_lerp_angle(a.fval[3], b.fval[3], t); // yaw wraps.
-    out->fval[4] = timeline_lerp(a.fval[4], b.fval[4], t);       // pitch is not clamped: camera can loop.
-    out->fval[5] = timeline_lerp(a.fval[5], b.fval[5], t);
-    out->fval[6] = timeline_lerp(a.fval[6], b.fval[6], t);
-    out->fval[7] = timeline_lerp(a.fval[7], b.fval[7], t);
-    out->fval[8] = timeline_lerp_angle(a.fval[8], b.fval[8], t); // roll wraps.
+    }
+    // Public track pointers are editor-facing. Playback has its own sampled
+    // timeline index so the sequence can advance without stealing the UI
+    // selection from the combo box.
+    TimelineState& tl = s_timelines[s_timeline_current_index];
+    g_timeline_tracks = tl.tracks;
+    g_timeline_track_count = tl.track_count;
 }
 
-static int timeline_clamp_frame(int frame) {
+static void timeline_ensure_one() {
+    if (s_timeline_count > 0) {
+        timeline_sync_public_tracks();
+        return;
+    }
+    s_timeline_count = 1;
+    s_timeline_current_index = 0;
+    s_timeline_playback_index = 0;
+    timeline_init_state(s_timelines[0], 0, "Timeline_1");
+    timeline_sync_public_tracks();
+}
+
+static TimelineState& timeline_current_state() {
+    timeline_ensure_one();
+    return s_timelines[s_timeline_current_index];
+}
+
+static TimelineState* timeline_state_at(int index) {
+    timeline_ensure_one();
+    if (index < 0 || index >= s_timeline_count)
+        return nullptr;
+    return &s_timelines[index];
+}
+
+static TimelineState& timeline_playback_state() {
+    timeline_ensure_one();
+    if (s_timeline_playback_index < 0 || s_timeline_playback_index >= s_timeline_count)
+        s_timeline_playback_index = s_timeline_current_index;
+    if (s_timeline_playback_index < 0 || s_timeline_playback_index >= s_timeline_count)
+        s_timeline_playback_index = 0;
+    return s_timelines[s_timeline_playback_index];
+}
+
+static int timeline_clamp_frame_for(const TimelineState& tl, int frame) {
     if (frame < 0) frame = 0;
-    if (frame >= s_timeline_length_frames)
-        frame = s_timeline_length_frames - 1;
+    if (frame >= tl.length_frames)
+        frame = tl.length_frames - 1;
     return frame;
+}
+
+static float timeline_duration_seconds(const TimelineState& tl) {
+    if (!tl.enabled || tl.fps <= 0 || tl.length_frames <= 0)
+        return 0.0f;
+    // length_frames is a frame count, not the index of the last frame. A 240
+    // frame timeline at 24 fps lasts 10 seconds; frame 239 is visible for the
+    // final 1/24s before the next enabled timeline starts.
+    return (float)tl.length_frames / (float)tl.fps;
+}
+
+static float timeline_prefix_seconds(int index) {
+    float t = 0.0f;
+    if (index < 0) return 0.0f;
+    if (index > s_timeline_count) index = s_timeline_count;
+    for (int i = 0; i < index; i++)
+        t += timeline_duration_seconds(s_timelines[i]);
+    return t;
+}
+
+static void timeline_sync_scene_time_from_current() {
+    if (s_timeline_setting_scene_time)
+        return;
+    TimelineState& tl = timeline_current_state();
+    if (!tl.enabled || tl.fps <= 0) {
+        app_request_scene_render();
+        return;
+    }
+    float seconds = timeline_prefix_seconds(s_timeline_current_index) +
+                    (float)tl.current_frame / (float)tl.fps;
+    app_set_scene_time(seconds);
 }
 
 static int timeline_user_var_index(const char* name) {
@@ -129,42 +211,202 @@ bool timeline_track_uses_integral_values(const TimelineTrack& track) {
 }
 
 void timeline_reset() {
-    memset(g_timeline_tracks, 0, sizeof(g_timeline_tracks));
-    g_timeline_track_count = 0;
-    s_timeline_fps = 24;
-    s_timeline_length_frames = 240;
-    s_timeline_current_frame = 0;
-    s_timeline_sample_frame = 0.0f;
+    memset(s_timelines, 0, sizeof(s_timelines));
+    s_timeline_count = 1;
+    s_timeline_current_index = 0;
+    s_timeline_playback_index = 0;
+    timeline_init_state(s_timelines[0], 0, "Timeline_1");
     s_timeline_setting_scene_time = false;
     s_timeline_enabled = false;
     s_timeline_loop = false;
-    s_timeline_interpolate_frames = false;
+    timeline_sync_public_tracks();
+}
+
+int timeline_count() {
+    timeline_ensure_one();
+    return s_timeline_count;
+}
+
+int timeline_current_index() {
+    timeline_ensure_one();
+    return s_timeline_current_index;
+}
+
+int timeline_playback_index() {
+    timeline_ensure_one();
+    return s_timeline_playback_index;
+}
+
+bool timeline_sync_editor_to_playback() {
+    timeline_ensure_one();
+    if (s_timeline_playback_index < 0 || s_timeline_playback_index >= s_timeline_count)
+        return false;
+    if (s_timeline_current_index == s_timeline_playback_index) {
+        timeline_sync_public_tracks();
+        return true;
+    }
+    s_timeline_current_index = s_timeline_playback_index;
+    timeline_sync_public_tracks();
+    return true;
+}
+
+bool timeline_set_current_index(int index) {
+    timeline_ensure_one();
+    if (index < 0 || index >= s_timeline_count)
+        return false;
+    if (s_timeline_current_index == index) {
+        timeline_sync_public_tracks();
+        return true;
+    }
+    s_timeline_current_index = index;
+    timeline_sync_public_tracks();
+    timeline_sync_scene_time_from_current();
+    return true;
+}
+
+int timeline_add(const char* name) {
+    timeline_ensure_one();
+    if (s_timeline_count >= MAX_TIMELINES)
+        return -1;
+    int index = s_timeline_count++;
+    timeline_init_state(s_timelines[index], index, name);
+    s_timeline_current_index = index;
+    // New timelines are selected for editing immediately; playback will follow
+    // after scene time is synced below if the global timeline runtime is active.
+    timeline_sync_public_tracks();
+    timeline_sync_scene_time_from_current();
+    return index;
+}
+
+bool timeline_delete(int index) {
+    timeline_ensure_one();
+    if (s_timeline_count <= 1 || index < 0 || index >= s_timeline_count)
+        return false;
+
+    int old_current = s_timeline_current_index;
+    int old_playback = s_timeline_playback_index;
+    for (int i = index; i < s_timeline_count - 1; i++) {
+        s_timelines[i] = s_timelines[i + 1];
+        if (!s_timelines[i].name[0])
+            snprintf(s_timelines[i].name, sizeof(s_timelines[i].name), "Timeline_%d", i + 1);
+    }
+    memset(&s_timelines[s_timeline_count - 1], 0, sizeof(TimelineState));
+    s_timeline_count--;
+
+    if (old_current > index)
+        s_timeline_current_index = old_current - 1;
+    else if (old_current == index)
+        s_timeline_current_index = index < s_timeline_count ? index : s_timeline_count - 1;
+    else
+        s_timeline_current_index = old_current;
+
+    if (old_playback > index)
+        s_timeline_playback_index = old_playback - 1;
+    else if (old_playback == index)
+        s_timeline_playback_index = s_timeline_current_index;
+    else
+        s_timeline_playback_index = old_playback;
+
+    if (s_timeline_current_index < 0) s_timeline_current_index = 0;
+    if (s_timeline_current_index >= s_timeline_count) s_timeline_current_index = s_timeline_count - 1;
+    if (s_timeline_playback_index < 0) s_timeline_playback_index = 0;
+    if (s_timeline_playback_index >= s_timeline_count) s_timeline_playback_index = s_timeline_count - 1;
+
+    timeline_sync_public_tracks();
+    timeline_sync_scene_time_from_current();
+    app_request_scene_render();
+    return true;
+}
+
+const char* timeline_name(int index) {
+    TimelineState* tl = timeline_state_at(index);
+    return tl ? tl->name : "";
+}
+
+void timeline_set_name(int index, const char* name) {
+    TimelineState* tl = timeline_state_at(index);
+    if (!tl || !name || !name[0])
+        return;
+    strncpy(tl->name, name, MAX_NAME - 1);
+    tl->name[MAX_NAME - 1] = '\0';
+    for (int i = 0; tl->name[i]; i++) {
+        if (tl->name[i] == ' ' || tl->name[i] == '\t')
+            tl->name[i] = '_';
+    }
+}
+
+bool timeline_timeline_enabled(int index) {
+    TimelineState* tl = timeline_state_at(index);
+    return tl ? tl->enabled : false;
+}
+
+int timeline_enabled_count() {
+    timeline_ensure_one();
+    int n = 0;
+    for (int i = 0; i < s_timeline_count; i++)
+        if (s_timelines[i].enabled)
+            n++;
+    return n;
+}
+
+void timeline_set_timeline_enabled(int index, bool enabled) {
+    TimelineState* tl = timeline_state_at(index);
+    if (!tl)
+        return;
+    if (!enabled && tl->enabled && timeline_enabled_count() <= 1)
+        return; // Keep at least one playable timeline.
+    tl->enabled = enabled;
+    timeline_sync_scene_time_from_current();
+    app_request_scene_render();
+}
+
+float timeline_sequence_duration_seconds() {
+    timeline_ensure_one();
+    float total = 0.0f;
+    for (int i = 0; i < s_timeline_count; i++)
+        total += timeline_duration_seconds(s_timelines[i]);
+    return total;
+}
+
+bool timeline_current_has_keys() {
+    // Runtime query: check the sampled sequence timeline, not the editor
+    // selection. Otherwise selecting a different clip in the UI can prevent the
+    // actually-playing clip from being applied.
+    TimelineState& tl = timeline_playback_state();
+    if (!tl.enabled)
+        return false;
+    for (int i = 0; i < tl.track_count; i++) {
+        if (tl.tracks[i].active && tl.tracks[i].enabled && tl.tracks[i].key_count > 0)
+            return true;
+    }
+    return false;
 }
 
 int timeline_fps() {
-    return s_timeline_fps;
+    return timeline_current_state().fps;
 }
 
 void timeline_set_fps(int fps) {
     if (fps < 1) fps = 1;
     if (fps > 240) fps = 240;
-    s_timeline_fps = fps;
+    TimelineState& tl = timeline_current_state();
+    tl.fps = fps;
     timeline_update(app_scene_time());
     app_request_scene_render();
 }
 
 int timeline_length_frames() {
-    return s_timeline_length_frames;
+    return timeline_current_state().length_frames;
 }
 
-static void timeline_prune_keys_to_length() {
-    for (int t = 0; t < g_timeline_track_count; t++) {
-        TimelineTrack& track = g_timeline_tracks[t];
+static void timeline_prune_keys_to_length(TimelineState& tl) {
+    for (int t = 0; t < tl.track_count; t++) {
+        TimelineTrack& track = tl.tracks[t];
         if (!track.active)
             continue;
         int write = 0;
         for (int k = 0; k < track.key_count; k++) {
-            if (track.keys[k].frame < s_timeline_length_frames)
+            if (track.keys[k].frame < tl.length_frames)
                 track.keys[write++] = track.keys[k];
         }
         for (int k = write; k < track.key_count; k++)
@@ -176,26 +418,27 @@ static void timeline_prune_keys_to_length() {
 void timeline_set_length_frames(int frames) {
     if (frames < 1) frames = 1;
     if (frames > MAX_TIMELINE_FRAMES) frames = MAX_TIMELINE_FRAMES;
-    s_timeline_length_frames = frames;
-    timeline_prune_keys_to_length();
-    int old_frame = s_timeline_current_frame;
-    s_timeline_current_frame = timeline_clamp_frame(s_timeline_current_frame);
-    s_timeline_sample_frame = (float)s_timeline_current_frame;
-    if (s_timeline_current_frame != old_frame && !s_timeline_setting_scene_time && s_timeline_fps > 0)
-        app_set_scene_time((float)s_timeline_current_frame / (float)s_timeline_fps);
+    TimelineState& tl = timeline_current_state();
+    tl.length_frames = frames;
+    timeline_prune_keys_to_length(tl);
+    int old_frame = tl.current_frame;
+    tl.current_frame = timeline_clamp_frame_for(tl, tl.current_frame);
+    tl.sample_frame = (float)tl.current_frame;
+    if (tl.current_frame != old_frame)
+        timeline_sync_scene_time_from_current();
     else
         app_request_scene_render();
 }
 
 int timeline_current_frame() {
-    return s_timeline_current_frame;
+    return timeline_current_state().current_frame;
 }
 
 void timeline_set_current_frame(int frame) {
-    s_timeline_current_frame = timeline_clamp_frame(frame);
-    s_timeline_sample_frame = (float)s_timeline_current_frame;
-    if (!s_timeline_setting_scene_time && s_timeline_fps > 0)
-        app_set_scene_time((float)s_timeline_current_frame / (float)s_timeline_fps);
+    TimelineState& tl = timeline_current_state();
+    tl.current_frame = timeline_clamp_frame_for(tl, frame);
+    tl.sample_frame = (float)tl.current_frame;
+    timeline_sync_scene_time_from_current();
 }
 
 bool timeline_enabled() {
@@ -216,12 +459,13 @@ void timeline_set_loop(bool loop) {
 }
 
 bool timeline_interpolate_frames() {
-    return s_timeline_interpolate_frames;
+    return timeline_current_state().interpolate_frames;
 }
 
 void timeline_set_interpolate_frames(bool enabled) {
-    s_timeline_interpolate_frames = enabled;
-    s_timeline_sample_frame = enabled ? s_timeline_sample_frame : (float)s_timeline_current_frame;
+    TimelineState& tl = timeline_current_state();
+    tl.interpolate_frames = enabled;
+    tl.sample_frame = enabled ? tl.sample_frame : (float)tl.current_frame;
     app_request_scene_render();
 }
 
@@ -234,31 +478,95 @@ void timeline_set_play_dir(int dir) {
 }
 
 void timeline_update(float scene_time_seconds) {
-    if (s_timeline_fps <= 0 || scene_time_seconds < 0.0f)
+    timeline_ensure_one();
+    if (scene_time_seconds < 0.0f)
         return;
 
-    float frame_f = scene_time_seconds * (float)s_timeline_fps;
+    float total = timeline_sequence_duration_seconds();
+    if (total <= 0.0f) {
+        for (int i = 0; i < s_timeline_count; i++) {
+            if (!s_timelines[i].enabled)
+                continue;
+            s_timeline_playback_index = i;
+            s_timelines[i].current_frame = 0;
+            s_timelines[i].sample_frame = 0.0f;
+            return;
+        }
+        return;
+    }
+
+    float sequence_time = scene_time_seconds;
+    if (sequence_time < 0.0f) sequence_time = 0.0f;
+    if (s_timeline_loop && total > 0.0f) {
+        while (sequence_time >= total)
+            sequence_time -= total;
+    } else if (sequence_time > total) {
+        sequence_time = total;
+    }
+
+    float accum = 0.0f;
+    int selected = -1;
+    float local_seconds = 0.0f;
+    int last_enabled = -1;
+    for (int i = 0; i < s_timeline_count; i++) {
+        if (!s_timelines[i].enabled)
+            continue;
+        last_enabled = i;
+        float dur = timeline_duration_seconds(s_timelines[i]);
+        if (dur <= 0.0f) {
+            if (selected < 0 && sequence_time <= accum) {
+                selected = i;
+                local_seconds = 0.0f;
+                break;
+            }
+            continue;
+        }
+        // Half-open clips: [start, end). Exact boundaries belong to the next
+        // enabled timeline. This avoids frame 0 of clip N resolving to the last
+        // frame of clip N-1.
+        if (selected < 0 && sequence_time < accum + dur) {
+            selected = i;
+            local_seconds = sequence_time - accum;
+            if (local_seconds < 0.0f) local_seconds = 0.0f;
+            break;
+        }
+        accum += dur;
+    }
+    if (selected < 0 && last_enabled >= 0) {
+        selected = last_enabled;
+        local_seconds = timeline_duration_seconds(s_timelines[selected]);
+    }
+    if (selected < 0)
+        return;
+
+    // Playback sampling is deliberately separate from editor selection. The UI
+    // combo owns s_timeline_current_index/g_timeline_tracks; sequence playback
+    // owns s_timeline_playback_index.
+    s_timeline_playback_index = selected;
+    TimelineState& tl = s_timelines[selected];
+    if (tl.fps <= 0)
+        return;
+
+    float frame_f = local_seconds * (float)tl.fps;
     if (frame_f < 0.0f) frame_f = 0.0f;
-    float max_frame_f = (float)(s_timeline_length_frames - 1);
+    float max_frame_f = (float)(tl.length_frames - 1);
     if (frame_f > max_frame_f) frame_f = max_frame_f;
 
     int frame = (int)floorf(frame_f + 0.0001f);
-    s_timeline_setting_scene_time = true;
-    timeline_set_current_frame(frame);
-    s_timeline_setting_scene_time = false;
+    tl.current_frame = timeline_clamp_frame_for(tl, frame);
 
     // The visible/current frame remains discrete, but when enabled the sampler
     // evaluates at the true fractional timeline position. This keeps low-FPS
     // timelines intentionally steppy by default while allowing smooth in-between
     // evaluation during playback.
-    s_timeline_sample_frame = s_timeline_interpolate_frames ? frame_f : (float)s_timeline_current_frame;
+    tl.sample_frame = tl.interpolate_frames ? frame_f : (float)tl.current_frame;
 }
 
-int timeline_find_track(TimelineTrackKind kind, const char* target, ResType value_type) {
+static int timeline_find_track_in(const TimelineState& tl, TimelineTrackKind kind, const char* target, ResType value_type) {
     (void)value_type;
     if (!target) target = "";
-    for (int i = 0; i < g_timeline_track_count; i++) {
-        TimelineTrack& t = g_timeline_tracks[i];
+    for (int i = 0; i < tl.track_count; i++) {
+        const TimelineTrack& t = tl.tracks[i];
         if (!t.active || t.kind != kind)
             continue;
         if (strcmp(t.target, target) != 0)
@@ -270,26 +578,32 @@ int timeline_find_track(TimelineTrackKind kind, const char* target, ResType valu
     return -1;
 }
 
+int timeline_find_track(TimelineTrackKind kind, const char* target, ResType value_type) {
+    return timeline_find_track_in(timeline_current_state(), kind, target, value_type);
+}
+
 int timeline_add_track(TimelineTrackKind kind, const char* target, ResType value_type) {
     if (kind == TIMELINE_TRACK_NONE)
         return -1;
+    TimelineState& tl = timeline_current_state();
     if (!target) target = "";
     if (kind == TIMELINE_TRACK_USER_VAR) {
         int user_idx = timeline_user_var_index(target);
         if (user_idx >= 0)
             value_type = g_user_cb_entries[user_idx].type;
     }
-    int existing = timeline_find_track(kind, target, value_type);
+    int existing = timeline_find_track_in(tl, kind, target, value_type);
     if (existing >= 0) {
         if (kind == TIMELINE_TRACK_USER_VAR)
-            g_timeline_tracks[existing].value_type = value_type;
+            tl.tracks[existing].value_type = value_type;
+        timeline_sync_public_tracks();
         return existing;
     }
-    if (g_timeline_track_count >= MAX_TIMELINE_TRACKS)
+    if (tl.track_count >= MAX_TIMELINE_TRACKS)
         return -1;
 
-    int index = g_timeline_track_count++;
-    TimelineTrack& t = g_timeline_tracks[index];
+    int index = tl.track_count++;
+    TimelineTrack& t = tl.tracks[index];
     memset(&t, 0, sizeof(t));
     t.active = true;
     t.enabled = true;
@@ -297,29 +611,41 @@ int timeline_add_track(TimelineTrackKind kind, const char* target, ResType value
     t.value_type = value_type;
     strncpy(t.target, target, MAX_NAME - 1);
     t.target[MAX_NAME - 1] = '\0';
+    timeline_sync_public_tracks();
     return index;
 }
 
-void timeline_delete_track(int track_index) {
-    if (track_index < 0 || track_index >= g_timeline_track_count)
+static void timeline_delete_track_in(TimelineState& tl, int track_index) {
+    if (track_index < 0 || track_index >= tl.track_count)
         return;
-    for (int i = track_index; i < g_timeline_track_count - 1; i++)
-        g_timeline_tracks[i] = g_timeline_tracks[i + 1];
-    memset(&g_timeline_tracks[--g_timeline_track_count], 0, sizeof(TimelineTrack));
+    for (int i = track_index; i < tl.track_count - 1; i++)
+        tl.tracks[i] = tl.tracks[i + 1];
+    memset(&tl.tracks[--tl.track_count], 0, sizeof(TimelineTrack));
+}
+
+void timeline_delete_track(int track_index) {
+    TimelineState& tl = timeline_current_state();
+    timeline_delete_track_in(tl, track_index);
+    timeline_sync_public_tracks();
 }
 
 void timeline_delete_tracks_for_command(const char* target) {
     if (!target || !target[0])
         return;
-    for (int i = g_timeline_track_count - 1; i >= 0; i--) {
-        TimelineTrack& track = g_timeline_tracks[i];
-        if (!track.active)
-            continue;
-        bool command_track = track.kind == TIMELINE_TRACK_COMMAND_TRANSFORM ||
-                             track.kind == TIMELINE_TRACK_COMMAND_ENABLED;
-        if (command_track && strcmp(track.target, target) == 0)
-            timeline_delete_track(i);
+    timeline_ensure_one();
+    for (int ti = 0; ti < s_timeline_count; ti++) {
+        TimelineState& tl = s_timelines[ti];
+        for (int i = tl.track_count - 1; i >= 0; i--) {
+            TimelineTrack& track = tl.tracks[i];
+            if (!track.active)
+                continue;
+            bool command_track = track.kind == TIMELINE_TRACK_COMMAND_TRANSFORM ||
+                                 track.kind == TIMELINE_TRACK_COMMAND_ENABLED;
+            if (command_track && strcmp(track.target, target) == 0)
+                timeline_delete_track_in(tl, i);
+        }
     }
+    timeline_sync_public_tracks();
 }
 
 void timeline_rename_tracks_for_command(const char* old_target, const char* new_target) {
@@ -327,29 +653,38 @@ void timeline_rename_tracks_for_command(const char* old_target, const char* new_
         strcmp(old_target, new_target) == 0)
         return;
 
-    for (int i = 0; i < g_timeline_track_count; i++) {
-        TimelineTrack& track = g_timeline_tracks[i];
-        if (!track.active)
-            continue;
-        bool command_track = track.kind == TIMELINE_TRACK_COMMAND_TRANSFORM ||
-                             track.kind == TIMELINE_TRACK_COMMAND_ENABLED;
-        if (!command_track || strcmp(track.target, old_target) != 0)
-            continue;
-        strncpy(track.target, new_target, MAX_NAME - 1);
-        track.target[MAX_NAME - 1] = '\0';
+    timeline_ensure_one();
+    for (int ti = 0; ti < s_timeline_count; ti++) {
+        TimelineState& tl = s_timelines[ti];
+        for (int i = 0; i < tl.track_count; i++) {
+            TimelineTrack& track = tl.tracks[i];
+            if (!track.active)
+                continue;
+            bool command_track = track.kind == TIMELINE_TRACK_COMMAND_TRANSFORM ||
+                                 track.kind == TIMELINE_TRACK_COMMAND_ENABLED;
+            if (!command_track || strcmp(track.target, old_target) != 0)
+                continue;
+            strncpy(track.target, new_target, MAX_NAME - 1);
+            track.target[MAX_NAME - 1] = '\0';
+        }
     }
 }
 
 void timeline_delete_tracks_for_user_var(const char* target) {
     if (!target || !target[0])
         return;
-    for (int i = g_timeline_track_count - 1; i >= 0; i--) {
-        TimelineTrack& track = g_timeline_tracks[i];
-        if (!track.active || track.kind != TIMELINE_TRACK_USER_VAR)
-            continue;
-        if (strcmp(track.target, target) == 0)
-            timeline_delete_track(i);
+    timeline_ensure_one();
+    for (int ti = 0; ti < s_timeline_count; ti++) {
+        TimelineState& tl = s_timelines[ti];
+        for (int i = tl.track_count - 1; i >= 0; i--) {
+            TimelineTrack& track = tl.tracks[i];
+            if (!track.active || track.kind != TIMELINE_TRACK_USER_VAR)
+                continue;
+            if (strcmp(track.target, target) == 0)
+                timeline_delete_track_in(tl, i);
+        }
     }
+    timeline_sync_public_tracks();
 }
 
 void timeline_rename_tracks_for_user_var(const char* old_target, const char* new_target) {
@@ -357,17 +692,21 @@ void timeline_rename_tracks_for_user_var(const char* old_target, const char* new
         strcmp(old_target, new_target) == 0)
         return;
 
-    for (int i = 0; i < g_timeline_track_count; i++) {
-        TimelineTrack& track = g_timeline_tracks[i];
-        if (!track.active || track.kind != TIMELINE_TRACK_USER_VAR)
-            continue;
-        if (strcmp(track.target, old_target) != 0)
-            continue;
-        strncpy(track.target, new_target, MAX_NAME - 1);
-        track.target[MAX_NAME - 1] = '\0';
-        int user_idx = timeline_user_var_index(new_target);
-        if (user_idx >= 0)
-            track.value_type = g_user_cb_entries[user_idx].type;
+    timeline_ensure_one();
+    for (int ti = 0; ti < s_timeline_count; ti++) {
+        TimelineState& tl = s_timelines[ti];
+        for (int i = 0; i < tl.track_count; i++) {
+            TimelineTrack& track = tl.tracks[i];
+            if (!track.active || track.kind != TIMELINE_TRACK_USER_VAR)
+                continue;
+            if (strcmp(track.target, old_target) != 0)
+                continue;
+            strncpy(track.target, new_target, MAX_NAME - 1);
+            track.target[MAX_NAME - 1] = '\0';
+            int user_idx = timeline_user_var_index(new_target);
+            if (user_idx >= 0)
+                track.value_type = g_user_cb_entries[user_idx].type;
+        }
     }
 }
 
@@ -420,11 +759,12 @@ int timeline_find_key_index(const TimelineTrack& track, int frame) {
 }
 
 TimelineKey* timeline_set_key(int track_index, int frame) {
-    if (track_index < 0 || track_index >= g_timeline_track_count)
+    TimelineState& tl = timeline_current_state();
+    if (track_index < 0 || track_index >= tl.track_count)
         return nullptr;
 
-    TimelineTrack& track = g_timeline_tracks[track_index];
-    frame = timeline_clamp_frame(frame);
+    TimelineTrack& track = tl.tracks[track_index];
+    frame = timeline_clamp_frame_for(tl, frame);
     int existing = timeline_find_key_index(track, frame);
     if (existing >= 0)
         return &track.keys[existing];
@@ -505,10 +845,11 @@ bool timeline_capture_key(int track_index, int frame) {
     TimelineKey* key = timeline_set_key(track_index, frame);
     if (!key)
         return false;
-    TimelineTrack& track = g_timeline_tracks[track_index];
+    TimelineState& tl = timeline_current_state();
+    TimelineTrack& track = tl.tracks[track_index];
     memset(key->ival, 0, sizeof(key->ival));
     memset(key->fval, 0, sizeof(key->fval));
-    key->frame = timeline_clamp_frame(frame);
+    key->frame = timeline_clamp_frame_for(tl, frame);
 
     bool ok = false;
     switch (track.kind) {
@@ -531,13 +872,14 @@ bool timeline_capture_if_tracked(TimelineTrackKind kind, const char* target, Res
     int track_index = timeline_find_track(kind, target ? target : "", value_type);
     if (track_index < 0)
         return false;
-    return timeline_capture_key(track_index, s_timeline_current_frame);
+    return timeline_capture_key(track_index, timeline_current_state().current_frame);
 }
 
 bool timeline_delete_key(int track_index, int frame) {
-    if (track_index < 0 || track_index >= g_timeline_track_count)
+    TimelineState& tl = timeline_current_state();
+    if (track_index < 0 || track_index >= tl.track_count)
         return false;
-    TimelineTrack& track = g_timeline_tracks[track_index];
+    TimelineTrack& track = tl.tracks[track_index];
     int key_index = timeline_find_key_index(track, frame);
     if (key_index < 0)
         return false;
@@ -547,7 +889,6 @@ bool timeline_delete_key(int track_index, int frame) {
     app_request_scene_render();
     return true;
 }
-
 
 static UserCBSourceKind timeline_user_var_source_kind(const TimelineTrack& track) {
     int idx = timeline_user_var_index(track.target);
@@ -591,13 +932,43 @@ static bool timeline_sample_user_var_special_rotation(const TimelineTrack& track
     return false;
 }
 
-static void timeline_sample_key(const TimelineTrack& track, TimelineKey* out) {
+static void timeline_sample_command_transform(const TimelineKey& a, const TimelineKey& b,
+                                              float t, TimelineKey* out) {
+    if (!out)
+        return;
+
+    for (int i = 0; i < 3; i++)
+        out->fval[i] = timeline_lerp(a.fval[i], b.fval[i], t);
+
+    Quat q = quat_slerp(quat_from_array(&a.fval[3]), quat_from_array(&b.fval[3]), t);
+    quat_to_array(q, &out->fval[3]);
+
+    for (int i = 7; i < 10; i++)
+        out->fval[i] = timeline_lerp(a.fval[i], b.fval[i], t);
+}
+
+static void timeline_sample_camera(const TimelineKey& a, const TimelineKey& b,
+                                   float t, TimelineKey* out) {
+    if (!out)
+        return;
+
+    for (int i = 0; i < 3; i++)
+        out->fval[i] = timeline_lerp(a.fval[i], b.fval[i], t);
+    out->fval[3] = timeline_lerp_angle(a.fval[3], b.fval[3], t); // yaw wraps.
+    out->fval[4] = timeline_lerp(a.fval[4], b.fval[4], t);       // pitch is not clamped: camera can loop.
+    out->fval[5] = timeline_lerp(a.fval[5], b.fval[5], t);
+    out->fval[6] = timeline_lerp(a.fval[6], b.fval[6], t);
+    out->fval[7] = timeline_lerp(a.fval[7], b.fval[7], t);
+    out->fval[8] = timeline_lerp_angle(a.fval[8], b.fval[8], t); // roll wraps.
+}
+
+static void timeline_sample_key(const TimelineState& tl, const TimelineTrack& track, TimelineKey* out) {
     if (!out || track.key_count <= 0)
         return;
 
-    float sample_frame = s_timeline_interpolate_frames ? s_timeline_sample_frame : (float)s_timeline_current_frame;
+    float sample_frame = tl.interpolate_frames ? tl.sample_frame : (float)tl.current_frame;
     if (sample_frame < 0.0f) sample_frame = 0.0f;
-    float max_sample_frame = (float)(s_timeline_length_frames - 1);
+    float max_sample_frame = (float)(tl.length_frames - 1);
     if (sample_frame > max_sample_frame) sample_frame = max_sample_frame;
 
     int display_frame = (int)floorf(sample_frame + 0.0001f);
@@ -780,13 +1151,16 @@ static void timeline_apply_dirlight(const TimelineKey& key) {
 }
 
 void timeline_apply_current() {
-    for (int i = 0; i < g_timeline_track_count; i++) {
-        TimelineTrack& track = g_timeline_tracks[i];
+    TimelineState& tl = timeline_playback_state();
+    if (!tl.enabled)
+        return;
+    for (int i = 0; i < tl.track_count; i++) {
+        TimelineTrack& track = tl.tracks[i];
         if (!track.active || !track.enabled || track.key_count <= 0)
             continue;
 
         TimelineKey sampled = {};
-        timeline_sample_key(track, &sampled);
+        timeline_sample_key(tl, track, &sampled);
         switch (track.kind) {
         case TIMELINE_TRACK_USER_VAR:          timeline_apply_user_var(track, sampled); break;
         case TIMELINE_TRACK_COMMAND_TRANSFORM: timeline_apply_command_transform(track, sampled); break;
@@ -798,19 +1172,9 @@ void timeline_apply_current() {
     }
 }
 
-void timeline_write_project(FILE* f) {
-    if (!f)
-        return;
-
-    fprintf(f, "\ntimeline\n");
-    fprintf(f, "timeline_settings %d %d %d 0 %d %d %d\n",
-            s_timeline_fps, s_timeline_length_frames,
-            s_timeline_current_frame, s_timeline_loop ? 1 : 0,
-            s_timeline_enabled ? 1 : 0,
-            s_timeline_interpolate_frames ? 1 : 0);
-
-    for (int i = 0; i < g_timeline_track_count; i++) {
-        const TimelineTrack& track = g_timeline_tracks[i];
+static void timeline_write_tracks(FILE* f, const TimelineState& tl) {
+    for (int i = 0; i < tl.track_count; i++) {
+        const TimelineTrack& track = tl.tracks[i];
         if (!track.active)
             continue;
 
@@ -833,6 +1197,29 @@ void timeline_write_project(FILE* f) {
             }
             fprintf(f, "\n");
         }
+    }
+}
+
+void timeline_write_project(FILE* f) {
+    if (!f)
+        return;
+    timeline_ensure_one();
+
+    fprintf(f, "\ntimeline\n");
+    fprintf(f, "timeline_global %d %d %d\n",
+            s_timeline_current_index,
+            s_timeline_loop ? 1 : 0,
+            s_timeline_enabled ? 1 : 0);
+
+    for (int i = 0; i < s_timeline_count; i++) {
+        const TimelineState& tl = s_timelines[i];
+        fprintf(f, "timeline_clip %s %d %d %d %d %d\n",
+                tl.name[0] ? tl.name : "Timeline",
+                tl.fps, tl.length_frames, tl.current_frame,
+                tl.enabled ? 1 : 0,
+                tl.interpolate_frames ? 1 : 0);
+        timeline_write_tracks(f, tl);
+        fprintf(f, "end_timeline_clip\n");
     }
     fprintf(f, "end_timeline\n");
 }

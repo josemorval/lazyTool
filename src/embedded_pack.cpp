@@ -474,6 +474,9 @@ static bool project_line_is_known_default(const char* line) {
         strcmp(line, "commands") == 0)
         return true;
 
+    if (strcmp(line, "export_settings 1 1 0 0 0 0 0") == 0)
+        return true;
+
     // Exported runtime projects start from the same defaults before parsing.
     if (strcmp(line, "camera_fps 5 5 5 -2.3561945 -0.615479767 1.04700005 0.00100000005 100") == 0)
         return true;
@@ -546,12 +549,9 @@ static bool project_timeline_block_disabled(const char* cursor, const char* end,
         char* tag = strtok(tmp, " \t\r\n");
         if (!tag)
             continue;
-        if (strcmp(tag, "timeline_settings") == 0) {
-            strtok(nullptr, " \t\r\n");
-            strtok(nullptr, " \t\r\n");
-            strtok(nullptr, " \t\r\n");
-            strtok(nullptr, " \t\r\n");
-            strtok(nullptr, " \t\r\n");
+        if (strcmp(tag, "timeline_global") == 0) {
+            strtok(nullptr, " \t\r\n"); // current selected timeline
+            strtok(nullptr, " \t\r\n"); // loop
             char* enabled = strtok(nullptr, " \t\r\n");
             if (enabled && atoi(enabled) == 0)
                 disabled = true;

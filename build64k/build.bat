@@ -24,7 +24,8 @@ REM   - scene render size = fullscreen/backbuffer size
 REM   - camera aspect ratio = fullscreen/backbuffer aspect ratio
 REM   - fixed-size custom render textures stay fixed
 REM   - scene-scaled render textures follow the fullscreen size
-REM   - VSync disabled
+REM   - VSync disabled unless the project export settings or LT64K_CFLAGS enable it
+REM   - Escape-to-close and lightweight runtime key toggles follow project export settings
 REM   - FPS overlay disabled
 REM
 REM Examples from cmd.exe:
@@ -35,6 +36,9 @@ REM   set "LT64K_SKIP_UPX=1"
 REM   build.bat ..\projects\procedural_spheres_pbr_post.lt
 REM
 REM   set "LT64K_CFLAGS=/DLT_VSYNC=1 /DLT_DEBUG_FPS=1"
+REM   build.bat ..\projects\procedural_spheres_pbr_post.lt
+REM
+REM   set "LT64K_CFLAGS=/DLT_INPUT=0 /DLT_ESC_CLOSE=0 /DLT_WIREFRAME=1"
 REM   build.bat ..\projects\procedural_spheres_pbr_post.lt
 REM
 REM Examples from PowerShell:

@@ -1747,7 +1747,7 @@ static void execute_shadow_prepass_command(CmdHandle h) {
     } else {
         if (procedural)
             return;
-        user_cb_bind();
+        // Built-in shadow shader has no project UserCB slot.
     }
 
     set_cached_vs_shader(shadow_vs);

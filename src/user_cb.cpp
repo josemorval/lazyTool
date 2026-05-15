@@ -20,7 +20,6 @@ void user_cb_init() {}
 void user_cb_shutdown() {}
 void user_cb_clear() {}
 void user_cb_update() {}
-void user_cb_bind() {}
 void user_cb_sync_command_params(Command* c, const Resource*) {
     if (c)
         c->param_count = 0;
@@ -488,12 +487,6 @@ void user_cb_update() {
     }
 }
 
-void user_cb_bind() {
-    // Intentionally empty. User CB binding is now resolved per shader from the
-    // reflected UserCB slot, which allows old b1 shaders and new b2 shaders to
-    // coexist during the migration.
-}
-
 static int command_param_find(const Command* c, const char* name) {
     if (!c || !name) return -1;
     for (int i = 0; i < c->param_count; i++)
@@ -786,32 +779,12 @@ const UserCBEntry* user_cb_get(const char* name) {
     return idx >= 0 ? &g_user_cb_entries[idx] : nullptr;
 }
 
-static bool user_cb_clear_source_is_resource(const char* source_name, ResType type) {
-    Resource* r = res_get(res_find_by_name(source_name));
-    return r && r->type == type;
-}
-
 void user_cb_rename_variable_references(const char* old_name, const char* new_name) {
     if (!old_name || !old_name[0] || !new_name || !new_name[0] ||
         strcmp(old_name, new_name) == 0)
         return;
 
     timeline_rename_tracks_for_user_var(old_name, new_name);
-    for (int c_i = 0; c_i < MAX_COMMANDS; c_i++) {
-        Command& c = g_commands[c_i];
-        if (!c.active)
-            continue;
-        if (strcmp(c.clear_color_source, old_name) == 0 &&
-            !user_cb_clear_source_is_resource(old_name, RES_FLOAT4)) {
-            strncpy(c.clear_color_source, new_name, MAX_NAME - 1);
-            c.clear_color_source[MAX_NAME - 1] = '\0';
-        }
-        if (strcmp(c.clear_depth_source, old_name) == 0 &&
-            !user_cb_clear_source_is_resource(old_name, RES_FLOAT)) {
-            strncpy(c.clear_depth_source, new_name, MAX_NAME - 1);
-            c.clear_depth_source[MAX_NAME - 1] = '\0';
-        }
-    }
 }
 
 void user_cb_delete_variable_references(const char* name) {
@@ -819,17 +792,6 @@ void user_cb_delete_variable_references(const char* name) {
         return;
 
     timeline_delete_tracks_for_user_var(name);
-    for (int c_i = 0; c_i < MAX_COMMANDS; c_i++) {
-        Command& c = g_commands[c_i];
-        if (!c.active)
-            continue;
-        if (strcmp(c.clear_color_source, name) == 0 &&
-            !user_cb_clear_source_is_resource(name, RES_FLOAT4))
-            c.clear_color_source[0] = '\0';
-        if (strcmp(c.clear_depth_source, name) == 0 &&
-            !user_cb_clear_source_is_resource(name, RES_FLOAT))
-            c.clear_depth_source[0] = '\0';
-    }
 }
 
 void user_cb_rename_resource_references(ResHandle h, const char* old_name, const char* new_name) {

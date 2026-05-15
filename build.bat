@@ -4,9 +4,11 @@ setlocal
 :: lazyTool build script
 ::
 :: Usage (run from VS Developer Command Prompt so cl.exe is in PATH):
-::   build.bat        -> release build
-::   build.bat run    -> release build + run
-::   build.bat copy   -> copy assets/projects/shaders to bin without compiling
+::   build.bat             -> release build, normal multi-TU mode
+::   build.bat unity       -> release build, unity mode: one TU for editor + one TU for player
+::   build.bat run         -> build + run editor
+::   build.bat unity run   -> unity build + run editor
+::   build.bat copy        -> copy assets/projects/shaders to bin without compiling
 
 set OUTDIR=bin
 set SRCDIR=src
@@ -29,6 +31,9 @@ set DEFINES=^
 
 set RUN_AFTER=0
 set COPY_ONLY=0
+set UNITY_BUILD=0
+set BUILD_MODE=multi-tu
+set UNITY_DEFINES=
 
 :parse_args
 if /I "%1"=="run" (
@@ -41,6 +46,20 @@ if /I "%1"=="copy" (
     shift
     goto parse_args
 )
+if /I "%1"=="unity" (
+    set UNITY_BUILD=1
+    set BUILD_MODE=unity
+    set UNITY_DEFINES=/DLAZYTOOL_UNITY_BUILD
+    shift
+    goto parse_args
+)
+if /I "%1"=="multi" (
+    set UNITY_BUILD=0
+    set BUILD_MODE=multi-tu
+    set UNITY_DEFINES=
+    shift
+    goto parse_args
+)
 if not "%1"=="" (
     echo [WARN] Unknown argument: %1
     shift
@@ -49,7 +68,7 @@ if not "%1"=="" (
 
 if "%COPY_ONLY%"=="1" (
     call :copy_folders
-    if %ERRORLEVEL% neq 0 (
+    if errorlevel 1 (
         echo.
         echo [FAILED]
         exit /b 1
@@ -64,7 +83,7 @@ if "%COPY_ONLY%"=="1" (
 )
 
 call :reset_outdir
-if %ERRORLEVEL% neq 0 (
+if errorlevel 1 (
     echo.
     echo [FAILED]
     exit /b 1
@@ -73,10 +92,25 @@ if %ERRORLEVEL% neq 0 (
 :: Two executables are built from the same repo:
 ::   lazyTool.exe         editor + exporter
 ::   lazyPlayer.exe       normal packed player for asset-heavy projects
+::
+:: `unity` mode compiles src/unity_editor.cpp and src/unity_player.cpp. This is
+:: usually faster for full release builds because Windows/D3D/imgui headers are
+:: parsed once per executable instead of once per .cpp. Use `multi` or omit
+:: `unity` when you want normal isolated translation units.
 set CFLAGS=/W3 /O2 /MT /EHsc /nologo /std:c++17 /DNDEBUG /Gy /Gw /GF
 set PLAYER_CFLAGS=/W3 /O1 /MT /EHsc /nologo /std:c++17 /DNDEBUG /DLAZYTOOL_PLAYER_ONLY /DLAZYTOOL_NO_LOG /Gy /Gw /GF
-echo [BUILD] release
 
+echo [BUILD] release %BUILD_MODE%
+
+if "%UNITY_BUILD%"=="1" goto set_unity_sources
+goto set_multi_sources
+
+:set_unity_sources
+set EDITOR_SRCS=%SRCDIR%\unity_editor.cpp
+set PLAYER_SRCS=%SRCDIR%\unity_player.cpp
+goto after_sources
+
+:set_multi_sources
 set EDITOR_SRCS=^
  %SRCDIR%\main.cpp ^
  %SRCDIR%\log.cpp ^
@@ -111,6 +145,9 @@ set PLAYER_SRCS=^
  %SRCDIR%\user_cb.cpp ^
  %SRCDIR%\impl.cpp
 
+goto after_sources
+
+:after_sources
 set LIBS=^
  d3d11.lib ^
  dxgi.lib ^
@@ -122,19 +159,19 @@ set LIBS=^
 
 set RES=%OUTDIR%\lazyTool.res
 rc /nologo /fo%RES% app.rc
-if %ERRORLEVEL% neq 0 (
+if errorlevel 1 (
     echo.
     echo [FAILED]
     exit /b 1
 )
 
-cl %CFLAGS% %DEFINES% %INCLUDES% %EDITOR_SRCS% %RES% ^
+cl %CFLAGS% %UNITY_DEFINES% %DEFINES% %INCLUDES% %EDITOR_SRCS% %RES% ^
    /Fe:%OUTDIR%\lazyTool.exe ^
    /Fo:%OUTDIR%\ ^
    /Fd:%OUTDIR%\lazyTool.pdb ^
    /link %LIBS% /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /INCREMENTAL:NO
 
-if %ERRORLEVEL% neq 0 (
+if errorlevel 1 (
     echo.
     echo [FAILED]
     exit /b 1
@@ -144,13 +181,13 @@ echo.
 echo [OK] %OUTDIR%\lazyTool.exe
 
 if not exist %OUTDIR%\player mkdir %OUTDIR%\player
-cl %PLAYER_CFLAGS% %DEFINES% %INCLUDES% %PLAYER_SRCS% %RES% ^
+cl %PLAYER_CFLAGS% %UNITY_DEFINES% %DEFINES% %INCLUDES% %PLAYER_SRCS% %RES% ^
    /Fe:%OUTDIR%\lazyPlayer.exe ^
    /Fo:%OUTDIR%\player\ ^
    /Fd:%OUTDIR%\lazyPlayer.pdb ^
    /link %LIBS% /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /INCREMENTAL:NO /MANIFEST:NO
 
-if %ERRORLEVEL% neq 0 (
+if errorlevel 1 (
     echo.
     echo [FAILED]
     exit /b 1
@@ -159,7 +196,7 @@ if %ERRORLEVEL% neq 0 (
 echo [OK] %OUTDIR%\lazyPlayer.exe
 
 call :copy_folders
-if %ERRORLEVEL% neq 0 (
+if errorlevel 1 (
     echo.
     echo [FAILED]
     exit /b 1
@@ -189,10 +226,16 @@ if not exist %OUTDIR% (
 exit /b 0
 
 :copy_folders
-xcopy assets %OUTDIR%\assets /E /I /Y >nul
-if %ERRORLEVEL% geq 4 exit /b %ERRORLEVEL%
-xcopy projects %OUTDIR%\projects /E /I /Y >nul
-if %ERRORLEVEL% geq 4 exit /b %ERRORLEVEL%
-xcopy shaders %OUTDIR%\shaders /E /I /Y >nul
-if %ERRORLEVEL% geq 4 exit /b %ERRORLEVEL%
+if exist assets\NUL (
+    xcopy assets %OUTDIR%\assets /E /I /Y >nul
+    if errorlevel 4 exit /b %ERRORLEVEL%
+)
+if exist projects\NUL (
+    xcopy projects %OUTDIR%\projects /E /I /Y >nul
+    if errorlevel 4 exit /b %ERRORLEVEL%
+)
+if exist shaders\NUL (
+    xcopy shaders %OUTDIR%\shaders /E /I /Y >nul
+    if errorlevel 4 exit /b %ERRORLEVEL%
+)
 exit /b 0

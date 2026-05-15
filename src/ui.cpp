@@ -995,24 +995,38 @@ static void ui_make_standalone_output_path(const char* project_path, char* out, 
 
     strncpy(out, project_path, out_sz - 1);
     out[out_sz - 1] = '\0';
-    const char* slash1 = strrchr(out, '/');
-    const char* slash2 = strrchr(out, '\\');
-    const char* slash = slash1 > slash2 ? slash1 : slash2;
-    char* base = slash ? (char*)slash + 1 : out;
+
+    char* base = out;
+    for (char* p = out; *p; ++p) {
+        if (*p == '/' || *p == '\\')
+            base = p + 1;
+    }
+
     char* dot = strrchr(base, '.');
     if (dot)
         *dot = '\0';
 
     int len = (int)strlen(out);
+    if (len <= 0 || len >= out_sz - 1) {
+        out[0] = '\0';
+        return;
+    }
     snprintf(out + len, out_sz - len, "_standalone.exe");
 }
 
 static void ui_export_current_project_single_exe() {
-    const char* project_path = project_current_path();
-    if (!project_path || !project_path[0]) {
+    const char* current_project_path = project_current_path();
+    if (!current_project_path || !current_project_path[0]) {
         log_warn("Export EXE needs a saved project path first.");
         return;
     }
+
+    // Keep a local copy before saving. project_save_text() updates the current
+    // project path, so using the returned static buffer directly here can make
+    // later output-path generation depend on a mutable global.
+    char project_path[MAX_PATH_LEN] = {};
+    strncpy(project_path, current_project_path, MAX_PATH_LEN - 1);
+    project_path[MAX_PATH_LEN - 1] = '\0';
 
     if (!project_save_text(project_path))
         return;
@@ -1710,7 +1724,7 @@ static bool ui_user_cb_value_editor(ResType type, int* ival, float* fval, float 
     }
 }
 
-static void command_param_copy_from_resource(CommandParam* p, const Resource* r) {
+static void ui_command_param_copy_from_resource(CommandParam* p, const Resource* r) {
     if (!p || !r || p->type != r->type) return;
     switch (p->type) {
     case RES_FLOAT:
@@ -1773,7 +1787,7 @@ static void ui_command_param_source_combo(CommandParam* p) {
                 p->source = h;
                 p->source_kind = USER_CB_SOURCE_RESOURCE;
                 p->source_target[0] = '\0';
-                command_param_copy_from_resource(p, &r);
+                ui_command_param_copy_from_resource(p, &r);
             }
             ImGui::PopID();
         }
@@ -1796,7 +1810,7 @@ static void ui_command_param_source_combo(CommandParam* p) {
                     p->source = h;
                     p->source_kind = USER_CB_SOURCE_RESOURCE;
                     p->source_target[0] = '\0';
-                    command_param_copy_from_resource(p, size_res);
+                    ui_command_param_copy_from_resource(p, size_res);
                 }
                 ImGui::PopID();
             }
@@ -5614,7 +5628,7 @@ static void ui_panel_commands(bool embedded = false) {
 
 // -- inspector -------------------------------------------------------------
 
-static void ui_compute_legacy_cascade_splits(float near_z, float far_z, int cascade_count,
+static void ui_compute_default_cascade_splits(float near_z, float far_z, int cascade_count,
                                              float lambda, float out_splits[MAX_SHADOW_CASCADES]) {
     if (!out_splits)
         return;
@@ -5655,7 +5669,7 @@ static void ui_seed_dirlight_cascade_range(Resource* r, int from_index, int casc
 
     float seeded_splits[MAX_SHADOW_CASCADES] = {};
     float split_far = r->shadow_distance > 0.1f ? r->shadow_distance : g_camera.far_z;
-    ui_compute_legacy_cascade_splits(g_camera.near_z, split_far, cascade_count,
+    ui_compute_default_cascade_splits(g_camera.near_z, split_far, cascade_count,
                                      r->shadow_split_lambda, seeded_splits);
 
     float base_extent_x = r->shadow_extent[0] > 0.01f ? r->shadow_extent[0] : 0.01f;
@@ -6431,12 +6445,9 @@ static bool ui_clear_resource_source_combo(const char* label, char* source_name,
         return false;
 
     Resource* current = ui_clear_source_resource(source_name, type);
-    const UserCBEntry* legacy_user_cb = current ? nullptr : user_cb_get(source_name);
     char preview[160] = {};
     if (current) {
         snprintf(preview, sizeof(preview), "%s", ui_resource_display_name(*current));
-    } else if (legacy_user_cb && legacy_user_cb->type == type) {
-        snprintf(preview, sizeof(preview), "UserCB: %s", legacy_user_cb->name);
     } else if (source_name[0]) {
         snprintf(preview, sizeof(preview), "(missing) %s", source_name);
     } else {
@@ -6476,11 +6487,7 @@ static bool ui_clear_resource_source_combo(const char* label, char* source_name,
 }
 
 static bool ui_clear_source_valid(const char* source_name, ResType type) {
-    Resource* r = ui_clear_source_resource(source_name, type);
-    if (r)
-        return true;
-    const UserCBEntry* e = user_cb_get(source_name);
-    return e && e->type == type;
+    return ui_clear_source_resource(source_name, type) != nullptr;
 }
 
 
@@ -6617,7 +6624,7 @@ static void ui_inspector_command(Command* c) {
             if (color_res) {
                 ImGui::TextWrapped("Clear color is driven by resource '%s'.", color_res->name);
             } else if (ui_clear_source_valid(c->clear_color_source, RES_FLOAT4)) {
-                ImGui::TextWrapped("Clear color is driven by legacy UserCB float4 '%s'.", c->clear_color_source);
+                ImGui::TextWrapped("Clear color is driven by resource '%s'.", c->clear_color_source);
             } else {
                 if (c->clear_color_source[0])
                     ImGui::TextWrapped("Selected color source is missing or not float4; using the hardcoded fallback value.");
@@ -6631,7 +6638,7 @@ static void ui_inspector_command(Command* c) {
             if (depth_res) {
                 ImGui::TextWrapped("Depth clear is driven by resource '%s'.", depth_res->name);
             } else if (ui_clear_source_valid(c->clear_depth_source, RES_FLOAT)) {
-                ImGui::TextWrapped("Depth clear is driven by legacy UserCB float '%s'.", c->clear_depth_source);
+                ImGui::TextWrapped("Depth clear is driven by resource '%s'.", c->clear_depth_source);
             } else {
                 if (c->clear_depth_source[0])
                     ImGui::TextWrapped("Selected depth source is missing or not float; using the hardcoded fallback value.");
@@ -7454,6 +7461,46 @@ static void ui_panel_general(bool embedded = false) {
         settings_dirty |= ImGui::Checkbox("VSync", &g_dx.vsync);
         ImGui::SameLine();
         ImGui::TextDisabled("%s", g_dx.vsync ? "Present interval 1" : "Present immediate");
+    }
+
+    if (ImGui::CollapsingHeader("Exporter / Standalone", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TextDisabled("Project settings used by Export EXE and build64k.");
+        ImGui::Checkbox("Runtime Input", &g_export_settings.runtime_input_enabled);
+        ImGui::SameLine();
+        ImGui::TextDisabled("camera/light controls in normal player; F1 debug toggle in 64k");
+        ImGui::Checkbox("Esc Closes Player", &g_export_settings.escape_closes_player);
+        ImGui::Checkbox("Force Wireframe", &g_export_settings.force_wireframe);
+        ImGui::Checkbox("Show Grid Overlay", &g_export_settings.show_grid_overlay);
+        ImGui::SameLine();
+        ImGui::TextDisabled("normal EXE only");
+        ImGui::Checkbox("VSync In Export", &g_export_settings.vsync);
+        ImGui::Checkbox("Profiler In Export", &g_export_settings.profiler);
+        ImGui::Checkbox("Shader Binding Warnings", &g_export_settings.shader_binding_warnings);
+
+        if (ImGui::Button("Final Optimized Preset")) {
+            g_export_settings.runtime_input_enabled = false;
+            g_export_settings.escape_closes_player = true;
+            g_export_settings.force_wireframe = false;
+            g_export_settings.show_grid_overlay = false;
+            g_export_settings.vsync = false;
+            g_export_settings.profiler = false;
+            g_export_settings.shader_binding_warnings = false;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Interactive Debug Preset")) {
+            g_export_settings.runtime_input_enabled = true;
+            g_export_settings.escape_closes_player = true;
+            g_export_settings.force_wireframe = false;
+            g_export_settings.show_grid_overlay = true;
+            g_export_settings.vsync = false;
+            g_export_settings.profiler = true;
+            g_export_settings.shader_binding_warnings = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset##export_settings")) {
+            g_export_settings = project_default_export_settings();
+        }
+        ImGui::TextDisabled("Normal EXE copies lazyPlayer.exe when present; 64k turns these into compile-time defaults.");
     }
 
     if (ImGui::CollapsingHeader("Viewport", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -9613,10 +9660,13 @@ struct TimelineSlotClipboard {
 
 static TimelineSlotSelection s_timeline_slot_selection = {};
 static TimelineSlotClipboard s_timeline_slot_clipboard = {};
+static int s_timeline_slot_selection_timeline = -1;
 static int s_timeline_frame_context_frame = 0;
 
 static bool ui_timeline_slot_selection_valid() {
     if (!s_timeline_slot_selection.valid)
+        return false;
+    if (s_timeline_slot_selection_timeline != timeline_current_index())
         return false;
     int track_index = s_timeline_slot_selection.track_index;
     if (track_index < 0 || track_index >= g_timeline_track_count)
@@ -9637,6 +9687,7 @@ static void ui_timeline_select_slot(int track_index, int frame) {
     if (track_index < 0 || track_index >= g_timeline_track_count)
         return;
     s_timeline_slot_selection.valid = true;
+    s_timeline_slot_selection_timeline = timeline_current_index();
     s_timeline_slot_selection.track_index = track_index;
     s_timeline_slot_selection.frame = frame;
 }
@@ -10044,9 +10095,10 @@ static void ui_draw_timeline_window() {
         return;
     }
 
-    char detail[128] = {};
-    snprintf(detail, sizeof(detail), "%s  frame %d / %d  %.2fs",
+    char detail[160] = {};
+    snprintf(detail, sizeof(detail), "%s  timeline %d / %d  frame %d / %d  %.2fs",
              timeline_enabled() ? "active" : "disabled",
+             timeline_current_index() + 1, timeline_count(),
              timeline_current_frame(), timeline_length_frames() - 1, app_scene_time());
     if (s_panel_tone_count < (int)(sizeof(s_panel_tone_stack) / sizeof(s_panel_tone_stack[0])))
         s_panel_tone_stack[s_panel_tone_count++] = UI_PANEL_DEFAULT;
@@ -10142,6 +10194,70 @@ static void ui_draw_timeline_window() {
     }
     if (track_enabled)
         ImGui::PopStyleColor(3);
+    ImGui::SameLine(0.0f, ui_margin_px(12.0f));
+
+    int current_timeline = timeline_current_index();
+    const char* timeline_preview = timeline_name(current_timeline);
+    ImGui::SetNextItemWidth(ui_px(136.0f));
+    if (ImGui::BeginCombo("##timeline_selector", timeline_preview && timeline_preview[0] ? timeline_preview : "Timeline")) {
+        for (int i = 0; i < timeline_count(); i++) {
+            char item_label[128] = {};
+            snprintf(item_label, sizeof(item_label), "%s%s",
+                     timeline_timeline_enabled(i) ? "" : "[off] ",
+                     timeline_name(i));
+            bool selected = i == current_timeline;
+            if (ImGui::Selectable(item_label, selected)) {
+                if (timeline_set_current_index(i)) {
+                    s_timeline_slot_selection.valid = false;
+                    s_timeline_slot_selection_timeline = -1;
+                    s_timeline_visible_first_frame = 0;
+                    s_timeline_ensure_current_visible = true;
+                }
+            }
+            if (selected)
+                ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine(0.0f, ui_margin_px(4.0f));
+    if (ImGui::Button("+##timeline_add", ImVec2(ui_px(26.0f), 0.0f))) {
+        if (timeline_add(nullptr) >= 0) {
+            s_timeline_slot_selection.valid = false;
+            s_timeline_slot_selection_timeline = -1;
+            s_timeline_visible_first_frame = 0;
+            s_timeline_ensure_current_visible = true;
+        }
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Create timeline");
+    ImGui::SameLine(0.0f, ui_margin_px(4.0f));
+    bool can_delete_timeline = timeline_count() > 1;
+    if (!can_delete_timeline)
+        ImGui::BeginDisabled();
+    if (ImGui::Button("-##timeline_delete", ImVec2(ui_px(26.0f), 0.0f))) {
+        if (timeline_delete(timeline_current_index())) {
+            s_timeline_slot_selection.valid = false;
+            s_timeline_slot_selection_timeline = -1;
+            s_timeline_visible_first_frame = 0;
+            s_timeline_ensure_current_visible = true;
+        }
+    }
+    if (!can_delete_timeline)
+        ImGui::EndDisabled();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(can_delete_timeline ? "Delete selected timeline" : "At least one timeline is always kept");
+    ImGui::SameLine(0.0f, ui_margin_px(8.0f));
+    bool selected_timeline_enabled = timeline_timeline_enabled(timeline_current_index());
+    bool can_toggle_selected_timeline = selected_timeline_enabled ? (timeline_enabled_count() > 1) : true;
+    if (!can_toggle_selected_timeline)
+        ImGui::BeginDisabled();
+    if (ImGui::Checkbox("Enabled##timeline_clip_enabled", &selected_timeline_enabled))
+        timeline_set_timeline_enabled(timeline_current_index(), selected_timeline_enabled);
+    if (!can_toggle_selected_timeline)
+        ImGui::EndDisabled();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(can_toggle_selected_timeline ? "Skip this timeline during playback/export when disabled" : "At least one timeline must stay enabled");
+
     ImGui::SameLine(0.0f, ui_margin_px(18.0f));
     if (!track_enabled)
         ImGui::BeginDisabled();
@@ -10306,6 +10422,12 @@ static void ui_draw_timeline_window() {
             ImGui::PushID(f);
             ImGui::SetCursorScreenPos(slot_min);
             ImGui::InvisibleButton("##frame_header", ImVec2(slot_size.x, ruler_h));
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                timeline_set_current_frame(f);
+                s_timeline_slot_selection.valid = false;
+                s_timeline_slot_selection_timeline = -1;
+                s_timeline_ensure_current_visible = true;
+            }
             if (ImGui::IsMouseHoveringRect(slot_min, slot_max) &&
                 ImGui::IsMouseClicked(ImGuiMouseButton_Right))
                 frame_context_request = f;

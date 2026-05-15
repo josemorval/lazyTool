@@ -768,6 +768,16 @@ static CmdHandle g_default_pixelize_cmd = INVALID_HANDLE;
 static bool     g_player_mode = false;
 static ULONGLONG g_last_editor_present_ms = 0;
 
+static void app_rewind_scene_runtime_state() {
+    g_time = 0.0f;
+    g_dt = 0.0f;
+    g_frame = 0;
+    g_scene_reset_execution_pending = true;
+    dx_invalidate_scene_history();
+}
+
+static void app_restart_scene_runtime();
+
 void app_request_scene_restart() {
     g_restart_scene_requested = true;
 }
@@ -785,6 +795,11 @@ void app_request_scene_render() {
 }
 
 void app_set_scene_paused(bool paused) {
+    if (!paused && g_scene_paused && timeline_enabled() && !timeline_loop()) {
+        float timeline_end_time = timeline_sequence_duration_seconds();
+        if (timeline_end_time > 0.0f && g_time >= timeline_end_time - 0.0005f)
+            app_restart_scene_runtime();
+    }
     if (g_scene_paused == paused)
         return;
     g_scene_paused = paused;
@@ -814,10 +829,7 @@ uint64_t app_scene_frame() {
 }
 
 static void app_restart_scene_runtime() {
-    g_time = 0.0f;
-    g_dt = 0.0f;
-    g_frame = 0;
-    g_scene_reset_execution_pending = true;
+    app_rewind_scene_runtime_state();
     dx_create_scene_rt(g_dx.scene_width, g_dx.scene_height);
     Resource* dl = res_get(g_builtin_dirlight);
     if (dl && dl->shadow_width > 0 && dl->shadow_height > 0)
@@ -827,12 +839,35 @@ static void app_restart_scene_runtime() {
     res_reset_transient_gpu_resources();
 }
 
-static bool app_timeline_has_keys() {
-    for (int i = 0; i < g_timeline_track_count; i++) {
-        if (g_timeline_tracks[i].active && g_timeline_tracks[i].key_count > 0)
-            return true;
+static void app_apply_export_settings_for_player() {
+    if (!g_player_mode)
+        return;
+
+    g_camera_controls.enabled = g_export_settings.runtime_input_enabled;
+    if (!g_export_settings.runtime_input_enabled)
+        g_camera_controls.mouse_look = false;
+
+    g_dx.vsync = g_export_settings.vsync;
+    g_dx.scene_wireframe = g_export_settings.force_wireframe;
+    g_dx.scene_grid_enabled = g_export_settings.show_grid_overlay;
+    if (g_export_settings.show_grid_overlay && g_dx.scene_grid_color[3] <= 0.0f) {
+        g_dx.scene_grid_color[0] = 1.00f;
+        g_dx.scene_grid_color[1] = 0.50f;
+        g_dx.scene_grid_color[2] = 0.01f;
+        g_dx.scene_grid_color[3] = 0.5f;
     }
-    return false;
+    g_profiler_enabled = g_export_settings.profiler;
+    g_dx.shader_validation_warnings = g_export_settings.shader_binding_warnings;
+
+    // The D3D debug layer is intentionally not exported as a project option:
+    // it changes device creation, adds heavy overhead, and is an editor-only
+    // diagnostic.
+    g_dx.d3d11_validation = false;
+    g_dx.d3d11_validation_active = false;
+}
+
+static bool app_timeline_has_keys() {
+    return timeline_current_has_keys();
 }
 
 Camera g_camera = {};
@@ -1103,6 +1138,9 @@ static bool update_camera_orbit() {
 // keeps distance stable and only changes azimuth/elevation, which matches the
 // inspector fields and makes it easy to extend with gizmos later.
 static bool update_dirlight_orbit() {
+    if (g_player_mode && !g_export_settings.runtime_input_enabled)
+        return false;
+
     float dx = 0.0f;
     float dy = 0.0f;
     bool active = begin_or_update_viewport_mouse_gesture(
@@ -1228,6 +1266,9 @@ static void update_camera_keyboard(float dt) {
 }
 
 static void update_camera_controls(float dt) {
+    if (g_player_mode && !g_export_settings.runtime_input_enabled)
+        return;
+
     if (GetForegroundWindow() != g_dx.hwnd)
         return;
 
@@ -1306,7 +1347,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         case WM_KEYDOWN:
-            if (wp == VK_ESCAPE) {
+            if (g_export_settings.escape_closes_player && wp == VK_ESCAPE) {
                 DestroyWindow(hwnd);
                 return 0;
             }
@@ -1797,6 +1838,21 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         project_new_default();
     }
 
+    if (g_player_mode) {
+        app_apply_export_settings_for_player();
+
+        // Project files store editor state too: selected timeline, selected frame
+        // and scrubbed scene time. A standalone/exported player must always run
+        // the sequence from the beginning instead of inheriting the editor's
+        // current clip/frame at export time. This matters for multi-timeline
+        // projects because saving while clip 2/3 is selected would otherwise make
+        // the exported EXE start there, or even start paused if that scrubbed time
+        // was already at the end of the sequence.
+        g_scene_paused = false;
+        app_rewind_scene_runtime_state();
+        app_request_scene_render();
+    }
+
     if (!g_player_mode && g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED)
         camera_apply_horizon_lock(&g_camera);
 
@@ -1864,9 +1920,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             g_frame++;
             bool timeline_runtime_active = timeline_enabled();
             if (timeline_runtime_active) {
-                float timeline_end_time = timeline_fps() > 0 ?
-                    (float)(timeline_length_frames() - 1) / (float)timeline_fps() : 0.0f;
-                if (timeline_loop() && timeline_end_time > 0.0f && g_time > timeline_end_time) {
+                float timeline_end_time = timeline_sequence_duration_seconds();
+                if (timeline_loop() && timeline_end_time > 0.0f && g_time >= timeline_end_time) {
                     force_scene_render = true;
                     app_restart_scene_runtime();
                 } else if (!timeline_loop() && timeline_end_time >= 0.0f && g_time >= timeline_end_time) {
@@ -1888,7 +1943,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             g_scene_view_hovered = true;
         bool scene_will_render = !g_scene_paused || force_scene_render;
         if (timeline_enabled() && scene_will_render) {
+            bool timeline_was_running = !g_scene_paused;
             timeline_update(g_time);
+            if (timeline_was_running)
+                timeline_sync_editor_to_playback();
             if (app_timeline_has_keys())
                 timeline_apply_current();
         }
@@ -1927,7 +1985,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             // The grid is an editor viewport aid. Do not run it in player mode:
             // it is a full-screen depth-reading pass and can be surprisingly
             // visible in performance on post-heavy scenes.
-            if (!g_player_mode)
+            if (!g_player_mode || g_export_settings.show_grid_overlay)
                 dx_render_scene_grid_overlay();
 #endif
             dx_end_scene();
