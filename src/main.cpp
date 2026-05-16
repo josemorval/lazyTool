@@ -21,6 +21,14 @@
 #include "timeline.h"
 #include "resource.h"
 
+// Hint hybrid-GPU laptops to start the editor/player on the high-performance GPU.
+// We still select the adapter explicitly in dx11_ctx.cpp, but these exports help
+// NVIDIA Optimus / AMD PowerXpress decide before D3D11 is initialized.
+extern "C" {
+    __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
+    __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+
 #ifdef LAZYTOOL_PLAYER_ONLY
 ResHandle g_sel_res = INVALID_HANDLE;
 CmdHandle g_sel_cmd = INVALID_HANDLE;
@@ -766,7 +774,69 @@ static bool     g_scene_render_requested = false;
 static bool     g_scene_reset_execution_pending = true;
 static CmdHandle g_default_pixelize_cmd = INVALID_HANDLE;
 static bool     g_player_mode = false;
-static ULONGLONG g_last_editor_present_ms = 0;
+static bool     g_player_exit_after_present = false;
+// CPU profiler values are double-buffered. The UI is drawn before the
+// current frame timing is complete, so it must display the last completed
+// frame instead of the in-progress accumulators.
+static float    g_cpu_frame_ms = 0.0f;
+static float    g_cpu_scene_ms = 0.0f;
+static float    g_cpu_ui_build_ms = 0.0f;
+static float    g_cpu_ui_render_ms = 0.0f;
+static float    g_cpu_present_ms = 0.0f;
+static float    g_cpu_other_ms = 0.0f;
+static float    g_editor_frame_cap_fps = 120.0f; // 0 = uncapped. Editor-only, ignored when VSync is enabled.
+static float    g_cpu_frame_display_ms = 0.0f;
+static float    g_cpu_scene_display_ms = 0.0f;
+static float    g_cpu_ui_build_display_ms = 0.0f;
+static float    g_cpu_ui_render_display_ms = 0.0f;
+static float    g_cpu_present_display_ms = 0.0f;
+static float    g_cpu_other_display_ms = 0.0f;
+static bool     g_cpu_profile_display_valid = false;
+
+static float qpc_elapsed_ms(const LARGE_INTEGER& a, const LARGE_INTEGER& b, const LARGE_INTEGER& freq) {
+    return (float)(((double)(b.QuadPart - a.QuadPart) * 1000.0) / (double)freq.QuadPart);
+}
+
+static void app_cpu_profile_reset_frame() {
+    g_cpu_scene_ms = 0.0f;
+    g_cpu_ui_build_ms = 0.0f;
+    g_cpu_ui_render_ms = 0.0f;
+    g_cpu_present_ms = 0.0f;
+    g_cpu_other_ms = 0.0f;
+}
+
+static void app_cpu_profile_publish_frame() {
+    const float a = 0.12f;
+    if (!g_cpu_profile_display_valid) {
+        g_cpu_frame_display_ms = g_cpu_frame_ms;
+        g_cpu_scene_display_ms = g_cpu_scene_ms;
+        g_cpu_ui_build_display_ms = g_cpu_ui_build_ms;
+        g_cpu_ui_render_display_ms = g_cpu_ui_render_ms;
+        g_cpu_present_display_ms = g_cpu_present_ms;
+        g_cpu_other_display_ms = g_cpu_other_ms;
+        g_cpu_profile_display_valid = true;
+        return;
+    }
+    g_cpu_frame_display_ms += (g_cpu_frame_ms - g_cpu_frame_display_ms) * a;
+    g_cpu_scene_display_ms += (g_cpu_scene_ms - g_cpu_scene_display_ms) * a;
+    g_cpu_ui_build_display_ms += (g_cpu_ui_build_ms - g_cpu_ui_build_display_ms) * a;
+    g_cpu_ui_render_display_ms += (g_cpu_ui_render_ms - g_cpu_ui_render_display_ms) * a;
+    g_cpu_present_display_ms += (g_cpu_present_ms - g_cpu_present_display_ms) * a;
+    g_cpu_other_display_ms += (g_cpu_other_ms - g_cpu_other_display_ms) * a;
+}
+
+float app_cpu_frame_ms() { return g_cpu_frame_display_ms; }
+float app_cpu_scene_ms() { return g_cpu_scene_display_ms; }
+float app_cpu_ui_build_ms() { return g_cpu_ui_build_display_ms; }
+float app_cpu_ui_render_ms() { return g_cpu_ui_render_display_ms; }
+float app_cpu_present_ms() { return g_cpu_present_display_ms; }
+float app_cpu_other_ms() { return g_cpu_other_display_ms; }
+float app_editor_frame_cap_fps() { return g_editor_frame_cap_fps; }
+void app_set_editor_frame_cap_fps(float fps) {
+    if (fps < 1.0f) fps = 0.0f;
+    if (fps > 1000.0f) fps = 1000.0f;
+    g_editor_frame_cap_fps = fps;
+}
 
 static void app_rewind_scene_runtime_state() {
     g_time = 0.0f;
@@ -843,27 +913,25 @@ static void app_apply_export_settings_for_player() {
     if (!g_player_mode)
         return;
 
-    g_camera_controls.enabled = g_export_settings.runtime_input_enabled;
-    if (!g_export_settings.runtime_input_enabled)
+    g_camera_controls.enabled = g_export_settings.camera_light_controls_enabled;
+    if (!g_export_settings.camera_light_controls_enabled)
         g_camera_controls.mouse_look = false;
 
     g_dx.vsync = g_export_settings.vsync;
-    g_dx.scene_wireframe = g_export_settings.force_wireframe;
-    g_dx.scene_grid_enabled = g_export_settings.show_grid_overlay;
-    if (g_export_settings.show_grid_overlay && g_dx.scene_grid_color[3] <= 0.0f) {
-        g_dx.scene_grid_color[0] = 1.00f;
-        g_dx.scene_grid_color[1] = 0.50f;
-        g_dx.scene_grid_color[2] = 0.01f;
-        g_dx.scene_grid_color[3] = 0.5f;
-    }
-    g_profiler_enabled = g_export_settings.profiler;
-    g_dx.shader_validation_warnings = g_export_settings.shader_binding_warnings;
 
-    // The D3D debug layer is intentionally not exported as a project option:
-    // it changes device creation, adds heavy overhead, and is an editor-only
-    // diagnostic.
+    // Exported players are final/demo builds. Editor viewport and diagnostic
+    // states must never leak into them.
+    g_dx.scene_wireframe = false;
+    g_dx.scene_grid_enabled = false;
+    g_profiler_enabled = false;
+    g_dx.shader_validation_warnings = false;
     g_dx.d3d11_validation = false;
     g_dx.d3d11_validation_active = false;
+
+    // A demo export is expected to finish. When exit-after-timeline is enabled,
+    // make it win over the editor's loop toggle instead of looping forever.
+    if (g_export_settings.exit_after_timeline)
+        timeline_set_loop(false);
 }
 
 static bool app_timeline_has_keys() {
@@ -1138,7 +1206,7 @@ static bool update_camera_orbit() {
 // keeps distance stable and only changes azimuth/elevation, which matches the
 // inspector fields and makes it easy to extend with gizmos later.
 static bool update_dirlight_orbit() {
-    if (g_player_mode && !g_export_settings.runtime_input_enabled)
+    if (g_player_mode && !g_export_settings.camera_light_controls_enabled)
         return false;
 
     float dx = 0.0f;
@@ -1266,7 +1334,7 @@ static void update_camera_keyboard(float dt) {
 }
 
 static void update_camera_controls(float dt) {
-    if (g_player_mode && !g_export_settings.runtime_input_enabled)
+    if (g_player_mode && !g_export_settings.camera_light_controls_enabled)
         return;
 
     if (GetForegroundWindow() != g_dx.hwnd)
@@ -1279,55 +1347,25 @@ static void update_camera_controls(float dt) {
 }
 
 
-static bool editor_any_navigation_key_down() {
-    return key_down(VK_LBUTTON) || key_down(VK_RBUTTON) || key_down(VK_MBUTTON) ||
-           key_down('W') || key_down('A') || key_down('S') || key_down('D') ||
-           key_down('Q') || key_down('E') || key_down('R') || key_down('T') ||
-           key_down('F') || key_down('L') || (key_down(VK_MENU) && key_down(VK_LBUTTON)) ||
-           key_down(VK_SHIFT) || key_down(VK_CONTROL);
-}
 
-static bool editor_imgui_wants_continuous_redraw() {
+static void editor_wait_for_frame_cap(const LARGE_INTEGER& frame_begin, const LARGE_INTEGER& freq) {
 #ifdef LAZYTOOL_PLAYER_ONLY
-    return false;
+    (void)frame_begin;
+    (void)freq;
 #else
-    if (!ImGui::GetCurrentContext())
-        return false;
-    ImGuiIO& io = ImGui::GetIO();
-    return io.WantTextInput || ImGui::IsAnyItemActive();
-#endif
-}
+    if (g_player_mode || g_dx.vsync || g_editor_frame_cap_fps <= 0.0f)
+        return;
 
-static bool editor_wait_when_paused_idle(bool had_messages) {
-#ifdef LAZYTOOL_PLAYER_ONLY
-    (void)had_messages;
-    return false;
-#else
-    if (g_player_mode || had_messages)
-        return false;
-    if (!g_scene_paused)
-        return false;
-    if (g_pending_resize || g_pending_scene_surface_resize || g_restart_scene_requested || g_scene_render_requested)
-        return false;
-    if (editor_any_navigation_key_down() || editor_imgui_wants_continuous_redraw())
-        return false;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double elapsed_ms = ((double)(now.QuadPart - frame_begin.QuadPart) * 1000.0) / (double)freq.QuadPart;
+    double target_ms = 1000.0 / (double)g_editor_frame_cap_fps;
+    if (elapsed_ms >= target_ms)
+        return;
 
-    DWORD interval_ms = 200; // Automatic paused-idle redraw cap, not a user-facing mode.
-    if (GetForegroundWindow() != g_dx.hwnd)
-        interval_ms = 400;
-    if (IsIconic(g_dx.hwnd))
-        interval_ms = 1000;
-
-    ULONGLONG now_ms = GetTickCount64();
-    if (g_last_editor_present_ms == 0)
-        g_last_editor_present_ms = now_ms;
-    ULONGLONG elapsed_ms = now_ms - g_last_editor_present_ms;
-    if (elapsed_ms >= interval_ms)
-        return false;
-
-    DWORD wait_ms = (DWORD)(interval_ms - elapsed_ms);
-    MsgWaitForMultipleObjectsEx(0, nullptr, wait_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-    return true;
+    DWORD wait_ms = (DWORD)(target_ms - elapsed_ms);
+    if (wait_ms > 0)
+        MsgWaitForMultipleObjectsEx(0, nullptr, wait_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
 #endif
 }
 
@@ -1848,6 +1886,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         // projects because saving while clip 2/3 is selected would otherwise make
         // the exported EXE start there, or even start paused if that scrubbed time
         // was already at the end of the sequence.
+        if (g_export_settings.timeline_autoplay)
+            timeline_set_enabled(true);
         g_scene_paused = false;
         app_rewind_scene_runtime_state();
         app_request_scene_render();
@@ -1873,17 +1913,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     MSG msg = {};
     while (g_running) {
-        bool had_messages = false;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            had_messages = true;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
             if (msg.message == WM_QUIT) g_running = false;
         }
         if (!g_running) break;
-
-        if (editor_wait_when_paused_idle(had_messages))
-            continue;
 
         bool force_scene_render = g_scene_render_requested;
         g_scene_render_requested = false;
@@ -1906,6 +1941,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
         LARGE_INTEGER now_t;
         QueryPerformanceCounter(&now_t);
+        LARGE_INTEGER cpu_frame_begin = now_t;
+        bool profile_cpu = g_profiler_enabled;
+        if (profile_cpu)
+            app_cpu_profile_reset_frame();
+        else
+            g_cpu_profile_display_valid = false;
         g_dt = (float)(now_t.QuadPart - prev_t.QuadPart) / (float)freq.QuadPart;
         if (g_dt > 0.1f) g_dt = 0.1f;
         float editor_dt = g_dt;
@@ -1921,7 +1962,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             bool timeline_runtime_active = timeline_enabled();
             if (timeline_runtime_active) {
                 float timeline_end_time = timeline_sequence_duration_seconds();
-                if (timeline_loop() && timeline_end_time > 0.0f && g_time >= timeline_end_time) {
+                bool player_should_exit_at_end = g_player_mode &&
+                    g_export_settings.exit_after_timeline && timeline_end_time > 0.0f;
+                if (player_should_exit_at_end && g_time >= timeline_end_time) {
+                    app_set_scene_time(timeline_end_time);
+                    g_scene_paused = true;
+                    force_scene_render = true;
+                    g_player_exit_after_present = true;
+                } else if (timeline_loop() && timeline_end_time > 0.0f && g_time >= timeline_end_time) {
                     force_scene_render = true;
                     app_restart_scene_runtime();
                 } else if (!timeline_loop() && timeline_end_time >= 0.0f && g_time >= timeline_end_time) {
@@ -1967,6 +2015,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         scene_will_render = !g_scene_paused || force_scene_render;
 
         if (scene_will_render) {
+            LARGE_INTEGER scene_cpu_begin = {};
+            if (profile_cpu)
+                QueryPerformanceCounter(&scene_cpu_begin);
+
             update_builtins_and_scene_cb();
             update_default_example_commands();
             // User cbuffer: pack editor defaults before any draw/dispatch.
@@ -1982,37 +2034,70 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             g_scene_reset_execution_pending = false;
 
 #ifndef LAZYTOOL_PLAYER_ONLY
-            // The grid is an editor viewport aid. Do not run it in player mode:
-            // it is a full-screen depth-reading pass and can be surprisingly
-            // visible in performance on post-heavy scenes.
-            if (!g_player_mode || g_export_settings.show_grid_overlay)
+            // The grid is an editor viewport aid. Never export it.
+            if (!g_player_mode)
                 dx_render_scene_grid_overlay();
 #endif
             dx_end_scene();
+
+            if (profile_cpu) {
+                LARGE_INTEGER scene_cpu_end;
+                QueryPerformanceCounter(&scene_cpu_end);
+                g_cpu_scene_ms = qpc_elapsed_ms(scene_cpu_begin, scene_cpu_end, freq);
+            }
         }
 
 #ifdef LAZYTOOL_PLAYER_ONLY
         dx_present_scene_to_backbuffer();
         cmd_profile_end_frame_capture();
+        if (g_player_exit_after_present)
+            PostQuitMessage(0);
 #else
         if (g_player_mode) {
             dx_present_scene_to_backbuffer();
             cmd_profile_end_frame_capture();
+            if (g_player_exit_after_present)
+                PostQuitMessage(0);
         } else {
-            // ImGui render to backbuffer
+            // ImGui render to backbuffer. Profile the immediate-mode build and
+            // backend draw submission separately; the public "dt" readout is
+            // only frame interval, not UI cost.
+            LARGE_INTEGER ui_build_begin = {};
+            LARGE_INTEGER ui_build_end = {};
+            if (profile_cpu)
+                QueryPerformanceCounter(&ui_build_begin);
             dx_begin_ui();
             ui_draw();
+            if (profile_cpu)
+                QueryPerformanceCounter(&ui_build_end);
             ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+            if (profile_cpu) {
+                LARGE_INTEGER ui_render_end;
+                QueryPerformanceCounter(&ui_render_end);
+                g_cpu_ui_build_ms = qpc_elapsed_ms(ui_build_begin, ui_build_end, freq);
+                g_cpu_ui_render_ms = qpc_elapsed_ms(ui_build_end, ui_render_end, freq);
+            }
             cmd_profile_end_frame_capture();
         }
 #endif
 
+        LARGE_INTEGER present_begin = {};
+        if (profile_cpu)
+            QueryPerformanceCounter(&present_begin);
         g_dx.sc->Present(g_dx.vsync ? 1 : 0, 0);
+        LARGE_INTEGER present_end = {};
+        if (profile_cpu) {
+            QueryPerformanceCounter(&present_end);
+            g_cpu_present_ms = qpc_elapsed_ms(present_begin, present_end, freq);
+            g_cpu_frame_ms = qpc_elapsed_ms(cpu_frame_begin, present_end, freq);
+            g_cpu_other_ms = g_cpu_frame_ms - g_cpu_scene_ms - g_cpu_ui_build_ms - g_cpu_ui_render_ms - g_cpu_present_ms;
+            if (g_cpu_other_ms < 0.0f) g_cpu_other_ms = 0.0f;
+            app_cpu_profile_publish_frame();
+        }
 #ifndef LAZYTOOL_PLAYER_ONLY
         if (!g_player_mode)
-            g_last_editor_present_ms = GetTickCount64();
+            editor_wait_for_frame_cap(cpu_frame_begin, freq);
 #endif
-        dx_debug_log_messages();
     }
 
 #ifndef LAZYTOOL_PLAYER_ONLY

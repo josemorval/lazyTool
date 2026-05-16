@@ -25,6 +25,14 @@ void app_set_scene_time(float seconds);
 bool app_scene_paused();
 float app_scene_time();
 uint64_t app_scene_frame();
+float app_cpu_frame_ms();
+float app_cpu_scene_ms();
+float app_cpu_ui_build_ms();
+float app_cpu_ui_render_ms();
+float app_cpu_present_ms();
+float app_cpu_other_ms();
+float app_editor_frame_cap_fps();
+void app_set_editor_frame_cap_fps(float fps);
 
 void ui_init();
 void ui_draw();

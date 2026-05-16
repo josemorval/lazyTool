@@ -403,13 +403,11 @@ struct CameraControls {
 // separate from editor preferences so an exported EXE can be deterministic and
 // cheap regardless of the machine's lazytool_general.ini.
 struct ExportSettings {
-    bool runtime_input_enabled;
+    bool camera_light_controls_enabled;
+    bool timeline_autoplay;
+    bool exit_after_timeline;
     bool escape_closes_player;
-    bool force_wireframe;
-    bool show_grid_overlay;
     bool vsync;
-    bool profiler;
-    bool shader_binding_warnings;
 };
 
 // ── math ──────────────────────────────────────────────────────────────────

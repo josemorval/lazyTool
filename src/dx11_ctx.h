@@ -18,6 +18,11 @@ struct DX11Ctx {
     bool                     d3d11_validation_supported;
     bool                     shader_validation_warnings;
     ID3D11InfoQueue*         info_queue;
+    char                     adapter_name[128];
+    unsigned int             adapter_vendor_id;
+    unsigned int             adapter_device_id;
+    unsigned long long       adapter_dedicated_vram_mb;
+    bool                     adapter_force_high_performance;
 
     ID3D11Texture2D*            scene_tex;
     ID3D11RenderTargetView*     scene_rtv;

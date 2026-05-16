@@ -22,6 +22,7 @@ static float   s_frame_profile_ms = 0.0f;
 static float   s_total_frame_profile_ms = 0.0f;
 static bool    s_gpu_profile_ready = false;
 static bool    s_gpu_total_ready = false;
+static bool    s_gpu_profile_display_valid = false;
 static bool    s_gpu_profiler_ok = false;
 static bool    s_prev_profiler_enabled = false;
 static bool    s_gpu_overflow_warned = false;
@@ -340,6 +341,7 @@ static void cmd_profile_reset_results() {
     s_total_frame_profile_ms = 0.0f;
     s_gpu_profile_ready = false;
     s_gpu_total_ready = false;
+    s_gpu_profile_display_valid = false;
     s_gpu_last_ready_frame = 0;
 }
 
@@ -396,9 +398,20 @@ static void cmd_gpu_collect_slot(GPUProfileFrameSlot& slot) {
     if (slot.frame_id < s_gpu_last_ready_frame)
         return;
 
-    memcpy(s_cmd_profile_ms, cmd_ms, sizeof(s_cmd_profile_ms));
-    s_frame_profile_ms = (float)((double)(frame_end - frame_begin) * 1000.0 / (double)disjoint.Frequency);
-    s_total_frame_profile_ms = (float)((double)(total_end - total_begin) * 1000.0 / (double)disjoint.Frequency);
+    float frame_ms = (float)((double)(frame_end - frame_begin) * 1000.0 / (double)disjoint.Frequency);
+    float total_ms = (float)((double)(total_end - total_begin) * 1000.0 / (double)disjoint.Frequency);
+    const float a = 0.16f;
+    if (!s_gpu_profile_display_valid) {
+        memcpy(s_cmd_profile_ms, cmd_ms, sizeof(s_cmd_profile_ms));
+        s_frame_profile_ms = frame_ms;
+        s_total_frame_profile_ms = total_ms;
+        s_gpu_profile_display_valid = true;
+    } else {
+        for (int i = 0; i < MAX_COMMANDS; i++)
+            s_cmd_profile_ms[i] += (cmd_ms[i] - s_cmd_profile_ms[i]) * a;
+        s_frame_profile_ms += (frame_ms - s_frame_profile_ms) * a;
+        s_total_frame_profile_ms += (total_ms - s_total_frame_profile_ms) * a;
+    }
     s_gpu_profile_ready = true;
     s_gpu_total_ready = true;
     s_gpu_last_ready_frame = slot.frame_id;
@@ -819,8 +832,12 @@ static ID3D11RasterizerState* rasterizer_state_for(const Command& c, const MeshM
     bool cull_back = c.cull_back;
     if (material && material->double_sided)
         cull_back = false;
+#ifndef LAZYTOOL_PLAYER_ONLY
     if (wireframe)
         return cull_back ? g_dx.rs_wire_solid : g_dx.rs_wire_cull_none;
+#else
+    (void)wireframe;
+#endif
     return cull_back ? g_dx.rs_solid : g_dx.rs_cull_none;
 }
 

@@ -530,7 +530,7 @@ struct TimelineClipDef {
     int fps = 24;
     int length = 240;
     bool enabled = true;
-    bool interpolate = false;
+    int interpolation_mode = 0;
     std::vector<TimelineTrackDef> tracks;
 };
 
@@ -544,9 +544,10 @@ struct Project {
     std::vector<CommandDef> commands;
     bool timeline_loop = false;
     bool timeline_enabled = false;
-    bool export_runtime_input = true;
+    bool export_camera_light_controls = false;
+    bool export_timeline_autoplay = true;
+    bool export_exit_after_timeline = true;
     bool export_escape_close = true;
-    bool export_wireframe = false;
     bool export_vsync = false;
     std::vector<TimelineClipDef> timelines;
 };
@@ -608,10 +609,13 @@ static Project parse_lt(const std::string& lt_path) {
         if (t.empty()) continue;
         const std::string& tag = t[0];
         if (tag == "export_settings") {
+            if (t.size() != 6)
+                die("lt export_settings must use current 5-field format");
             saw_export_settings = true;
-            p.export_runtime_input = toki(t,1,1) != 0;
-            p.export_escape_close = toki(t,2,1) != 0;
-            p.export_wireframe = toki(t,3,0) != 0;
+            p.export_camera_light_controls = toki(t,1,0) != 0;
+            p.export_timeline_autoplay = toki(t,2,1) != 0;
+            p.export_exit_after_timeline = toki(t,3,1) != 0;
+            p.export_escape_close = toki(t,4,1) != 0;
             p.export_vsync = toki(t,5,0) != 0;
         } else if (tag == "camera_fps") {
             for (int i = 0; i < 8; i++) p.camera[i] = tokf(t, (size_t)i + 1, p.camera[i]);
@@ -777,7 +781,9 @@ static Project parse_lt(const std::string& lt_path) {
             tl.fps = toki(t,2,24);
             tl.length = toki(t,3,240);
             tl.enabled = toki(t,5,1) != 0;
-            tl.interpolate = toki(t,6,0) != 0;
+            tl.interpolation_mode = toki(t,6,0);
+            if (tl.interpolation_mode < 0) tl.interpolation_mode = 0;
+            if (tl.interpolation_mode > 3) tl.interpolation_mode = 3;
             if (tl.fps < 1) tl.fps = 1;
             if (tl.length < 1) tl.length = 1;
             p.timelines.push_back(tl);
@@ -1410,7 +1416,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     // int[4] and float[16] even when a track is a single float. Instead, each track
     // records how many components it owns and points into one of two typed streams.
     // This preserves all useful timeline features while avoiding the worst bloat.
-    struct FlatTimeline { int fps, length, enabled, interpolate; };
+    struct FlatTimeline { int fps, length, enabled, interpolation_mode; };
     struct FlatTrack { int timeline, kind, target, type, integral, frame_start, data_start, count, comp, enabled; };
     std::vector<FlatTimeline> flat_timelines;
     std::vector<FlatTrack> flat_tracks;
@@ -1423,7 +1429,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
         ftl.fps = tl.fps < 1 ? 1 : tl.fps;
         ftl.length = tl.length < 1 ? 1 : tl.length;
         ftl.enabled = tl.enabled ? 1 : 0;
-        ftl.interpolate = tl.interpolate ? 1 : 0;
+        ftl.interpolation_mode = tl.interpolation_mode;
         flat_timelines.push_back(ftl);
 
         if (!tl.enabled) continue;
@@ -1546,10 +1552,10 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     fprintf(f, "//   /DLT_VSYNC=1                        Override project VSync default.\n");
     fprintf(f, "//   /DLT_INPUT=0                        Remove runtime key toggles.\n");
     fprintf(f, "//   /DLT_ESC_CLOSE=0                    Do not close on Escape.\n");
-    fprintf(f, "//   /DLT_WIREFRAME=1                    Force wireframe rasterizer state.\n");
+    fprintf(f, "//   /DLT_EXIT_AFTER_TIMELINE=0          Keep the demo open after the timeline.\n");
     fprintf(f, "//   /DLT_DEBUG_FPS=1                    Compile the tiny GDI FPS overlay.\n");
     fprintf(f, "// -----------------------------------------------------------------------------\n");
-    fprintf(f, "#define LT_PROJECT_W %d\n#define LT_PROJECT_H %d\n#define LT_SHADOW_W %d\n#define LT_SHADOW_H %d\n#ifndef LT_VSYNC\n#define LT_VSYNC %d\n#endif\n#ifndef LT_INPUT\n#define LT_INPUT %d\n#endif\n#ifndef LT_ESC_CLOSE\n#define LT_ESC_CLOSE %d\n#endif\n#ifndef LT_WIREFRAME\n#define LT_WIREFRAME %d\n#endif\n#ifndef LT_DEBUG_FPS\n#define LT_DEBUG_FPS 0\n#endif\n", project_w, project_h, shadow_tex_w, shadow_tex_h, p.export_vsync ? 1 : 0, p.export_runtime_input ? 1 : 0, p.export_escape_close ? 1 : 0, p.export_wireframe ? 1 : 0);
+    fprintf(f, "#define LT_PROJECT_W %d\n#define LT_PROJECT_H %d\n#define LT_SHADOW_W %d\n#define LT_SHADOW_H %d\n#ifndef LT_VSYNC\n#define LT_VSYNC %d\n#endif\n#ifndef LT_INPUT\n#define LT_INPUT %d\n#endif\n#ifndef LT_ESC_CLOSE\n#define LT_ESC_CLOSE %d\n#endif\n#ifndef LT_EXIT_AFTER_TIMELINE\n#define LT_EXIT_AFTER_TIMELINE %d\n#endif\n#ifndef LT_DEBUG_FPS\n#define LT_DEBUG_FPS 0\n#endif\n", project_w, project_h, shadow_tex_w, shadow_tex_h, p.export_vsync ? 1 : 0, p.export_camera_light_controls ? 1 : 0, p.export_escape_close ? 1 : 0, p.export_exit_after_timeline ? 1 : 0);
     fprintf(f, "// Minimal CRT replacements and tiny math types. /NODEFAULTLIB builds need these.\n");
     fprintf(f, "int _fltused=0; typedef unsigned int u32; typedef struct { float m[16]; } M4;\n");
     fprintf(f, "void* __cdecl memset(void* d,int c,size_t n){ unsigned char* p=(unsigned char*)d; while(n--)*p++=(unsigned char)c; return d; }\n");
@@ -1646,12 +1652,12 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
 
     fprintf(f, "// Timeline data. Frames are separate from values, and values are split into\n");
     fprintf(f, "// int and float streams so a float track does not carry unused int/quaternion data.\n");
-    fprintf(f, "typedef struct { int fps,len,enabled,lerp; } Tl; typedef struct { int tl,kind,target,type,integral,fs,ds,count,comp,enabled; } Tr;\n");
+    fprintf(f, "typedef struct { int fps,len,enabled,mode; } Tl; typedef struct { int tl,kind,target,type,integral,fs,ds,count,comp,enabled; } Tr;\n");
     fprintf(f, "static Tl tls[%u]={\n", (unsigned)(flat_timelines.empty() ? 1 : flat_timelines.size()));
     if (flat_timelines.empty()) fprintf(f, " {24,240,1,0},\n");
     for (size_t i = 0; i < flat_timelines.size(); i++) {
         const FlatTimeline& tl = flat_timelines[i];
-        fprintf(f, " {%d,%d,%d,%d},\n", tl.fps, tl.length, tl.enabled, tl.interpolate);
+        fprintf(f, " {%d,%d,%d,%d},\n", tl.fps, tl.length, tl.enabled, tl.interpolation_mode);
     }
     fprintf(f, "};\n");
     fprintf(f, "static int kfr[%u]={", (unsigned)(flat_key_frames.empty() ? 1 : flat_key_frames.size()));
@@ -1672,7 +1678,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     fprintf(f, "};\n");
     fprintf(f, "static float cam0[8]={"); emit_float_array(f, p.camera, 8); fprintf(f, "}; static float dl0[39]={"); emit_float_array(f, p.dirlight, 39); fprintf(f, "}; static float cam[8],dl[39];\n");
     fprintf(f, "enum{ CMDN=%u, SHN=%u, RTN=%u, UVN=%u, PN=%u, TLN=%u, TRN=%u, KEYN=%u, TL_LOOP=%d, TL_ON=%d };\n",
-            (unsigned)out_cmds.size(), (unsigned)shader_sources.size(), (unsigned)rt_res_indices.size(), (unsigned)p.user_vars.size(), (unsigned)flat_params.size(), (unsigned)flat_timelines.size(), (unsigned)flat_tracks.size(), (unsigned)flat_key_frames.size(), p.timeline_loop?1:0, p.timeline_enabled?1:0);
+            (unsigned)out_cmds.size(), (unsigned)shader_sources.size(), (unsigned)rt_res_indices.size(), (unsigned)p.user_vars.size(), (unsigned)flat_params.size(), (unsigned)flat_timelines.size(), (unsigned)flat_tracks.size(), (unsigned)flat_key_frames.size(), (p.timeline_loop && !p.export_exit_after_timeline)?1:0, (p.timeline_enabled || p.export_timeline_autoplay)?1:0);
 
     // Runtime support. Written as plain C and deliberately compact.
     fputs(R"LT64K(
@@ -1719,14 +1725,17 @@ static int isint(int ty){ return ty>=1&&ty<=3; }
 static int tr_frame(Tr* r,int k){ return kfr[r->fs+k]; }
 static int tr_i(Tr* r,int k,int c){ return ki[r->ds+k*r->comp+c]; }
 static float tr_f(Tr* r,int k,int c){ return kf[r->ds+k*r->comp+c]; }
+static float ease(int m,float t){ t=cl(t,0,1); if(m==2){ if(t<0.5f)return 2*t*t; float u=1-t; return 1-2*u*u; } return t; }
+static float cubic(float p0,float p1,float p2,float p3,int f0,int f1,int f2,int f3,float t){ float sp=(float)(f2-f1),m1=f2!=f0?(p2-p0)*sp/(float)(f2-f0):0,m2=f3!=f1?(p3-p1)*sp/(float)(f3-f1):0,t2=t*t,t3=t2*t; return (2*t3-3*t2+1)*p1+(t3-2*t2+t)*m1+(-2*t3+3*t2)*p2+(t3-t2)*m2; }
+static float cval(Tr* r,int p0,int p1,int p2,int p3,int c,float t){ return cubic(tr_f(r,p0,c),tr_f(r,p1,c),tr_f(r,p2,c),tr_f(r,p3,c),tr_frame(r,p0),tr_frame(r,p1),tr_frame(r,p2),tr_frame(r,p3),t); }
 
 // Evaluate one timeline track at the sampled frame and write the result directly
 // into the live command, camera, light or user-variable array.
 //
-// TL_LERP samples fractional frames for smooth timeline playback; disabled
-// interpolation floors to integer frames at the timeline FPS.
+// mode 0 floors to integer frames; mode 1 linear; mode 2 quadratic ease;
+// mode 3 cubic Hermite for continuous values.
 static void apply_track(Tr* r, float fr){
-    int a=-1,b=-1,i,n=r->count;
+    int a=-1,b=-1,p0,p3,i,n=r->count,mode=(r->tl>=0&&r->tl<TLN)?tls[r->tl].mode:1;
     int oi[4]={0,0,0,0};
     float A[16],B[16],O[16];
     Q qq;
@@ -1740,6 +1749,8 @@ static void apply_track(Tr* r, float fr){
     }
     if(a<0)a=b>=0?b:0;
     if(b<0)b=a;
+    p0=a>0?a-1:a;
+    p3=b+1<n?b+1:b;
 
     if(r->integral){
         // Integral tracks are always stepped. Currently this is mainly command enabled.
@@ -1754,24 +1765,25 @@ static void apply_track(Tr* r, float fr){
             int fa=tr_frame(r,a),fb=tr_frame(r,b);
             float tt=fb>fa?(fr-(float)fa)/(float)(fb-fa):0;
             tt=cl(tt,0,1);
+            float et=ease(mode,tt);
 
             if(r->kind==2){
                 // Command transform: position + quaternion + scale.
-                for(i=0;i<3;i++)O[i]=lerp(A[i],B[i],tt);
-                qq=ql(qfa(A+3),qfa(B+3),tt);
+                for(i=0;i<3;i++)O[i]=mode==3?cval(r,p0,a,b,p3,i,tt):lerp(A[i],B[i],et);
+                qq=ql(qfa(A+3),qfa(B+3),et);
                 O[3]=qq.x;O[4]=qq.y;O[5]=qq.z;O[6]=qq.w;
-                for(i=7;i<10;i++)O[i]=lerp(A[i],B[i],tt);
+                for(i=7;i<10;i++)O[i]=mode==3?cval(r,p0,a,b,p3,i,tt):lerp(A[i],B[i],et);
             } else if(r->kind==4){
                 // Camera: interpolate yaw as an angle so it wraps correctly.
-                for(i=0;i<8;i++)O[i]=(i==3)?lerpa(A[i],B[i],tt):lerp(A[i],B[i],tt);
+                for(i=0;i<8;i++)O[i]=(i==3)?lerpa(A[i],B[i],et):(mode==3?cval(r,p0,a,b,p3,i,tt):lerp(A[i],B[i],et));
             } else {
                 int cnt=r->comp;
                 // User rotation sources can be stored either as Euler float3 or quaternion float4.
                 if(r->kind==1 && r->target>=0&&r->target<UVN && uv[r->target].src==3 && uv[r->target].type==7){
-                    qq=ql(qfa(A),qfa(B),tt);
+                    qq=ql(qfa(A),qfa(B),et);
                     O[0]=qq.x;O[1]=qq.y;O[2]=qq.z;O[3]=qq.w;
                 } else {
-                    for(i=0;i<cnt&&i<16;i++)O[i]=lerp(A[i],B[i],tt);
+                    for(i=0;i<cnt&&i<16;i++)O[i]=mode==3?cval(r,p0,a,b,p3,i,tt):lerp(A[i],B[i],et);
                 }
             }
         }
@@ -1809,10 +1821,10 @@ static void apply_track(Tr* r, float fr){
 }
 
 static float tldur(Tl* t){ if(!t->enabled||t->fps<=0||t->len<=0)return 0; return (float)t->len/(float)t->fps; }
+static float tltotal(void){ float total=0; int i; for(i=0;i<TLN;i++)total+=tldur(tls+i); return total; }
 static void timeline(float sec){
     if(!TL_ON||TLN<1)return;
-    float total=0,acc=0,local=0,fr=0,d; int i,ci=-1,last=-1;
-    for(i=0;i<TLN;i++)total+=tldur(tls+i);
+    float total=tltotal(),acc=0,local=0,fr=0,d; int i,ci=-1,last=-1;
     if(total<=0)return;
     if(sec<0)sec=0;
     if(TL_LOOP)while(sec>=total)sec-=total; else if(sec>total)sec=total;
@@ -1829,7 +1841,7 @@ static void timeline(float sec){
     if(fr<0)fr=0;
     d=(float)(tls[ci].len-1);
     if(fr>d)fr=d;
-    if(!tls[ci].lerp)fr=(float)((int)(fr+0.0001f));
+    if(!tls[ci].mode)fr=(float)((int)(fr+0.0001f));
     for(i=0;i<TRN;i++)if(tr[i].enabled&&tr[i].tl==ci)apply_track(tr+i,fr);
 }
 static int invm(M4* a,M4* o){ float* m=a->m; float v[16],d; v[0]=m[5]*m[10]*m[15]-m[5]*m[11]*m[14]-m[9]*m[6]*m[15]+m[9]*m[7]*m[14]+m[13]*m[6]*m[11]-m[13]*m[7]*m[10]; v[4]=-m[4]*m[10]*m[15]+m[4]*m[11]*m[14]+m[8]*m[6]*m[15]-m[8]*m[7]*m[14]-m[12]*m[6]*m[11]+m[12]*m[7]*m[10]; v[8]=m[4]*m[9]*m[15]-m[4]*m[11]*m[13]-m[8]*m[5]*m[15]+m[8]*m[7]*m[13]+m[12]*m[5]*m[11]-m[12]*m[7]*m[9]; v[12]=-m[4]*m[9]*m[14]+m[4]*m[10]*m[13]+m[8]*m[5]*m[14]-m[8]*m[6]*m[13]-m[12]*m[5]*m[10]+m[12]*m[6]*m[9]; v[1]=-m[1]*m[10]*m[15]+m[1]*m[11]*m[14]+m[9]*m[2]*m[15]-m[9]*m[3]*m[14]-m[13]*m[2]*m[11]+m[13]*m[3]*m[10]; v[5]=m[0]*m[10]*m[15]-m[0]*m[11]*m[14]-m[8]*m[2]*m[15]+m[8]*m[3]*m[14]+m[12]*m[2]*m[11]-m[12]*m[3]*m[10]; v[9]=-m[0]*m[9]*m[15]+m[0]*m[11]*m[13]+m[8]*m[1]*m[15]-m[8]*m[3]*m[13]-m[12]*m[1]*m[11]+m[12]*m[3]*m[9]; v[13]=m[0]*m[9]*m[14]-m[0]*m[10]*m[13]-m[8]*m[1]*m[14]+m[8]*m[2]*m[13]+m[12]*m[1]*m[10]-m[12]*m[2]*m[9]; v[2]=m[1]*m[6]*m[15]-m[1]*m[7]*m[14]-m[5]*m[2]*m[15]+m[5]*m[3]*m[14]+m[13]*m[2]*m[7]-m[13]*m[3]*m[6]; v[6]=-m[0]*m[6]*m[15]+m[0]*m[7]*m[14]+m[4]*m[2]*m[15]-m[4]*m[3]*m[14]-m[12]*m[2]*m[7]+m[12]*m[3]*m[6]; v[10]=m[0]*m[5]*m[15]-m[0]*m[7]*m[13]-m[4]*m[1]*m[15]+m[4]*m[3]*m[13]+m[12]*m[1]*m[7]-m[12]*m[3]*m[5]; v[14]=-m[0]*m[5]*m[14]+m[0]*m[6]*m[13]+m[4]*m[1]*m[14]-m[4]*m[2]*m[13]-m[12]*m[1]*m[6]+m[12]*m[2]*m[5]; v[3]=-m[1]*m[6]*m[11]+m[1]*m[7]*m[10]+m[5]*m[2]*m[11]-m[5]*m[3]*m[10]-m[9]*m[2]*m[7]+m[9]*m[3]*m[6]; v[7]=m[0]*m[6]*m[11]-m[0]*m[7]*m[10]-m[4]*m[2]*m[11]+m[4]*m[3]*m[10]+m[8]*m[2]*m[7]-m[8]*m[3]*m[6]; v[11]=-m[0]*m[5]*m[11]+m[0]*m[7]*m[9]+m[4]*m[1]*m[11]-m[4]*m[3]*m[9]-m[8]*m[1]*m[7]+m[8]*m[3]*m[5]; v[15]=m[0]*m[5]*m[10]-m[0]*m[6]*m[9]-m[4]*m[1]*m[10]+m[4]*m[2]*m[9]+m[8]*m[1]*m[6]-m[8]*m[2]*m[5]; d=m[0]*v[0]+m[1]*v[4]+m[2]*v[8]+m[3]*v[12]; if(d==0){mid(o);return 0;} d=1.0f/d; for(int i=0;i<16;i++)o->m[i]=v[i]*d; return 1; }
@@ -1878,11 +1890,7 @@ static void init_rts(){ for(int i=0;i<RTN;i++){ D3D11_TEXTURE2D_DESC d; zmem(&d,
 // Create the main depth buffer and the shared shadow-map atlas. Both also have
 // SRVs so post effects and material shaders can sample them.
 static void init_depth_shadow(){ D3D11_TEXTURE2D_DESC d; D3D11_DEPTH_STENCIL_VIEW_DESC dv; D3D11_SHADER_RESOURCE_VIEW_DESC sv; zmem(&d,sizeof(d)); d.Width=RW;d.Height=RH;d.MipLevels=1;d.ArraySize=1;d.Format=DXGI_FORMAT_R24G8_TYPELESS;d.SampleDesc.Count=1;d.BindFlags=D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE; if(SUCCEEDED(ID3D11Device_CreateTexture2D(dev,&d,0,&depth_tex))){ zmem(&dv,sizeof(dv)); zmem(&sv,sizeof(sv)); dv.Format=DXGI_FORMAT_D24_UNORM_S8_UINT; dv.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2D; ID3D11Device_CreateDepthStencilView(dev,(ID3D11Resource*)depth_tex,&dv,&dsv); sv.Format=DXGI_FORMAT_R24_UNORM_X8_TYPELESS; sv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels=1; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)depth_tex,&sv,&depth_srv); } zmem(&d,sizeof(d)); d.Width=LT_SHADOW_W;d.Height=LT_SHADOW_H;d.MipLevels=1;d.ArraySize=1;d.Format=DXGI_FORMAT_R24G8_TYPELESS;d.SampleDesc.Count=1;d.BindFlags=D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE; if(SUCCEEDED(ID3D11Device_CreateTexture2D(dev,&d,0,&shadow_tex))){ zmem(&dv,sizeof(dv)); zmem(&sv,sizeof(sv)); dv.Format=DXGI_FORMAT_D24_UNORM_S8_UINT; dv.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2D; ID3D11Device_CreateDepthStencilView(dev,(ID3D11Resource*)shadow_tex,&dv,&shadow_dsv); sv.Format=DXGI_FORMAT_R24_UNORM_X8_TYPELESS; sv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels=1; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)shadow_tex,&sv,&shadow_srv); } }
-static void init_states(){ D3D11_SAMPLER_DESC sp; zmem(&sp,sizeof(sp)); sp.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR; sp.AddressU=sp.AddressV=sp.AddressW=D3D11_TEXTURE_ADDRESS_WRAP; sp.MaxLOD=3.402823466e38f; ID3D11Device_CreateSamplerState(dev,&sp,&smp_lin); sp.Filter=D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT; sp.ComparisonFunc=D3D11_COMPARISON_LESS_EQUAL; sp.AddressU=sp.AddressV=sp.AddressW=D3D11_TEXTURE_ADDRESS_BORDER; sp.BorderColor[0]=sp.BorderColor[1]=sp.BorderColor[2]=sp.BorderColor[3]=1.0f; ID3D11Device_CreateSamplerState(dev,&sp,&smp_cmp); for(int i=0;i<4;i++){ D3D11_DEPTH_STENCIL_DESC dd; zmem(&dd,sizeof(dd)); dd.DepthEnable=(i&1)!=0; dd.DepthWriteMask=(i&2)?D3D11_DEPTH_WRITE_MASK_ALL:D3D11_DEPTH_WRITE_MASK_ZERO; /* Keep the tiny-player depth test as LESS_EQUAL, matching the previous working 64k path.
-           The editor uses LESS for the interactive viewport, but this standalone path also
-           uses generated primitive shadow shaders and very small procedural meshes; LEQUAL
-           is more robust for the shadow/color depth state and fixes the black test2 output
-           introduced in v7. */ dd.DepthFunc=D3D11_COMPARISON_LESS_EQUAL; ID3D11Device_CreateDepthStencilState(dev,&dd,&ds[i]); D3D11_BLEND_DESC bd; zmem(&bd,sizeof(bd)); bd.RenderTarget[0].BlendEnable=(i&1)!=0; bd.RenderTarget[0].SrcBlend=D3D11_BLEND_SRC_ALPHA; bd.RenderTarget[0].DestBlend=D3D11_BLEND_INV_SRC_ALPHA; bd.RenderTarget[0].BlendOp=D3D11_BLEND_OP_ADD; bd.RenderTarget[0].SrcBlendAlpha=D3D11_BLEND_ONE; bd.RenderTarget[0].DestBlendAlpha=D3D11_BLEND_INV_SRC_ALPHA; bd.RenderTarget[0].BlendOpAlpha=D3D11_BLEND_OP_ADD; bd.RenderTarget[0].RenderTargetWriteMask=(i&2)?D3D11_COLOR_WRITE_ENABLE_ALL:0; ID3D11Device_CreateBlendState(dev,&bd,&bs[i]); } for(int i=0;i<2;i++){ D3D11_RASTERIZER_DESC rd; zmem(&rd,sizeof(rd)); rd.FillMode=LT_WIREFRAME?D3D11_FILL_WIREFRAME:D3D11_FILL_SOLID; rd.CullMode=i?D3D11_CULL_BACK:D3D11_CULL_NONE; rd.DepthClipEnable=TRUE; ID3D11Device_CreateRasterizerState(dev,&rd,&rs[i]); } }
+static void init_states(){ D3D11_SAMPLER_DESC sp; zmem(&sp,sizeof(sp)); sp.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR; sp.AddressU=sp.AddressV=sp.AddressW=D3D11_TEXTURE_ADDRESS_WRAP; sp.MaxLOD=3.402823466e38f; ID3D11Device_CreateSamplerState(dev,&sp,&smp_lin); sp.Filter=D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT; sp.ComparisonFunc=D3D11_COMPARISON_LESS_EQUAL; sp.AddressU=sp.AddressV=sp.AddressW=D3D11_TEXTURE_ADDRESS_BORDER; sp.BorderColor[0]=sp.BorderColor[1]=sp.BorderColor[2]=sp.BorderColor[3]=1.0f; ID3D11Device_CreateSamplerState(dev,&sp,&smp_cmp); for(int i=0;i<4;i++){ D3D11_DEPTH_STENCIL_DESC dd; zmem(&dd,sizeof(dd)); dd.DepthEnable=(i&1)!=0; dd.DepthWriteMask=(i&2)?D3D11_DEPTH_WRITE_MASK_ALL:D3D11_DEPTH_WRITE_MASK_ZERO; /* The tiny player keeps LESS_EQUAL depth testing because procedural primitives and generated shadow shaders can otherwise hit avoidable precision edge cases. */ dd.DepthFunc=D3D11_COMPARISON_LESS_EQUAL; ID3D11Device_CreateDepthStencilState(dev,&dd,&ds[i]); D3D11_BLEND_DESC bd; zmem(&bd,sizeof(bd)); bd.RenderTarget[0].BlendEnable=(i&1)!=0; bd.RenderTarget[0].SrcBlend=D3D11_BLEND_SRC_ALPHA; bd.RenderTarget[0].DestBlend=D3D11_BLEND_INV_SRC_ALPHA; bd.RenderTarget[0].BlendOp=D3D11_BLEND_OP_ADD; bd.RenderTarget[0].SrcBlendAlpha=D3D11_BLEND_ONE; bd.RenderTarget[0].DestBlendAlpha=D3D11_BLEND_INV_SRC_ALPHA; bd.RenderTarget[0].BlendOpAlpha=D3D11_BLEND_OP_ADD; bd.RenderTarget[0].RenderTargetWriteMask=(i&2)?D3D11_COLOR_WRITE_ENABLE_ALL:0; ID3D11Device_CreateBlendState(dev,&bd,&bs[i]); } for(int i=0;i<2;i++){ D3D11_RASTERIZER_DESC rd; zmem(&rd,sizeof(rd)); rd.FillMode=D3D11_FILL_SOLID; rd.CullMode=i?D3D11_CULL_BACK:D3D11_CULL_NONE; rd.DepthClipEnable=TRUE; ID3D11Device_CreateRasterizerState(dev,&rd,&rs[i]); } }
 static void cb_make(ID3D11Buffer** b, unsigned int sz){ D3D11_BUFFER_DESC d; zmem(&d,sizeof(d)); d.ByteWidth=(sz+15)&~15; d.Usage=D3D11_USAGE_DYNAMIC; d.BindFlags=D3D11_BIND_CONSTANT_BUFFER; d.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE; ID3D11Device_CreateBuffer(dev,&d,0,b); }
 static void cb_up(ID3D11Buffer* b, void* data, unsigned int sz){ D3D11_MAPPED_SUBRESOURCE m; if(SUCCEEDED(ID3D11DeviceContext_Map(ctx,(ID3D11Resource*)b,0,D3D11_MAP_WRITE_DISCARD,0,&m))){ cpy(m.pData,data,sz); ID3D11DeviceContext_Unmap(ctx,(ID3D11Resource*)b,0); } }
 static ID3D11ShaderResourceView* srvof(int s){ if(s>=0&&s<RTN)return rt_srv[s]; if(s==-2)return depth_srv; if(s==-3)return shadow_srv; return 0; }
@@ -1955,7 +1963,7 @@ void WINAPI WinMainCRTStartup(void){ WNDCLASSA wc; zmem(&wc,sizeof(wc)); wc.lpfn
 // Fullscreen-only size policy: render at the real monitor/backbuffer size.
 // RW/RH are deliberately equal to W/H, so the camera aspect ratio cannot be
 // different from the final presentation aspect ratio.
-W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); RW=W; RH=H; HWND hw=CreateWindowExA(WS_EX_TOPMOST,LT_WNDCLS,"lt64k",WS_POPUP|WS_VISIBLE,0,0,W,H,0,0,wc.hInstance,0); wh=hw; SetWindowPos(hw,HWND_TOPMOST,0,0,W,H,SWP_SHOWWINDOW); ShowCursor(FALSE); DXGI_SWAP_CHAIN_DESC sd; zmem(&sd,sizeof(sd)); sd.BufferCount=1; sd.BufferDesc.Width=W; sd.BufferDesc.Height=H; sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow=hw; sd.SampleDesc.Count=1; sd.Windowed=TRUE; if(FAILED(D3D11CreateDeviceAndSwapChain(0,D3D_DRIVER_TYPE_HARDWARE,0,0,0,0,D3D11_SDK_VERSION,&sd,&swp,&dev,0,&ctx)))ExitProcess(1); ID3D11Texture2D* bb=0; IDXGISwapChain_GetBuffer(swp,0,&IID_ID3D11Texture2D,(void**)&bb); ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)bb,0,&rtv); ID3D11Texture2D_Release(bb); init_depth_shadow(); init_rts(); init_states(); cb_make(&scene_cb,sizeof(SceneCB)); cb_make(&object_cb,sizeof(ObjectCB)); cb_make(&user_cb,sizeof(UserCB)); init_shaders(); init_prims(); LARGE_INTEGER fq,t0,tn; QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0); float sec=0; MSG msg; for(;;){ while(PeekMessageA(&msg,0,0,0,PM_REMOVE)){ if(msg.message==WM_QUIT)ExitProcess(0); TranslateMessage(&msg); DispatchMessageA(&msg);} QueryPerformanceCounter(&tn); sec+=qpcdt(&tn,&t0,&fq); t0=tn; render(sec); } }
+W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); RW=W; RH=H; HWND hw=CreateWindowExA(WS_EX_TOPMOST,LT_WNDCLS,"lt64k",WS_POPUP|WS_VISIBLE,0,0,W,H,0,0,wc.hInstance,0); wh=hw; SetWindowPos(hw,HWND_TOPMOST,0,0,W,H,SWP_SHOWWINDOW); ShowCursor(FALSE); DXGI_SWAP_CHAIN_DESC sd; zmem(&sd,sizeof(sd)); sd.BufferCount=1; sd.BufferDesc.Width=W; sd.BufferDesc.Height=H; sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow=hw; sd.SampleDesc.Count=1; sd.Windowed=TRUE; if(FAILED(D3D11CreateDeviceAndSwapChain(0,D3D_DRIVER_TYPE_HARDWARE,0,0,0,0,D3D11_SDK_VERSION,&sd,&swp,&dev,0,&ctx)))ExitProcess(1); ID3D11Texture2D* bb=0; IDXGISwapChain_GetBuffer(swp,0,&IID_ID3D11Texture2D,(void**)&bb); ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)bb,0,&rtv); ID3D11Texture2D_Release(bb); init_depth_shadow(); init_rts(); init_states(); cb_make(&scene_cb,sizeof(SceneCB)); cb_make(&object_cb,sizeof(ObjectCB)); cb_make(&user_cb,sizeof(UserCB)); init_shaders(); init_prims(); LARGE_INTEGER fq,t0,tn; QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0); float sec=0; MSG msg; for(;;){ while(PeekMessageA(&msg,0,0,0,PM_REMOVE)){ if(msg.message==WM_QUIT)ExitProcess(0); TranslateMessage(&msg); DispatchMessageA(&msg);} QueryPerformanceCounter(&tn); sec+=qpcdt(&tn,&t0,&fq); t0=tn; render(sec); if(LT_EXIT_AFTER_TIMELINE&&TL_ON){float tt=tltotal(); if(tt>0&&sec>=tt)PostQuitMessage(0);} } }
 )LT64K", f);
 
     std::fclose(f);
@@ -1978,7 +1986,7 @@ W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); RW=W; RH=H; HW
     }
     fprintf(stderr, "generated %s\n", out_c.c_str());
     fprintf(stderr, "commands: %u, shaders: %u, user vars: %u, timelines: %u, timeline tracks: %u\n", (unsigned)out_cmds.size(), (unsigned)shader_sources.size(), (unsigned)p.user_vars.size(), (unsigned)flat_timelines.size(), (unsigned)flat_tracks.size());
-    fprintf(stderr, "timeline sequence: loop=%s enabled=%s duration=%.3fs\n", p.timeline_loop?"on":"off", p.timeline_enabled?"on":"off", timeline_total_seconds_for_report);
+    fprintf(stderr, "timeline sequence: loop=%s enabled=%s autoplay=%s exit_after=%s duration=%.3fs\n", p.timeline_loop?"on":"off", (p.timeline_enabled || p.export_timeline_autoplay)?"on":"off", p.export_timeline_autoplay?"on":"off", p.export_exit_after_timeline?"on":"off", timeline_total_seconds_for_report);
     fprintf(stderr, "\n64k exporter size report (source-side, before MSVC/linker packing):\n");
     if (out_bytes >= 0) fprintf(stderr, "  out64k.c:                 %lld bytes\n", out_bytes);
     fprintf(stderr, "  HLSL expanded raw:        %u bytes\n", (unsigned)raw_hlsl);

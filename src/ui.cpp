@@ -23,6 +23,105 @@
 #include <string>
 #pragma comment(lib, "psapi.lib")
 
+#ifndef LAZYTOOL_BUILD_CONFIG
+#define LAZYTOOL_BUILD_CONFIG "custom"
+#endif
+
+// Lightweight UI build profiler. Values are shown one frame late on purpose:
+// the profiler panel is drawn while the current UI frame is still being built.
+// Timing every top-level panel makes it obvious whether a slow frame is ImGui
+// itself, a specific panel, or Present/driver throttling.
+enum UiProfileSection {
+    UI_PROFILE_FRAME_SETUP = 0,
+    UI_PROFILE_TOP_BAR,
+    UI_PROFILE_PROJECT_FILE_BAR,
+    UI_PROFILE_COMMANDS,
+    UI_PROFILE_RESOURCES,
+    UI_PROFILE_VIEWPORT,
+    UI_PROFILE_LOG,
+    UI_PROFILE_INSPECTOR_GENERAL,
+    UI_PROFILE_FLOATING_WINDOWS,
+    UI_PROFILE_IMGUI_RENDER_FINALIZE,
+    UI_PROFILE_COUNT
+};
+
+struct UiProfileEntry {
+    const char* name;
+    float accum_ms;
+    float display_ms;
+};
+
+static UiProfileEntry s_ui_profile[UI_PROFILE_COUNT] = {
+    { "Frame setup",       0.0f, 0.0f },
+    { "Top bar",           0.0f, 0.0f },
+    { "Project file bar",  0.0f, 0.0f },
+    { "Commands",          0.0f, 0.0f },
+    { "Resources",         0.0f, 0.0f },
+    { "Viewport",          0.0f, 0.0f },
+    { "Log",               0.0f, 0.0f },
+    { "Inspector/General", 0.0f, 0.0f },
+    { "Floating windows",  0.0f, 0.0f },
+    { "ImGui::Render",     0.0f, 0.0f },
+};
+
+static LARGE_INTEGER s_ui_profile_freq = {};
+static bool s_ui_profile_display_valid = false;
+
+static void ui_profile_ensure_freq() {
+    if (s_ui_profile_freq.QuadPart == 0)
+        QueryPerformanceFrequency(&s_ui_profile_freq);
+}
+
+static float ui_profile_elapsed_ms(const LARGE_INTEGER& a, const LARGE_INTEGER& b) {
+    ui_profile_ensure_freq();
+    return (float)(((double)(b.QuadPart - a.QuadPart) * 1000.0) / (double)s_ui_profile_freq.QuadPart);
+}
+
+static void ui_profile_begin_frame() {
+    ui_profile_ensure_freq();
+    if (!g_profiler_enabled) {
+        s_ui_profile_display_valid = false;
+        for (int i = 0; i < UI_PROFILE_COUNT; i++) {
+            s_ui_profile[i].display_ms = 0.0f;
+            s_ui_profile[i].accum_ms = 0.0f;
+        }
+        return;
+    }
+
+    const float a = 0.16f;
+    for (int i = 0; i < UI_PROFILE_COUNT; i++) {
+        if (s_ui_profile_display_valid)
+            s_ui_profile[i].display_ms += (s_ui_profile[i].accum_ms - s_ui_profile[i].display_ms) * a;
+        else
+            s_ui_profile[i].display_ms = s_ui_profile[i].accum_ms;
+        s_ui_profile[i].accum_ms = 0.0f;
+    }
+    s_ui_profile_display_valid = true;
+}
+
+struct UiProfileScope {
+    UiProfileSection section;
+    LARGE_INTEGER begin;
+    bool active;
+
+    explicit UiProfileScope(UiProfileSection section_) : section(section_), begin({}), active(g_profiler_enabled) {
+        if (active)
+            QueryPerformanceCounter(&begin);
+    }
+
+    ~UiProfileScope() {
+        if (!active)
+            return;
+        LARGE_INTEGER end;
+        QueryPerformanceCounter(&end);
+        s_ui_profile[(int)section].accum_ms += ui_profile_elapsed_ms(begin, end);
+    }
+};
+
+#define UI_PROFILE_CONCAT_INNER(a, b) a##b
+#define UI_PROFILE_CONCAT(a, b) UI_PROFILE_CONCAT_INNER(a, b)
+#define UI_PROFILE_SCOPE(section) UiProfileScope UI_PROFILE_CONCAT(_ui_profile_scope_, __LINE__)(section)
+
 // The UI module is the editor shell. It presents resources, commands,
 // inspectors, logs, and the live scene view on top of the runtime state.
 
@@ -159,6 +258,19 @@ static void ui_draw_command_bounds_inspector(Command* c, CmdHandle h);
 static void ui_align_frame_row(float row_y);
 static void ui_align_text_row(float row_y);
 static float ui_px(float v);
+
+struct UiProfilerReadoutCache {
+    double next_update_time = -1.0;
+    uint64_t app_memory_bytes = 0;
+    uint64_t gpu_memory_bytes = 0;
+    uint64_t project_gpu_memory_bytes = 0;
+    char app_memory[32] = "0 B";
+    char gpu_memory[32] = "0 B";
+    char project_gpu_memory[32] = "0 B";
+};
+
+static UiProfilerReadoutCache s_profiler_readout_cache;
+static void ui_refresh_profiler_readout_cache(bool force = false);
 
 struct PathCandidate {
     char display[MAX_PATH_LEN];
@@ -7461,46 +7573,59 @@ static void ui_panel_general(bool embedded = false) {
         settings_dirty |= ImGui::Checkbox("VSync", &g_dx.vsync);
         ImGui::SameLine();
         ImGui::TextDisabled("%s", g_dx.vsync ? "Present interval 1" : "Present immediate");
+
+        float frame_cap = app_editor_frame_cap_fps();
+        if (ImGui::SliderFloat("Editor Frame Cap", &frame_cap, 0.0f, 240.0f, frame_cap <= 0.0f ? "uncapped" : "%.0f fps")) {
+            app_set_editor_frame_cap_fps(frame_cap);
+            settings_dirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Uncap##editor_frame_cap")) {
+            app_set_editor_frame_cap_fps(0.0f);
+            settings_dirty = true;
+        }
+        ImGui::TextDisabled("Editor-only throttle. It is ignored when VSync is enabled and does not affect exported players.");
     }
 
     if (ImGui::CollapsingHeader("Exporter / Standalone", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::TextDisabled("Project settings used by Export EXE and build64k.");
-        ImGui::Checkbox("Runtime Input", &g_export_settings.runtime_input_enabled);
+        // Keep every item in this section explicitly namespaced. The General panel
+        // also has editor/runtime diagnostics with similarly named controls, and
+        // Dear ImGui IDs are scoped by window/ID stack, not by visual collapsing
+        // headers. Hidden ## suffixes avoid accidental ID collisions while keeping
+        // the visible labels readable.
+        ImGui::Checkbox("Camera/Light Controls##export_camera_light_controls", &g_export_settings.camera_light_controls_enabled);
         ImGui::SameLine();
-        ImGui::TextDisabled("camera/light controls in normal player; F1 debug toggle in 64k");
-        ImGui::Checkbox("Esc Closes Player", &g_export_settings.escape_closes_player);
-        ImGui::Checkbox("Force Wireframe", &g_export_settings.force_wireframe);
-        ImGui::Checkbox("Show Grid Overlay", &g_export_settings.show_grid_overlay);
+        ImGui::TextDisabled("off by default for demo playback");
+        ImGui::Checkbox("Autoplay Timeline##export_timeline_autoplay", &g_export_settings.timeline_autoplay);
         ImGui::SameLine();
-        ImGui::TextDisabled("normal EXE only");
-        ImGui::Checkbox("VSync In Export", &g_export_settings.vsync);
-        ImGui::Checkbox("Profiler In Export", &g_export_settings.profiler);
-        ImGui::Checkbox("Shader Binding Warnings", &g_export_settings.shader_binding_warnings);
+        ImGui::TextDisabled("starts the sequence from frame 0 in the player");
+        ImGui::Checkbox("Exit After Timeline##export_exit_after_timeline", &g_export_settings.exit_after_timeline);
+        ImGui::SameLine();
+        ImGui::TextDisabled("overrides timeline loop in player/export");
+        ImGui::Checkbox("Esc Closes Player##export_escape_closes_player", &g_export_settings.escape_closes_player);
+        ImGui::Checkbox("VSync In Export##export_vsync", &g_export_settings.vsync);
 
-        if (ImGui::Button("Final Optimized Preset")) {
-            g_export_settings.runtime_input_enabled = false;
+        if (ImGui::Button("Demo Preset")) {
+            g_export_settings.camera_light_controls_enabled = false;
+            g_export_settings.timeline_autoplay = true;
+            g_export_settings.exit_after_timeline = true;
             g_export_settings.escape_closes_player = true;
-            g_export_settings.force_wireframe = false;
-            g_export_settings.show_grid_overlay = false;
             g_export_settings.vsync = false;
-            g_export_settings.profiler = false;
-            g_export_settings.shader_binding_warnings = false;
         }
         ImGui::SameLine();
-        if (ImGui::Button("Interactive Debug Preset")) {
-            g_export_settings.runtime_input_enabled = true;
+        if (ImGui::Button("Interactive Preset")) {
+            g_export_settings.camera_light_controls_enabled = true;
+            g_export_settings.timeline_autoplay = true;
+            g_export_settings.exit_after_timeline = false;
             g_export_settings.escape_closes_player = true;
-            g_export_settings.force_wireframe = false;
-            g_export_settings.show_grid_overlay = true;
             g_export_settings.vsync = false;
-            g_export_settings.profiler = true;
-            g_export_settings.shader_binding_warnings = true;
         }
         ImGui::SameLine();
         if (ImGui::Button("Reset##export_settings")) {
             g_export_settings = project_default_export_settings();
         }
-        ImGui::TextDisabled("Normal EXE uses the sibling lazyPlayer.exe; 64k turns these into compile-time defaults.");
+        ImGui::TextDisabled("Exported players ignore editor wireframe, grid, profiler and shader diagnostics.");
     }
 
     if (ImGui::CollapsingHeader("Viewport", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -7522,6 +7647,14 @@ static void ui_panel_general(bool embedded = false) {
     }
 
     if (ImGui::CollapsingHeader("Diagnostics", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Text("DX11 Adapter: %s", g_dx.adapter_name[0] ? g_dx.adapter_name : "unknown");
+        ImGui::TextDisabled("vendor=0x%04X device=0x%04X dedicated=%llu MB",
+            g_dx.adapter_vendor_id,
+            g_dx.adapter_device_id,
+            g_dx.adapter_dedicated_vram_mb);
+        ImGui::TextDisabled("High-performance GPU hints are exported; on hybrid laptops the final desktop composition may still show iGPU activity.");
+        ImGui::Separator();
+
         settings_dirty |= ImGui::Checkbox("D3D11 Runtime Validation", &g_dx.d3d11_validation);
         if (g_dx.d3d11_validation_active) {
             ImGui::TextDisabled("Debug layer active in this session. Adds overhead.");
@@ -7534,8 +7667,8 @@ static void ui_panel_general(bool embedded = false) {
             ImGui::TextDisabled("Disabled. Enable and restart to capture D3D11 runtime warnings.");
         }
 
-        settings_dirty |= ImGui::Checkbox("Shader Binding Warnings", &g_dx.shader_validation_warnings);
-        ImGui::TextDisabled("Warn once when a shader expects SRV/UAV bindings that a command does not provide.");
+        settings_dirty |= ImGui::Checkbox("Shader Binding Warnings##runtime_shader_binding_warnings", &g_dx.shader_validation_warnings);
+        ImGui::TextDisabled("Editor/runtime diagnostic only. Export defaults are controlled in Exporter / Standalone.");
 
         bool can_flush_d3d11 = g_dx.d3d11_validation_active && g_dx.info_queue;
         if (!can_flush_d3d11)
@@ -7549,12 +7682,28 @@ static void ui_panel_general(bool embedded = false) {
     if (ImGui::CollapsingHeader("Profiler", ImGuiTreeNodeFlags_DefaultOpen)) {
         settings_dirty |= ImGui::Checkbox("Enable profiling", &g_profiler_enabled);
         if (g_profiler_enabled) {
-            char app_mem[32] = {};
-            char gpu_mem[32] = {};
-            char project_gpu_mem[32] = {};
-            ui_format_bytes(ui_process_memory_bytes(), app_mem, sizeof(app_mem));
-            ui_format_bytes(ui_estimated_gpu_memory_bytes(), gpu_mem, sizeof(gpu_mem));
-            ui_format_bytes(res_estimate_gpu_total(false), project_gpu_mem, sizeof(project_gpu_mem));
+            ui_refresh_profiler_readout_cache();
+            ImGui::Text("CPU frame: %.3f ms", app_cpu_frame_ms());
+            ImGui::Text("Scene CPU: %.3f ms", app_cpu_scene_ms());
+            ImGui::Text("ImGui build CPU: %.3f ms", app_cpu_ui_build_ms());
+            ImGui::Text("ImGui render CPU: %.3f ms", app_cpu_ui_render_ms());
+            ImGui::Text("Present CPU: %.3f ms", app_cpu_present_ms());
+            ImGui::Text("Other CPU: %.3f ms", app_cpu_other_ms());
+            ImGuiIO& profiler_io = ImGui::GetIO();
+            ImGui::Text("ImGui output: %d verts, %d indices, %d windows",
+                profiler_io.MetricsRenderVertices,
+                profiler_io.MetricsRenderIndices,
+                profiler_io.MetricsRenderWindows);
+            if (ImGui::TreeNodeEx("ImGui build breakdown", ImGuiTreeNodeFlags_DefaultOpen)) {
+                float total = app_cpu_ui_build_ms();
+                if (total <= 0.0001f) total = 1.0f;
+                for (int i = 0; i < UI_PROFILE_COUNT; i++) {
+                    float ms = s_ui_profile[i].display_ms;
+                    ImGui::Text("%s: %.3f ms  %.1f%%", s_ui_profile[i].name, ms, (ms / total) * 100.0f);
+                }
+                ImGui::TreePop();
+            }
+            ImGui::Separator();
             if (cmd_profile_total_ready())
                 ImGui::Text("Frame GPU time: %.3f ms", cmd_profile_total_frame_ms());
             else
@@ -7563,9 +7712,9 @@ static void ui_panel_general(bool embedded = false) {
                 ImGui::Text("Command GPU time: %.3f ms", cmd_profile_frame_ms());
             else
                 ImGui::TextDisabled("Command GPU time: warming up...");
-            ImGui::Text("Application memory: %s", app_mem);
-            ImGui::Text("Estimated GPU memory: %s", gpu_mem);
-            ImGui::TextDisabled("Project GPU resources: %s", project_gpu_mem);
+            ImGui::Text("Application memory: %s", s_profiler_readout_cache.app_memory);
+            ImGui::Text("Estimated GPU memory: %s", s_profiler_readout_cache.gpu_memory);
+            ImGui::TextDisabled("Project GPU resources: %s", s_profiler_readout_cache.project_gpu_memory);
         }
     }
 
@@ -9388,6 +9537,31 @@ static uint64_t ui_estimated_gpu_memory_bytes() {
     return total;
 }
 
+static void ui_refresh_profiler_readout_cache(bool force) {
+    // These readouts are useful diagnostics, not per-frame simulation data.
+    // Keep them slightly decimated so an open profiler panel does not add
+    // process-memory queries and resource-memory walks to every ImGui frame.
+    double now = ImGui::GetTime();
+    if (!force && s_profiler_readout_cache.next_update_time >= 0.0 &&
+        now < s_profiler_readout_cache.next_update_time) {
+        return;
+    }
+
+    s_profiler_readout_cache.app_memory_bytes = ui_process_memory_bytes();
+    s_profiler_readout_cache.gpu_memory_bytes = ui_estimated_gpu_memory_bytes();
+    s_profiler_readout_cache.project_gpu_memory_bytes = res_estimate_gpu_total(false);
+    ui_format_bytes(s_profiler_readout_cache.app_memory_bytes,
+                    s_profiler_readout_cache.app_memory,
+                    sizeof(s_profiler_readout_cache.app_memory));
+    ui_format_bytes(s_profiler_readout_cache.gpu_memory_bytes,
+                    s_profiler_readout_cache.gpu_memory,
+                    sizeof(s_profiler_readout_cache.gpu_memory));
+    ui_format_bytes(s_profiler_readout_cache.project_gpu_memory_bytes,
+                    s_profiler_readout_cache.project_gpu_memory,
+                    sizeof(s_profiler_readout_cache.project_gpu_memory));
+    s_profiler_readout_cache.next_update_time = now + 0.25;
+}
+
 static void ui_viewport_detail(char* out, int out_sz) {
     snprintf(out, out_sz, "frame %llu  %.2fs  %dx%d  %s",
         (unsigned long long)app_scene_frame(), app_scene_time(),
@@ -10281,18 +10455,31 @@ static void ui_draw_timeline_window() {
     if (loop)
         ImGui::PopStyleColor(3);
     ImGui::SameLine(0.0f, ui_margin_px(10.0f));
-    bool interpolate_frames = timeline_interpolate_frames();
-    if (interpolate_frames) {
+    int interpolation_mode = timeline_interpolation_mode();
+    const char* interpolation_label =
+        interpolation_mode == TIMELINE_INTERP_CUBIC ? "Cubic" :
+        interpolation_mode == TIMELINE_INTERP_QUADRATIC ? "Quadratic" :
+        interpolation_mode == TIMELINE_INTERP_LINEAR ? "Linear" : "Step";
+    bool interpolation_active = interpolation_mode != TIMELINE_INTERP_STEP;
+    if (interpolation_active) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.33f, 0.18f, 0.10f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.24f, 0.12f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.58f, 0.30f, 0.14f, 1.0f));
     }
-    if (ImGui::Button(interpolate_frames ? "Linear" : "Step"))
-        timeline_set_interpolate_frames(!interpolate_frames);
-    if (interpolate_frames)
+    if (ImGui::Button(interpolation_label)) {
+        int next_mode = interpolation_mode + 1;
+        if (next_mode > TIMELINE_INTERP_CUBIC)
+            next_mode = TIMELINE_INTERP_STEP;
+        timeline_set_interpolation_mode(next_mode);
+    }
+    if (interpolation_active)
         ImGui::PopStyleColor(3);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(interpolate_frames ?
+        ImGui::SetTooltip(interpolation_mode == TIMELINE_INTERP_CUBIC ?
+                          "Cubic Hermite interpolation with continuous velocity across keyed frames" :
+                          interpolation_mode == TIMELINE_INTERP_QUADRATIC ?
+                          "Quadratic ease-in/out between real timeline frames" :
+                          interpolation_mode == TIMELINE_INTERP_LINEAR ?
                           "Linear interpolation between real timeline frames" :
                           "Stepped playback: hold each real timeline frame");
     ImGui::SameLine(0.0f, ui_margin_px(18.0f));
@@ -11537,29 +11724,53 @@ static void ui_top_bar() {
         s_shortcuts_popup_open = !s_shortcuts_popup_open;
 
     char summary[256] = {};
-    float frame_ms = ImGui::GetIO().DeltaTime * 1000.0f;
+    static bool s_frame_ms_display_valid = false;
+    static float s_frame_ms_display = 0.0f;
+    float frame_ms_raw = ImGui::GetIO().DeltaTime * 1000.0f;
+    if (s_frame_ms_display_valid)
+        s_frame_ms_display += (frame_ms_raw - s_frame_ms_display) * 0.12f;
+    else {
+        s_frame_ms_display = frame_ms_raw;
+        s_frame_ms_display_valid = true;
+    }
+    float frame_ms = s_frame_ms_display;
     if (g_profiler_enabled) {
-        char app_mem[32] = {};
-        char gpu_mem[32] = {};
-        ui_format_bytes(ui_process_memory_bytes(), app_mem, sizeof(app_mem));
-        ui_format_bytes(ui_estimated_gpu_memory_bytes(), gpu_mem, sizeof(gpu_mem));
+        ui_refresh_profiler_readout_cache();
         if (cmd_profile_total_ready() && cmd_profile_ready()) {
-            snprintf(summary, sizeof(summary), "dt %.2f ms  frame gpu %.3f ms  cmds gpu %.3f ms  app %s  vram %s  %s",
-                frame_ms, cmd_profile_total_frame_ms(), cmd_profile_frame_ms(), app_mem, gpu_mem,
-                g_dx.vsync ? "vsync" : "no-vsync");
+            snprintf(summary, sizeof(summary),
+                "dt %.2f ms  cpu %.2f ms  ui %.2f+%.2f ms  present %.2f ms  other %.2f ms  gpu %.3f ms  cmds %.3f ms  app %s  vram %s  %s  cfg %s",
+                frame_ms, app_cpu_frame_ms(), app_cpu_ui_build_ms(), app_cpu_ui_render_ms(),
+                app_cpu_present_ms(), app_cpu_other_ms(),
+                cmd_profile_total_frame_ms(), cmd_profile_frame_ms(),
+                s_profiler_readout_cache.app_memory, s_profiler_readout_cache.gpu_memory,
+                g_dx.vsync ? "vsync" : "no-vsync", LAZYTOOL_BUILD_CONFIG);
         } else if (cmd_profile_total_ready()) {
-            snprintf(summary, sizeof(summary), "dt %.2f ms  frame gpu %.3f ms  cmds gpu ...  app %s  vram %s  %s",
-                frame_ms, cmd_profile_total_frame_ms(), app_mem, gpu_mem, g_dx.vsync ? "vsync" : "no-vsync");
+            snprintf(summary, sizeof(summary),
+                "dt %.2f ms  cpu %.2f ms  ui %.2f+%.2f ms  present %.2f ms  other %.2f ms  gpu %.3f ms  cmds ...  app %s  vram %s  %s  cfg %s",
+                frame_ms, app_cpu_frame_ms(), app_cpu_ui_build_ms(), app_cpu_ui_render_ms(),
+                app_cpu_present_ms(), app_cpu_other_ms(),
+                cmd_profile_total_frame_ms(),
+                s_profiler_readout_cache.app_memory, s_profiler_readout_cache.gpu_memory,
+                g_dx.vsync ? "vsync" : "no-vsync", LAZYTOOL_BUILD_CONFIG);
         } else if (cmd_profile_ready()) {
-            snprintf(summary, sizeof(summary), "dt %.2f ms  frame gpu ...  cmds gpu %.3f ms  app %s  vram %s  %s",
-                frame_ms, cmd_profile_frame_ms(), app_mem, gpu_mem, g_dx.vsync ? "vsync" : "no-vsync");
+            snprintf(summary, sizeof(summary),
+                "dt %.2f ms  cpu %.2f ms  ui %.2f+%.2f ms  present %.2f ms  other %.2f ms  gpu ...  cmds %.3f ms  app %s  vram %s  %s  cfg %s",
+                frame_ms, app_cpu_frame_ms(), app_cpu_ui_build_ms(), app_cpu_ui_render_ms(),
+                app_cpu_present_ms(), app_cpu_other_ms(),
+                cmd_profile_frame_ms(),
+                s_profiler_readout_cache.app_memory, s_profiler_readout_cache.gpu_memory,
+                g_dx.vsync ? "vsync" : "no-vsync", LAZYTOOL_BUILD_CONFIG);
         } else {
-            snprintf(summary, sizeof(summary), "dt %.2f ms  frame gpu ...  cmds gpu ...  app %s  vram %s  %s",
-                frame_ms, app_mem, gpu_mem, g_dx.vsync ? "vsync" : "no-vsync");
+            snprintf(summary, sizeof(summary),
+                "dt %.2f ms  cpu %.2f ms  ui %.2f+%.2f ms  present %.2f ms  other %.2f ms  gpu ...  cmds ...  app %s  vram %s  %s  cfg %s",
+                frame_ms, app_cpu_frame_ms(), app_cpu_ui_build_ms(), app_cpu_ui_render_ms(),
+                app_cpu_present_ms(), app_cpu_other_ms(),
+                s_profiler_readout_cache.app_memory, s_profiler_readout_cache.gpu_memory,
+                g_dx.vsync ? "vsync" : "no-vsync", LAZYTOOL_BUILD_CONFIG);
         }
     } else {
-        snprintf(summary, sizeof(summary), "dt %.2f ms  cmds %d  %s",
-            frame_ms, ui_active_command_count(), g_dx.vsync ? "vsync" : "no-vsync");
+        snprintf(summary, sizeof(summary), "dt %.2f ms  cmds %d  %s  cfg %s",
+            frame_ms, ui_active_command_count(), g_dx.vsync ? "vsync" : "no-vsync", LAZYTOOL_BUILD_CONFIG);
     }
 
     float content_max_x = ImGui::GetWindowContentRegionMax().x;
@@ -11614,6 +11825,7 @@ static void ui_workspace_layout() {
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
     if (avail.x < 640.0f || avail.y < 360.0f) {
+        UI_PROFILE_SCOPE(UI_PROFILE_VIEWPORT);
         ui_panel_scene(true);
         return;
     }
@@ -11637,7 +11849,10 @@ static void ui_workspace_layout() {
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
             ImGui::BeginChild("##viewport_frame_full", ImVec2(0.0f, 0.0f), false,
                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-            ui_panel_scene(true);
+            {
+                UI_PROFILE_SCOPE(UI_PROFILE_VIEWPORT);
+                ui_panel_scene(true);
+            }
             ImGui::EndChild();
             ImGui::PopStyleVar();
         }
@@ -11662,11 +11877,13 @@ static void ui_workspace_layout() {
 
     ImGui::BeginGroup();
     if (ui_begin_tool_panel("##pipeline_panel", "COMMAND PIPELINE", "right click to create", ImVec2(left_w, cmd_h), UI_PANEL_PIPELINE)) {
+        UI_PROFILE_SCOPE(UI_PROFILE_COMMANDS);
         ui_panel_commands(true);
     }
     ui_end_tool_panel();
 
     if (ui_begin_tool_panel("##resources_panel", "RESOURCES", "right click to create", ImVec2(left_w, 0.0f), UI_PANEL_RESOURCES)) {
+        UI_PROFILE_SCOPE(UI_PROFILE_RESOURCES);
         ui_panel_resources(true);
     }
     ui_end_tool_panel();
@@ -11692,13 +11909,17 @@ static void ui_workspace_layout() {
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
         ImGui::BeginChild("##viewport_frame", ImVec2(0.0f, 0.0f), false,
             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        ui_panel_scene(true);
+        {
+            UI_PROFILE_SCOPE(UI_PROFILE_VIEWPORT);
+            ui_panel_scene(true);
+        }
         ImGui::EndChild();
         ImGui::PopStyleVar();
     }
     ui_end_tool_panel();
 
     if (ui_begin_tool_panel("##log_panel", "LOG", nullptr, ImVec2(center_w, 0.0f), UI_PANEL_LOG)) {
+        UI_PROFILE_SCOPE(UI_PROFILE_LOG);
         ui_panel_log(true);
     }
     ui_end_tool_panel();
@@ -11726,12 +11947,14 @@ static void ui_workspace_layout() {
 
             if (ui_begin_tool_panel("##general_panel", "GENERAL", nullptr,
                                     ImVec2(0.0f, expanded_h), UI_PANEL_GENERAL)) {
+                UI_PROFILE_SCOPE(UI_PROFILE_INSPECTOR_GENERAL);
                 ui_panel_general(true);
             }
             ui_end_tool_panel();
         } else {
             if (ui_begin_tool_panel("##inspector_panel", "INSPECTOR", ui_inspector_header_detail(),
                                     ImVec2(0.0f, expanded_h), UI_PANEL_INSPECTOR)) {
+                UI_PROFILE_SCOPE(UI_PROFILE_INSPECTOR_GENERAL);
                 if (ImGui::BeginTabBar("##inspector_tabs")) {
                     if (ImGui::BeginTabItem("Properties")) {
                         ui_panel_inspector(true);
@@ -11843,19 +12066,25 @@ void ui_init() {
 
 // Draw one full editor frame on top of the already-rendered scene texture.
 void ui_draw() {
-    if (s_ui_scale_dirty) {
-        ui_apply_global_scale_now();
-        s_ui_scale_dirty = false;
-    }
+    ui_profile_begin_frame();
 
-    ImGui_ImplDX11_NewFrame();
-    ImGui_ImplWin32_NewFrame();
-    ImGui::NewFrame();
+    {
+        UI_PROFILE_SCOPE(UI_PROFILE_FRAME_SETUP);
+        if (s_ui_scale_dirty) {
+            ui_apply_global_scale_now();
+            s_ui_scale_dirty = false;
+        }
+
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+    }
 
     ImGuiIO& io = ImGui::GetIO();
     bool shader_editor_was_focused = s_shader_source_editor_focused;
     s_shader_source_editor_focused = false;
-    bool hotkeys_ok = !io.WantTextInput && !ImGui::IsAnyItemActive();
+    bool hotkeys_ok = !io.WantTextInput && !io.WantCaptureKeyboard &&
+                      !ImGui::IsAnyItemActive() && !shader_editor_was_focused;
     bool editor_selection_hotkeys_ok = hotkeys_ok && !s_timeline_keyboard_focus;
     if (ImGui::IsKeyPressed(ImGuiKey_F5, false))
         ui_recompile_all_shaders();
@@ -11891,8 +12120,14 @@ void ui_draw() {
         ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus);
     ImGui::PopStyleVar(3);
 
-    ui_top_bar();
-    ui_project_file_bar();
+    {
+        UI_PROFILE_SCOPE(UI_PROFILE_TOP_BAR);
+        ui_top_bar();
+    }
+    {
+        UI_PROFILE_SCOPE(UI_PROFILE_PROJECT_FILE_BAR);
+        ui_project_file_bar();
+    }
 
     ImVec2 workspace_size = ImGui::GetContentRegionAvail();
     if (workspace_size.x < 1.0f) workspace_size.x = 1.0f;
@@ -11903,14 +12138,23 @@ void ui_draw() {
     ui_workspace_layout();
     ImGui::EndChild();
     ImGui::PopStyleVar();
-    ui_draw_shortcuts_popup();
+    {
+        UI_PROFILE_SCOPE(UI_PROFILE_FLOATING_WINDOWS);
+        ui_draw_shortcuts_popup();
+    }
     ImGui::End();
 
-    ui_draw_render_graph_window();
-    ui_draw_timeline_window();
-    ui_draw_shader_editor_window();
+    {
+        UI_PROFILE_SCOPE(UI_PROFILE_FLOATING_WINDOWS);
+        ui_draw_render_graph_window();
+        ui_draw_timeline_window();
+        ui_draw_shader_editor_window();
+    }
 
-    ImGui::Render();
+    {
+        UI_PROFILE_SCOPE(UI_PROFILE_IMGUI_RENDER_FINALIZE);
+        ImGui::Render();
+    }
 }
 
 void ui_shutdown() {

@@ -38,9 +38,6 @@ REM
 REM   set "LT64K_CFLAGS=/DLT_VSYNC=1 /DLT_DEBUG_FPS=1"
 REM   build.bat ..\projects\procedural_spheres_pbr_post.lt
 REM
-REM   set "LT64K_CFLAGS=/DLT_INPUT=0 /DLT_ESC_CLOSE=0 /DLT_WIREFRAME=1"
-REM   build.bat ..\projects\procedural_spheres_pbr_post.lt
-REM
 REM Examples from PowerShell:
 REM   $env:LT64K_CFLAGS="/DLT_DEBUG_FPS=1"
 REM   .\build.bat ..\projects\procedural_spheres_pbr_post.lt

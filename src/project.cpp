@@ -19,13 +19,11 @@ static const char* bool_str(bool v) { return v ? "1" : "0"; }
 static char s_project_current_path[MAX_PATH_LEN] = {};
 
 static const ExportSettings k_project_export_defaults = {
-    /* runtime_input_enabled  */ true,
-    /* escape_closes_player   */ true,
-    /* force_wireframe        */ false,
-    /* show_grid_overlay      */ false,
-    /* vsync                  */ false,
-    /* profiler               */ false,
-    /* shader_binding_warnings*/ false
+    /* camera_light_controls_enabled */ false,
+    /* timeline_autoplay             */ true,
+    /* exit_after_timeline           */ true,
+    /* escape_closes_player          */ true,
+    /* vsync                         */ false
 };
 
 ExportSettings g_export_settings = k_project_export_defaults;
@@ -682,14 +680,12 @@ bool project_save_text(const char* path) {
         fprintf(f, "\n\n");
     }
 
-    fprintf(f, "export_settings %s %s %s %s %s %s %s\n\n",
-        bool_str(g_export_settings.runtime_input_enabled),
+    fprintf(f, "export_settings %s %s %s %s %s\n\n",
+        bool_str(g_export_settings.camera_light_controls_enabled),
+        bool_str(g_export_settings.timeline_autoplay),
+        bool_str(g_export_settings.exit_after_timeline),
         bool_str(g_export_settings.escape_closes_player),
-        bool_str(g_export_settings.force_wireframe),
-        bool_str(g_export_settings.show_grid_overlay),
-        bool_str(g_export_settings.vsync),
-        bool_str(g_export_settings.profiler),
-        bool_str(g_export_settings.shader_binding_warnings));
+        bool_str(g_export_settings.vsync));
 
     fprintf(f, "resources\n");
     for (int i = 0; i < MAX_RESOURCES; i++) {
@@ -1029,21 +1025,21 @@ bool project_load_text(const char* path) {
         if (!tag || tag[0] == '#') continue;
 
         if (strcmp(tag, "export_settings") == 0) {
-            saw_export_settings = true;
-            char* runtime_input = strtok(nullptr, " \t\r\n");
+            char* camera_light_controls = strtok(nullptr, " \t\r\n");
+            char* timeline_autoplay = strtok(nullptr, " \t\r\n");
+            char* exit_after_timeline = strtok(nullptr, " \t\r\n");
             char* esc_close = strtok(nullptr, " \t\r\n");
-            char* wireframe = strtok(nullptr, " \t\r\n");
-            char* grid = strtok(nullptr, " \t\r\n");
             char* vsync = strtok(nullptr, " \t\r\n");
-            char* profiler = strtok(nullptr, " \t\r\n");
-            char* shader_warnings = strtok(nullptr, " \t\r\n");
-            if (runtime_input) g_export_settings.runtime_input_enabled = atoi(runtime_input) != 0;
-            if (esc_close) g_export_settings.escape_closes_player = atoi(esc_close) != 0;
-            if (wireframe) g_export_settings.force_wireframe = atoi(wireframe) != 0;
-            if (grid) g_export_settings.show_grid_overlay = atoi(grid) != 0;
-            if (vsync) g_export_settings.vsync = atoi(vsync) != 0;
-            if (profiler) g_export_settings.profiler = atoi(profiler) != 0;
-            if (shader_warnings) g_export_settings.shader_binding_warnings = atoi(shader_warnings) != 0;
+            char* extra = strtok(nullptr, " \t\r\n");
+            if (camera_light_controls && timeline_autoplay && exit_after_timeline &&
+                esc_close && vsync && !extra) {
+                saw_export_settings = true;
+                g_export_settings.camera_light_controls_enabled = atoi(camera_light_controls) != 0;
+                g_export_settings.timeline_autoplay = atoi(timeline_autoplay) != 0;
+                g_export_settings.exit_after_timeline = atoi(exit_after_timeline) != 0;
+                g_export_settings.escape_closes_player = atoi(esc_close) != 0;
+                g_export_settings.vsync = atoi(vsync) != 0;
+            }
         } else if (strcmp(tag, "timeline") == 0) {
             timeline_reset();
             timeline_load_track = -1;
@@ -1079,7 +1075,7 @@ bool project_load_text(const char* path) {
             char* length = strtok(nullptr, " \t\r\n");
             char* frame = strtok(nullptr, " \t\r\n");
             char* enabled = strtok(nullptr, " \t\r\n");
-            char* interpolate = strtok(nullptr, " \t\r\n");
+            char* interpolation_mode = strtok(nullptr, " \t\r\n");
             int clip_index = timeline_clip_count;
             if (clip_index == 0)
                 timeline_set_current_index(0);
@@ -1091,7 +1087,7 @@ bool project_load_text(const char* path) {
                 if (fps) timeline_set_fps(atoi(fps));
                 if (length) timeline_set_length_frames(atoi(length));
                 if (frame) timeline_set_current_frame(atoi(frame));
-                if (interpolate) timeline_set_interpolate_frames(atoi(interpolate) != 0);
+                if (interpolation_mode) timeline_set_interpolation_mode(atoi(interpolation_mode));
                 if (clip_index < MAX_TIMELINES)
                     timeline_clip_enabled_load[clip_index] = enabled ? (atoi(enabled) != 0) : true;
                 timeline_current_clip = clip_index;
@@ -1463,7 +1459,7 @@ bool project_load_text(const char* path) {
 
     if (!saw_export_settings) {
         lt_free_file(project_bytes);
-        log_error("Project load failed: missing export_settings in current .lt format.");
+        log_error("Project load failed: missing or invalid current 5-field export_settings block.");
         return false;
     }
     if (!saw_timeline_global || timeline_clip_count <= 0) {

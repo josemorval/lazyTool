@@ -23,7 +23,6 @@
 //   /DLT_VSYNC=1                        Override project VSync default.
 //   /DLT_INPUT=0                        Remove runtime key toggles.
 //   /DLT_ESC_CLOSE=0                    Do not close on Escape.
-//   /DLT_WIREFRAME=1                    Force wireframe rasterizer state.
 //   /DLT_DEBUG_FPS=1                    Compile the tiny GDI FPS overlay.
 // -----------------------------------------------------------------------------
 #define LT_PROJECT_W 945
@@ -39,8 +38,8 @@
 #ifndef LT_ESC_CLOSE
 #define LT_ESC_CLOSE 1
 #endif
-#ifndef LT_WIREFRAME
-#define LT_WIREFRAME 0
+#ifndef LT_EXIT_AFTER_TIMELINE
+#define LT_EXIT_AFTER_TIMELINE 1
 #endif
 #ifndef LT_DEBUG_FPS
 #define LT_DEBUG_FPS 0
@@ -4389,7 +4388,7 @@ static float dl0[39]= {
 };
 static float cam[8], dl[39];
 enum {
-    CMDN=15, SHN=11, RTN=9, UVN=0, PN=23, TLN=1, TRN=1, KEYN=8, TL_LOOP=1, TL_ON=1
+    CMDN=15, SHN=11, RTN=9, UVN=0, PN=23, TLN=1, TRN=1, KEYN=8, TL_LOOP=0, TL_ON=1
 };
 // -----------------------------------------------------------------------------
 // Runtime helpers
@@ -4905,6 +4904,12 @@ static float tldur(Tl* t) {
     if(!t->enabled||t->fps<=0||t->len<=0)return 0;
     return (float)t->len/(float)t->fps;
 }
+static float tltotal(void) {
+    float total=0;
+    int i;
+    for(i=0;i<TLN;i++)total+=tldur(tls+i);
+    return total;
+}
 static void timeline(float sec) {
     if(!TL_ON||TLN<1)return;
     float total=0, acc=0, local=0, fr=0, d;
@@ -5325,7 +5330,7 @@ static void init_states() {
     for(int i=0;i<2;i++) {
         D3D11_RASTERIZER_DESC rd;
         zmem(&rd, sizeof(rd));
-        rd.FillMode=LT_WIREFRAME?D3D11_FILL_WIREFRAME:D3D11_FILL_SOLID;
+        rd.FillMode=D3D11_FILL_SOLID;
         rd.CullMode=i?D3D11_CULL_BACK:D3D11_CULL_NONE;
         rd.DepthClipEnable=TRUE;
         ID3D11Device_CreateRasterizerState(dev, &rd, &rs[i]);
@@ -5729,6 +5734,10 @@ void WINAPI WinMainCRTStartup(void) {
         sec+=qpcdt(&tn, &t0, &fq);
         t0=tn;
         render(sec);
+        if(LT_EXIT_AFTER_TIMELINE&&TL_ON) {
+            float tt=tltotal();
+            if(tt>0&&sec>=tt)PostQuitMessage(0);
+        }
     }
 }
 

@@ -19,7 +19,7 @@ static void app_settings_apply_defaults() {
     g_dx.d3d11_validation = false;
     g_dx.d3d11_validation_active = false;
     g_dx.d3d11_validation_supported = true;
-    g_dx.shader_validation_warnings = true;
+    g_dx.shader_validation_warnings = false;
     g_dx.scene_grid_enabled = true;
     g_dx.scene_orientation_gizmo_enabled = true;
     g_dx.scene_bounds_debug_enabled = false;
@@ -28,6 +28,7 @@ static void app_settings_apply_defaults() {
     g_dx.scene_grid_color[2] = 0.01f;
     g_dx.scene_grid_color[3] = 0.5f;
     g_profiler_enabled = false;
+    app_set_editor_frame_cap_fps(120.0f);
 
     g_camera_controls.enabled = true;
     g_camera_controls.mouse_look = true;
@@ -53,6 +54,7 @@ void app_settings_save() {
     fprintf(f, "d3d11_validation %d\n", g_dx.d3d11_validation ? 1 : 0);
     fprintf(f, "shader_validation_warnings %d\n", g_dx.shader_validation_warnings ? 1 : 0);
     fprintf(f, "profiler %d\n", g_profiler_enabled ? 1 : 0);
+    fprintf(f, "editor_frame_cap_fps %.9g\n", app_editor_frame_cap_fps());
     fprintf(f, "ui_scale %.9g\n", ui_global_scale());
     fprintf(f, "code_font_size %.9g\n", ui_code_font_size());
     fprintf(f, "shader_auto_save_compile %d\n", ui_shader_auto_save_compile() ? 1 : 0);
@@ -95,6 +97,7 @@ void app_settings_load_or_create() {
         else if (strcmp(key, "d3d11_validation") == 0) g_dx.d3d11_validation = atoi(value) != 0;
         else if (strcmp(key, "shader_validation_warnings") == 0) g_dx.shader_validation_warnings = atoi(value) != 0;
         else if (strcmp(key, "profiler") == 0) g_profiler_enabled = atoi(value) != 0;
+        else if (strcmp(key, "editor_frame_cap_fps") == 0) app_set_editor_frame_cap_fps((float)atof(value));
         else if (strcmp(key, "ui_scale") == 0) ui_set_global_scale((float)atof(value));
         else if (strcmp(key, "code_font_size") == 0) ui_set_code_font_size((float)atof(value));
         else if (strcmp(key, "shader_auto_save_compile") == 0) ui_set_shader_auto_save_compile(atoi(value) != 0);

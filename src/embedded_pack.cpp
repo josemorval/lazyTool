@@ -1,7 +1,9 @@
 #include "embedded_pack.h"
 #include "types.h"
 #include "log.h"
+#ifndef LAZYTOOL_PLAYER_ONLY
 #include "cgltf.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +20,7 @@ static const unsigned char k_footer_magic[8] = { 'L','T','P','A','C','K','1','!'
 static const unsigned char k_data_magic[8]   = { 'L','T','P','D','A','T','1','!' };
 static const unsigned int  k_pack_version    = 1;
 static const char*         k_embedded_project = "p";
+static const char*         k_player_stub_marker = "LAZYTOOL_PLAYER_STUB_V2";
 
 #pragma pack(push, 1)
 struct LtPackFooter {
@@ -81,6 +84,47 @@ static bool read_u64_file_size(FILE* f, unsigned long long* out_size) {
     *out_size = (unsigned long long)end;
 #endif
     return true;
+}
+
+static bool seek_file_start(FILE* f) {
+#if defined(_WIN32)
+    return f && _fseeki64(f, 0, SEEK_SET) == 0;
+#else
+    return f && fseek(f, 0, SEEK_SET) == 0;
+#endif
+}
+
+static bool file_contains_marker(FILE* f, const char* marker) {
+    if (!f || !marker || !marker[0] || !seek_file_start(f))
+        return false;
+
+    size_t marker_len = strlen(marker);
+    unsigned char buffer[64 * 1024 + 64] = {};
+    size_t carry = 0;
+    bool found = false;
+
+    while (!found) {
+        size_t got = fread(buffer + carry, 1, 64 * 1024, f);
+        size_t total = carry + got;
+        if (total >= marker_len) {
+            size_t scan_end = total - marker_len + 1;
+            for (size_t i = 0; i < scan_end; i++) {
+                if (memcmp(buffer + i, marker, marker_len) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (got == 0)
+            break;
+        carry = marker_len > 1 ? marker_len - 1 : 0;
+        if (carry > total)
+            carry = total;
+        memmove(buffer, buffer + total - carry, carry);
+    }
+
+    seek_file_start(f);
+    return found;
 }
 
 static void normalize_path(const char* in, char* out, int out_sz) {
@@ -368,6 +412,7 @@ int lt_pack_file_count() {
     return s_pack_file_count;
 }
 
+#ifndef LAZYTOOL_PLAYER_ONLY
 struct ExportFile {
     char pack_path[MAX_PATH_LEN];
     char source_path[MAX_PATH_LEN];
@@ -460,8 +505,9 @@ static bool project_line_is_known_default(const char* line) {
         strcmp(line, "commands") == 0)
         return true;
 
-    if (strcmp(line, "export_settings 1 1 0 0 0 0 0") == 0)
-        return true;
+    // Keep export_settings even when it matches defaults. The runtime loader
+    // treats it as part of the current .lt format, and exported player EXEs
+    // load this minified project directly.
 
     // Exported runtime projects start from the same defaults before parsing.
     if (strcmp(line, "camera_fps 5 5 5 -2.3561945 -0.615479767 1.04700005 0.00100000005 100") == 0)
@@ -508,49 +554,6 @@ static void project_minify_command_line(char* line) {
         snprintf(line, 1024, "command %s %s", kind, name);
 }
 
-static bool project_timeline_block_disabled(const char* cursor, const char* end, const char** out_after_block) {
-    if (out_after_block)
-        *out_after_block = cursor;
-
-    const char* scan = cursor;
-    const char* after_end = cursor;
-    bool found_end = false;
-    bool disabled = false;
-    while (scan < end) {
-        char line[1024] = {};
-        int n = 0;
-        while (scan < end && *scan != '\n' && *scan != '\r') {
-            if (n < (int)sizeof(line) - 1)
-                line[n++] = *scan;
-            scan++;
-        }
-        while (scan < end && (*scan == '\n' || *scan == '\r'))
-            scan++;
-        after_end = scan;
-        line[n] = '\0';
-        trim_line(line);
-
-        char tmp[1024] = {};
-        strncpy(tmp, line, sizeof(tmp) - 1);
-        char* tag = strtok(tmp, " \t\r\n");
-        if (!tag)
-            continue;
-        if (strcmp(tag, "timeline_global") == 0) {
-            strtok(nullptr, " \t\r\n"); // current selected timeline
-            strtok(nullptr, " \t\r\n"); // loop
-            char* enabled = strtok(nullptr, " \t\r\n");
-            if (enabled && atoi(enabled) == 0)
-                disabled = true;
-        } else if (strcmp(tag, "end_timeline") == 0) {
-            found_end = true;
-            break;
-        }
-    }
-
-    if (disabled && found_end && out_after_block)
-        *out_after_block = after_end;
-    return disabled && found_end;
-}
 
 static bool minify_project_text(const void* data, size_t size, void** out_data, size_t* out_size) {
     if (!data || !out_data || !out_size)
@@ -574,13 +577,10 @@ static bool minify_project_text(const void* data, size_t size, void** out_data, 
             cursor++;
         line[n] = '\0';
         trim_line(line);
-        if (strcmp(line, "timeline") == 0) {
-            const char* after_timeline = cursor;
-            if (project_timeline_block_disabled(cursor, end, &after_timeline)) {
-                cursor = after_timeline;
-                continue;
-            }
-        }
+        // Keep timeline blocks even if the global runtime toggle is off.
+        // They contain the animation curves/keyframes and are required by the
+        // current runtime loader. The player will still respect timeline_global
+        // enabled=0 at playback time.
         if (project_line_is_known_default(line))
             continue;
         project_minify_command_line(line);
@@ -949,6 +949,12 @@ static bool lt_export_normal_exe_internal(const char* base_exe_path,
         set_err(err, err_sz, "lazyPlayer.exe not found next to the editor. Run build.bat all or build.bat player before exporting.");
         return false;
     }
+    if (!file_contains_marker(base, k_player_stub_marker)) {
+        fclose(base);
+        lt_free_file(project_bytes);
+        set_err(err, err_sz, "lazyPlayer.exe is outdated or not a player stub. Rebuild with build.bat player before exporting.");
+        return false;
+    }
     unsigned long long base_file_size = 0;
     if (!read_u64_file_size(base, &base_file_size)) {
         fclose(base);
@@ -1073,3 +1079,4 @@ static bool lt_export_normal_exe_internal(const char* base_exe_path,
     }
     return true;
 }
+#endif // !LAZYTOOL_PLAYER_ONLY

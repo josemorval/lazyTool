@@ -4,6 +4,8 @@
 // LAZYTOOL_PLAYER_ONLY so editor UI/app settings/imgui are not compiled into
 // lazyPlayer.exe.
 
+extern "C" __declspec(dllexport) const char LazyToolPlayerStubMarker[] = "LAZYTOOL_PLAYER_STUB_V2";
+
 #include "impl.cpp"
 #include "log.cpp"
 #include "dx11_ctx.cpp"

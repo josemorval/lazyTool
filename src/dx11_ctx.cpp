@@ -55,6 +55,7 @@ VSOut VSMain(VSIn v) {
 }
 )HLSL";
 
+#ifndef LAZYTOOL_PLAYER_ONLY
 struct EditorGridCBData {
     float color[4];
     float viewport[4];
@@ -63,6 +64,7 @@ struct EditorGridCBData {
 static ID3D11VertexShader* s_editor_grid_vs = nullptr;
 static ID3D11PixelShader*  s_editor_grid_ps = nullptr;
 static ID3D11Buffer*       s_editor_grid_cb = nullptr;
+#endif
 
 static SceneCBData   s_uploaded_scene_cb = {};
 static ObjectCBData  s_uploaded_object_cb = {};
@@ -71,6 +73,7 @@ static ID3D11Buffer* s_uploaded_object_cb_buffer = nullptr;
 static bool          s_uploaded_scene_cb_valid = false;
 static bool          s_uploaded_object_cb_valid = false;
 
+#ifndef LAZYTOOL_PLAYER_ONLY
 static const char* s_editor_grid_vs_src = R"HLSL(
 struct VSOut {
     float4 pos : SV_POSITION;
@@ -87,7 +90,9 @@ VSOut VSMain(uint vid : SV_VertexID) {
     return o;
 }
 )HLSL";
+#endif
 
+#ifndef LAZYTOOL_PLAYER_ONLY
 static const char* s_editor_grid_ps_src = R"HLSL(
 cbuffer SceneCB : register(b0)
 {
@@ -188,6 +193,7 @@ float4 PSMain(float4 sv_pos : SV_POSITION) : SV_Target
     return float4(GridColor.rgb, saturate(alpha));
 }
 )HLSL";
+#endif
 
 static void safe_release_scene_rt() {
     if (g_dx.scene_rtv) { g_dx.scene_rtv->Release(); g_dx.scene_rtv = nullptr; }
@@ -210,9 +216,103 @@ static void safe_release_info_queue() {
 }
 
 static void safe_release_editor_grid() {
+#ifndef LAZYTOOL_PLAYER_ONLY
     if (s_editor_grid_cb) { s_editor_grid_cb->Release(); s_editor_grid_cb = nullptr; }
     if (s_editor_grid_ps) { s_editor_grid_ps->Release(); s_editor_grid_ps = nullptr; }
     if (s_editor_grid_vs) { s_editor_grid_vs->Release(); s_editor_grid_vs = nullptr; }
+#endif
+}
+
+
+static void dx11_wide_to_utf8(const wchar_t* src, char* dst, int dst_size) {
+    if (!dst || dst_size <= 0)
+        return;
+    dst[0] = 0;
+    if (!src)
+        return;
+    int n = WideCharToMultiByte(CP_UTF8, 0, src, -1, dst, dst_size, nullptr, nullptr);
+    if (n <= 0)
+        snprintf(dst, (size_t)dst_size, "unknown");
+    dst[dst_size - 1] = 0;
+}
+
+static IDXGIAdapter1* choose_high_performance_adapter() {
+    IDXGIFactory1* factory = nullptr;
+    HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory);
+    if (FAILED(hr) || !factory)
+        return nullptr;
+
+    IDXGIAdapter1* best_adapter = nullptr;
+    DXGI_ADAPTER_DESC1 best_desc = {};
+    SIZE_T best_vram = 0;
+
+    for (UINT i = 0;; i++) {
+        IDXGIAdapter1* adapter = nullptr;
+        if (factory->EnumAdapters1(i, &adapter) == DXGI_ERROR_NOT_FOUND)
+            break;
+        if (!adapter)
+            continue;
+
+        DXGI_ADAPTER_DESC1 desc = {};
+        adapter->GetDesc1(&desc);
+        bool software = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+        if (!software && desc.DedicatedVideoMemory >= best_vram) {
+            if (best_adapter)
+                best_adapter->Release();
+            best_adapter = adapter;
+            best_desc = desc;
+            best_vram = desc.DedicatedVideoMemory;
+        } else {
+            adapter->Release();
+        }
+    }
+
+    if (best_adapter) {
+        char name[128] = {};
+        dx11_wide_to_utf8(best_desc.Description, name, (int)sizeof(name));
+        log_info("DX11 preferred adapter: %s (%llu MB dedicated VRAM)",
+            name, (unsigned long long)(best_desc.DedicatedVideoMemory / (1024ull * 1024ull)));
+    }
+
+    factory->Release();
+    return best_adapter;
+}
+
+static void store_active_adapter_info() {
+    snprintf(g_dx.adapter_name, sizeof(g_dx.adapter_name), "unknown");
+    g_dx.adapter_vendor_id = 0;
+    g_dx.adapter_device_id = 0;
+    g_dx.adapter_dedicated_vram_mb = 0;
+
+    if (!g_dx.dev)
+        return;
+
+    IDXGIDevice* dxgi_device = nullptr;
+    HRESULT hr = g_dx.dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgi_device);
+    if (FAILED(hr) || !dxgi_device)
+        return;
+
+    IDXGIAdapter* adapter = nullptr;
+    hr = dxgi_device->GetAdapter(&adapter);
+    dxgi_device->Release();
+    if (FAILED(hr) || !adapter)
+        return;
+
+    DXGI_ADAPTER_DESC desc = {};
+    adapter->GetDesc(&desc);
+    adapter->Release();
+
+    dx11_wide_to_utf8(desc.Description, g_dx.adapter_name, (int)sizeof(g_dx.adapter_name));
+    g_dx.adapter_vendor_id = desc.VendorId;
+    g_dx.adapter_device_id = desc.DeviceId;
+    g_dx.adapter_dedicated_vram_mb = (unsigned long long)(desc.DedicatedVideoMemory / (1024ull * 1024ull));
+    g_dx.adapter_force_high_performance = true;
+
+    log_info("DX11 active adapter: %s vendor=0x%04X device=0x%04X dedicated=%llu MB",
+        g_dx.adapter_name,
+        g_dx.adapter_vendor_id,
+        g_dx.adapter_device_id,
+        g_dx.adapter_dedicated_vram_mb);
 }
 
 static void create_builtin_shadow_shader() {
@@ -239,6 +339,7 @@ static void create_builtin_shadow_shader() {
     blob->Release();
 }
 
+#ifndef LAZYTOOL_PLAYER_ONLY
 static bool create_editor_grid_shader() {
     safe_release_editor_grid();
 
@@ -291,6 +392,7 @@ static bool create_editor_grid_shader() {
 
     return true;
 }
+#endif
 
 bool dx_init(HWND hwnd, int w, int h) {
     g_dx.hwnd   = hwnd;
@@ -308,7 +410,7 @@ bool dx_init(HWND hwnd, int w, int h) {
     scd.OutputWindow                       = hwnd;
     scd.SampleDesc.Count                   = 1;
     scd.Windowed                           = TRUE;
-    scd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
+    scd.SwapEffect                         = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
     UINT flags = 0;
@@ -319,20 +421,39 @@ bool dx_init(HWND hwnd, int w, int h) {
     g_dx.d3d11_validation_supported = true;
     safe_release_info_queue();
 
+    IDXGIAdapter1* preferred_adapter = choose_high_performance_adapter();
     HRESULT hr = D3D11CreateDeviceAndSwapChain(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+        preferred_adapter,
+        preferred_adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+        nullptr,
         flags, &fl, 1, D3D11_SDK_VERSION,
         &scd, &g_dx.sc, &g_dx.dev, nullptr, &g_dx.ctx);
     if (FAILED(hr) && g_dx.d3d11_validation) {
         g_dx.d3d11_validation_supported = false;
         log_warn("D3D11 validation requested, but the debug layer is unavailable. Retrying without it.");
         hr = D3D11CreateDeviceAndSwapChain(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+            preferred_adapter,
+            preferred_adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,
             0, &fl, 1, D3D11_SDK_VERSION,
             &scd, &g_dx.sc, &g_dx.dev, nullptr, &g_dx.ctx);
     }
+    if (FAILED(hr) && preferred_adapter) {
+        log_warn("Preferred adapter failed with 0x%08X. Retrying default hardware adapter.", hr);
+        preferred_adapter->Release();
+        preferred_adapter = nullptr;
+        UINT retry_flags = (g_dx.d3d11_validation && g_dx.d3d11_validation_supported) ? flags : 0;
+        hr = D3D11CreateDeviceAndSwapChain(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+            retry_flags,
+            &fl, 1, D3D11_SDK_VERSION,
+            &scd, &g_dx.sc, &g_dx.dev, nullptr, &g_dx.ctx);
+    }
+    if (preferred_adapter)
+        preferred_adapter->Release();
     if (FAILED(hr)) { log_error("D3D11CreateDeviceAndSwapChain failed: 0x%08X", hr); return false; }
     g_dx.d3d11_validation_active = g_dx.d3d11_validation && g_dx.d3d11_validation_supported;
+    store_active_adapter_info();
 
     if (g_dx.d3d11_validation_active) {
         HRESULT info_hr = g_dx.dev->QueryInterface(__uuidof(ID3D11InfoQueue), (void**)&g_dx.info_queue);
@@ -362,11 +483,13 @@ bool dx_init(HWND hwnd, int w, int h) {
     g_dx.dev->CreateRasterizerState(&rd, &g_dx.rs_solid);
     rd.CullMode = D3D11_CULL_NONE;
     g_dx.dev->CreateRasterizerState(&rd, &g_dx.rs_cull_none);
+#ifndef LAZYTOOL_PLAYER_ONLY
     rd.FillMode = D3D11_FILL_WIREFRAME;
     rd.CullMode = D3D11_CULL_BACK;
     g_dx.dev->CreateRasterizerState(&rd, &g_dx.rs_wire_solid);
     rd.CullMode = D3D11_CULL_NONE;
     g_dx.dev->CreateRasterizerState(&rd, &g_dx.rs_wire_cull_none);
+#endif
 
     D3D11_DEPTH_STENCIL_DESC dsd = {};
     dsd.DepthEnable    = TRUE;
@@ -427,8 +550,10 @@ bool dx_init(HWND hwnd, int w, int h) {
     project_apply_default_dirlight(&default_dl);
     dx_create_shadow_map(default_dl.shadow_width, default_dl.shadow_height);
     create_builtin_shadow_shader();
+#ifndef LAZYTOOL_PLAYER_ONLY
     if (!create_editor_grid_shader())
         log_warn("Editor grid shader unavailable. Grid overlay disabled.");
+#endif
 
     log_info("DX11 init OK (%dx%d)", w, h);
     return true;
@@ -625,6 +750,9 @@ void dx_end_scene() {
 }
 
 void dx_render_scene_grid_overlay() {
+#ifdef LAZYTOOL_PLAYER_ONLY
+    return;
+#else
     if (!g_dx.scene_grid_enabled || !g_dx.ctx || !g_dx.scene_rtv || !g_dx.depth_srv ||
         !g_dx.scene_cb || !s_editor_grid_vs || !s_editor_grid_ps || !s_editor_grid_cb ||
         g_dx.scene_width <= 0 || g_dx.scene_height <= 0)
@@ -669,6 +797,7 @@ void dx_render_scene_grid_overlay() {
     g_dx.ctx->PSSetShaderResources(0, 1, &null_srv);
     g_dx.ctx->VSSetShader(nullptr, nullptr, 0);
     g_dx.ctx->PSSetShader(nullptr, nullptr, 0);
+#endif
 }
 
 void dx_begin_ui() {

@@ -16,7 +16,7 @@ struct TimelineState {
     int length_frames;
     int current_frame;
     float sample_frame;
-    bool interpolate_frames;
+    int interpolation_mode;
     int track_count;
     TimelineTrack tracks[MAX_TIMELINE_TRACKS];
 };
@@ -49,6 +49,71 @@ static float timeline_lerp_angle(float a, float b, float t) {
     return a + timeline_wrap_angle(b - a) * t;
 }
 
+static int timeline_clamp_interpolation_mode(int mode) {
+    if (mode < TIMELINE_INTERP_STEP)
+        return TIMELINE_INTERP_STEP;
+    if (mode > TIMELINE_INTERP_CUBIC)
+        return TIMELINE_INTERP_CUBIC;
+    return mode;
+}
+
+static float timeline_ease_t(int mode, float t) {
+    t = clampf(t, 0.0f, 1.0f);
+    if (mode == TIMELINE_INTERP_QUADRATIC) {
+        if (t < 0.5f)
+            return 2.0f * t * t;
+        float u = 1.0f - t;
+        return 1.0f - 2.0f * u * u;
+    }
+    return t;
+}
+
+static float timeline_cubic_hermite(float p0, float p1, float p2, float p3,
+                                    int f0, int f1, int f2, int f3, float t) {
+    float span = (float)(f2 - f1);
+    float m1 = (f2 != f0) ? (p2 - p0) * span / (float)(f2 - f0) : 0.0f;
+    float m2 = (f3 != f1) ? (p3 - p1) * span / (float)(f3 - f1) : 0.0f;
+    float t2 = t * t;
+    float t3 = t2 * t;
+    return (2.0f * t3 - 3.0f * t2 + 1.0f) * p1 +
+           (t3 - 2.0f * t2 + t) * m1 +
+           (-2.0f * t3 + 3.0f * t2) * p2 +
+           (t3 - t2) * m2;
+}
+
+static float timeline_cubic_hermite_angle(float p0, float p1, float p2, float p3,
+                                          int f0, int f1, int f2, int f3, float t) {
+    float u1 = p1;
+    float u0 = u1 - timeline_wrap_angle(u1 - p0);
+    float u2 = u1 + timeline_wrap_angle(p2 - p1);
+    float u3 = u2 + timeline_wrap_angle(p3 - p2);
+    return timeline_wrap_angle(timeline_cubic_hermite(u0, u1, u2, u3, f0, f1, f2, f3, t));
+}
+
+static float timeline_sample_float_component(const TimelineKey& k0,
+                                             const TimelineKey& k1,
+                                             const TimelineKey& k2,
+                                             const TimelineKey& k3,
+                                             int component,
+                                             float t,
+                                             int mode,
+                                             bool angle) {
+    if (mode == TIMELINE_INTERP_CUBIC) {
+        if (angle) {
+            return timeline_cubic_hermite_angle(
+                k0.fval[component], k1.fval[component], k2.fval[component], k3.fval[component],
+                k0.frame, k1.frame, k2.frame, k3.frame, t);
+        }
+        return timeline_cubic_hermite(
+            k0.fval[component], k1.fval[component], k2.fval[component], k3.fval[component],
+            k0.frame, k1.frame, k2.frame, k3.frame, t);
+    }
+    float st = timeline_ease_t(mode, t);
+    return angle ?
+        timeline_lerp_angle(k1.fval[component], k2.fval[component], st) :
+        timeline_lerp(k1.fval[component], k2.fval[component], st);
+}
+
 static void timeline_init_state(TimelineState& tl, int index, const char* name) {
     memset(&tl, 0, sizeof(tl));
     tl.active = true;
@@ -57,7 +122,7 @@ static void timeline_init_state(TimelineState& tl, int index, const char* name) 
     tl.length_frames = 240;
     tl.current_frame = 0;
     tl.sample_frame = 0.0f;
-    tl.interpolate_frames = false;
+    tl.interpolation_mode = TIMELINE_INTERP_STEP;
     tl.track_count = 0;
     if (name && name[0]) {
         strncpy(tl.name, name, MAX_NAME - 1);
@@ -363,8 +428,11 @@ void timeline_set_timeline_enabled(int index, bool enabled) {
 float timeline_sequence_duration_seconds() {
     timeline_ensure_one();
     float total = 0.0f;
-    for (int i = 0; i < s_timeline_count; i++)
+    for (int i = 0; i < s_timeline_count; i++) {
+        if (!s_timelines[i].enabled)
+            continue;
         total += timeline_duration_seconds(s_timelines[i]);
+    }
     return total;
 }
 
@@ -458,14 +526,14 @@ void timeline_set_loop(bool loop) {
     s_timeline_loop = loop;
 }
 
-bool timeline_interpolate_frames() {
-    return timeline_current_state().interpolate_frames;
+int timeline_interpolation_mode() {
+    return timeline_current_state().interpolation_mode;
 }
 
-void timeline_set_interpolate_frames(bool enabled) {
+void timeline_set_interpolation_mode(int mode) {
     TimelineState& tl = timeline_current_state();
-    tl.interpolate_frames = enabled;
-    tl.sample_frame = enabled ? tl.sample_frame : (float)tl.current_frame;
+    tl.interpolation_mode = timeline_clamp_interpolation_mode(mode);
+    tl.sample_frame = tl.interpolation_mode != TIMELINE_INTERP_STEP ? tl.sample_frame : (float)tl.current_frame;
     app_request_scene_render();
 }
 
@@ -559,7 +627,7 @@ void timeline_update(float scene_time_seconds) {
     // evaluates at the true fractional timeline position. This keeps low-FPS
     // timelines intentionally steppy by default while allowing smooth in-between
     // evaluation during playback.
-    tl.sample_frame = tl.interpolate_frames ? frame_f : (float)tl.current_frame;
+    tl.sample_frame = tl.interpolation_mode != TIMELINE_INTERP_STEP ? frame_f : (float)tl.current_frame;
 }
 
 static int timeline_find_track_in(const TimelineState& tl, TimelineTrackKind kind, const char* target, ResType value_type) {
@@ -902,71 +970,75 @@ static UserCBSourceKind timeline_user_var_source_kind(const TimelineTrack& track
 
 static bool timeline_sample_user_var_special_rotation(const TimelineTrack& track,
                                                       const TimelineKey& a, const TimelineKey& b,
-                                                      float t, TimelineKey* out) {
+                                                      float t, int mode, TimelineKey* out) {
     if (!out)
         return false;
+    float st = timeline_ease_t(mode, t);
 
     UserCBSourceKind source_kind = timeline_user_var_source_kind(track);
     if (source_kind == USER_CB_SOURCE_COMMAND_ROTATION) {
         if (track.value_type == RES_FLOAT4) {
-            quat_to_array(quat_slerp(quat_from_array(a.fval), quat_from_array(b.fval), t), out->fval);
+            quat_to_array(quat_slerp(quat_from_array(a.fval), quat_from_array(b.fval), st), out->fval);
             return true;
         }
 
         Quat q = quat_slerp(
             quat_from_euler_xyz(v3(a.fval[0], a.fval[1], a.fval[2])),
             quat_from_euler_xyz(v3(b.fval[0], b.fval[1], b.fval[2])),
-            t);
+            st);
         quat_to_euler_xyz(q, a.fval, out->fval);
         return true;
     }
 
     if (source_kind == USER_CB_SOURCE_CAMERA_ROTATION) {
         int n = timeline_track_value_count(track);
-        if (n > 0) out->fval[0] = timeline_lerp_angle(a.fval[0], b.fval[0], t);
+        if (n > 0) out->fval[0] = timeline_lerp_angle(a.fval[0], b.fval[0], st);
         for (int i = 1; i < n; i++)
-            out->fval[i] = timeline_lerp(a.fval[i], b.fval[i], t);
+            out->fval[i] = timeline_lerp(a.fval[i], b.fval[i], st);
         return true;
     }
 
     return false;
 }
 
-static void timeline_sample_command_transform(const TimelineKey& a, const TimelineKey& b,
-                                              float t, TimelineKey* out) {
+static void timeline_sample_command_transform(const TimelineKey& k0, const TimelineKey& a,
+                                              const TimelineKey& b, const TimelineKey& k3,
+                                              float t, int mode, TimelineKey* out) {
     if (!out)
         return;
 
     for (int i = 0; i < 3; i++)
-        out->fval[i] = timeline_lerp(a.fval[i], b.fval[i], t);
+        out->fval[i] = timeline_sample_float_component(k0, a, b, k3, i, t, mode, false);
 
-    Quat q = quat_slerp(quat_from_array(&a.fval[3]), quat_from_array(&b.fval[3]), t);
+    Quat q = quat_slerp(quat_from_array(&a.fval[3]), quat_from_array(&b.fval[3]),
+                        timeline_ease_t(mode, t));
     quat_to_array(q, &out->fval[3]);
 
     for (int i = 7; i < 10; i++)
-        out->fval[i] = timeline_lerp(a.fval[i], b.fval[i], t);
+        out->fval[i] = timeline_sample_float_component(k0, a, b, k3, i, t, mode, false);
 }
 
-static void timeline_sample_camera(const TimelineKey& a, const TimelineKey& b,
-                                   float t, TimelineKey* out) {
+static void timeline_sample_camera(const TimelineKey& k0, const TimelineKey& a,
+                                   const TimelineKey& b, const TimelineKey& k3,
+                                   float t, int mode, TimelineKey* out) {
     if (!out)
         return;
 
     for (int i = 0; i < 3; i++)
-        out->fval[i] = timeline_lerp(a.fval[i], b.fval[i], t);
-    out->fval[3] = timeline_lerp_angle(a.fval[3], b.fval[3], t); // yaw wraps.
-    out->fval[4] = timeline_lerp(a.fval[4], b.fval[4], t);       // pitch is not clamped: camera can loop.
-    out->fval[5] = timeline_lerp(a.fval[5], b.fval[5], t);
-    out->fval[6] = timeline_lerp(a.fval[6], b.fval[6], t);
-    out->fval[7] = timeline_lerp(a.fval[7], b.fval[7], t);
-    out->fval[8] = timeline_lerp_angle(a.fval[8], b.fval[8], t); // roll wraps.
+        out->fval[i] = timeline_sample_float_component(k0, a, b, k3, i, t, mode, false);
+    out->fval[3] = timeline_sample_float_component(k0, a, b, k3, 3, t, mode, true);
+    out->fval[4] = timeline_sample_float_component(k0, a, b, k3, 4, t, mode, false);
+    out->fval[5] = timeline_sample_float_component(k0, a, b, k3, 5, t, mode, false);
+    out->fval[6] = timeline_sample_float_component(k0, a, b, k3, 6, t, mode, false);
+    out->fval[7] = timeline_sample_float_component(k0, a, b, k3, 7, t, mode, false);
+    out->fval[8] = timeline_sample_float_component(k0, a, b, k3, 8, t, mode, true);
 }
 
 static void timeline_sample_key(const TimelineState& tl, const TimelineTrack& track, TimelineKey* out) {
     if (!out || track.key_count <= 0)
         return;
 
-    float sample_frame = tl.interpolate_frames ? tl.sample_frame : (float)tl.current_frame;
+    float sample_frame = tl.interpolation_mode != TIMELINE_INTERP_STEP ? tl.sample_frame : (float)tl.current_frame;
     if (sample_frame < 0.0f) sample_frame = 0.0f;
     float max_sample_frame = (float)(tl.length_frames - 1);
     if (sample_frame > max_sample_frame) sample_frame = max_sample_frame;
@@ -986,8 +1058,12 @@ static void timeline_sample_key(const TimelineState& tl, const TimelineTrack& tr
     if (prev < 0) prev = next >= 0 ? next : 0;
     if (next < 0) next = prev;
 
+    int before = prev > 0 ? prev - 1 : prev;
+    int after = next + 1 < track.key_count ? next + 1 : next;
+    const TimelineKey& k0 = track.keys[before];
     const TimelineKey& a = track.keys[prev];
     const TimelineKey& b = track.keys[next];
+    const TimelineKey& k3 = track.keys[after];
     *out = a;
     out->frame = display_frame;
 
@@ -999,21 +1075,21 @@ static void timeline_sample_key(const TimelineState& tl, const TimelineTrack& tr
     t = clampf(t, 0.0f, 1.0f);
 
     if (track.kind == TIMELINE_TRACK_COMMAND_TRANSFORM) {
-        timeline_sample_command_transform(a, b, t, out);
+        timeline_sample_command_transform(k0, a, b, k3, t, tl.interpolation_mode, out);
         return;
     }
     if (track.kind == TIMELINE_TRACK_CAMERA) {
-        timeline_sample_camera(a, b, t, out);
+        timeline_sample_camera(k0, a, b, k3, t, tl.interpolation_mode, out);
         return;
     }
     if (track.kind == TIMELINE_TRACK_USER_VAR &&
-        timeline_sample_user_var_special_rotation(track, a, b, t, out)) {
+        timeline_sample_user_var_special_rotation(track, a, b, t, tl.interpolation_mode, out)) {
         return;
     }
 
     int n = timeline_track_value_count(track);
     for (int i = 0; i < n; i++)
-        out->fval[i] = timeline_lerp(a.fval[i], b.fval[i], t);
+        out->fval[i] = timeline_sample_float_component(k0, a, b, k3, i, t, tl.interpolation_mode, false);
 }
 
 static void timeline_apply_user_var_to_source(UserCBEntry& e, const TimelineKey& key) {
@@ -1217,7 +1293,7 @@ void timeline_write_project(FILE* f) {
                 tl.name[0] ? tl.name : "Timeline",
                 tl.fps, tl.length_frames, tl.current_frame,
                 tl.enabled ? 1 : 0,
-                tl.interpolate_frames ? 1 : 0);
+                timeline_clamp_interpolation_mode(tl.interpolation_mode));
         timeline_write_tracks(f, tl);
         fprintf(f, "end_timeline_clip\n");
     }

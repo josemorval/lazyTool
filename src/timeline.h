@@ -20,6 +20,13 @@ typedef enum {
     TIMELINE_TRACK_DIRLIGHT
 } TimelineTrackKind;
 
+typedef enum {
+    TIMELINE_INTERP_STEP = 0,
+    TIMELINE_INTERP_LINEAR = 1,
+    TIMELINE_INTERP_QUADRATIC = 2,
+    TIMELINE_INTERP_CUBIC = 3
+} TimelineInterpolationMode;
+
 struct TimelineKey {
     int   frame;
     int   ival[4];
@@ -71,8 +78,8 @@ bool timeline_enabled();
 void timeline_set_enabled(bool enabled);
 bool timeline_loop();
 void timeline_set_loop(bool loop);
-bool timeline_interpolate_frames();
-void timeline_set_interpolate_frames(bool enabled);
+int  timeline_interpolation_mode();
+void timeline_set_interpolation_mode(int mode);
 int  timeline_play_dir();
 void timeline_set_play_dir(int dir);
 
