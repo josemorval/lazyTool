@@ -27,6 +27,9 @@ static void app_settings_apply_defaults() {
     g_dx.scene_grid_color[1] = 0.50f;
     g_dx.scene_grid_color[2] = 0.01f;
     g_dx.scene_grid_color[3] = 0.5f;
+    g_dx.scene_grid_distance_fade = true;
+    g_dx.scene_grid_fade_start = 80.0f;
+    g_dx.scene_grid_fade_end = 260.0f;
     g_profiler_enabled = false;
     app_set_editor_frame_cap_fps(120.0f);
 
@@ -40,7 +43,6 @@ static void app_settings_apply_defaults() {
     g_camera_controls.mouse_sensitivity = 0.0025f;
 
     ui_set_code_font_size(16.0f);
-    ui_set_shader_auto_save_compile(false);
 }
 
 void app_settings_save() {
@@ -57,7 +59,6 @@ void app_settings_save() {
     fprintf(f, "editor_frame_cap_fps %.9g\n", app_editor_frame_cap_fps());
     fprintf(f, "ui_scale %.9g\n", ui_global_scale());
     fprintf(f, "code_font_size %.9g\n", ui_code_font_size());
-    fprintf(f, "shader_auto_save_compile %d\n", ui_shader_auto_save_compile() ? 1 : 0);
     fprintf(f, "scene_grid_enabled %d\n", g_dx.scene_grid_enabled ? 1 : 0);
     fprintf(f, "scene_orientation_gizmo_enabled %d\n", g_dx.scene_orientation_gizmo_enabled ? 1 : 0);
     fprintf(f, "scene_bounds_debug_enabled %d\n", g_dx.scene_bounds_debug_enabled ? 1 : 0);
@@ -65,6 +66,9 @@ void app_settings_save() {
     fprintf(f, "scene_grid_color_g %.9g\n", g_dx.scene_grid_color[1]);
     fprintf(f, "scene_grid_color_b %.9g\n", g_dx.scene_grid_color[2]);
     fprintf(f, "scene_grid_color_a %.9g\n", g_dx.scene_grid_color[3]);
+    fprintf(f, "scene_grid_distance_fade %d\n", g_dx.scene_grid_distance_fade ? 1 : 0);
+    fprintf(f, "scene_grid_fade_start %.9g\n", g_dx.scene_grid_fade_start);
+    fprintf(f, "scene_grid_fade_end %.9g\n", g_dx.scene_grid_fade_end);
     fprintf(f, "camera_enabled %d\n", g_camera_controls.enabled ? 1 : 0);
     fprintf(f, "camera_mouse_look %d\n", g_camera_controls.mouse_look ? 1 : 0);
     fprintf(f, "camera_invert_y %d\n", g_camera_controls.invert_y ? 1 : 0);
@@ -100,7 +104,6 @@ void app_settings_load_or_create() {
         else if (strcmp(key, "editor_frame_cap_fps") == 0) app_set_editor_frame_cap_fps((float)atof(value));
         else if (strcmp(key, "ui_scale") == 0) ui_set_global_scale((float)atof(value));
         else if (strcmp(key, "code_font_size") == 0) ui_set_code_font_size((float)atof(value));
-        else if (strcmp(key, "shader_auto_save_compile") == 0) ui_set_shader_auto_save_compile(atoi(value) != 0);
         else if (strcmp(key, "scene_grid_enabled") == 0) g_dx.scene_grid_enabled = atoi(value) != 0;
         else if (strcmp(key, "scene_orientation_gizmo_enabled") == 0) g_dx.scene_orientation_gizmo_enabled = atoi(value) != 0;
         else if (strcmp(key, "scene_bounds_debug_enabled") == 0) g_dx.scene_bounds_debug_enabled = atoi(value) != 0;
@@ -108,6 +111,9 @@ void app_settings_load_or_create() {
         else if (strcmp(key, "scene_grid_color_g") == 0) g_dx.scene_grid_color[1] = (float)atof(value);
         else if (strcmp(key, "scene_grid_color_b") == 0) g_dx.scene_grid_color[2] = (float)atof(value);
         else if (strcmp(key, "scene_grid_color_a") == 0) g_dx.scene_grid_color[3] = (float)atof(value);
+        else if (strcmp(key, "scene_grid_distance_fade") == 0) g_dx.scene_grid_distance_fade = atoi(value) != 0;
+        else if (strcmp(key, "scene_grid_fade_start") == 0) g_dx.scene_grid_fade_start = (float)atof(value);
+        else if (strcmp(key, "scene_grid_fade_end") == 0) g_dx.scene_grid_fade_end = (float)atof(value);
         else if (strcmp(key, "camera_enabled") == 0) g_camera_controls.enabled = atoi(value) != 0;
         else if (strcmp(key, "camera_mouse_look") == 0) g_camera_controls.mouse_look = atoi(value) != 0;
         else if (strcmp(key, "camera_invert_y") == 0) g_camera_controls.invert_y = atoi(value) != 0;
@@ -130,4 +136,7 @@ void app_settings_load_or_create() {
     g_dx.scene_grid_color[1] = clampf(g_dx.scene_grid_color[1], 0.0f, 1.0f);
     g_dx.scene_grid_color[2] = clampf(g_dx.scene_grid_color[2], 0.0f, 1.0f);
     g_dx.scene_grid_color[3] = clampf(g_dx.scene_grid_color[3], 0.0f, 1.0f);
+    if (g_dx.scene_grid_fade_start < 0.0f) g_dx.scene_grid_fade_start = 0.0f;
+    if (g_dx.scene_grid_fade_end < g_dx.scene_grid_fade_start + 1.0f)
+        g_dx.scene_grid_fade_end = g_dx.scene_grid_fade_start + 1.0f;
 }

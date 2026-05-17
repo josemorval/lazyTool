@@ -13,7 +13,7 @@ Use this exporter when the project is fully procedural:
 - `value` resources baked into command parameters
 - UserCB values, command parameters and timeline tracks
 - multiple sequential timelines; disabled timelines are skipped and the loop point is the end of the last enabled timeline
-- project export settings from the editor's **Exporter / Standalone** section: VSync, Escape-to-close, runtime camera/light controls and demo exit behavior become compile-time defaults in `out64k.c`
+- project export settings from the editor's **Exporter / Standalone** section: VSync, Escape-to-close, timeline exit behavior and FPS-in-title are copied into `out64k.c`
 - command/camera/dirlight scene sources supported by the current `.lt` format (`param_source` and `source` fields); `cmd_rot` is exported as a float4 quaternion in the 64k runtime
 
 ## Not supported by design
@@ -36,13 +36,7 @@ From `build64k` on Windows:
 build.bat ..\projects\procedural_spheres_pbr_post.lt
 ```
 
-Useful options:
-
-```bat
-set "LT64K_SKIP_UPX=1"        rem keep the uncompressed exe for inspection
-set "LT64K_CFLAGS=/DLT_DEBUG_FPS=1"  rem add debug FPS overlay define
-set "LT64K_CFLAGS=/DLT_INPUT=0 /DLT_ESC_CLOSE=0"  rem override runtime input defaults
-```
+The batch script is intentionally fixed: it builds the exporter, generates `out64k.c`, compiles `lt64k.exe`, packs it with `upx.exe`, and deletes intermediates.
 
 The main regression scene is:
 
@@ -54,4 +48,4 @@ That project is intentionally procedural and should generate an `out64k.c` with 
 
 Timeline export accepts the current `timeline_global` / `timeline_clip` blocks written by the editor. Each exported track is tagged with its source timeline so playback applies only the active clip at that moment.
 
-The `.lt` file must include the current 5-field `export_settings` line written by the editor before `build64k` will export it.
+The `.lt` file should include the current `export_settings` line written by the editor before `build64k` exports it.

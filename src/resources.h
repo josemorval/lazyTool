@@ -67,3 +67,4 @@ void      res_make_unique_name(const char* base, char* out, int out_sz);
 const char* res_type_str(ResType t);
 uint64_t  res_estimate_gpu_bytes(const Resource& r);
 uint64_t  res_estimate_gpu_total(bool include_builtin = true);
+uint64_t  res_revision();

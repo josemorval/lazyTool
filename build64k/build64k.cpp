@@ -549,6 +549,7 @@ struct Project {
     bool export_exit_after_timeline = true;
     bool export_escape_close = true;
     bool export_vsync = false;
+    bool export_show_fps_title = false;
     std::vector<TimelineClipDef> timelines;
 };
 
@@ -609,14 +610,15 @@ static Project parse_lt(const std::string& lt_path) {
         if (t.empty()) continue;
         const std::string& tag = t[0];
         if (tag == "export_settings") {
-            if (t.size() != 6)
-                die("lt export_settings must use current 5-field format");
+            if (t.size() != 6 && t.size() != 7)
+                die("lt export_settings must use current format");
             saw_export_settings = true;
             p.export_camera_light_controls = toki(t,1,0) != 0;
             p.export_timeline_autoplay = toki(t,2,1) != 0;
             p.export_exit_after_timeline = toki(t,3,1) != 0;
             p.export_escape_close = toki(t,4,1) != 0;
             p.export_vsync = toki(t,5,0) != 0;
+            p.export_show_fps_title = toki(t,6,0) != 0;
         } else if (tag == "camera_fps") {
             for (int i = 0; i < 8; i++) p.camera[i] = tokf(t, (size_t)i + 1, p.camera[i]);
         } else if (tag == "dirlight") {
@@ -1542,20 +1544,14 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     // this is represented by scene_scale_divisor == 0. Render textures with
     // scene_scale_divisor > 0 are derived from RW/RH, just like in the editor.
     fprintf(f, "// -----------------------------------------------------------------------------\n");
-    fprintf(f, "// Build-time options. This generated player assumes fullscreen borderless mode.\n");
+    fprintf(f, "// Project export settings copied from the .lt file. The 64k player assumes\n");
+    fprintf(f, "// fullscreen borderless mode and does not support debug HUD/build overrides.\n");
     fprintf(f, "// W/H and RW/RH are always the fullscreen monitor/backbuffer size. That keeps\n");
     fprintf(f, "// the projection aspect, scene depth, scene-scaled render targets, and final\n");
     fprintf(f, "// output in the same resolution space. Fixed custom RTs still keep the size\n");
     fprintf(f, "// authored in the .lt file when scene_scale_divisor == 0.\n");
-    fprintf(f, "//\n");
-    fprintf(f, "// Useful overrides through LT64K_CFLAGS:\n");
-    fprintf(f, "//   /DLT_VSYNC=1                        Override project VSync default.\n");
-    fprintf(f, "//   /DLT_INPUT=0                        Remove runtime key toggles.\n");
-    fprintf(f, "//   /DLT_ESC_CLOSE=0                    Do not close on Escape.\n");
-    fprintf(f, "//   /DLT_EXIT_AFTER_TIMELINE=0          Keep the demo open after the timeline.\n");
-    fprintf(f, "//   /DLT_DEBUG_FPS=1                    Compile the tiny GDI FPS overlay.\n");
     fprintf(f, "// -----------------------------------------------------------------------------\n");
-    fprintf(f, "#define LT_PROJECT_W %d\n#define LT_PROJECT_H %d\n#define LT_SHADOW_W %d\n#define LT_SHADOW_H %d\n#ifndef LT_VSYNC\n#define LT_VSYNC %d\n#endif\n#ifndef LT_INPUT\n#define LT_INPUT %d\n#endif\n#ifndef LT_ESC_CLOSE\n#define LT_ESC_CLOSE %d\n#endif\n#ifndef LT_EXIT_AFTER_TIMELINE\n#define LT_EXIT_AFTER_TIMELINE %d\n#endif\n#ifndef LT_DEBUG_FPS\n#define LT_DEBUG_FPS 0\n#endif\n", project_w, project_h, shadow_tex_w, shadow_tex_h, p.export_vsync ? 1 : 0, p.export_camera_light_controls ? 1 : 0, p.export_escape_close ? 1 : 0, p.export_exit_after_timeline ? 1 : 0);
+    fprintf(f, "#define LT_PROJECT_W %d\n#define LT_PROJECT_H %d\n#define LT_SHADOW_W %d\n#define LT_SHADOW_H %d\n#define LT_VSYNC %d\n#define LT_ESC_CLOSE %d\n#define LT_EXIT_AFTER_TIMELINE %d\n#define LT_SHOW_FPS_TITLE %d\n", project_w, project_h, shadow_tex_w, shadow_tex_h, p.export_vsync ? 1 : 0, p.export_escape_close ? 1 : 0, p.export_exit_after_timeline ? 1 : 0, p.export_show_fps_title ? 1 : 0);
     fprintf(f, "// Minimal CRT replacements and tiny math types. /NODEFAULTLIB builds need these.\n");
     fprintf(f, "int _fltused=0; typedef unsigned int u32; typedef struct { float m[16]; } M4;\n");
     fprintf(f, "void* __cdecl memset(void* d,int c,size_t n){ unsigned char* p=(unsigned char*)d; while(n--)*p++=(unsigned char)c; return d; }\n");
@@ -1567,7 +1563,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     fprintf(f, "// W/H are the monitor/backbuffer size and RW/RH intentionally equal W/H.\n");
     fprintf(f, "// Camera projection, scene depth and scene-scaled render textures all use\n");
     fprintf(f, "// this fullscreen size. Only fixed custom RTs keep their authored dimensions.\n");
-    fprintf(f, "static ID3D11Device* dev; static ID3D11DeviceContext* ctx; static IDXGISwapChain* swp; static ID3D11RenderTargetView* rtv; static ID3D11Texture2D* depth_tex; static ID3D11DepthStencilView* dsv; static ID3D11ShaderResourceView* depth_srv; static ID3D11Texture2D* shadow_tex; static ID3D11DepthStencilView* shadow_dsv; static ID3D11ShaderResourceView* shadow_srv; static ID3D11SamplerState* smp_lin; static ID3D11SamplerState* smp_cmp; static ID3D11DepthStencilState* ds[4]; static ID3D11RasterizerState* rs[2]; static ID3D11BlendState* bs[4]; static ID3D11Buffer* scene_cb; static ID3D11Buffer* object_cb; static ID3D11Buffer* user_cb; static ID3D11Buffer* prim_vb[6]; static HWND wh; static int W,H,RW,RH,dbg_on=LT_DEBUG_FPS;\n");
+    fprintf(f, "static ID3D11Device* dev; static ID3D11DeviceContext* ctx; static IDXGISwapChain* swp; static ID3D11RenderTargetView* rtv; static ID3D11Texture2D* depth_tex; static ID3D11DepthStencilView* dsv; static ID3D11ShaderResourceView* depth_srv; static ID3D11Texture2D* shadow_tex; static ID3D11DepthStencilView* shadow_dsv; static ID3D11ShaderResourceView* shadow_srv; static ID3D11SamplerState* smp_lin; static ID3D11SamplerState* smp_cmp; static ID3D11DepthStencilState* ds[4]; static ID3D11RasterizerState* rs[2]; static ID3D11BlendState* bs[4]; static ID3D11Buffer* scene_cb; static ID3D11Buffer* object_cb; static ID3D11Buffer* user_cb; static ID3D11Buffer* prim_vb[6]; static HWND wh; static int W,H,RW,RH;\n");
     fprintf(f, "typedef struct { const char* src; unsigned int len; ID3D11VertexShader* vs; ID3D11PixelShader* ps; ID3D11InputLayout* il; } Sh;\n");
     fprintf(f, "typedef struct { int w,h,fmt,rtv,srv,uav,dsv,div; } Rtd;\n");
 
@@ -1901,54 +1897,16 @@ static void shadow_draw(Cmd* c){ if(!c->enabled||!c->scast||c->shs<0||c->shs>=SH
 static void shadowpass(SceneCB* sc){ if(!shadow_dsv)return; int need=0; for(int i=0;i<CMDN;i++)if(cmd[i].enabled&&cmd[i].scast)need=1; if(!need)return; ID3D11ShaderResourceView* nulls[16]; zmem(nulls,sizeof(nulls)); ID3D11DeviceContext_PSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_VSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_OMSetRenderTargets(ctx,0,0,shadow_dsv); ID3D11DeviceContext_ClearDepthStencilView(ctx,shadow_dsv,D3D11_CLEAR_DEPTH,1,0); ID3D11DeviceContext_OMSetDepthStencilState(ctx,ds[3],0); float bf[4]={0,0,0,0}; ID3D11DeviceContext_OMSetBlendState(ctx,bs[0],bf,0xffffffff); int cc=(int)sc->shadow_params[0]; if(cc<1)cc=1;if(cc>4)cc=4; for(int ci=0;ci<cc;ci++){ float* r=sc->shadow_cascade_rects[ci]; D3D11_VIEWPORT vp; zmem(&vp,sizeof(vp)); vp.TopLeftX=r[2]*(float)LT_SHADOW_W;vp.TopLeftY=r[3]*(float)LT_SHADOW_H;vp.Width=(r[0]>0?r[0]:1)*(float)LT_SHADOW_W;vp.Height=(r[1]>0?r[1]:1)*(float)LT_SHADOW_H;vp.MinDepth=0;vp.MaxDepth=1; ID3D11DeviceContext_RSSetViewports(ctx,1,&vp); SceneCB t=*sc; cpy(t.shadow_view_proj,sc->shadow_cascade_view_proj[ci],64); cb_up(scene_cb,&t,sizeof(t)); for(int i=0;i<CMDN;i++)shadow_draw(cmd+i); } cb_up(scene_cb,sc,sizeof(*sc)); }
 )LT64K", f);
     fputs(R"LT64K(// Main frame: update animation, render shadows, then execute the command list.
-// Draw a tiny, optional FPS overlay directly over the presented window.
-// It is compiled out by default because final/demo builds should not show any
-// diagnostic text and should not spend even a small amount of time in GDI.
-//
-// Enable it with /DLT_DEBUG_FPS=1 when you need to check pacing. It uses GDI
-// after Present instead of D3D, so it does not add another shader, texture,
-// buffer or render pass. Press F1 to toggle it while the program is running.
-#if LT_DEBUG_FPS
+#if LT_SHOW_FPS_TITLE
 static char* apu(char* p,unsigned int v){ char b[10]; int n=0; if(!v){*p++='0';return p;} while(v&&n<10){b[n++]=(char)('0'+v%10);v/=10;} while(n--)*p++=b[n]; return p; }
 static char* aps(char* p,const char* s){ while(*s)*p++=*s++; return p; }
-static void dbg_fps(void){
-    static DWORD last_tick=0, win0=0;
-    static unsigned int frames=0, fps=0, avg10=0, maxms=0, maxwin=0;
-    DWORD now=GetTickCount();
-    if(!last_tick) last_tick=now;
-    if(!win0) win0=now;
-
-    // Use wall-clock milliseconds rather than the timeline clock. The timeline
-    // may clamp very large deltas to avoid animation jumps, but the debug HUD
-    // should report the real frame pacing that the user sees.
-    { DWORD frame_ms=now-last_tick; if(frame_ms>maxwin)maxwin=frame_ms; last_tick=now; }
-    frames++;
-    { DWORD dt=now-win0; if(dt>=500){ fps=(unsigned int)((frames*1000u + dt/2u)/dt); avg10=(unsigned int)((dt*10u + frames/2u)/frames); maxms=maxwin; frames=0; maxwin=0; win0=now; } }
-
-    if(dbg_on){
-        char txt[128]; char* p=txt;
-        p=aps(p,"FPS "); p=apu(p,fps);
-        p=aps(p,"  avg "); p=apu(p,avg10/10u); *p++='.'; *p++=(char)('0'+(avg10%10u)); p=aps(p,"ms");
-        p=aps(p,"  max "); p=apu(p,maxms); p=aps(p,"ms");
-        p=aps(p,"  rt "); p=apu(p,(unsigned int)RW); *p++='x'; p=apu(p,(unsigned int)RH);
-        p=aps(p,"  win "); p=apu(p,(unsigned int)W); *p++='x'; p=apu(p,(unsigned int)H);
-        p=aps(p,LT_VSYNC?"  vsync":"  immediate");
-        *p=0;
-        HDC dc=GetDC(wh);
-        if(dc){ SetBkMode(dc,OPAQUE); SetBkColor(dc,0x00000000); SetTextColor(dc,0x00ffffff); TextOutA(dc,12,12,txt,(int)(p-txt)); ReleaseDC(wh,dc); }
-    }
-}
+static void fps_title(void){ static DWORD t0=0; static unsigned int frames=0; DWORD now=GetTickCount(); if(!t0)t0=now; frames++; DWORD dt=now-t0; if(dt>=500){ char txt[32]; char* p=txt; p=aps(p,"lt64k - "); p=apu(p,(frames*1000u+dt/2u)/dt); p=aps(p," fps"); *p=0; SetWindowTextA(wh,txt); frames=0; t0=now; } }
 #else
-static void dbg_fps(void){}
+static void fps_title(void){}
 #endif
-static void render(float sec){ cpy(cam,cam0,sizeof(cam));cpy(dl,dl0,sizeof(dl)); timeline(sec); float clr[4]={0,0,0,1},bf[4]={0,0,0,0}; SceneCB sc; ObjectCB oc; M4 vp,ivp; zmem(&sc,sizeof(sc)); viewproj(&vp,sec); invm(&vp,&ivp); cpy(sc.view_proj,vp.m,64); cpy(sc.prev_view_proj,vp.m,64); cpy(sc.inv_view_proj,ivp.m,64); cpy(sc.prev_inv_view_proj,ivp.m,64); shadowvp(&sc); sc.time_vec[0]=sec; sc.time_vec[2]=sec*60.0f; sc.cam_pos[0]=cam[0];sc.cam_pos[1]=cam[1];sc.cam_pos[2]=cam[2]; float cp=cs(cam[4]); sc.cam_dir[0]=sn(cam[3])*cp;sc.cam_dir[1]=sn(cam[4]);sc.cam_dir[2]=cs(cam[3])*cp; float ldx=dl[3]-dl[0],ldy=dl[4]-dl[1],ldz=dl[5]-dl[2],li=rsq(ldx*ldx+ldy*ldy+ldz*ldz); sc.light_dir[0]=ldx*li;sc.light_dir[1]=ldy*li;sc.light_dir[2]=ldz*li;sc.light_dir[3]=dl[9]; sc.light_color[0]=dl[6];sc.light_color[1]=dl[7];sc.light_color[2]=dl[8]; shadowpass(&sc); cb_up(scene_cb,&sc,sizeof(sc)); ID3D11DeviceContext_ClearRenderTargetView(ctx,rtv,clr); if(dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,1,0); for(int i=0;i<CMDN;i++){ Cmd* c=cmd+i; if(!c->enabled)continue; set_target(c); if(c->type==1){ ID3D11RenderTargetView* rv=rtvof(c->rt); float cc[4],dc; clear_vals(c,cc,&dc); if(c->ccen&&rv)ID3D11DeviceContext_ClearRenderTargetView(ctx,rv,cc); if(c->cden&&c->dep==-2&&dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,dc,0); } else if(c->type==2 && c->shader>=0&&c->shader<SHN&&sh[c->shader].vs&&sh[c->shader].ps){ UserCB uc; M4 w; world(c,&w); cpy(oc.world,w.m,64); fill_user_cmd(&uc,c); cb_up(object_cb,&oc,sizeof(oc)); cb_up(user_cb,&uc,sizeof(uc)); ID3D11DeviceContext_OMSetDepthStencilState(ctx,ds[(c->dt?1:0)|(c->dw?2:0)],0); ID3D11DeviceContext_RSSetState(ctx,rs[c->cb?1:0]); ID3D11DeviceContext_OMSetBlendState(ctx,bs[(c->ab?1:0)|(c->cw?2:0)],bf,0xffffffff); ID3D11DeviceContext_VSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetSamplers(ctx,0,1,&smp_lin); ID3D11DeviceContext_PSSetSamplers(ctx,1,1,&smp_cmp); for(int t=0;t<c->tc;t++){ ID3D11ShaderResourceView* sv=srvof(c->tex[t]); ID3D11DeviceContext_PSSetShaderResources(ctx,c->tsl[t],1,&sv); } if(c->srecv){ ID3D11ShaderResourceView* sv=shadow_srv; ID3D11DeviceContext_PSSetShaderResources(ctx,7,1,&sv); } for(int t=0;t<c->sc;t++){ ID3D11ShaderResourceView* sv=srvof(c->srv[t]); ID3D11DeviceContext_VSSetShaderResources(ctx,c->ssl[t],1,&sv); } if(c->mk>0&&c->mk<6&&prim_vb[c->mk]){ unsigned int st=32,off=0; ID3D11DeviceContext_IASetInputLayout(ctx,sh[c->shader].il); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,1,&prim_vb[c->mk],&st,&off); } else { ID3D11DeviceContext_IASetInputLayout(ctx,0); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,0,0,0,0); } ID3D11DeviceContext_IASetIndexBuffer(ctx,0,DXGI_FORMAT_R32_UINT,0); ID3D11DeviceContext_IASetPrimitiveTopology(ctx,c->topology?D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST:D3D11_PRIMITIVE_TOPOLOGY_POINTLIST); ID3D11DeviceContext_VSSetShader(ctx,sh[c->shader].vs,0,0); ID3D11DeviceContext_PSSetShader(ctx,sh[c->shader].ps,0,0); ID3D11DeviceContext_DrawInstanced(ctx,c->vc,c->ic,0,0); } } IDXGISwapChain_Present(swp,LT_VSYNC?1:0,0); dbg_fps(); }
+static void render(float sec){ cpy(cam,cam0,sizeof(cam));cpy(dl,dl0,sizeof(dl)); timeline(sec); float clr[4]={0,0,0,1},bf[4]={0,0,0,0}; SceneCB sc; ObjectCB oc; M4 vp,ivp; zmem(&sc,sizeof(sc)); viewproj(&vp,sec); invm(&vp,&ivp); cpy(sc.view_proj,vp.m,64); cpy(sc.prev_view_proj,vp.m,64); cpy(sc.inv_view_proj,ivp.m,64); cpy(sc.prev_inv_view_proj,ivp.m,64); shadowvp(&sc); sc.time_vec[0]=sec; sc.time_vec[2]=sec*60.0f; sc.cam_pos[0]=cam[0];sc.cam_pos[1]=cam[1];sc.cam_pos[2]=cam[2]; float cp=cs(cam[4]); sc.cam_dir[0]=sn(cam[3])*cp;sc.cam_dir[1]=sn(cam[4]);sc.cam_dir[2]=cs(cam[3])*cp; float ldx=dl[3]-dl[0],ldy=dl[4]-dl[1],ldz=dl[5]-dl[2],li=rsq(ldx*ldx+ldy*ldy+ldz*ldz); sc.light_dir[0]=ldx*li;sc.light_dir[1]=ldy*li;sc.light_dir[2]=ldz*li;sc.light_dir[3]=dl[9]; sc.light_color[0]=dl[6];sc.light_color[1]=dl[7];sc.light_color[2]=dl[8]; shadowpass(&sc); cb_up(scene_cb,&sc,sizeof(sc)); ID3D11DeviceContext_ClearRenderTargetView(ctx,rtv,clr); if(dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,1,0); for(int i=0;i<CMDN;i++){ Cmd* c=cmd+i; if(!c->enabled)continue; set_target(c); if(c->type==1){ ID3D11RenderTargetView* rv=rtvof(c->rt); float cc[4],dc; clear_vals(c,cc,&dc); if(c->ccen&&rv)ID3D11DeviceContext_ClearRenderTargetView(ctx,rv,cc); if(c->cden&&c->dep==-2&&dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,dc,0); } else if(c->type==2 && c->shader>=0&&c->shader<SHN&&sh[c->shader].vs&&sh[c->shader].ps){ UserCB uc; M4 w; world(c,&w); cpy(oc.world,w.m,64); fill_user_cmd(&uc,c); cb_up(object_cb,&oc,sizeof(oc)); cb_up(user_cb,&uc,sizeof(uc)); ID3D11DeviceContext_OMSetDepthStencilState(ctx,ds[(c->dt?1:0)|(c->dw?2:0)],0); ID3D11DeviceContext_RSSetState(ctx,rs[c->cb?1:0]); ID3D11DeviceContext_OMSetBlendState(ctx,bs[(c->ab?1:0)|(c->cw?2:0)],bf,0xffffffff); ID3D11DeviceContext_VSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetSamplers(ctx,0,1,&smp_lin); ID3D11DeviceContext_PSSetSamplers(ctx,1,1,&smp_cmp); for(int t=0;t<c->tc;t++){ ID3D11ShaderResourceView* sv=srvof(c->tex[t]); ID3D11DeviceContext_PSSetShaderResources(ctx,c->tsl[t],1,&sv); } if(c->srecv){ ID3D11ShaderResourceView* sv=shadow_srv; ID3D11DeviceContext_PSSetShaderResources(ctx,7,1,&sv); } for(int t=0;t<c->sc;t++){ ID3D11ShaderResourceView* sv=srvof(c->srv[t]); ID3D11DeviceContext_VSSetShaderResources(ctx,c->ssl[t],1,&sv); } if(c->mk>0&&c->mk<6&&prim_vb[c->mk]){ unsigned int st=32,off=0; ID3D11DeviceContext_IASetInputLayout(ctx,sh[c->shader].il); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,1,&prim_vb[c->mk],&st,&off); } else { ID3D11DeviceContext_IASetInputLayout(ctx,0); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,0,0,0,0); } ID3D11DeviceContext_IASetIndexBuffer(ctx,0,DXGI_FORMAT_R32_UINT,0); ID3D11DeviceContext_IASetPrimitiveTopology(ctx,c->topology?D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST:D3D11_PRIMITIVE_TOPOLOGY_POINTLIST); ID3D11DeviceContext_VSSetShader(ctx,sh[c->shader].vs,0,0); ID3D11DeviceContext_PSSetShader(ctx,sh[c->shader].ps,0,0); ID3D11DeviceContext_DrawInstanced(ctx,c->vc,c->ic,0,0); } } IDXGISwapChain_Present(swp,LT_VSYNC?1:0,0); fps_title(); }
 static LRESULT CALLBACK wp(HWND h,UINT m,WPARAM w,LPARAM l){
     if(LT_ESC_CLOSE&&m==WM_KEYDOWN&&w==VK_ESCAPE)PostQuitMessage(0);
-#if LT_DEBUG_FPS && LT_INPUT
-    // F1 is a runtime toggle for the optional FPS overlay. In release mode,
-    // or when exported runtime input is disabled, this branch is removed.
-    if(m==WM_KEYDOWN&&w==VK_F1){dbg_on=!dbg_on;return 0;}
-#endif
     if(m==WM_CLOSE||m==WM_DESTROY){PostQuitMessage(0);return 0;}
     return DefWindowProcA(h,m,w,l);
 }
@@ -1958,12 +1916,9 @@ static LRESULT CALLBACK wp(HWND h,UINT m,WPARAM w,LPARAM l){
 // consecutive frames, so the unsigned 32-bit low-part difference is enough and is wrap-safe as
 // long as a single frame does not last several minutes.
 static float qpcdt(LARGE_INTEGER* now,LARGE_INTEGER* prev,LARGE_INTEGER* freq){ unsigned int dt=(unsigned int)now->LowPart-(unsigned int)prev->LowPart; unsigned int fq=(unsigned int)freq->LowPart? (unsigned int)freq->LowPart:1; float s=(float)dt/(float)fq; if(s>0.10f)s=0.10f; return s; }
-void WINAPI WinMainCRTStartup(void){ WNDCLASSA wc; zmem(&wc,sizeof(wc)); wc.lpfnWndProc=wp; wc.hInstance=GetModuleHandleA(0); wc.lpszClassName=LT_WNDCLS; RegisterClassA(&wc); // Fullscreen is implemented as borderless desktop fullscreen instead of exclusive mode.
-// That keeps startup simple, avoids display-mode changes, and is friendly to demos compressed with UPX.
-// Fullscreen-only size policy: render at the real monitor/backbuffer size.
-// RW/RH are deliberately equal to W/H, so the camera aspect ratio cannot be
-// different from the final presentation aspect ratio.
-W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); RW=W; RH=H; HWND hw=CreateWindowExA(WS_EX_TOPMOST,LT_WNDCLS,"lt64k",WS_POPUP|WS_VISIBLE,0,0,W,H,0,0,wc.hInstance,0); wh=hw; SetWindowPos(hw,HWND_TOPMOST,0,0,W,H,SWP_SHOWWINDOW); ShowCursor(FALSE); DXGI_SWAP_CHAIN_DESC sd; zmem(&sd,sizeof(sd)); sd.BufferCount=1; sd.BufferDesc.Width=W; sd.BufferDesc.Height=H; sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow=hw; sd.SampleDesc.Count=1; sd.Windowed=TRUE; if(FAILED(D3D11CreateDeviceAndSwapChain(0,D3D_DRIVER_TYPE_HARDWARE,0,0,0,0,D3D11_SDK_VERSION,&sd,&swp,&dev,0,&ctx)))ExitProcess(1); ID3D11Texture2D* bb=0; IDXGISwapChain_GetBuffer(swp,0,&IID_ID3D11Texture2D,(void**)&bb); ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)bb,0,&rtv); ID3D11Texture2D_Release(bb); init_depth_shadow(); init_rts(); init_states(); cb_make(&scene_cb,sizeof(SceneCB)); cb_make(&object_cb,sizeof(ObjectCB)); cb_make(&user_cb,sizeof(UserCB)); init_shaders(); init_prims(); LARGE_INTEGER fq,t0,tn; QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0); float sec=0; MSG msg; for(;;){ while(PeekMessageA(&msg,0,0,0,PM_REMOVE)){ if(msg.message==WM_QUIT)ExitProcess(0); TranslateMessage(&msg); DispatchMessageA(&msg);} QueryPerformanceCounter(&tn); sec+=qpcdt(&tn,&t0,&fq); t0=tn; render(sec); if(LT_EXIT_AFTER_TIMELINE&&TL_ON){float tt=tltotal(); if(tt>0&&sec>=tt)PostQuitMessage(0);} } }
+void WINAPI WinMainCRTStartup(void){ WNDCLASSA wc; zmem(&wc,sizeof(wc)); wc.lpfnWndProc=wp; wc.hInstance=GetModuleHandleA(0); wc.lpszClassName=LT_WNDCLS; RegisterClassA(&wc); // FPS-in-title builds use a maximized overlapped window so the title bar is visible.
+// Otherwise the tiny player uses borderless desktop fullscreen.
+W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); DWORD st=LT_SHOW_FPS_TITLE?WS_OVERLAPPEDWINDOW:(WS_POPUP|WS_VISIBLE); DWORD ex=LT_SHOW_FPS_TITLE?0:WS_EX_TOPMOST; HWND hw=CreateWindowExA(ex,LT_WNDCLS,"lt64k",st,0,0,W,H,0,0,wc.hInstance,0); wh=hw; if(LT_SHOW_FPS_TITLE){ShowWindow(hw,SW_SHOWMAXIMIZED); RECT rc; GetClientRect(hw,&rc); W=rc.right-rc.left; H=rc.bottom-rc.top;}else{SetWindowPos(hw,HWND_TOPMOST,0,0,W,H,SWP_SHOWWINDOW); ShowCursor(FALSE);} RW=W; RH=H; DXGI_SWAP_CHAIN_DESC sd; zmem(&sd,sizeof(sd)); sd.BufferCount=1; sd.BufferDesc.Width=W; sd.BufferDesc.Height=H; sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow=hw; sd.SampleDesc.Count=1; sd.Windowed=TRUE; if(FAILED(D3D11CreateDeviceAndSwapChain(0,D3D_DRIVER_TYPE_HARDWARE,0,0,0,0,D3D11_SDK_VERSION,&sd,&swp,&dev,0,&ctx)))ExitProcess(1); ID3D11Texture2D* bb=0; IDXGISwapChain_GetBuffer(swp,0,&IID_ID3D11Texture2D,(void**)&bb); ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)bb,0,&rtv); ID3D11Texture2D_Release(bb); init_depth_shadow(); init_rts(); init_states(); cb_make(&scene_cb,sizeof(SceneCB)); cb_make(&object_cb,sizeof(ObjectCB)); cb_make(&user_cb,sizeof(UserCB)); init_shaders(); init_prims(); LARGE_INTEGER fq,t0,tn; QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0); float sec=0; MSG msg; for(;;){ while(PeekMessageA(&msg,0,0,0,PM_REMOVE)){ if(msg.message==WM_QUIT)ExitProcess(0); TranslateMessage(&msg); DispatchMessageA(&msg);} QueryPerformanceCounter(&tn); sec+=qpcdt(&tn,&t0,&fq); t0=tn; render(sec); if(LT_EXIT_AFTER_TIMELINE&&TL_ON){float tt=tltotal(); if(tt>0&&sec>=tt)PostQuitMessage(0);} } }
 )LT64K", f);
 
     std::fclose(f);
@@ -1986,7 +1941,7 @@ W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); RW=W; RH=H; HW
     }
     fprintf(stderr, "generated %s\n", out_c.c_str());
     fprintf(stderr, "commands: %u, shaders: %u, user vars: %u, timelines: %u, timeline tracks: %u\n", (unsigned)out_cmds.size(), (unsigned)shader_sources.size(), (unsigned)p.user_vars.size(), (unsigned)flat_timelines.size(), (unsigned)flat_tracks.size());
-    fprintf(stderr, "timeline sequence: loop=%s enabled=%s autoplay=%s exit_after=%s duration=%.3fs\n", p.timeline_loop?"on":"off", (p.timeline_enabled || p.export_timeline_autoplay)?"on":"off", p.export_timeline_autoplay?"on":"off", p.export_exit_after_timeline?"on":"off", timeline_total_seconds_for_report);
+    fprintf(stderr, "timeline sequence: loop=%s enabled=%s autoplay=%s exit_after=%s fps_title=%s duration=%.3fs\n", p.timeline_loop?"on":"off", (p.timeline_enabled || p.export_timeline_autoplay)?"on":"off", p.export_timeline_autoplay?"on":"off", p.export_exit_after_timeline?"on":"off", p.export_show_fps_title?"on":"off", timeline_total_seconds_for_report);
     fprintf(stderr, "\n64k exporter size report (source-side, before MSVC/linker packing):\n");
     if (out_bytes >= 0) fprintf(stderr, "  out64k.c:                 %lld bytes\n", out_bytes);
     fprintf(stderr, "  HLSL expanded raw:        %u bytes\n", (unsigned)raw_hlsl);

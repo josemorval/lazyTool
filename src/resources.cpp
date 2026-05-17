@@ -18,6 +18,7 @@
 
 Resource  g_resources[MAX_RESOURCES] = {};
 int       g_resource_count = 0;
+static uint64_t s_res_revision = 1;
 
 ResHandle g_builtin_time        = INVALID_HANDLE;
 ResHandle g_builtin_scene_color = INVALID_HANDLE;
@@ -629,6 +630,7 @@ uint64_t res_estimate_gpu_total(bool include_builtin) {
 void res_init() {
     memset(g_resources, 0, sizeof(g_resources));
     g_resource_count = 0;
+    s_res_revision = 1;
 
     g_builtin_time = res_alloc("time", RES_BUILTIN_TIME);
     g_resources[g_builtin_time - 1].is_builtin = true;
@@ -671,6 +673,7 @@ ResHandle res_alloc(const char* name, ResType type) {
             g_resources[i].mesh_primitive_type = -1;
             res_reset_mesh_asset(&g_resources[i]);
             g_resource_count++;
+            ++s_res_revision;
             return (ResHandle)(i + 1);
         }
     }
@@ -738,6 +741,7 @@ void res_free(ResHandle h) {
     res_release_gpu(r);
     r->active = false;
     g_resource_count--;
+    ++s_res_revision;
     log_info("Resource freed: %s", name);
 }
 
@@ -2638,6 +2642,11 @@ void res_rename(ResHandle h, const char* new_name) {
     r->name[MAX_NAME - 1] = '\0';
     user_cb_rename_resource_references(h, old_name, r->name);
     res_sync_size_resource(h);
+    ++s_res_revision;
+}
+
+uint64_t res_revision() {
+    return s_res_revision;
 }
 
 void res_make_unique_name(const char* base, char* out, int out_sz) {

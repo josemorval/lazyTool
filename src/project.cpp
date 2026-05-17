@@ -23,7 +23,8 @@ static const ExportSettings k_project_export_defaults = {
     /* timeline_autoplay             */ true,
     /* exit_after_timeline           */ true,
     /* escape_closes_player          */ true,
-    /* vsync                         */ false
+    /* vsync                         */ false,
+    /* show_fps_title                */ false
 };
 
 ExportSettings g_export_settings = k_project_export_defaults;
@@ -364,6 +365,63 @@ static void clear_source_ref(const char* source_name, ResType type, char* out, i
     out[out_sz - 1] = '\0';
 }
 
+static const char* project_after_tokens(const char* line, int token_count) {
+    const char* p = line ? line : "";
+    for (int i = 0; i < token_count; i++) {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n')
+            p++;
+    }
+    while (*p == ' ' || *p == '\t')
+        p++;
+    return p;
+}
+
+static void project_write_escaped_text(FILE* f, const char* text) {
+    if (!f || !text)
+        return;
+
+    for (const char* p = text; *p; p++) {
+        switch (*p) {
+        case '\\': fputs("\\\\", f); break;
+        case '\n': fputs("\\n", f); break;
+        case '\r': fputs("\\r", f); break;
+        case '\t': fputs("\\t", f); break;
+        default:
+            if ((unsigned char)*p >= 32)
+                fputc(*p, f);
+            break;
+        }
+    }
+}
+
+static void project_read_escaped_text(const char* src, char* out, int out_sz) {
+    if (!out || out_sz <= 0)
+        return;
+
+    out[0] = '\0';
+    if (!src)
+        return;
+
+    int n = 0;
+    for (const char* p = src; *p && n < out_sz - 1; p++) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            switch (*p) {
+            case 'n': out[n++] = '\n'; break;
+            case 'r': out[n++] = '\r'; break;
+            case 't': out[n++] = '\t'; break;
+            case '\\': out[n++] = '\\'; break;
+            default: out[n++] = *p; break;
+            }
+        } else {
+            out[n++] = *p;
+        }
+    }
+    out[n] = '\0';
+}
+
 struct ResourceLookup {
     ResType types[4];
     int type_count;
@@ -680,12 +738,13 @@ bool project_save_text(const char* path) {
         fprintf(f, "\n\n");
     }
 
-    fprintf(f, "export_settings %s %s %s %s %s\n\n",
+    fprintf(f, "export_settings %s %s %s %s %s %s\n\n",
         bool_str(g_export_settings.camera_light_controls_enabled),
         bool_str(g_export_settings.timeline_autoplay),
         bool_str(g_export_settings.exit_after_timeline),
         bool_str(g_export_settings.escape_closes_player),
-        bool_str(g_export_settings.vsync));
+        bool_str(g_export_settings.vsync),
+        bool_str(g_export_settings.show_fps_title));
 
     fprintf(f, "resources\n");
     for (int i = 0; i < MAX_RESOURCES; i++) {
@@ -738,6 +797,18 @@ bool project_save_text(const char* path) {
 
     for (int i = 0; i < MAX_RESOURCES; i++) {
         Resource& r = g_resources[i];
+        if (!r.active || r.is_builtin || r.is_generated || !r.note[0])
+            continue;
+
+        char ref[MAX_PATH_LEN] = {};
+        res_ref((ResHandle)(i + 1), ref, MAX_PATH_LEN);
+        fprintf(f, "resource_note %s ", ref);
+        project_write_escaped_text(f, r.note);
+        fprintf(f, "\n");
+    }
+
+    for (int i = 0; i < MAX_RESOURCES; i++) {
+        Resource& r = g_resources[i];
         if (!r.active || r.type != RES_MESH || r.is_builtin || r.is_generated)
             continue;
         for (int pi = 0; pi < r.mesh_part_count; pi++) {
@@ -784,6 +855,11 @@ bool project_save_text(const char* path) {
         res_ref(c.shadow_shader, shadow_shader_ref, MAX_PATH_LEN);
 
         fprintf(f, "command %s %s %s\n", cmd_type_name(c.type), c.name, bool_str(c.enabled));
+        if (c.note[0]) {
+            fprintf(f, "  note ");
+            project_write_escaped_text(f, c.note);
+            fprintf(f, "\n");
+        }
         fprintf(f, "  targets %s %s\n", rt_ref, depth_ref);
         fprintf(f, "  mrts %d", c.mrt_count);
         for (int rt_i = 0; rt_i < c.mrt_count; rt_i++) {
@@ -946,11 +1022,11 @@ bool project_load_text(const char* path) {
         bool has_export_settings = false;
         bool has_timeline_global = false;
         bool has_timeline_clip = false;
-        char scan_line[1024] = {};
+        char scan_line[4096] = {};
         const char* scan = (const char*)project_bytes;
         const char* scan_end = scan + project_size;
         while (project_read_line(scan, scan_end, scan_line, sizeof(scan_line))) {
-            char tmp[1024] = {};
+            char tmp[4096] = {};
             strncpy(tmp, scan_line, sizeof(tmp) - 1);
             char* tag = strtok(tmp, " \t\r\n");
             if (!tag || tag[0] == '#')
@@ -969,7 +1045,7 @@ bool project_load_text(const char* path) {
     project_clear_user_data();
     project_reset_view_defaults();
 
-    char line[1024] = {};
+    char line[4096] = {};
     Command* cur = nullptr;
     CmdHandle cur_h = INVALID_HANDLE;
     CmdHandle pending_parent_cmds[MAX_COMMANDS] = {};
@@ -1018,7 +1094,7 @@ bool project_load_text(const char* path) {
     const char* cursor = (const char*)project_bytes;
     const char* end = cursor + project_size;
     while (project_read_line(cursor, end, line, sizeof(line))) {
-        char tmp[1024];
+        char tmp[4096];
         strncpy(tmp, line, sizeof(tmp) - 1);
         tmp[sizeof(tmp) - 1] = '\0';
         char* tag = strtok(tmp, " \t\r\n");
@@ -1030,6 +1106,7 @@ bool project_load_text(const char* path) {
             char* exit_after_timeline = strtok(nullptr, " \t\r\n");
             char* esc_close = strtok(nullptr, " \t\r\n");
             char* vsync = strtok(nullptr, " \t\r\n");
+            char* show_fps_title = strtok(nullptr, " \t\r\n");
             char* extra = strtok(nullptr, " \t\r\n");
             if (camera_light_controls && timeline_autoplay && exit_after_timeline &&
                 esc_close && vsync && !extra) {
@@ -1039,6 +1116,7 @@ bool project_load_text(const char* path) {
                 g_export_settings.exit_after_timeline = atoi(exit_after_timeline) != 0;
                 g_export_settings.escape_closes_player = atoi(esc_close) != 0;
                 g_export_settings.vsync = atoi(vsync) != 0;
+                g_export_settings.show_fps_title = show_fps_title && atoi(show_fps_title) != 0;
             }
         } else if (strcmp(tag, "timeline") == 0) {
             timeline_reset();
@@ -1256,6 +1334,12 @@ bool project_load_text(const char* path) {
                 char* p = strtok(nullptr, " \t\r\n");
                 if (p && strcmp(p, "-") != 0) res_load_texture(name, p);
             }
+        } else if (strcmp(tag, "resource_note") == 0) {
+            char* ref = strtok(nullptr, " \t\r\n");
+            ResHandle h = res_by_ref(ref, res_lookup_types());
+            Resource* r = res_get(h);
+            if (r)
+                project_read_escaped_text(project_after_tokens(line, 2), r->note, MAX_NOTE);
         } else if (strcmp(tag, "mesh_part_disabled") == 0) {
             char* mesh_ref = strtok(nullptr, " \t\r\n");
             char* part_tok = strtok(nullptr, " \t\r\n");
@@ -1311,7 +1395,9 @@ bool project_load_text(const char* path) {
             cur = nullptr;
             cur_h = INVALID_HANDLE;
         } else if (cur) {
-            if (strcmp(tag, "targets") == 0) {
+            if (strcmp(tag, "note") == 0) {
+                project_read_escaped_text(project_after_tokens(line, 1), cur->note, MAX_NOTE);
+            } else if (strcmp(tag, "targets") == 0) {
                 cur->rt = res_by_ref(strtok(nullptr, " \t\r\n"),
                     res_lookup_types(RES_RENDER_TEXTURE2D, RES_RENDER_TEXTURE3D, RES_BUILTIN_SCENE_COLOR));
                 cur->depth = res_by_ref(strtok(nullptr, " \t\r\n"),
@@ -1459,7 +1545,7 @@ bool project_load_text(const char* path) {
 
     if (!saw_export_settings) {
         lt_free_file(project_bytes);
-        log_error("Project load failed: missing or invalid current 5-field export_settings block.");
+        log_error("Project load failed: missing or invalid export_settings block.");
         return false;
     }
     if (!saw_timeline_global || timeline_clip_count <= 0) {
@@ -1467,6 +1553,8 @@ bool project_load_text(const char* path) {
         log_error("Project load failed: missing current timeline_global/timeline_clip block.");
         return false;
     }
+
+    timeline_delete_invalid_user_var_tracks();
 
     lt_free_file(project_bytes);
     project_set_current_path(path);

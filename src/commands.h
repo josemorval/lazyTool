@@ -31,6 +31,7 @@ const char* cmd_type_str(CmdType t);
 void        cmd_make_unique_name(const char* base, char* out, int out_sz);
 float       cmd_profile_ms(CmdHandle h);
 float       cmd_profile_frame_ms();
+float       cmd_profile_shadow_ms();
 bool        cmd_profile_ready();
 void        cmd_profile_begin_frame_capture();
 void        cmd_profile_end_frame_capture();

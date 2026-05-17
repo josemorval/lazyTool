@@ -778,6 +778,22 @@ void timeline_rename_tracks_for_user_var(const char* old_target, const char* new
     }
 }
 
+void timeline_delete_invalid_user_var_tracks() {
+    timeline_ensure_one();
+    for (int ti = 0; ti < s_timeline_count; ti++) {
+        TimelineState& tl = s_timelines[ti];
+        for (int i = tl.track_count - 1; i >= 0; i--) {
+            TimelineTrack& track = tl.tracks[i];
+            if (!track.active || track.kind != TIMELINE_TRACK_USER_VAR)
+                continue;
+            int user_idx = timeline_user_var_index(track.target);
+            if (user_idx < 0 || g_user_cb_entries[user_idx].type != track.value_type)
+                timeline_delete_track_in(tl, i);
+        }
+    }
+    timeline_sync_public_tracks();
+}
+
 bool timeline_track_target_exists(const TimelineTrack& track) {
     switch (track.kind) {
     case TIMELINE_TRACK_USER_VAR:
@@ -1253,6 +1269,8 @@ static void timeline_write_tracks(FILE* f, const TimelineState& tl) {
         const TimelineTrack& track = tl.tracks[i];
         if (!track.active)
             continue;
+        if (!timeline_track_target_exists(track))
+            continue;
 
         fprintf(f, "timeline_track %s %s %s %d %d\n",
                 timeline_track_kind_token(track.kind), track.target,
@@ -1280,6 +1298,7 @@ void timeline_write_project(FILE* f) {
     if (!f)
         return;
     timeline_ensure_one();
+    timeline_delete_invalid_user_var_tracks();
 
     fprintf(f, "\ntimeline\n");
     fprintf(f, "timeline_global %d %d %d\n",

@@ -28,6 +28,7 @@
 #define MAX_SHADER_RESOURCE_BINDINGS 32
 #define MAX_COMMAND_PARAMS 32
 #define MAX_SHADOW_CASCADES 4
+#define MAX_NOTE        1024
 #define INVALID_HANDLE   0u
 
 typedef uint32_t ResHandle;
@@ -174,6 +175,7 @@ struct MeshPart {
 // ── resource ─────────────────────────────────────────────────────────────
 struct Resource {
     char     name[MAX_NAME];
+    char     note[MAX_NOTE];
     ResType  type;
     bool     active;
     bool     is_builtin;
@@ -256,6 +258,7 @@ struct Resource {
 // ── command ──────────────────────────────────────────────────────────────
 struct Command {
     char    name[MAX_NAME];
+    char    note[MAX_NOTE];
     CmdType type;
     bool    active;
     bool    enabled;
@@ -408,6 +411,7 @@ struct ExportSettings {
     bool exit_after_timeline;
     bool escape_closes_player;
     bool vsync;
+    bool show_fps_title;
 };
 
 // ── math ──────────────────────────────────────────────────────────────────

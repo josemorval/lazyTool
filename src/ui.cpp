@@ -88,7 +88,7 @@ static void ui_profile_begin_frame() {
         return;
     }
 
-    const float a = 0.16f;
+    const float a = 0.04f;
     for (int i = 0; i < UI_PROFILE_COUNT; i++) {
         if (s_ui_profile_display_valid)
             s_ui_profile[i].display_ms += (s_ui_profile[i].accum_ms - s_ui_profile[i].display_ms) * a;
@@ -128,6 +128,7 @@ struct UiProfileScope {
 ResHandle g_sel_res = INVALID_HANDLE;
 CmdHandle g_sel_cmd = INVALID_HANDLE;
 bool g_scene_view_hovered = false;
+bool g_editor_mouse_capture = false;
 static RECT s_scene_view_screen_rect = {};
 static bool s_scene_view_screen_rect_valid = false;
 static RECT s_scene_view_overlay_screen_rect = {};
@@ -153,7 +154,10 @@ static bool s_right_panel_general_open = false;
 static bool s_shortcuts_popup_open = false;
 static bool s_timeline_window_open = false;
 static bool s_render_graph_window_open = false;
+static bool s_render_graph_center_next = true;
+static bool s_render_graph_mouse_dragging = false;
 static float s_render_graph_zoom = 1.0f;
+static ImVec2 s_render_graph_pan = ImVec2(0.0f, 0.0f);
 static bool s_timeline_keyboard_focus = false;
 static int s_timeline_visible_first_frame = 0;
 static bool s_timeline_ensure_current_visible = false;
@@ -174,8 +178,10 @@ static ImGuiStyle s_ui_base_style = {};
 static bool s_ui_base_style_valid = false;
 static ImFont* s_code_font = nullptr;
 static float s_code_font_size = 16.0f;
-static bool s_shader_editor_auto_save_compile = false;
 static bool s_shader_source_editor_focused = false;
+static bool s_show_inspector_notes = false;
+static bool s_inspector_resource_note_open[MAX_RESOURCES] = {};
+static bool s_inspector_command_note_open[MAX_COMMANDS] = {};
 
 static ResHandle ui_resource_handle_from_ptr(const Resource* r);
 
@@ -258,6 +264,7 @@ static void ui_draw_command_bounds_inspector(Command* c, CmdHandle h);
 static void ui_align_frame_row(float row_y);
 static void ui_align_text_row(float row_y);
 static float ui_px(float v);
+static void ui_draw_profiler_gpu_command_table();
 
 struct UiProfilerReadoutCache {
     double next_update_time = -1.0;
@@ -1998,6 +2005,33 @@ static void ui_inspector_section(const char* title) {
     ImGui::Separator();
 }
 
+static bool ui_inspector_note_editor(char* note, int note_size, bool* note_open) {
+    if (!note || note_size <= 0 || !note_open)
+        return false;
+    if (!s_show_inspector_notes)
+        return false;
+
+    ui_inspector_section("NOTES");
+    ImGui::Checkbox("Show note", note_open);
+    if (!*note_open)
+        return false;
+
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+    if (note[0])
+        ImGui::TextUnformatted(note);
+    else
+        ImGui::TextDisabled("No note yet.");
+    ImGui::PopTextWrapPos();
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Edit note");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    return ImGui::InputTextMultiline("##inspector_note", note, (size_t)note_size,
+                                     ImVec2(-FLT_MIN, ui_px(84.0f)),
+                                     ImGuiInputTextFlags_AllowTabInput |
+                                     ImGuiInputTextFlags_NoHorizontalScroll);
+}
+
 static bool ui_ascii_ident_start(char c) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
 }
@@ -2194,6 +2228,7 @@ struct UiCodeLine {
 
 struct UiShaderSourceEditor {
     ResHandle h;
+    char      root_path[MAX_PATH_LEN];
     char      path[MAX_PATH_LEN];
     char*     text;
     size_t    cap;
@@ -2214,6 +2249,8 @@ struct UiShaderSourceEditor {
     std::vector<UiCodeLine> line_cache;
     int       line_cache_max_cols;
     bool      line_cache_dirty;
+    bool      viewing_include;
+    std::vector<std::string> include_back_stack;
 };
 
 static UiShaderSourceEditor s_shader_source_ed = {};
@@ -2339,6 +2376,99 @@ static const std::vector<UiCodeLine>& ui_shader_editor_line_cache(UiShaderSource
     return ed->line_cache;
 }
 
+static bool ui_shader_path_is_absolute(const char* path) {
+    if (!path || !path[0])
+        return false;
+    if (path[0] == '/' || path[0] == '\\')
+        return true;
+    return path[0] && path[1] == ':' && (path[2] == '/' || path[2] == '\\');
+}
+
+static void ui_shader_resolve_include_path(const UiShaderSourceEditor* ed, const char* include_name,
+                                           char* out, int out_sz) {
+    if (!out || out_sz <= 0)
+        return;
+    out[0] = '\0';
+    if (!include_name || !include_name[0])
+        return;
+
+    if (ui_shader_path_is_absolute(include_name)) {
+        ui_normalize_path_text(include_name, out, out_sz);
+        return;
+    }
+
+    char current_dir[MAX_PATH_LEN] = {};
+    ui_path_parent_dir(ed ? ed->path : nullptr, current_dir, MAX_PATH_LEN);
+    if (current_dir[0]) {
+        char candidate[MAX_PATH_LEN] = {};
+        snprintf(candidate, sizeof(candidate), "%s/%s", current_dir, include_name);
+        ui_normalize_path_text(candidate, out, out_sz);
+        if (ui_file_exists(out))
+            return;
+    }
+
+    char root_dir[MAX_PATH_LEN] = {};
+    ui_path_parent_dir(ed ? ed->root_path : nullptr, root_dir, MAX_PATH_LEN);
+    if (root_dir[0]) {
+        char candidate[MAX_PATH_LEN] = {};
+        snprintf(candidate, sizeof(candidate), "%s/%s", root_dir, include_name);
+        ui_normalize_path_text(candidate, out, out_sz);
+        return;
+    }
+
+    ui_normalize_path_text(include_name, out, out_sz);
+}
+
+static bool ui_shader_parse_include_line(const UiCodeLine& line, char* out_path, int out_sz,
+                                         int* out_start = nullptr, int* out_end = nullptr) {
+    if (out_path && out_sz > 0)
+        out_path[0] = '\0';
+    const char* p = line.begin;
+    while (p < line.end && (*p == ' ' || *p == '\t'))
+        p++;
+    if (p >= line.end || *p != '#')
+        return false;
+    p++;
+    while (p < line.end && (*p == ' ' || *p == '\t'))
+        p++;
+    const char kw[] = "include";
+    for (int i = 0; kw[i]; i++) {
+        if (p >= line.end || *p != kw[i])
+            return false;
+        p++;
+    }
+    if (p < line.end && ui_ascii_ident_char(*p))
+        return false;
+    while (p < line.end && (*p == ' ' || *p == '\t'))
+        p++;
+    if (p >= line.end || (*p != '"' && *p != '<'))
+        return false;
+
+    char close = *p == '"' ? '"' : '>';
+    p++;
+    const char* path_begin = p;
+    while (p < line.end && *p != close)
+        p++;
+    if (p <= path_begin || p >= line.end)
+        return false;
+
+    int len = (int)(p - path_begin);
+    if (out_path && out_sz > 0) {
+        int copy_len = len;
+        if (copy_len >= out_sz)
+            copy_len = out_sz - 1;
+        memcpy(out_path, path_begin, copy_len);
+        out_path[copy_len] = '\0';
+    }
+    if (out_start) *out_start = line.offset + (int)(path_begin - line.begin);
+    if (out_end) *out_end = line.offset + (int)(p - line.begin);
+    return true;
+}
+
+static bool ui_shader_editor_save_current_file(UiShaderSourceEditor* ed);
+static bool ui_shader_editor_go_back(UiShaderSourceEditor* ed, ResHandle h, Resource* r);
+static bool ui_shader_editor_open_include(UiShaderSourceEditor* ed, const char* include_name);
+
 static int ui_code_line_from_offset(const std::vector<UiCodeLine>& lines, int offset) {
     if (lines.empty())
         return 0;
@@ -2354,6 +2484,7 @@ static int ui_code_line_from_offset(const std::vector<UiCodeLine>& lines, int of
 
 struct UiShaderErrorMarker {
     int  line;
+    char path[MAX_PATH_LEN];
     char message[256];
 };
 
@@ -2368,6 +2499,19 @@ static bool ui_shader_compile_error_marker(const Resource* r, UiShaderErrorMarke
         if (line > 0 && end_line && (*end_line == ',' || *end_line == ')')) {
             const char* close = strstr(end_line, "):");
             if (close) {
+                const char* path_begin = p;
+                while (path_begin > r->compile_err && path_begin[-1] != '\n' && path_begin[-1] != '\r')
+                    path_begin--;
+                while (*path_begin == ' ' || *path_begin == '\t')
+                    path_begin++;
+                int path_len = (int)(p - path_begin);
+                while (path_len > 0 && (path_begin[path_len - 1] == ' ' || path_begin[path_len - 1] == '\t'))
+                    path_len--;
+                if (path_len >= MAX_PATH_LEN)
+                    path_len = MAX_PATH_LEN - 1;
+                memcpy(out->path, path_begin, path_len);
+                out->path[path_len] = '\0';
+                ui_normalize_path_text_inplace(out->path, MAX_PATH_LEN);
                 const char* msg = close + 2;
                 while (*msg == ' ' || *msg == '\t')
                     msg++;
@@ -2386,6 +2530,22 @@ static bool ui_shader_compile_error_marker(const Resource* r, UiShaderErrorMarke
         p++;
     }
     return false;
+}
+
+static bool ui_shader_error_marker_matches_file(const UiShaderSourceEditor* ed, const Resource* r,
+                                                const UiShaderErrorMarker* marker) {
+    if (!ed || !r || !marker)
+        return false;
+
+    char error_path[MAX_PATH_LEN] = {};
+    if (marker->path[0])
+        ui_shader_resolve_include_path(ed, marker->path, error_path, MAX_PATH_LEN);
+    else
+        ui_normalize_path_text(r->path, error_path, MAX_PATH_LEN);
+
+    char edit_path[MAX_PATH_LEN] = {};
+    ui_normalize_path_text(ed->path, edit_path, MAX_PATH_LEN);
+    return error_path[0] && edit_path[0] && strcmp(error_path, edit_path) == 0;
 }
 
 static bool ui_shader_editor_has_selection(const UiShaderSourceEditor* ed) {
@@ -3419,6 +3579,8 @@ static bool ui_shader_code_editor(UiShaderSourceEditor* ed, const Resource* shad
         ui_shader_editor_selection(ed, &sel_a, &sel_b);
     UiShaderErrorMarker error_marker = {};
     bool has_error_marker = ui_shader_compile_error_marker(shader_resource, &error_marker);
+    has_error_marker = has_error_marker && ui_shader_error_marker_matches_file(ed, shader_resource, &error_marker);
+    char include_to_open[MAX_PATH_LEN] = {};
 
     for (int i = first_line; i < last_line; i++) {
         const UiCodeLine& line = lines[i];
@@ -3490,6 +3652,50 @@ static bool ui_shader_code_editor(UiShaderSourceEditor* ed, const Resource* shad
                     ImVec2(origin.x, y), pal.muted, line_no);
         ui_hlsl_draw_line_at(dl, ImVec2(origin.x + gutter_w, y),
                              line.begin, line.end, char_w, pal);
+
+        char include_name[MAX_PATH_LEN] = {};
+        int include_start = 0;
+        int include_end = 0;
+        if (ui_shader_parse_include_line(line, include_name, MAX_PATH_LEN, &include_start, &include_end)) {
+            char include_path[MAX_PATH_LEN] = {};
+            ui_shader_resolve_include_path(ed, include_name, include_path, MAX_PATH_LEN);
+            bool include_exists = ui_file_exists(include_path);
+            const char* path_begin = ed->text + include_start;
+            const char* path_end = ed->text + include_end;
+            float x0 = origin.x + gutter_w + ui_code_x_from_ptr(line.begin, path_begin, char_w);
+            float x1 = origin.x + gutter_w + ui_code_x_from_ptr(line.begin, path_end, char_w);
+            if (x1 <= x0)
+                x1 = x0 + char_w;
+
+            ImVec4 include_col_v = include_exists
+                ? ImVec4(0.96f, 0.54f, 0.24f, 1.0f)
+                : ImVec4(0.34f, 0.86f, 0.46f, 1.0f);
+            ImU32 include_col = ImGui::GetColorU32(include_col_v);
+            char include_label[MAX_PATH_LEN] = {};
+            int include_label_len = include_end - include_start;
+            if (include_label_len >= MAX_PATH_LEN)
+                include_label_len = MAX_PATH_LEN - 1;
+            memcpy(include_label, path_begin, include_label_len);
+            include_label[include_label_len] = '\0';
+            dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(x0, y), include_col, include_label);
+
+            ImVec2 link_min(x0, y);
+            ImVec2 link_max(x1, y + line_h);
+            bool include_hovered = content_hovered && ImGui::IsMouseHoveringRect(link_min, link_max, false);
+            dl->AddLine(ImVec2(x0, y + line_h - ui_px(1.0f)),
+                        ImVec2(x1, y + line_h - ui_px(1.0f)), include_col,
+                        include_hovered ? ui_px(1.6f) : ui_px(1.0f));
+            if (include_hovered) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::SetTooltip("%s include: %s\n%s", include_exists ? "Open" : "Create",
+                                  include_name, include_path[0] ? include_path : include_name);
+            }
+            if (include_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                strncpy(include_to_open, include_name, MAX_PATH_LEN - 1);
+                include_to_open[MAX_PATH_LEN - 1] = '\0';
+                ed->dragging_selection = false;
+            }
+        }
     }
 
     if (ed->editor_focused) {
@@ -3525,6 +3731,10 @@ static bool ui_shader_code_editor(UiShaderSourceEditor* ed, const Resource* shad
     }
     dl->PopClipRect();
 
+    if (include_to_open[0])
+        ui_shader_editor_open_include(ed, include_to_open);
+
+    ImGui::SetCursorScreenPos(origin);
     ImGui::Dummy(ImVec2(content_w, content_h));
     ImGui::EndChild();
     if (s_code_font)
@@ -3533,7 +3743,8 @@ static bool ui_shader_code_editor(UiShaderSourceEditor* ed, const Resource* shad
     return changed;
 }
 
-static bool ui_shader_editor_load(UiShaderSourceEditor* ed, ResHandle h, const char* path) {
+static bool ui_shader_editor_load_file(UiShaderSourceEditor* ed, ResHandle h, const char* root_path,
+                                       const char* path, bool viewing_include, bool clear_back_stack) {
     if (!ed)
         return false;
     free(ed->text);
@@ -3556,8 +3767,15 @@ static bool ui_shader_editor_load(UiShaderSourceEditor* ed, ResHandle h, const c
     ed->undo_stack.clear();
     ed->redo_stack.clear();
     ed->h = h;
+    ed->viewing_include = viewing_include;
+    if (clear_back_stack)
+        ed->include_back_stack.clear();
+    strncpy(ed->root_path, root_path ? root_path : "", MAX_PATH_LEN - 1);
+    ed->root_path[MAX_PATH_LEN - 1] = '\0';
+    ui_normalize_path_text_inplace(ed->root_path, MAX_PATH_LEN);
     strncpy(ed->path, path ? path : "", MAX_PATH_LEN - 1);
     ed->path[MAX_PATH_LEN - 1] = '\0';
+    ui_normalize_path_text_inplace(ed->path, MAX_PATH_LEN);
 
     if (!ed->path[0])
         return false;
@@ -3581,6 +3799,10 @@ static bool ui_shader_editor_load(UiShaderSourceEditor* ed, ResHandle h, const c
     lt_free_file(data);
     ed->ok = true;
     return true;
+}
+
+static bool ui_shader_editor_load(UiShaderSourceEditor* ed, ResHandle h, const char* path) {
+    return ui_shader_editor_load_file(ed, h, path, path, false, true);
 }
 
 static bool ui_write_text_file_atomic(const char* path, const char* text) {
@@ -3608,6 +3830,106 @@ static bool ui_write_text_file_atomic(const char* path, const char* text) {
         return false;
     }
     return true;
+}
+
+static bool ui_shader_editor_save_current_file(UiShaderSourceEditor* ed) {
+    if (!ed || !ed->ok || !ed->text || !ed->path[0])
+        return false;
+    if (!ui_write_text_file_atomic(ed->path, ed->text)) {
+        log_error("Shader source save failed: %s", ed->path);
+        return false;
+    }
+    ed->dirty = false;
+    log_info("Shader source saved: %s", ed->path);
+    return true;
+}
+
+static bool ui_shader_editor_open_file_preserving_root(UiShaderSourceEditor* ed, const char* path,
+                                                       bool include, bool push_back) {
+    if (!ed || !path || !path[0])
+        return false;
+    if (ed->dirty && !ui_shader_editor_save_current_file(ed))
+        return false;
+    if (push_back && ed->path[0])
+        ed->include_back_stack.push_back(ed->path);
+    return ui_shader_editor_load_file(ed, ed->h, ed->root_path, path, include, false);
+}
+
+static bool ui_shader_editor_open_include(UiShaderSourceEditor* ed, const char* include_name) {
+    if (!ed || !include_name || !include_name[0])
+        return false;
+
+    char include_path[MAX_PATH_LEN] = {};
+    ui_shader_resolve_include_path(ed, include_name, include_path, MAX_PATH_LEN);
+    if (!include_path[0])
+        return false;
+
+    if (!ui_file_exists(include_path)) {
+        char starter[512] = {};
+        snprintf(starter, sizeof(starter),
+                 "// Include: %s\n\n", include_name);
+        if (!ui_write_text_file_atomic(include_path, starter)) {
+            log_error("Shader include create failed: %s", include_path);
+            return false;
+        }
+        log_info("Shader include created: %s", include_path);
+    }
+
+    if (strcmp(ed->path, include_path) == 0)
+        return true;
+    return ui_shader_editor_open_file_preserving_root(ed, include_path, true, true);
+}
+
+static bool ui_shader_editor_go_back(UiShaderSourceEditor* ed, ResHandle h, Resource* r) {
+    (void)h;
+    (void)r;
+    if (!ed || ed->include_back_stack.empty())
+        return false;
+
+    std::string path = ed->include_back_stack.back();
+    ed->include_back_stack.pop_back();
+    bool include = strcmp(path.c_str(), ed->root_path) != 0;
+    if (ed->dirty && !ui_shader_editor_save_current_file(ed))
+        return false;
+    return ui_shader_editor_load_file(ed, ed->h, ed->root_path, path.c_str(), include, false);
+}
+
+static bool ui_shader_editor_open_compile_error_file(UiShaderSourceEditor* ed, const Resource* r) {
+    if (!ed || !r || !r->compile_err[0])
+        return false;
+
+    UiShaderErrorMarker marker = {};
+    if (!ui_shader_compile_error_marker(r, &marker))
+        return false;
+
+    char error_path[MAX_PATH_LEN] = {};
+    if (marker.path[0] && ui_file_exists(marker.path)) {
+        ui_normalize_path_text(marker.path, error_path, MAX_PATH_LEN);
+    } else if (marker.path[0]) {
+        ui_shader_resolve_include_path(ed, marker.path, error_path, MAX_PATH_LEN);
+    } else {
+        ui_normalize_path_text(r->path, error_path, MAX_PATH_LEN);
+    }
+
+    if (!error_path[0])
+        return false;
+
+    bool opened = true;
+    if (strcmp(ed->path, error_path) != 0 && ui_file_exists(error_path)) {
+        bool include = strcmp(error_path, ed->root_path) != 0;
+        opened = ui_shader_editor_open_file_preserving_root(ed, error_path, include, true);
+    }
+    if (opened && marker.line > 0) {
+        int max_cols = 0;
+        const std::vector<UiCodeLine>& lines = ui_shader_editor_line_cache(ed, &max_cols);
+        int line_i = marker.line - 1;
+        if (line_i < 0) line_i = 0;
+        if (line_i >= (int)lines.size()) line_i = (int)lines.size() - 1;
+        if (!lines.empty())
+            ui_shader_editor_set_cursor(ed, lines[line_i].offset, false);
+        (void)max_cols;
+    }
+    return opened;
 }
 
 static const char* k_shader_template_common_scene_cb = R"HLSL(// Built-in scene constants supplied by the editor in register(b0).
@@ -3965,14 +4287,13 @@ static void ui_shader_template_buttons(ResHandle h, Resource* r, const char* pat
 static bool ui_shader_editor_save(UiShaderSourceEditor* ed, ResHandle h, Resource* r, bool compile_after) {
     if (!ed || !ed->ok || !ed->text || !r)
         return false;
-    if (!ui_write_text_file_atomic(ed->path, ed->text)) {
-        log_error("Shader source save failed: %s", ed->path);
+    if (!ui_shader_editor_save_current_file(ed))
         return false;
-    }
-    ed->dirty = false;
-    log_info("Shader source saved: %s", ed->path);
-    if (compile_after)
+    if (compile_after) {
         ui_recompile_shader_resource(h, r, r->path);
+        if (!r->compiled_ok || r->using_fallback)
+            ui_shader_editor_open_compile_error_file(ed, r);
+    }
     return true;
 }
 
@@ -4097,8 +4418,18 @@ static void ui_shader_source_editor_toolbar(UiShaderSourceEditor* ed, ResHandle 
     if (!ed || !r)
         return;
 
-    if (ImGui::Button("Reload"))
-        ui_shader_editor_load(ed, h, r->path);
+    if (ed->viewing_include && ImGui::Button("Back")) {
+        ui_shader_editor_go_back(ed, h, r);
+    }
+    if (ed->viewing_include)
+        ImGui::SameLine();
+
+    if (ImGui::Button("Reload")) {
+        if (ed->viewing_include)
+            ui_shader_editor_load_file(ed, h, r->path, ed->path, true, false);
+        else
+            ui_shader_editor_load(ed, h, r->path);
+    }
     ImGui::SameLine();
     if (ImGui::Button("Save"))
         ui_shader_editor_save(ed, h, r, false);
@@ -4127,14 +4458,20 @@ static void ui_shader_source_editor_toolbar(UiShaderSourceEditor* ed, ResHandle 
             ImGui::SetCursorPosX(right_x);
         ResHandle selected_h = s_shader_editor_floating_h;
         if (ui_shader_editor_selector(&selected_h, selector_w)) {
+            if (ed->dirty)
+                ui_shader_editor_save_current_file(ed);
             s_shader_editor_floating_h = selected_h;
         }
 
-        ImGui::TextDisabled("%zu bytes%s  |  Ln %d, Col %d  |  Ctrl+S save, Ctrl+D compile, Ctrl+Z/Y undo/redo, Ctrl+Space autocomplete",
+        ImGui::TextDisabled("%s%s  |  %zu bytes%s  |  Ln %d, Col %d  |  Ctrl+S save, Ctrl+D compile root, Ctrl+Z/Y undo/redo",
+                            ed->viewing_include ? "include " : "root ",
+                            ed->path[0] ? ed->path : "(no file)",
                             ed->text ? strlen(ed->text) : 0, ed->dirty ? "  modified" : "",
                             cursor_line, cursor_col);
     } else {
-        ImGui::TextDisabled("%zu bytes%s  |  Ln %d, Col %d  |  Ctrl+S save, Ctrl+D compile, Ctrl+Z/Y undo/redo, Ctrl+Space autocomplete",
+        ImGui::TextDisabled("%s%s  |  %zu bytes%s  |  Ln %d, Col %d  |  Ctrl+S save, Ctrl+D compile root, Ctrl+Z/Y undo/redo",
+                            ed->viewing_include ? "include " : "root ",
+                            ed->path[0] ? ed->path : "(no file)",
                             ed->text ? strlen(ed->text) : 0, ed->dirty ? "  modified" : "",
                             cursor_line, cursor_col);
     }
@@ -4148,9 +4485,6 @@ static void ui_shader_source_editor_body(UiShaderSourceEditor* ed, ResHandle h, 
         ui_shader_editor_save(ed, h, r, false);
     ui_shader_code_editor(ed, r);
     s_shader_source_editor_focused = ed->editor_focused;
-
-    if (s_shader_editor_auto_save_compile && ed->dirty && ImGui::GetTime() - ed->last_edit_time > 0.65)
-        ui_shader_editor_save(ed, h, r, true);
 }
 
 static void ui_shader_source_viewer(ResHandle h, Resource* r) {
@@ -4163,10 +4497,15 @@ static void ui_shader_source_viewer(ResHandle h, Resource* r) {
 
     UiShaderSourceEditor& ed = s_shader_source_ed;
     const char* path = r ? r->path : "";
-    bool reload = ed.h != h || strcmp(ed.path, path ? path : "") != 0;
+    char root_path[MAX_PATH_LEN] = {};
+    ui_normalize_path_text(path ? path : "", root_path, MAX_PATH_LEN);
+    bool reload = ed.h != h || strcmp(ed.root_path, root_path) != 0;
 
-    if (reload)
+    if (reload) {
+        if (ed.dirty)
+            ui_shader_editor_save_current_file(&ed);
         ui_shader_editor_load(&ed, h, path);
+    }
 
     if (!ed.path[0]) {
         ImGui::TextDisabled("No shader path.");
@@ -4445,6 +4784,20 @@ static void ui_filter_button(const char* label, int value, int* current) {
         *current = value;
     if (selected)
         ImGui::PopStyleColor(2);
+}
+
+static ImVec4 ui_command_type_color(CmdType type) {
+    switch (type) {
+    case CMD_CLEAR:             return ImVec4(0.45f, 0.72f, 0.94f, 1.0f);
+    case CMD_DRAW_MESH:         return ImVec4(0.48f, 0.78f, 0.54f, 1.0f);
+    case CMD_DRAW_INSTANCED:    return ImVec4(0.42f, 0.78f, 0.72f, 1.0f);
+    case CMD_DISPATCH:          return ImVec4(0.76f, 0.62f, 0.94f, 1.0f);
+    case CMD_INDIRECT_DRAW:     return ImVec4(0.92f, 0.70f, 0.38f, 1.0f);
+    case CMD_INDIRECT_DISPATCH: return ImVec4(0.84f, 0.58f, 0.86f, 1.0f);
+    case CMD_REPEAT:            return ImVec4(0.93f, 0.62f, 0.36f, 1.0f);
+    case CMD_GROUP:             return ImVec4(0.66f, 0.68f, 0.74f, 1.0f);
+    default:                    return ImVec4(0.60f, 0.62f, 0.66f, 1.0f);
+    }
 }
 
 static void ui_draw_badge(ImDrawList* dl, ImVec2 min, const char* text, ImVec4 tint) {
@@ -5002,7 +5355,7 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
     }
     ImVec2 badge_min = ImVec2(right_x - badge_w, floorf(cy - badge_h * 0.5f));
     if (show_type_badge && badge_min.x > row_x + 96.0f)
-        ui_draw_badge(dl, badge_min, type, ImVec4(0.60f, 0.62f, 0.66f, 1.0f));
+        ui_draw_badge(dl, badge_min, type, ui_command_type_color(c.type));
 
     ImU32 name_col = ImGui::GetColorU32(c.enabled ? ImVec4(0.92f, 0.93f, 0.94f, 1.0f) :
         ImVec4(0.48f, 0.49f, 0.51f, 1.0f));
@@ -5147,7 +5500,18 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
     return deleted;
 }
 
-static int ui_collect_visible_resources(bool builtins, int filter, ResHandle* out, int max_count) {
+struct UiVisibleResourceCache {
+    bool builtins;
+    int filter;
+    uint64_t revision;
+    ResHandle items[MAX_RESOURCES];
+    int count;
+    bool valid;
+};
+
+static UiVisibleResourceCache s_visible_resource_cache[2] = {};
+
+static int ui_collect_visible_resources_uncached(bool builtins, int filter, ResHandle* out, int max_count) {
     int count = 0;
     for (int i = 0; i < MAX_RESOURCES && count < max_count; i++) {
         Resource& r = g_resources[i];
@@ -5158,6 +5522,19 @@ static int ui_collect_visible_resources(bool builtins, int filter, ResHandle* ou
     return count;
 }
 
+static const UiVisibleResourceCache* ui_visible_resources(bool builtins, int filter) {
+    UiVisibleResourceCache& cache = s_visible_resource_cache[builtins ? 1 : 0];
+    uint64_t revision = res_revision();
+    if (!cache.valid || cache.builtins != builtins || cache.filter != filter || cache.revision != revision) {
+        cache.builtins = builtins;
+        cache.filter = filter;
+        cache.revision = revision;
+        cache.count = ui_collect_visible_resources_uncached(builtins, filter, cache.items, MAX_RESOURCES);
+        cache.valid = true;
+    }
+    return &cache;
+}
+
 static int ui_find_visible_resource_index(const ResHandle* items, int count, ResHandle h) {
     for (int i = 0; i < count; i++)
         if (items[i] == h)
@@ -5165,7 +5542,20 @@ static int ui_find_visible_resource_index(const ResHandle* items, int count, Res
     return -1;
 }
 
-static int ui_collect_visible_commands_recursive(CmdHandle parent, CmdHandle* out, int max_count) {
+struct UiVisibleCommandCache {
+    CmdHandle items[MAX_COMMANDS];
+    unsigned char depths[MAX_COMMANDS];
+    int count;
+    uint64_t graph_revision;
+    uint64_t expanded_hash;
+    bool valid;
+};
+
+static UiVisibleCommandCache s_visible_command_cache = {};
+
+static int ui_collect_visible_commands_recursive_uncached(CmdHandle parent, int depth,
+                                                          CmdHandle* out, unsigned char* depths,
+                                                          int max_count) {
     int count = 0;
     for (int i = 0; i < MAX_COMMANDS && count < max_count; i++) {
         Command& c = g_commands[i];
@@ -5173,10 +5563,43 @@ static int ui_collect_visible_commands_recursive(CmdHandle parent, CmdHandle* ou
             continue;
         CmdHandle h = (CmdHandle)(i + 1);
         out[count++] = h;
+        if (depths)
+            depths[count - 1] = (unsigned char)(depth < 255 ? depth : 255);
         if ((c.type == CMD_REPEAT || c.type == CMD_GROUP) && c.repeat_expanded)
-            count += ui_collect_visible_commands_recursive(h, out + count, max_count - count);
+            count += ui_collect_visible_commands_recursive_uncached(h, depth + (c.type == CMD_GROUP ? 0 : 1),
+                                                                    out + count, depths ? depths + count : nullptr,
+                                                                    max_count - count);
     }
     return count;
+}
+
+static uint64_t ui_command_expanded_hash() {
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        Command& c = g_commands[i];
+        if (!c.active || (c.type != CMD_GROUP && c.type != CMD_REPEAT))
+            continue;
+        h ^= (uint64_t)(i + 1);
+        h *= 1099511628211ull;
+        h ^= c.repeat_expanded ? 1ull : 0ull;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static const UiVisibleCommandCache* ui_visible_commands() {
+    uint64_t graph_revision = cmd_graph_revision();
+    uint64_t expanded_hash = ui_command_expanded_hash();
+    if (!s_visible_command_cache.valid ||
+        s_visible_command_cache.graph_revision != graph_revision ||
+        s_visible_command_cache.expanded_hash != expanded_hash) {
+        s_visible_command_cache.graph_revision = graph_revision;
+        s_visible_command_cache.expanded_hash = expanded_hash;
+        s_visible_command_cache.count = ui_collect_visible_commands_recursive_uncached(
+            INVALID_HANDLE, 0, s_visible_command_cache.items, s_visible_command_cache.depths, MAX_COMMANDS);
+        s_visible_command_cache.valid = true;
+    }
+    return &s_visible_command_cache;
 }
 
 static int ui_find_visible_command_index(const CmdHandle* items, int count, CmdHandle h) {
@@ -5484,8 +5907,9 @@ static void ui_panel_resources(bool embedded = false) {
     if (ImGui::BeginTabBar("##resource_scope_tabs")) {
         if (ImGui::BeginTabItem("User")) {
             s_user_scope_active = true;
-            ResHandle visible_items[MAX_RESOURCES] = {};
-            int visible = ui_collect_visible_resources(false, s_res_filter, visible_items, MAX_RESOURCES);
+            const UiVisibleResourceCache* visible_cache = ui_visible_resources(false, s_res_filter);
+            const ResHandle* visible_items = visible_cache->items;
+            int visible = visible_cache->count;
             if (ImGui::IsWindowFocused(ImGuiFocusedFlags_None) && !ImGui::IsAnyItemActive()) {
                 ImGui::SetNextFrameWantCaptureKeyboard(true);
                 if (visible > 0) {
@@ -5504,11 +5928,15 @@ static void ui_panel_resources(bool embedded = false) {
                     }
                 }
             }
-            for (int item = 0; item < visible; item++) {
-                Resource* r = res_get(visible_items[item]);
-                if (!r) continue;
-                if (ui_resource_row((int)visible_items[item] - 1, *r))
-                    continue;
+            ImGuiListClipper clipper;
+            clipper.Begin(visible, ImGui::GetTextLineHeight() + 10.0f);
+            while (clipper.Step()) {
+                for (int item = clipper.DisplayStart; item < clipper.DisplayEnd; item++) {
+                    Resource* r = res_get(visible_items[item]);
+                    if (!r) continue;
+                    if (ui_resource_row((int)visible_items[item] - 1, *r))
+                        continue;
+                }
             }
             if (visible == 0)
                 ImGui::TextDisabled("No user resources match this filter.");
@@ -5516,8 +5944,9 @@ static void ui_panel_resources(bool embedded = false) {
         }
         if (ImGui::BeginTabItem("Built-in")) {
             s_user_scope_active = false;
-            ResHandle visible_items[MAX_RESOURCES] = {};
-            int visible = ui_collect_visible_resources(true, s_res_filter, visible_items, MAX_RESOURCES);
+            const UiVisibleResourceCache* visible_cache = ui_visible_resources(true, s_res_filter);
+            const ResHandle* visible_items = visible_cache->items;
+            int visible = visible_cache->count;
             if (ImGui::IsWindowFocused(ImGuiFocusedFlags_None) && !ImGui::IsAnyItemActive()) {
                 ImGui::SetNextFrameWantCaptureKeyboard(true);
                 if (visible > 0) {
@@ -5536,10 +5965,14 @@ static void ui_panel_resources(bool embedded = false) {
                     }
                 }
             }
-            for (int item = 0; item < visible; item++) {
-                Resource* r = res_get(visible_items[item]);
-                if (!r) continue;
-                ui_resource_row((int)visible_items[item] - 1, *r);
+            ImGuiListClipper clipper;
+            clipper.Begin(visible, ImGui::GetTextLineHeight() + 10.0f);
+            while (clipper.Step()) {
+                for (int item = clipper.DisplayStart; item < clipper.DisplayEnd; item++) {
+                    Resource* r = res_get(visible_items[item]);
+                    if (!r) continue;
+                    ui_resource_row((int)visible_items[item] - 1, *r);
+                }
             }
             if (visible == 0)
                 ImGui::TextDisabled("No built-in resources match this filter.");
@@ -5565,40 +5998,43 @@ static float ui_command_tree_row_height(const Command& c) {
     return c.type == CMD_GROUP ? (ImGui::GetTextLineHeight() + 8.0f) : (ImGui::GetTextLineHeight() + 12.0f);
 }
 
-static void ui_accumulate_command_subtree_height(CmdHandle parent, int depth, float* total, bool* first) {
-    if (depth > 8)
-        return;
-    for (int i = 0; i < MAX_COMMANDS; i++) {
-        Command& c = g_commands[i];
-        if (!c.active || c.parent != parent)
-            continue;
-        if (!*first)
-            *total += ImGui::GetStyle().ItemSpacing.y;
-        *total += ui_command_tree_row_height(c);
-        *first = false;
-        if ((c.type == CMD_REPEAT || c.type == CMD_GROUP) && c.repeat_expanded)
-            ui_accumulate_command_subtree_height((CmdHandle)(i + 1), depth + (c.type == CMD_GROUP ? 0 : 1), total, first);
-    }
-}
+static float ui_command_visible_subtree_height(const UiVisibleCommandCache* cache, int parent_index) {
+    if (!cache || parent_index < 0 || parent_index >= cache->count)
+        return 0.0f;
 
-static float ui_command_subtree_height(CmdHandle parent, int depth) {
     float total = 0.0f;
     bool first = true;
-    ui_accumulate_command_subtree_height(parent, depth, &total, &first);
+    CmdHandle parent_h = cache->items[parent_index];
+    for (int i = parent_index + 1; i < cache->count; i++) {
+        if (!ui_command_is_descendant(cache->items[i], parent_h))
+            break;
+        Command* c = cmd_get(cache->items[i]);
+        if (!c)
+            continue;
+        if (!first)
+            total += ImGui::GetStyle().ItemSpacing.y;
+        total += ui_command_tree_row_height(*c);
+        first = false;
+    }
     return total;
 }
 
-static void ui_draw_command_tree(CmdHandle parent, int depth) {
-    if (depth > 8) return;
-    for (int i = 0; i < MAX_COMMANDS; i++) {
-        Command& c = g_commands[i];
-        if (!c.active || c.parent != parent) continue;
-        if (ui_command_row(i, c, depth))
+static void ui_draw_command_tree_cached(const UiVisibleCommandCache* cache) {
+    if (!cache)
+        return;
+    for (int visible_i = 0; visible_i < cache->count; visible_i++) {
+        CmdHandle h = cache->items[visible_i];
+        Command* c = cmd_get(h);
+        if (!c)
             continue;
 
-        CmdHandle h = (CmdHandle)(i + 1);
-        if (c.type == CMD_GROUP && c.repeat_expanded) {
-            float child_h = ui_command_subtree_height(h, depth);
+        int index = (int)h - 1;
+        int depth = (int)cache->depths[visible_i];
+        if (ui_command_row(index, *c, depth))
+            continue;
+
+        if (c->type == CMD_GROUP && c->repeat_expanded) {
+            float child_h = ui_command_visible_subtree_height(cache, visible_i);
             if (child_h > 1.0f) {
                 ImDrawList* dl = ImGui::GetWindowDrawList();
                 ImVec2 child_min = ImGui::GetCursorScreenPos();
@@ -5612,8 +6048,6 @@ static void ui_draw_command_tree(CmdHandle parent, int depth) {
                     ImGui::GetColorU32(ImVec4(0.245f, 0.188f, 0.118f, 0.58f)), 5.0f);
             }
         }
-        if ((c.type == CMD_REPEAT || c.type == CMD_GROUP) && c.repeat_expanded)
-            ui_draw_command_tree(h, depth + (c.type == CMD_GROUP ? 0 : 1));
     }
 }
 
@@ -5686,8 +6120,9 @@ static void ui_panel_commands(bool embedded = false) {
         ImGui::EndPopup();
     }
 
-    CmdHandle visible_items[MAX_COMMANDS] = {};
-    int visible = ui_collect_visible_commands_recursive(INVALID_HANDLE, visible_items, MAX_COMMANDS);
+    const UiVisibleCommandCache* visible_cache = ui_visible_commands();
+    const CmdHandle* visible_items = visible_cache->items;
+    int visible = visible_cache->count;
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_None) && !ImGui::IsAnyItemActive()) {
         ImGuiIO& io = ImGui::GetIO();
         ImGui::SetNextFrameWantCaptureKeyboard(true);
@@ -5713,10 +6148,14 @@ static void ui_panel_commands(bool embedded = false) {
             s_cmd_nav = visible_items[nav_index];
             Command* nav_cmd = cmd_get(s_cmd_nav);
             if (nav_cmd && (nav_cmd->type == CMD_REPEAT || nav_cmd->type == CMD_GROUP)) {
-                if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false))
+                if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false) && nav_cmd->repeat_expanded) {
                     nav_cmd->repeat_expanded = false;
-                if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false))
+                    cmd_mark_dirty(s_cmd_nav);
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false) && !nav_cmd->repeat_expanded) {
                     nav_cmd->repeat_expanded = true;
+                    cmd_mark_dirty(s_cmd_nav);
+                }
             }
             if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
                 g_sel_cmd = s_cmd_nav;
@@ -5725,7 +6164,7 @@ static void ui_panel_commands(bool embedded = false) {
         }
     }
 
-    ui_draw_command_tree(INVALID_HANDLE, 0);
+    ui_draw_command_tree_cached(visible_cache);
 
     if (ImGui::IsWindowFocused() && ImGui::IsKeyPressed(ImGuiKey_F2)) {
         Command* c = cmd_get(g_sel_cmd);
@@ -6430,6 +6869,12 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         ui_timeline_capture_user_vars_for_resource(h);
         app_request_scene_render();
     }
+
+    if (!r->is_builtin) {
+        int note_idx = (int)h - 1;
+        if (note_idx >= 0 && note_idx < MAX_RESOURCES)
+            ui_inspector_note_editor(r->note, MAX_NOTE, &s_inspector_resource_note_open[note_idx]);
+    }
 }
 
 static bool ui_compute_shader_combo(const char* label, ResHandle* h) {
@@ -6666,7 +7111,8 @@ static void ui_inspector_command(Command* c) {
     switch (c->type) {
     case CMD_GROUP: {
         ui_inspector_section("GROUP");
-        ImGui::Checkbox("Expanded", &c->repeat_expanded);
+        if (ImGui::Checkbox("Expanded", &c->repeat_expanded))
+            cmd_mark_dirty(inspected_h);
         ImGui::Spacing();
         for (int i = 0; i < MAX_COMMANDS; i++) {
             Command& child = g_commands[i];
@@ -6688,7 +7134,8 @@ static void ui_inspector_command(Command* c) {
         ui_inspector_section("REPEAT");
         ImGui::InputInt("Iterations", &c->repeat_count);
         if (c->repeat_count < 1) c->repeat_count = 1;
-        ImGui::Checkbox("Expanded", &c->repeat_expanded);
+        if (ImGui::Checkbox("Expanded", &c->repeat_expanded))
+            cmd_mark_dirty(inspected_h);
 
         ui_inspector_section("COMPUTE SHADERS");
         static CmdHandle s_repeat_parent = INVALID_HANDLE;
@@ -6985,6 +7432,9 @@ static void ui_inspector_command(Command* c) {
     default: break;
     }
 
+    if (inspected_idx >= 0 && inspected_idx < MAX_COMMANDS)
+        ui_inspector_note_editor(c->note, MAX_NOTE, &s_inspector_command_note_open[inspected_idx]);
+
     if (inspected_h != INVALID_HANDLE && memcmp(&before_edit, c, sizeof(Command)) != 0) {
         bool graph_changed = before_edit.parent != c->parent ||
                              before_edit.type != c->type ||
@@ -6998,10 +7448,17 @@ static void ui_inspector_command(Command* c) {
 
 static void ui_panel_inspector(bool embedded = false) {
     if (!embedded) ImGui::Begin("Inspector");
+    ImGui::Checkbox("Notes", &s_show_inspector_notes);
+    ImGui::Separator();
     if (g_sel_res != INVALID_HANDLE) {
         Resource* r = res_get(g_sel_res);
-        if (r) ui_inspector_resource(r, g_sel_res);
-        else   ImGui::TextDisabled("(stale selection)");
+        if (r) {
+            ImGui::PushID((int)g_sel_res);
+            ui_inspector_resource(r, g_sel_res);
+            ImGui::PopID();
+        } else {
+            ImGui::TextDisabled("(stale selection)");
+        }
     } else if (g_sel_cmd != INVALID_HANDLE) {
         Command* c = cmd_get(g_sel_cmd);
         if (c) ui_inspector_command(c);
@@ -7561,11 +8018,6 @@ static void ui_panel_general(bool embedded = false) {
             ui_set_code_font_size(font_size);
             settings_dirty = true;
         }
-        bool auto_save_compile = ui_shader_auto_save_compile();
-        if (ImGui::Checkbox("Auto Save + Compile", &auto_save_compile)) {
-            ui_set_shader_auto_save_compile(auto_save_compile);
-            settings_dirty = true;
-        }
         ImGui::TextDisabled("Shader source editor defaults. Saved outside project files.");
     }
 
@@ -7605,6 +8057,7 @@ static void ui_panel_general(bool embedded = false) {
         ImGui::TextDisabled("overrides timeline loop in player/export");
         ImGui::Checkbox("Esc Closes Player##export_escape_closes_player", &g_export_settings.escape_closes_player);
         ImGui::Checkbox("VSync In Export##export_vsync", &g_export_settings.vsync);
+        ImGui::Checkbox("Show FPS In Title##export_show_fps_title", &g_export_settings.show_fps_title);
 
         if (ImGui::Button("Demo Preset")) {
             g_export_settings.camera_light_controls_enabled = false;
@@ -7612,6 +8065,7 @@ static void ui_panel_general(bool embedded = false) {
             g_export_settings.exit_after_timeline = true;
             g_export_settings.escape_closes_player = true;
             g_export_settings.vsync = false;
+            g_export_settings.show_fps_title = false;
         }
         ImGui::SameLine();
         if (ImGui::Button("Interactive Preset")) {
@@ -7620,6 +8074,7 @@ static void ui_panel_general(bool embedded = false) {
             g_export_settings.exit_after_timeline = false;
             g_export_settings.escape_closes_player = true;
             g_export_settings.vsync = false;
+            g_export_settings.show_fps_title = true;
         }
         ImGui::SameLine();
         if (ImGui::Button("Reset##export_settings")) {
@@ -7637,6 +8092,22 @@ static void ui_panel_general(bool embedded = false) {
             ImGuiColorEditFlags_Float | ImGuiColorEditFlags_AlphaBar)) {
             settings_dirty = true;
             app_request_scene_render();
+        }
+        if (ImGui::Checkbox("Grid Distance Fade", &g_dx.scene_grid_distance_fade)) {
+            settings_dirty = true;
+            app_request_scene_render();
+        }
+        if (g_dx.scene_grid_distance_fade) {
+            if (ImGui::DragFloat("Grid Fade Start", &g_dx.scene_grid_fade_start, 1.0f, 0.0f, 10000.0f, "%.0f")) {
+                settings_dirty = true;
+                app_request_scene_render();
+            }
+            if (ImGui::DragFloat("Grid Fade End", &g_dx.scene_grid_fade_end, 1.0f, 1.0f, 10000.0f, "%.0f")) {
+                settings_dirty = true;
+                app_request_scene_render();
+            }
+            if (g_dx.scene_grid_fade_end < g_dx.scene_grid_fade_start + 1.0f)
+                g_dx.scene_grid_fade_end = g_dx.scene_grid_fade_start + 1.0f;
         }
         settings_dirty |= ImGui::Checkbox("Show Camera Orientation Gizmo", &g_dx.scene_orientation_gizmo_enabled);
         if (ImGui::Checkbox("Debug Draw Bounds", &g_dx.scene_bounds_debug_enabled)) {
@@ -7683,6 +8154,7 @@ static void ui_panel_general(bool embedded = false) {
         settings_dirty |= ImGui::Checkbox("Enable profiling", &g_profiler_enabled);
         if (g_profiler_enabled) {
             ui_refresh_profiler_readout_cache();
+            ImGui::SeparatorText("CPU");
             ImGui::Text("CPU frame: %.3f ms", app_cpu_frame_ms());
             ImGui::Text("Scene CPU: %.3f ms", app_cpu_scene_ms());
             ImGui::Text("ImGui build CPU: %.3f ms", app_cpu_ui_build_ms());
@@ -7703,7 +8175,8 @@ static void ui_panel_general(bool embedded = false) {
                 }
                 ImGui::TreePop();
             }
-            ImGui::Separator();
+
+            ImGui::SeparatorText("GPU");
             if (cmd_profile_total_ready())
                 ImGui::Text("Frame GPU time: %.3f ms", cmd_profile_total_frame_ms());
             else
@@ -7712,6 +8185,13 @@ static void ui_panel_general(bool embedded = false) {
                 ImGui::Text("Command GPU time: %.3f ms", cmd_profile_frame_ms());
             else
                 ImGui::TextDisabled("Command GPU time: warming up...");
+            if (cmd_profile_ready())
+                ImGui::Text("Shadow prepass GPU: %.3f ms", cmd_profile_shadow_ms());
+            else
+                ImGui::TextDisabled("Shadow prepass GPU: warming up...");
+            ui_draw_profiler_gpu_command_table();
+
+            ImGui::SeparatorText("Memory");
             ImGui::Text("Application memory: %s", s_profiler_readout_cache.app_memory);
             ImGui::Text("Estimated GPU memory: %s", s_profiler_readout_cache.gpu_memory);
             ImGui::TextDisabled("Project GPU resources: %s", s_profiler_readout_cache.project_gpu_memory);
@@ -7787,13 +8267,17 @@ static void ui_panel_log(bool embedded = false) {
     int total = g_log.count < LOG_MAX_ENTRIES ? g_log.count : LOG_MAX_ENTRIES;
     int start = g_log.count < LOG_MAX_ENTRIES ? 0 : g_log.head;
 
-    for (int i = 0; i < total; i++) {
-        const LogEntry& e = g_log.entries[(start + i) % LOG_MAX_ENTRIES];
-        ImVec4 col = {0.85f, 0.85f, 0.85f, 1.f};
-        const char* prefix = "   ";
-        if (e.level == LOG_WARN)  { col = {1.0f, 0.85f, 0.2f, 1.f};  prefix = "[W]"; }
-        if (e.level == LOG_ERROR) { col = {1.0f, 0.35f, 0.3f, 1.f};  prefix = "[E]"; }
-        ImGui::TextColored(col, "[%s] %s %s", e.time[0] ? e.time : "--:--:--", prefix, e.msg);
+    ImGuiListClipper clipper;
+    clipper.Begin(total, ImGui::GetTextLineHeightWithSpacing());
+    while (clipper.Step()) {
+        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
+            const LogEntry& e = g_log.entries[(start + i) % LOG_MAX_ENTRIES];
+            ImVec4 col = {0.85f, 0.85f, 0.85f, 1.f};
+            const char* prefix = "   ";
+            if (e.level == LOG_WARN)  { col = {1.0f, 0.85f, 0.2f, 1.f};  prefix = "[W]"; }
+            if (e.level == LOG_ERROR) { col = {1.0f, 0.35f, 0.3f, 1.f};  prefix = "[E]"; }
+            ImGui::TextColored(col, "[%s] %s %s", e.time[0] ? e.time : "--:--:--", prefix, e.msg);
+        }
     }
 
     if (g_log.scroll_to_bottom) {
@@ -8374,14 +8858,49 @@ static bool ui_selected_or_any_bounds(float out_min[3], float out_max[3]) {
 static void ui_draw_bounds_values(const char* label, const float bmin[3], const float bmax[3]) {
     if (label && label[0])
         ImGui::TextDisabled("%s", label);
-    ImGui::Text("Min: %.4g  %.4g  %.4g", bmin[0], bmin[1], bmin[2]);
-    ImGui::Text("Max: %.4g  %.4g  %.4g", bmax[0], bmax[1], bmax[2]);
     Vec3 center = v3((bmin[0] + bmax[0]) * 0.5f,
                      (bmin[1] + bmax[1]) * 0.5f,
                      (bmin[2] + bmax[2]) * 0.5f);
     Vec3 size = v3(bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2]);
-    ImGui::Text("Center: %.4g  %.4g  %.4g", center.x, center.y, center.z);
-    ImGui::Text("Size: %.4g  %.4g  %.4g", size.x, size.y, size.z);
+    float rows[4][3] = {
+        { bmin[0], bmin[1], bmin[2] },
+        { bmax[0], bmax[1], bmax[2] },
+        { center.x, center.y, center.z },
+        { size.x, size.y, size.z },
+    };
+    const char* names[4] = { "Min", "Max", "Center", "Size" };
+    ImVec4 name_cols[4] = {
+        ImVec4(0.68f, 0.73f, 0.78f, 1.0f),
+        ImVec4(0.82f, 0.72f, 0.62f, 1.0f),
+        ImVec4(0.74f, 0.58f, 0.44f, 1.0f),
+        ImVec4(0.55f, 0.72f, 0.58f, 1.0f),
+    };
+
+    if (ImGui::BeginTable("##bounds_values", 4,
+        ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp))
+    {
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ui_px(58.0f));
+        ImGui::TableSetupColumn("X", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Y", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Z", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        for (int r = 0; r < 4; r++) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::PushStyleColor(ImGuiCol_Text, name_cols[r]);
+            ImGui::TextUnformatted(names[r]);
+            ImGui::PopStyleColor();
+            for (int axis = 0; axis < 3; axis++) {
+                ImGui::TableSetColumnIndex(axis + 1);
+                ImGui::Text("%.4g", rows[r][axis]);
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    float diagonal = sqrtf(size.x * size.x + size.y * size.y + size.z * size.z);
+    float volume = fabsf(size.x * size.y * size.z);
+    ImGui::TextDisabled("Diagonal %.4g    Volume %.4g", diagonal, volume);
 }
 
 static void ui_draw_command_bounds_inspector(Command* c, CmdHandle h) {
@@ -8745,10 +9264,21 @@ enum UiPanelTone {
 
 static UiPanelTone s_panel_tone_stack[16] = {};
 static int s_panel_tone_count = 0;
+static bool s_panel_focus_stack[16] = {};
+static int s_panel_focus_count = 0;
+static ImGuiID s_focused_panel_id = 0;
 
 static ImVec4 ui_panel_bg(UiPanelTone tone) {
     (void)tone;
     return ImVec4(0.090f, 0.087f, 0.092f, 1.0f);
+}
+
+static ImVec4 ui_panel_focus_bg(UiPanelTone tone) {
+    ImVec4 bg = ui_panel_bg(tone);
+    bg.x += 0.014f;
+    bg.y += 0.012f;
+    bg.z += 0.010f;
+    return bg;
 }
 
 static ImVec4 ui_panel_accent(UiPanelTone tone) {
@@ -8763,6 +9293,42 @@ static ImVec4 ui_with_alpha(ImVec4 c, float a) {
 
 static UiPanelTone ui_current_panel_tone() {
     return s_panel_tone_count > 0 ? s_panel_tone_stack[s_panel_tone_count - 1] : UI_PANEL_DEFAULT;
+}
+
+static bool ui_current_panel_focused() {
+    if (s_panel_focus_count > 0)
+        return s_panel_focus_stack[s_panel_focus_count - 1];
+    return ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
+}
+
+static void ui_push_panel_focus(bool focused) {
+    if (s_panel_focus_count < (int)(sizeof(s_panel_focus_stack) / sizeof(s_panel_focus_stack[0])))
+        s_panel_focus_stack[s_panel_focus_count++] = focused;
+}
+
+static void ui_pop_panel_focus() {
+    if (s_panel_focus_count > 0)
+        s_panel_focus_count--;
+}
+
+static bool ui_update_panel_focus_from_current_window(bool accept_imgui_focus = true) {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (!window)
+        return false;
+
+    ImGuiID panel_id = window->ID;
+    bool hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+    bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
+    if ((accept_imgui_focus && focused) || (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)))
+        s_focused_panel_id = panel_id;
+    return s_focused_panel_id == panel_id;
+}
+
+static void ui_draw_panel_focus_bg(UiPanelTone tone) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 min = ImGui::GetWindowPos();
+    ImVec2 max = ImVec2(min.x + ImGui::GetWindowWidth(), min.y + ImGui::GetWindowHeight());
+    dl->AddRectFilled(min, max, ImGui::GetColorU32(ui_with_alpha(ui_panel_focus_bg(tone), 0.28f)), 4.0f);
 }
 
 static void ui_lock_current_window_scroll_x() {
@@ -9212,16 +9778,17 @@ static void ui_panel_header(const char* title, const char* detail = nullptr,
 
     UiPanelTone tone = ui_current_panel_tone();
     ImVec4 accent = ui_panel_accent(tone);
+    bool focused = ui_current_panel_focused();
     ImVec2 header_pos = ImGui::GetCursorScreenPos();
     float header_h = ImGui::GetTextLineHeight() + ui_margin_px(10.0f);
     ImDrawList* header_dl = ImGui::GetWindowDrawList();
     float header_right = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
     header_dl->AddRectFilled(ImVec2(header_pos.x - ui_margin_px(3.0f), header_pos.y - ui_margin_px(2.0f)),
         ImVec2(header_right, header_pos.y + header_h + ui_margin_px(2.0f)),
-        ImGui::GetColorU32(ui_with_alpha(accent, 0.040f)), 3.0f);
+        ImGui::GetColorU32(ui_with_alpha(accent, focused ? 0.075f : 0.035f)), 3.0f);
     header_dl->AddRectFilled(ImVec2(header_pos.x - ui_margin_px(3.0f), header_pos.y - ui_margin_px(2.0f)),
         ImVec2(header_pos.x, header_pos.y + header_h + ui_margin_px(2.0f)),
-        ImGui::GetColorU32(ui_with_alpha(accent, 0.62f)), 1.5f);
+        ImGui::GetColorU32(ui_with_alpha(accent, focused ? 0.86f : 0.50f)), 1.5f);
 
     float button_size = ui_px(22.0f);
     float button_spacing = ui_margin_px(4.0f);
@@ -9250,7 +9817,7 @@ static void ui_panel_header(const char* title, const char* detail = nullptr,
     // consistent without special-case layout code for each panel.
     float text_y = header_pos.y + floorf((header_h - ImGui::GetTextLineHeight()) * 0.5f);
     header_dl->AddText(ImVec2(text_left, text_y),
-        ImGui::GetColorU32(ui_with_alpha(accent, 0.95f)), title);
+        ImGui::GetColorU32(ui_with_alpha(accent, focused ? 1.0f : 0.74f)), title);
 
     float title_w = ImGui::CalcTextSize(title).x;
     if (detail && detail[0]) {
@@ -9303,7 +9870,9 @@ static void ui_draw_shader_editor_window() {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowViewport(vp->ID);
     ImGui::SetNextWindowSize(ImVec2(ui_px(900.0f), ui_px(640.0f)), ImGuiCond_FirstUseEver);
-    ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar;
+    ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoCollapse |
+                                    ImGuiWindowFlags_NoTitleBar |
+                                    ImGuiWindowFlags_NoFocusOnAppearing;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ui_panel_bg(UI_PANEL_DEFAULT));
@@ -9363,9 +9932,14 @@ static void ui_draw_shader_editor_window() {
     } else {
         UiShaderSourceEditor& ed = s_shader_source_ed;
         const char* path = r->path;
-        bool reload = ed.h != s_shader_editor_floating_h || strcmp(ed.path, path ? path : "") != 0;
-        if (reload)
+        char root_path[MAX_PATH_LEN] = {};
+        ui_normalize_path_text(path ? path : "", root_path, MAX_PATH_LEN);
+        bool reload = ed.h != s_shader_editor_floating_h || strcmp(ed.root_path, root_path) != 0;
+        if (reload) {
+            if (ed.dirty)
+                ui_shader_editor_save_current_file(&ed);
             ui_shader_editor_load(&ed, s_shader_editor_floating_h, path);
+        }
 
         if (!ed.path[0]) {
             ImGui::TextDisabled("No shader path.");
@@ -9403,7 +9977,10 @@ static bool ui_compile_open_shader_editor() {
     if (ed.dirty)
         return ui_shader_editor_save(&ed, ed.h, r, true);
 
-    return ui_recompile_shader_resource(ed.h, r, r->path);
+    ui_recompile_shader_resource(ed.h, r, r->path);
+    if (!r->compiled_ok || r->using_fallback)
+        ui_shader_editor_open_compile_error_file(&ed, r);
+    return true;
 }
 
 static void ui_recompile_active_or_selected_shader() {
@@ -9439,18 +10016,30 @@ static bool ui_begin_tool_panel(const char* id, const char* title, const char* d
     float content_w = child_w - ui_margin_px(16.0f);
     if (content_w < ui_px(1.0f))
         content_w = ui_px(1.0f);
-    ImGui::SetNextWindowContentSize(ImVec2(content_w, 0.0f));
-    bool open = ImGui::BeginChild(id, size, true);
+    bool open = ImGui::BeginChild(id, size, true,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ui_lock_current_window_scroll_x();
+    bool focused = ui_update_panel_focus_from_current_window(false);
+    ui_push_panel_focus(focused);
+    if (focused)
+        ui_draw_panel_focus_bg(tone);
     ui_panel_header(title, detail,
                     action_a, clicked_a, action_b, clicked_b, action_c, clicked_c,
                     action_d, clicked_d, action_e, clicked_e, action_f, clicked_f,
                     action_g, clicked_g, action_h, clicked_h);
-    return open;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, ui_margin_px(6.0f)));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::SetNextWindowContentSize(ImVec2(content_w, 0.0f));
+    bool content_open = ImGui::BeginChild("##tool_panel_content", ImVec2(0.0f, 0.0f), false);
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+    return open && content_open;
 }
 
 static void ui_end_tool_panel() {
     ui_lock_current_window_scroll_x();
+    ImGui::EndChild();
+    ui_pop_panel_focus();
     ImGui::EndChild();
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar();
@@ -9468,8 +10057,13 @@ static bool ui_header_only_panel(const char* id, const char* title, const char* 
     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.220f, 0.205f, 0.200f, 1.0f));
     if (ImGui::BeginChild(id, size, true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
         ui_lock_current_window_scroll_x();
+        bool focused = ui_update_panel_focus_from_current_window();
+        ui_push_panel_focus(focused);
+        if (focused)
+            ui_draw_panel_focus_bg(tone);
         ui_panel_header(title, detail);
         clicked = ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0);
+        ui_pop_panel_focus();
     }
     ImGui::EndChild();
     ImGui::PopStyleColor(2);
@@ -9516,6 +10110,89 @@ static void ui_format_bytes(uint64_t bytes, char* out, int out_sz) {
         snprintf(out, out_sz, "%llu %s", (unsigned long long)bytes, units[unit]);
     else
         snprintf(out, out_sz, "%.1f %s", v, units[unit]);
+}
+
+static void ui_draw_profiler_gpu_command_table() {
+    if (!cmd_profile_ready()) {
+        ImGui::TextDisabled("Command GPU ranges: warming up...");
+        return;
+    }
+
+    int active_count = 0;
+    for (int i = 0; i < MAX_COMMANDS; i++)
+        if (g_commands[i].active)
+            active_count++;
+
+    if (active_count == 0) {
+        ImGui::TextDisabled("Command GPU ranges: no active commands");
+        return;
+    }
+
+    ImGui::TextDisabled("Command GPU ranges. Groups and repeats include their children.");
+
+    const ImGuiTableFlags flags =
+        ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_BordersInnerV |
+        ImGuiTableFlags_SizingStretchProp |
+        ImGuiTableFlags_ScrollY;
+    const float table_h = ImGui::GetTextLineHeightWithSpacing() * 8.0f;
+    if (!ImGui::BeginTable("##profiler_gpu_command_table", 5, flags, ImVec2(0.0f, table_h)))
+        return;
+
+    ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, ui_px(34.0f));
+    ImGui::TableSetupColumn("Command", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, ui_px(72.0f));
+    ImGui::TableSetupColumn("GPU ms", ImGuiTableColumnFlags_WidthFixed, ui_px(74.0f));
+    ImGui::TableHeadersRow();
+
+    if (cmd_profile_shadow_ms() > 0.00001f) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextUnformatted("--");
+        ImGui::TableSetColumnIndex(1);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.86f, 0.70f, 0.38f, 1.0f));
+        ImGui::TextUnformatted("shadow_prepass");
+        ImGui::PopStyleColor();
+        ImGui::TableSetColumnIndex(2);
+        ImGui::TextUnformatted("Shadow");
+        ImGui::TableSetColumnIndex(3);
+        ImGui::TextUnformatted("internal");
+        ImGui::TableSetColumnIndex(4);
+        ImGui::Text("%.3f", cmd_profile_shadow_ms());
+    }
+
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        Command& c = g_commands[i];
+        if (!c.active)
+            continue;
+
+        CmdHandle h = (CmdHandle)(i + 1);
+        bool dim = !c.enabled || cmd_profile_ms(h) <= 0.00001f;
+        if (dim)
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::Text("%03d", i + 1);
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextUnformatted(c.name[0] ? c.name : "<unnamed>");
+        ImGui::TableSetColumnIndex(2);
+        if (!dim)
+            ImGui::PushStyleColor(ImGuiCol_Text, ui_command_type_color(c.type));
+        ImGui::TextUnformatted(cmd_type_str(c.type));
+        if (!dim)
+            ImGui::PopStyleColor();
+        ImGui::TableSetColumnIndex(3);
+        ImGui::TextUnformatted(c.enabled ? "enabled" : "disabled");
+        ImGui::TableSetColumnIndex(4);
+        ImGui::Text("%.3f", cmd_profile_ms(h));
+
+        if (dim)
+            ImGui::PopStyleColor();
+    }
+
+    ImGui::EndTable();
 }
 
 static uint64_t ui_process_memory_bytes() {
@@ -9714,9 +10391,17 @@ static void ui_draw_shortcuts_popup() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 5.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 8.0f));
     if (ImGui::Begin("Shortcuts", &s_shortcuts_popup_open,
-        ImGuiWindowFlags_NoCollapse))
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar))
     {
-        ui_panel_header("SHORTCUTS", "F1");
+        bool close_clicked = false;
+        bool focused = ui_update_panel_focus_from_current_window();
+        ui_push_panel_focus(focused);
+        if (focused)
+            ui_draw_panel_focus_bg(UI_PANEL_GENERAL);
+        ui_panel_header("SHORTCUTS", "F1", "Close##shortcuts_close", &close_clicked);
+        ui_pop_panel_focus();
+        if (close_clicked)
+            s_shortcuts_popup_open = false;
         ImGui::TextDisabled("Viewport, runtime and editor controls in one place.");
         ImGui::Spacing();
 
@@ -10250,11 +10935,14 @@ static void ui_draw_timeline_window() {
         s_timeline_keyboard_focus = false;
         return;
     }
+    timeline_delete_invalid_user_var_tracks();
 
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowViewport(vp->ID);
     ImGui::SetNextWindowSize(ImVec2(ui_px(920.0f), ui_px(420.0f)), ImGuiCond_FirstUseEver);
-    ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar;
+    ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoCollapse |
+                                    ImGuiWindowFlags_NoTitleBar |
+                                    ImGuiWindowFlags_NoFocusOnAppearing;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ui_panel_bg(UI_PANEL_DEFAULT));
@@ -10294,7 +10982,24 @@ static void ui_draw_timeline_window() {
         return;
     }
     ui_lock_current_window_scroll_x();
-    ui_panel_header("TIMELINE", detail);
+    bool focused = ui_update_panel_focus_from_current_window(false);
+    ui_push_panel_focus(focused);
+    if (focused)
+        ui_draw_panel_focus_bg(UI_PANEL_DEFAULT);
+    bool close_clicked = false;
+    ui_panel_header("TIMELINE", detail, "Close##timeline_close", &close_clicked);
+    ui_pop_panel_focus();
+    if (close_clicked) {
+        s_timeline_window_open = false;
+        s_timeline_keyboard_focus = false;
+        ImGui::EndChild();
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar();
+        if (s_panel_tone_count > 0)
+            s_panel_tone_count--;
+        ImGui::End();
+        return;
+    }
 
     ImGuiIO& io = ImGui::GetIO();
     bool track_enabled = timeline_enabled();
@@ -10814,6 +11519,16 @@ struct UiRenderGraphBuild {
     int       resource_count;
 };
 
+struct UiRenderGraphCache {
+    UiRenderGraphBuild graph;
+    uint64_t cmd_revision;
+    uint64_t cmd_graph_revision;
+    uint64_t res_revision;
+    bool valid;
+};
+
+static UiRenderGraphCache s_render_graph_build_cache = {};
+
 static bool ui_render_graph_command_effectively_enabled(CmdHandle h) {
     int guard = 0;
     while (h != INVALID_HANDLE && guard++ < MAX_COMMANDS) {
@@ -10999,6 +11714,23 @@ static void ui_render_graph_build(UiRenderGraphBuild* graph) {
     }
 }
 
+static const UiRenderGraphBuild* ui_render_graph_cached_build() {
+    uint64_t cr = cmd_revision();
+    uint64_t cgr = cmd_graph_revision();
+    uint64_t rr = res_revision();
+    if (!s_render_graph_build_cache.valid ||
+        s_render_graph_build_cache.cmd_revision != cr ||
+        s_render_graph_build_cache.cmd_graph_revision != cgr ||
+        s_render_graph_build_cache.res_revision != rr) {
+        ui_render_graph_build(&s_render_graph_build_cache.graph);
+        s_render_graph_build_cache.cmd_revision = cr;
+        s_render_graph_build_cache.cmd_graph_revision = cgr;
+        s_render_graph_build_cache.res_revision = rr;
+        s_render_graph_build_cache.valid = true;
+    }
+    return &s_render_graph_build_cache.graph;
+}
+
 static const char* ui_render_graph_usage_label(unsigned int flags) {
     if ((flags & UI_RENDER_GRAPH_READ) && (flags & UI_RENDER_GRAPH_WRITE)) return "R/W";
     if (flags & UI_RENDER_GRAPH_WRITE) return "Write";
@@ -11098,35 +11830,83 @@ static void ui_render_graph_draw_arrow_head(ImDrawList* dl, ImVec2 tip, ImVec2 d
                           col);
 }
 
-static void ui_render_graph_draw_bezier_arrow(ImDrawList* dl, ImVec2 from, ImVec2 to,
-                                              ImU32 col, float thickness, float scale,
-                                              float bend_bias = 0.0f) {
+static void ui_render_graph_draw_ortho_arrow(ImDrawList* dl, ImVec2 from, ImVec2 to,
+                                             ImU32 col, float thickness, float scale,
+                                             float lane_bias = 0.0f) {
     if (!dl)
         return;
 
     float dx = to.x - from.x;
     float dy = to.y - from.y;
-    ImVec2 c1, c2;
-    if (fabsf(dx) > fabsf(dy)) {
-        float bend = dx * 0.50f;
-        c1 = ImVec2(from.x + bend, from.y + bend_bias);
-        c2 = ImVec2(to.x - bend, to.y + bend_bias);
-    } else {
-        float bend = dy * 0.48f;
-        c1 = ImVec2(from.x + bend_bias, from.y + bend);
-        c2 = ImVec2(to.x + bend_bias, to.y - bend);
+    float r = 10.0f * scale;
+    if (fabsf(dx) < 2.0f * scale || fabsf(dy) < 2.0f * scale) {
+        dl->AddLine(from, to, col, thickness);
+        ui_render_graph_draw_arrow_head(dl, to, ui_render_graph_v2_sub(to, from), col, 7.0f * scale);
+        return;
     }
 
+    bool horizontal_first = fabsf(dx) >= fabsf(dy);
+    ImVec2 mid = horizontal_first ?
+        ImVec2(from.x + dx * 0.50f + lane_bias, from.y) :
+        ImVec2(from.x, from.y + dy * 0.50f + lane_bias);
+    ImVec2 corner_b = horizontal_first ? ImVec2(mid.x, to.y) : ImVec2(to.x, mid.y);
+    ImVec2 dir_a = ui_render_graph_v2_norm(ui_render_graph_v2_sub(mid, from));
+    ImVec2 dir_b = ui_render_graph_v2_norm(ui_render_graph_v2_sub(corner_b, mid));
+    ImVec2 dir_c = ui_render_graph_v2_norm(ui_render_graph_v2_sub(to, corner_b));
+
+    ImVec2 p0 = from;
+    ImVec2 p1 = ui_render_graph_v2_sub(mid, ui_render_graph_v2_scale(dir_a, r));
+    ImVec2 p2 = ui_render_graph_v2_add(mid, ui_render_graph_v2_scale(dir_b, r));
+    ImVec2 p3 = ui_render_graph_v2_sub(corner_b, ui_render_graph_v2_scale(dir_b, r));
+    ImVec2 p4 = ui_render_graph_v2_add(corner_b, ui_render_graph_v2_scale(dir_c, r));
+
     dl->PathClear();
-    dl->PathLineTo(from);
-    dl->PathBezierCubicCurveTo(c1, c2, to, 24);
+    dl->PathLineTo(p0);
+    dl->PathLineTo(p1);
+    dl->PathBezierQuadraticCurveTo(mid, p2, 8);
+    dl->PathLineTo(p3);
+    dl->PathBezierQuadraticCurveTo(corner_b, p4, 8);
+    dl->PathLineTo(to);
     dl->PathStroke(col, 0, thickness);
-    ui_render_graph_draw_arrow_head(dl, to, ui_render_graph_v2_sub(to, c2), col, 7.0f * scale);
+    ui_render_graph_draw_arrow_head(dl, to, dir_c, col, 7.0f * scale);
+}
+
+static void ui_render_graph_draw_grid_layer(ImDrawList* dl, ImVec2 min, ImVec2 max,
+                                            float scroll_x, float scroll_y,
+                                            float step, ImU32 col) {
+    if (!dl)
+        return;
+    if (step < 2.0f)
+        return;
+    float start_x = min.x - fmodf(scroll_x, step);
+    float start_y = min.y - fmodf(scroll_y, step);
+    for (float x = start_x; x < max.x; x += step)
+        dl->AddLine(ImVec2(x, min.y), ImVec2(x, max.y), col, 1.0f);
+    for (float y = start_y; y < max.y; y += step)
+        dl->AddLine(ImVec2(min.x, y), ImVec2(max.x, y), col, 1.0f);
+}
+
+static void ui_render_graph_draw_canvas_grid(ImDrawList* dl, ImVec2 min, ImVec2 max,
+                                             float scroll_x, float scroll_y, float scale) {
+    if (!dl)
+        return;
+
+    float fine_step = 32.0f * scale;
+    while (fine_step < 18.0f) fine_step *= 3.0f;
+    while (fine_step > 54.0f) fine_step /= 3.0f;
+    float coarse_step = fine_step * 3.0f;
+
+    ImU32 fine_col = ImGui::GetColorU32(ImVec4(0.20f, 0.19f, 0.20f, 0.30f));
+    ImU32 coarse_col = ImGui::GetColorU32(ImVec4(0.34f, 0.30f, 0.27f, 0.44f));
+    ui_render_graph_draw_grid_layer(dl, min, max, scroll_x, scroll_y, fine_step, fine_col);
+    ui_render_graph_draw_grid_layer(dl, min, max, scroll_x, scroll_y, coarse_step, coarse_col);
 }
 
 static void ui_draw_render_graph_window() {
-    if (!s_render_graph_window_open)
+    if (!s_render_graph_window_open) {
+        s_render_graph_center_next = true;
         return;
+    }
 
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowViewport(vp->ID);
@@ -11136,7 +11916,9 @@ static void ui_draw_render_graph_window() {
                                    vp->WorkPos.y + vp->WorkSize.y - default_size.y - ui_margin_px(24.0f)),
                             ImGuiCond_FirstUseEver);
 
-    ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar;
+    ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoCollapse |
+                                    ImGuiWindowFlags_NoTitleBar |
+                                    ImGuiWindowFlags_NoFocusOnAppearing;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ui_panel_bg(UI_PANEL_DEFAULT));
@@ -11151,8 +11933,7 @@ static void ui_draw_render_graph_window() {
         return;
     }
 
-    UiRenderGraphBuild graph = {};
-    ui_render_graph_build(&graph);
+    const UiRenderGraphBuild& graph = *ui_render_graph_cached_build();
 
     char detail[128] = {};
     snprintf(detail, sizeof(detail), "%d cmds  %d resources", graph.cmd_count, graph.resource_count);
@@ -11177,9 +11958,26 @@ static void ui_draw_render_graph_window() {
         return;
     }
 
-    ui_panel_header("RENDER GRAPH", detail);
+    bool focused = ui_update_panel_focus_from_current_window(false);
+    ui_push_panel_focus(focused);
+    if (focused)
+        ui_draw_panel_focus_bg(UI_PANEL_DEFAULT);
+    bool close_clicked = false;
+    ui_panel_header("RENDER GRAPH", detail, "Close##render_graph_close", &close_clicked);
+    ui_pop_panel_focus();
+    if (close_clicked) {
+        s_render_graph_window_open = false;
+        s_render_graph_center_next = true;
+        ImGui::EndChild();
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar();
+        if (s_panel_tone_count > 0)
+            s_panel_tone_count--;
+        ImGui::End();
+        return;
+    }
     ImGui::Spacing();
-    ImGui::TextDisabled("Commands are shown in execution order. Mouse wheel zooms, middle-drag pans, double middle-click resets.");
+    ImGui::TextDisabled("Commands are shown in execution order. Mouse wheel zooms, right-drag pans, double middle-click resets.");
     ImGui::SameLine();
     ImGui::TextDisabled("Zoom %.0f%%", s_render_graph_zoom * 100.0f);
     ImGui::Spacing();
@@ -11197,40 +11995,52 @@ static void ui_draw_render_graph_window() {
 
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.048f, 0.047f, 0.050f, 1.0f));
     ImGui::BeginChild("##render_graph_canvas", ImVec2(0.0f, 0.0f), true,
-                      ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_AlwaysVerticalScrollbar);
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleColor();
 
     ImGuiIO& io = ImGui::GetIO();
     bool canvas_hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows);
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Right))
+        s_render_graph_mouse_dragging = false;
+    if (canvas_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+        s_render_graph_mouse_dragging = true;
+    if (canvas_hovered || s_render_graph_mouse_dragging) {
+        g_editor_mouse_capture = true;
+    }
     ImVec2 canvas_pos = ImGui::GetWindowPos();
-    ImVec2 mouse_before(io.MousePos.x - canvas_pos.x + ImGui::GetScrollX(),
-                        io.MousePos.y - canvas_pos.y + ImGui::GetScrollY());
+    ImVec2 canvas_size = ImGui::GetWindowSize();
+    ImVec2 mouse_local(io.MousePos.x - canvas_pos.x, io.MousePos.y - canvas_pos.y);
     float zoom_before = s_render_graph_zoom;
     if (canvas_hovered && io.MouseWheel != 0.0f) {
+        ImVec2 graph_under_mouse(
+            (mouse_local.x - s_render_graph_pan.x) / zoom_before,
+            (mouse_local.y - s_render_graph_pan.y) / zoom_before);
         float zoom_next = s_render_graph_zoom * powf(1.12f, io.MouseWheel);
         if (zoom_next < 0.35f) zoom_next = 0.35f;
         if (zoom_next > 2.50f) zoom_next = 2.50f;
         if (fabsf(zoom_next - s_render_graph_zoom) > 0.0001f) {
             s_render_graph_zoom = zoom_next;
-            float ratio = s_render_graph_zoom / zoom_before;
-            ImGui::SetScrollX(mouse_before.x * ratio - (io.MousePos.x - canvas_pos.x));
-            ImGui::SetScrollY(mouse_before.y * ratio - (io.MousePos.y - canvas_pos.y));
+            s_render_graph_pan.x = mouse_local.x - graph_under_mouse.x * s_render_graph_zoom;
+            s_render_graph_pan.y = mouse_local.y - graph_under_mouse.y * s_render_graph_zoom;
         }
     }
-    if (canvas_hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.0f)) {
+    if (s_render_graph_mouse_dragging && ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.0f)) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
-        ImGui::SetScrollX(ImGui::GetScrollX() - io.MouseDelta.x);
-        ImGui::SetScrollY(ImGui::GetScrollY() - io.MouseDelta.y);
+        s_render_graph_pan.x += io.MouseDelta.x;
+        s_render_graph_pan.y += io.MouseDelta.y;
     }
-    if (canvas_hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Middle))
+    if (canvas_hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Middle)) {
         s_render_graph_zoom = 1.0f;
+        s_render_graph_center_next = true;
+    }
     if (s_render_graph_zoom < 0.35f) s_render_graph_zoom = 0.35f;
     if (s_render_graph_zoom > 2.50f) s_render_graph_zoom = 2.50f;
     ImGui::SetWindowFontScale(s_render_graph_zoom);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 origin = ImGui::GetCursorScreenPos();
     float scale = ui_global_scale() * s_render_graph_zoom;
+    ImVec2 origin = ImVec2(canvas_pos.x + s_render_graph_pan.x,
+                           canvas_pos.y + s_render_graph_pan.y);
     float left_pad = 42.0f * scale;
     float top = 28.0f * scale;
     float cmd_w = 166.0f * scale;
@@ -11311,12 +12121,24 @@ static void ui_draw_render_graph_window() {
     float graph_w = ImMax(left_pad + (float)graph.cmd_count * (cmd_w + cmd_gap) + 60.0f * scale,
                           command_right + 60.0f * scale);
     float graph_h = resource_top + resource_area_h;
-    float bottom = origin.y + graph_h;
+
+    if (s_render_graph_center_next) {
+        ImVec2 old_pan = s_render_graph_pan;
+        s_render_graph_pan.x = floorf((canvas_size.x - graph_w) * 0.5f);
+        s_render_graph_pan.y = floorf((canvas_size.y - graph_h) * 0.5f);
+        ImVec2 delta(s_render_graph_pan.x - old_pan.x, s_render_graph_pan.y - old_pan.y);
+        origin.x += delta.x;
+        origin.y += delta.y;
+        for (int i = 0; i < MAX_COMMANDS; i++) {
+            cmd_node_min[i].x += delta.x; cmd_node_min[i].y += delta.y;
+            cmd_node_max[i].x += delta.x; cmd_node_max[i].y += delta.y;
+            group_box_min[i].x += delta.x; group_box_min[i].y += delta.y;
+            group_box_max[i].x += delta.x; group_box_max[i].y += delta.y;
+        }
+        s_render_graph_center_next = false;
+    }
 
     const ImU32 bg_col = ImGui::GetColorU32(ImVec4(0.058f, 0.056f, 0.060f, 1.0f));
-    const ImU32 lane_col = ImGui::GetColorU32(ImVec4(0.072f, 0.068f, 0.072f, 0.56f));
-    const ImU32 lane_line_col = ImGui::GetColorU32(ImVec4(0.19f, 0.17f, 0.16f, 0.62f));
-    const ImU32 faint_line_col = ImGui::GetColorU32(ImVec4(0.38f, 0.28f, 0.22f, 0.36f));
     const ImU32 seq_col = ImGui::GetColorU32(ImVec4(0.72f, 0.47f, 0.31f, 0.42f));
     const ImU32 cmd_bg_col = ImGui::GetColorU32(ImVec4(0.105f, 0.100f, 0.105f, 1.0f));
     const ImU32 cmd_bg_disabled_col = ImGui::GetColorU32(ImVec4(0.075f, 0.073f, 0.077f, 1.0f));
@@ -11331,22 +12153,14 @@ static void ui_draw_render_graph_window() {
     const ImU32 text_col = ImGui::GetColorU32(ImGuiCol_Text);
     const ImU32 text_disabled_col = ImGui::GetColorU32(ImGuiCol_TextDisabled);
 
-    dl->AddRectFilled(origin, ImVec2(origin.x + graph_w, bottom), bg_col, ui_px(6.0f));
+    ImVec2 canvas_min = ImGui::GetWindowPos();
+    ImVec2 canvas_max(canvas_min.x + ImGui::GetWindowWidth(), canvas_min.y + ImGui::GetWindowHeight());
+    dl->AddRectFilled(canvas_min, canvas_max, bg_col);
+    ui_render_graph_draw_canvas_grid(dl, canvas_min, canvas_max, -s_render_graph_pan.x, -s_render_graph_pan.y, scale);
 
     if (graph.resource_count > 0) {
         dl->AddText(ImVec2(origin.x + 16.0f * scale, origin.y + resource_top - 30.0f * scale),
                     text_disabled_col, "Resources");
-        dl->AddLine(ImVec2(origin.x + 16.0f * scale, origin.y + resource_top - 10.0f * scale),
-                    ImVec2(origin.x + graph_w - 20.0f * scale, origin.y + resource_top - 10.0f * scale),
-                    faint_line_col, 1.0f);
-        for (int lane = 0; lane < graph.resource_count; lane++) {
-            float y = origin.y + resource_top + (float)lane * res_lane_h - 5.0f * scale;
-            dl->AddRectFilled(ImVec2(origin.x + 10.0f * scale, y),
-                              ImVec2(origin.x + graph_w - 14.0f * scale, y + res_lane_h), lane_col, 4.0f * scale);
-            dl->AddLine(ImVec2(origin.x + 18.0f * scale, y + res_lane_h - 1.0f),
-                        ImVec2(origin.x + graph_w - 24.0f * scale, y + res_lane_h - 1.0f),
-                        lane_line_col, 1.0f);
-        }
     } else {
         dl->AddText(ImVec2(origin.x + 16.0f * scale, origin.y + resource_top),
                     text_disabled_col, "No traceable render resources are currently referenced by the command list.");
@@ -11401,58 +12215,28 @@ static void ui_draw_render_graph_window() {
         dl->AddText(ImVec2(head1.x - meta_w - 12.0f * scale, head0.y + 24.0f * scale), text_disabled_col, meta);
     }
 
-    // Hanging connectors for direct children of group and repeat containers.
+    // Execution-order arrows. Groups behave as one node at their parent level;
+    // their children connect only to siblings inside the group.
     for (int ci = 0; ci < graph.cmd_count; ci++) {
         Command* c = cmd_get(graph.cmd_handles[ci]);
-        if (!c || !has_group_box[ci])
+        if (!c)
             continue;
 
-        int child_count = 0;
-        float first_x = 0.0f;
-        float last_x = 0.0f;
-        float child_top_y = 0.0f;
-        for (int j = ci + 1; j < subtree_end[ci]; j++) {
-            Command* child = cmd_get(graph.cmd_handles[j]);
-            if (!child || child->parent != graph.cmd_handles[ci])
-                continue;
-
-            float cx = (cmd_node_min[j].x + cmd_node_max[j].x) * 0.5f;
-            if (child_count == 0) {
-                first_x = last_x = cx;
-                child_top_y = cmd_node_min[j].y;
-            } else {
-                if (cx < first_x) first_x = cx;
-                if (cx > last_x) last_x = cx;
-            }
-            child_count++;
-        }
-        if (child_count <= 0)
+        int next = has_group_box[ci] ? subtree_end[ci] : ci + 1;
+        if (next >= graph.cmd_count)
             continue;
 
-        float parent_x = (cmd_node_min[ci].x + cmd_node_max[ci].x) * 0.5f;
-        float parent_y = cmd_node_max[ci].y;
-        float bus_y = parent_y + (child_top_y - parent_y) * 0.46f;
-        ImU32 col = c->type == CMD_REPEAT ? repeat_border_col : group_border_col;
-        dl->AddLine(ImVec2(parent_x, parent_y), ImVec2(parent_x, bus_y), col, 1.2f * scale);
-        dl->AddLine(ImVec2(first_x, bus_y), ImVec2(last_x, bus_y), col, 1.2f * scale);
-        for (int j = ci + 1; j < subtree_end[ci]; j++) {
-            Command* child = cmd_get(graph.cmd_handles[j]);
-            if (!child || child->parent != graph.cmd_handles[ci])
-                continue;
-            float cx = (cmd_node_min[j].x + cmd_node_max[j].x) * 0.5f;
-            dl->AddLine(ImVec2(cx, bus_y), ImVec2(cx, cmd_node_min[j].y), col, 1.2f * scale);
-        }
-    }
+        Command* n = cmd_get(graph.cmd_handles[next]);
+        if (!n || n->parent != c->parent || graph.cmd_depths[next] != graph.cmd_depths[ci])
+            continue;
 
-    // Execution-order arrows between command nodes.
-    for (int ci = 0; ci < graph.cmd_count - 1; ci++) {
         ImVec2 from(cmd_node_max[ci].x, (cmd_node_min[ci].y + cmd_node_max[ci].y) * 0.5f);
-        ImVec2 to(cmd_node_min[ci + 1].x, (cmd_node_min[ci + 1].y + cmd_node_max[ci + 1].y) * 0.5f);
-        float bias = ((ci & 1) ? -10.0f : 10.0f) * scale;
-        ui_render_graph_draw_bezier_arrow(dl, from, to, seq_col, 1.2f * scale, scale, bias);
+        ImVec2 to(cmd_node_min[next].x, (cmd_node_min[next].y + cmd_node_max[next].y) * 0.5f);
+        float bias = ((ci & 1) ? -7.0f : 7.0f) * scale;
+        ui_render_graph_draw_ortho_arrow(dl, from, to, seq_col, 1.2f * scale, scale, bias);
     }
 
-    // Curved resource trace arrows and command/resource dependency arrows.
+    // Resource trace arrows and command/resource dependency arrows.
     for (int lane = 0; lane < graph.resource_count; lane++) {
         Resource* r = res_get(graph.resource_handles[lane]);
         if (!r)
@@ -11478,21 +12262,21 @@ static void ui_draw_render_graph_window() {
             if (has_prev) {
                 ImVec2 from(prev_max.x, prev_center.y);
                 ImVec2 to(r0.x, rc.y);
-                ui_render_graph_draw_bezier_arrow(dl, from, to, trace_col, 1.6f * scale, scale,
-                                                  ((lane & 1) ? -12.0f : 12.0f) * scale);
+                ui_render_graph_draw_ortho_arrow(dl, from, to, trace_col, 1.6f * scale, scale,
+                                                 ((lane & 1) ? -10.0f : 10.0f) * scale);
             }
             has_prev = true;
             prev_center = rc;
             prev_max = r1;
 
             if ((flags & UI_RENDER_GRAPH_READ) && !(flags & UI_RENDER_GRAPH_WRITE)) {
-                ImVec2 from(rc.x, r0.y);
-                ImVec2 to((c0.x + c1.x) * 0.5f, c1.y);
-                ui_render_graph_draw_bezier_arrow(dl, from, to, use_col, 1.2f * scale, scale, -8.0f * scale);
+                ImVec2 from(rc.x - res_node_w * 0.24f, r0.y);
+                ImVec2 to(c0.x + (c1.x - c0.x) * 0.36f, c1.y);
+                ui_render_graph_draw_ortho_arrow(dl, from, to, use_col, 1.2f * scale, scale, -7.0f * scale);
             } else {
-                ImVec2 from((c0.x + c1.x) * 0.5f, c1.y);
-                ImVec2 to(rc.x, r0.y);
-                ui_render_graph_draw_bezier_arrow(dl, from, to, use_col, 1.2f * scale, scale, 8.0f * scale);
+                ImVec2 from(c0.x + (c1.x - c0.x) * 0.64f, c1.y);
+                ImVec2 to(rc.x + res_node_w * 0.24f, r0.y);
+                ui_render_graph_draw_ortho_arrow(dl, from, to, use_col, 1.2f * scale, scale, 7.0f * scale);
             }
         }
     }
@@ -11524,7 +12308,9 @@ static void ui_draw_render_graph_window() {
         char type_buf[64] = {};
         snprintf(type_buf, sizeof(type_buf), "%s", cmd_type_str(c->type));
         float type_w = ImGui::CalcTextSize(type_buf).x;
-        dl->AddText(ImVec2(n1.x - type_w - 10.0f * scale, n0.y + 7.0f * scale), text_disabled_col, type_buf);
+        ImVec4 type_col_v = enabled ? ui_command_type_color(c->type) : ImVec4(0.46f, 0.47f, 0.50f, 1.0f);
+        dl->AddText(ImVec2(n1.x - type_w - 10.0f * scale, n0.y + 7.0f * scale),
+                    ImGui::GetColorU32(type_col_v), type_buf);
     }
 
     // Resource nodes.
@@ -11613,8 +12399,8 @@ static void ui_draw_render_graph_window() {
         }
     }
 
-    ImGui::SetCursorScreenPos(origin);
-    ImGui::Dummy(ImVec2(graph_w, graph_h));
+    ImGui::SetCursorScreenPos(canvas_pos);
+    ImGui::Dummy(canvas_size);
     ImGui::SetWindowFontScale(1.0f);
     ImGui::EndChild();
     ImGui::EndChild();
@@ -11710,8 +12496,11 @@ static void ui_top_bar() {
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.24f, 0.12f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.58f, 0.30f, 0.14f, 1.0f));
     }
-    if (ui_icon_button("##render_graph_button", UI_ICON_RENDER_GRAPH, ImVec2(ui_px(28.0f), 0.0f), "Render graph"))
+    if (ui_icon_button("##render_graph_button", UI_ICON_RENDER_GRAPH, ImVec2(ui_px(28.0f), 0.0f), "Render graph")) {
         s_render_graph_window_open = !s_render_graph_window_open;
+        if (s_render_graph_window_open)
+            s_render_graph_center_next = true;
+    }
     if (render_graph_was_open)
         ImGui::PopStyleColor(3);
     ImGui::SameLine();
@@ -11728,7 +12517,7 @@ static void ui_top_bar() {
     static float s_frame_ms_display = 0.0f;
     float frame_ms_raw = ImGui::GetIO().DeltaTime * 1000.0f;
     if (s_frame_ms_display_valid)
-        s_frame_ms_display += (frame_ms_raw - s_frame_ms_display) * 0.12f;
+        s_frame_ms_display += (frame_ms_raw - s_frame_ms_display) * 0.04f;
     else {
         s_frame_ms_display = frame_ms_raw;
         s_frame_ms_display_valid = true;
@@ -12027,14 +12816,6 @@ float ui_code_font_size() {
     return s_code_font_size;
 }
 
-void ui_set_shader_auto_save_compile(bool enabled) {
-    s_shader_editor_auto_save_compile = enabled;
-}
-
-bool ui_shader_auto_save_compile() {
-    return s_shader_editor_auto_save_compile;
-}
-
 void ui_init() {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -12067,6 +12848,7 @@ void ui_init() {
 // Draw one full editor frame on top of the already-rendered scene texture.
 void ui_draw() {
     ui_profile_begin_frame();
+    g_editor_mouse_capture = false;
 
     {
         UI_PROFILE_SCOPE(UI_PROFILE_FRAME_SETUP);

@@ -20,6 +20,7 @@ static Command s_cmd_move_new[MAX_COMMANDS] = {};
 static float   s_cmd_profile_ms[MAX_COMMANDS] = {};
 static float   s_frame_profile_ms = 0.0f;
 static float   s_total_frame_profile_ms = 0.0f;
+static float   s_shadow_profile_ms = 0.0f;
 static bool    s_gpu_profile_ready = false;
 static bool    s_gpu_total_ready = false;
 static bool    s_gpu_profile_display_valid = false;
@@ -323,6 +324,10 @@ float cmd_profile_frame_ms() {
     return s_frame_profile_ms;
 }
 
+float cmd_profile_shadow_ms() {
+    return s_shadow_profile_ms;
+}
+
 bool cmd_profile_ready() {
     return s_gpu_profile_ready;
 }
@@ -339,6 +344,7 @@ static void cmd_profile_reset_results() {
     memset(s_cmd_profile_ms, 0, sizeof(s_cmd_profile_ms));
     s_frame_profile_ms = 0.0f;
     s_total_frame_profile_ms = 0.0f;
+    s_shadow_profile_ms = 0.0f;
     s_gpu_profile_ready = false;
     s_gpu_total_ready = false;
     s_gpu_profile_display_valid = false;
@@ -380,15 +386,19 @@ static void cmd_gpu_collect_slot(GPUProfileFrameSlot& slot) {
     if (!cmd_gpu_get_data(slot.frame_end, &frame_end, sizeof(frame_end))) return;
 
     float cmd_ms[MAX_COMMANDS] = {};
+    float shadow_ms = 0.0f;
     for (int i = 0; i < slot.event_count; i++) {
         UINT64 ev_begin = 0;
         UINT64 ev_end = 0;
         if (!cmd_gpu_get_data(slot.events[i].begin, &ev_begin, sizeof(ev_begin))) return;
         if (!cmd_gpu_get_data(slot.events[i].end, &ev_end, sizeof(ev_end))) return;
         CmdHandle h = slot.events[i].handle;
-        if (h != INVALID_HANDLE && h <= MAX_COMMANDS && ev_end >= ev_begin && !disjoint.Disjoint && disjoint.Frequency > 0) {
+        if (ev_end >= ev_begin && !disjoint.Disjoint && disjoint.Frequency > 0) {
             double ms = (double)(ev_end - ev_begin) * 1000.0 / (double)disjoint.Frequency;
-            cmd_ms[h - 1] += (float)ms;
+            if (h == INVALID_HANDLE)
+                shadow_ms += (float)ms;
+            else if (h <= MAX_COMMANDS)
+                cmd_ms[h - 1] += (float)ms;
         }
     }
 
@@ -400,17 +410,19 @@ static void cmd_gpu_collect_slot(GPUProfileFrameSlot& slot) {
 
     float frame_ms = (float)((double)(frame_end - frame_begin) * 1000.0 / (double)disjoint.Frequency);
     float total_ms = (float)((double)(total_end - total_begin) * 1000.0 / (double)disjoint.Frequency);
-    const float a = 0.16f;
+    const float a = 0.04f;
     if (!s_gpu_profile_display_valid) {
         memcpy(s_cmd_profile_ms, cmd_ms, sizeof(s_cmd_profile_ms));
         s_frame_profile_ms = frame_ms;
         s_total_frame_profile_ms = total_ms;
+        s_shadow_profile_ms = shadow_ms;
         s_gpu_profile_display_valid = true;
     } else {
         for (int i = 0; i < MAX_COMMANDS; i++)
             s_cmd_profile_ms[i] += (cmd_ms[i] - s_cmd_profile_ms[i]) * a;
         s_frame_profile_ms += (frame_ms - s_frame_profile_ms) * a;
         s_total_frame_profile_ms += (total_ms - s_total_frame_profile_ms) * a;
+        s_shadow_profile_ms += (shadow_ms - s_shadow_profile_ms) * a;
     }
     s_gpu_profile_ready = true;
     s_gpu_total_ready = true;
@@ -480,6 +492,23 @@ static int cmd_gpu_begin_command(CmdHandle h) {
 
     int event_index = s_gpu_active_slot->event_count++;
     s_gpu_active_slot->events[event_index].handle = h;
+    g_dx.ctx->End(s_gpu_active_slot->events[event_index].begin);
+    return event_index;
+}
+
+static int cmd_gpu_begin_shadow_prepass() {
+    if (!g_profiler_enabled || !s_gpu_active_slot || !g_dx.ctx)
+        return -1;
+    if (s_gpu_active_slot->event_count >= GPU_PROFILE_MAX_EVENTS) {
+        if (!s_gpu_overflow_warned) {
+            log_warn("GPU profiler event pool exhausted; some commands will be skipped.");
+            s_gpu_overflow_warned = true;
+        }
+        return -1;
+    }
+
+    int event_index = s_gpu_active_slot->event_count++;
+    s_gpu_active_slot->events[event_index].handle = INVALID_HANDLE;
     g_dx.ctx->End(s_gpu_active_slot->events[event_index].begin);
     return event_index;
 }
@@ -754,6 +783,8 @@ static Resource* get_output_size_resource(ResHandle h) {
     return res_get(h);
 }
 
+static void set_cached_viewport(const D3D11_VIEWPORT& vp);
+
 static void set_viewport_for_target(ResHandle color, ResHandle depth, bool prefer_color) {
     int w = g_dx.scene_width;
     int hgt = g_dx.scene_height;
@@ -768,7 +799,7 @@ static void set_viewport_for_target(ResHandle color, ResHandle depth, bool prefe
     }
 
     D3D11_VIEWPORT vp = { 0, 0, (float)w, (float)hgt, 0, 1 };
-    g_dx.ctx->RSSetViewports(1, &vp);
+    set_cached_viewport(vp);
 }
 
 static void set_viewport_for_draw_outputs(const Command& c) {
@@ -802,7 +833,7 @@ static void set_viewport_for_draw_outputs(const Command& c) {
     }
 
     D3D11_VIEWPORT vp = { 0, 0, (float)w, (float)hgt, 0, 1 };
-    g_dx.ctx->RSSetViewports(1, &vp);
+    set_cached_viewport(vp);
 }
 
 static ID3D11DepthStencilView* get_draw_dsv(const Command& c) {
@@ -1010,6 +1041,8 @@ static UINT                     s_cached_vb_offset = 0;
 static ID3D11Buffer*            s_cached_ib = nullptr;
 static DXGI_FORMAT              s_cached_ib_format = DXGI_FORMAT_UNKNOWN;
 static UINT                     s_cached_ib_offset = 0;
+static D3D11_VIEWPORT           s_cached_viewport = {};
+static bool                     s_cached_viewport_valid = false;
 
 static void command_state_cache_reset() {
     s_cached_rs = nullptr;
@@ -1029,9 +1062,19 @@ static void command_state_cache_reset() {
     s_cached_ib = nullptr;
     s_cached_ib_format = DXGI_FORMAT_UNKNOWN;
     s_cached_ib_offset = 0;
+    s_cached_viewport = {};
+    s_cached_viewport_valid = false;
     memset(s_cached_vs_srv_valid, 0, sizeof(s_cached_vs_srv_valid));
     memset(s_cached_ps_srv_valid, 0, sizeof(s_cached_ps_srv_valid));
     memset(s_cached_cs_srv_valid, 0, sizeof(s_cached_cs_srv_valid));
+}
+
+static void set_cached_viewport(const D3D11_VIEWPORT& vp) {
+    if (s_cached_viewport_valid && memcmp(&s_cached_viewport, &vp, sizeof(vp)) == 0)
+        return;
+    g_dx.ctx->RSSetViewports(1, &vp);
+    s_cached_viewport = vp;
+    s_cached_viewport_valid = true;
 }
 
 static void set_cached_rasterizer_state(ID3D11RasterizerState* rs) {
@@ -1861,6 +1904,12 @@ static void execute_shadow_prepass() {
     dx_update_scene_cb(scene_cb_backup);
 }
 
+static void execute_profiled_shadow_prepass() {
+    int gpu_event = cmd_gpu_begin_shadow_prepass();
+    execute_shadow_prepass();
+    cmd_gpu_end_command(gpu_event);
+}
+
 static void clear_compute_bindings() {
     ID3D11ShaderResourceView* null_srvs[MAX_SRV_SLOTS] = {};
     ID3D11UnorderedAccessView* null_uavs[MAX_UAV_SLOTS] = {};
@@ -2059,9 +2108,12 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         if (!procedural && (!mesh || !mesh->vb))         break;
 
         if (c.shadow_receive && !shadow_prepass_done) {
-            execute_shadow_prepass();
+            cmd_gpu_end_command(gpu_event);
+            gpu_event = -1;
+            execute_profiled_shadow_prepass();
             shadow_prepass_done = true;
             command_state_cache_reset();
+            gpu_event = cmd_gpu_begin_command(h);
         }
 
         set_cached_vs_shader(shader->vs);
@@ -2134,9 +2186,12 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         if (!is_valid_indirect_draw_call(c, mesh, ibuf) || !shader || !shader->vs || !shader->ps) break;
         if (!procedural && (!mesh || !mesh->vb)) break;
         if (c.shadow_receive && !shadow_prepass_done) {
-            execute_shadow_prepass();
+            cmd_gpu_end_command(gpu_event);
+            gpu_event = -1;
+            execute_profiled_shadow_prepass();
             shadow_prepass_done = true;
             command_state_cache_reset();
+            gpu_event = cmd_gpu_begin_command(h);
         }
 
         set_cached_vs_shader(shader->vs);

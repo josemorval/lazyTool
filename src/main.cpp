@@ -775,6 +775,7 @@ static bool     g_scene_reset_execution_pending = true;
 static CmdHandle g_default_pixelize_cmd = INVALID_HANDLE;
 static bool     g_player_mode = false;
 static bool     g_player_exit_after_present = false;
+static HWND     g_main_hwnd = nullptr;
 // CPU profiler values are double-buffered. The UI is drawn before the
 // current frame timing is complete, so it must display the last completed
 // frame instead of the in-progress accumulators.
@@ -806,7 +807,7 @@ static void app_cpu_profile_reset_frame() {
 }
 
 static void app_cpu_profile_publish_frame() {
-    const float a = 0.12f;
+    const float a = 0.04f;
     if (!g_cpu_profile_display_valid) {
         g_cpu_frame_display_ms = g_cpu_frame_ms;
         g_cpu_scene_display_ms = g_cpu_scene_ms;
@@ -836,6 +837,34 @@ void app_set_editor_frame_cap_fps(float fps) {
     if (fps < 1.0f) fps = 0.0f;
     if (fps > 1000.0f) fps = 1000.0f;
     g_editor_frame_cap_fps = fps;
+}
+
+static void app_update_player_title_fps(float dt) {
+    if (!g_player_mode || !g_main_hwnd)
+        return;
+
+    if (!g_export_settings.show_fps_title) {
+        static bool title_reset = false;
+        if (!title_reset) {
+            SetWindowTextW(g_main_hwnd, L"lazyTool Player");
+            title_reset = true;
+        }
+        return;
+    }
+
+    static float accum = 0.0f;
+    static int frames = 0;
+    accum += dt;
+    frames++;
+    if (accum < 0.5f)
+        return;
+
+    float fps = accum > 0.0f ? (float)frames / accum : 0.0f;
+    wchar_t title[96] = {};
+    swprintf(title, 96, L"lazyTool Player - %.0f fps", fps);
+    SetWindowTextW(g_main_hwnd, title);
+    accum = 0.0f;
+    frames = 0;
 }
 
 static void app_rewind_scene_runtime_state() {
@@ -1013,6 +1042,16 @@ static bool imgui_keyboard_capture_requested() {
 #endif
 }
 
+static bool imgui_mouse_capture_requested() {
+#ifdef LAZYTOOL_PLAYER_ONLY
+    return false;
+#else
+    if (!ImGui::GetCurrentContext())
+        return false;
+    return g_editor_mouse_capture || ImGui::IsAnyItemActive();
+#endif
+}
+
 static void end_viewport_mouse_gesture(ViewportMouseGesture* gesture) {
     if (!gesture || !gesture->active)
         return;
@@ -1079,13 +1118,19 @@ static bool begin_or_update_viewport_mouse_gesture(
 // integrate deltas from the window center. That removes the screen-edge limit
 // without needing raw-input plumbing yet.
 static void update_camera_mouse() {
+    if (imgui_mouse_capture_requested()) {
+        end_viewport_mouse_gesture(&s_camera_mouse_gesture);
+        return;
+    }
+
     float dx = 0.0f;
     float dy = 0.0f;
     bool active = begin_or_update_viewport_mouse_gesture(
         &s_camera_mouse_gesture,
         key_down(VK_RBUTTON),
         g_scene_view_hovered || cursor_over_editor_scene_view(),
-        g_camera_controls.enabled && g_camera_controls.mouse_look && !imgui_keyboard_capture_requested(),
+        g_camera_controls.enabled && g_camera_controls.mouse_look &&
+            !imgui_keyboard_capture_requested() && !imgui_mouse_capture_requested(),
         &dx, &dy);
     if (!active)
         return;
@@ -1123,6 +1168,12 @@ static void update_camera_mouse() {
 
 
 static bool update_camera_orbit() {
+    if (imgui_mouse_capture_requested()) {
+        end_viewport_mouse_gesture(&s_camera_orbit_gesture);
+        s_camera_orbit_state.active = false;
+        return false;
+    }
+
     float dx = 0.0f;
     float dy = 0.0f;
     bool was_active = s_camera_orbit_gesture.active;
@@ -1131,7 +1182,7 @@ static bool update_camera_orbit() {
         &s_camera_orbit_gesture,
         trigger,
         g_scene_view_hovered || cursor_over_editor_scene_view(),
-        g_camera_controls.enabled && !imgui_keyboard_capture_requested(),
+        g_camera_controls.enabled && !imgui_keyboard_capture_requested() && !imgui_mouse_capture_requested(),
         &dx, &dy);
     if (!active) {
         s_camera_orbit_state.active = false;
@@ -1208,6 +1259,10 @@ static bool update_camera_orbit() {
 static bool update_dirlight_orbit() {
     if (g_player_mode && !g_export_settings.camera_light_controls_enabled)
         return false;
+    if (imgui_mouse_capture_requested()) {
+        end_viewport_mouse_gesture(&s_light_orbit_gesture);
+        return false;
+    }
 
     float dx = 0.0f;
     float dy = 0.0f;
@@ -1215,7 +1270,7 @@ static bool update_dirlight_orbit() {
         &s_light_orbit_gesture,
         key_down('L'),
         g_scene_view_hovered,
-        !imgui_keyboard_capture_requested(),
+        !imgui_keyboard_capture_requested() && !imgui_mouse_capture_requested(),
         &dx, &dy);
     if (!active)
         return false;
@@ -1267,7 +1322,7 @@ static void update_camera_keyboard(float dt) {
     if (!viewport_active)
         return;
 
-    if (imgui_keyboard_capture_requested())
+    if (imgui_keyboard_capture_requested() || imgui_mouse_capture_requested())
         return;
 
     static bool s_f_was_down = false;
@@ -1834,6 +1889,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         WS_OVERLAPPEDWINDOW,
         100, 100, 1600, 900,
         nullptr, nullptr, hInst, nullptr);
+    g_main_hwnd = hwnd;
     ShowWindow(hwnd, SW_SHOWMAXIMIZED);
     UpdateWindow(hwnd);
 
@@ -2094,6 +2150,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             if (g_cpu_other_ms < 0.0f) g_cpu_other_ms = 0.0f;
             app_cpu_profile_publish_frame();
         }
+        app_update_player_title_fps(editor_dt);
 #ifndef LAZYTOOL_PLAYER_ONLY
         if (!g_player_mode)
             editor_wait_for_frame_cap(cpu_frame_begin, freq);

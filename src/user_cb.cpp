@@ -792,6 +792,7 @@ void user_cb_delete_variable_references(const char* name) {
         return;
 
     timeline_delete_tracks_for_user_var(name);
+    timeline_delete_invalid_user_var_tracks();
 }
 
 void user_cb_rename_resource_references(ResHandle h, const char* old_name, const char* new_name) {
@@ -978,14 +979,15 @@ bool user_cb_set_scene_source(int idx, UserCBSourceKind kind, const char* target
 
 void user_cb_detach_resource(ResHandle h) {
     Resource* r = res_get(h);
-    for (int i = 0; i < g_user_cb_count; i++) {
+    for (int i = g_user_cb_count - 1; i >= 0; i--) {
         UserCBEntry* e = &g_user_cb_entries[i];
         if (e->source_kind != USER_CB_SOURCE_RESOURCE || e->source != h) continue;
 
-        if (r && r->type == e->type)
-            user_cb_copy_from_resource(e, r);
-        user_cb_clear_source(e);
-        log_info("UserCB: detached '%s' from deleted resource", e->name);
+        char removed_name[MAX_NAME] = {};
+        strncpy(removed_name, e->name, MAX_NAME - 1);
+        removed_name[MAX_NAME - 1] = '\0';
+        user_cb_remove(i);
+        log_info("UserCB: removed '%s' with deleted resource", removed_name);
     }
 
     for (int c_i = 0; c_i < MAX_COMMANDS; c_i++) {
@@ -1048,10 +1050,10 @@ void user_cb_remove(int idx) {
     char removed_name[MAX_NAME] = {};
     strncpy(removed_name, g_user_cb_entries[idx].name, MAX_NAME - 1);
     removed_name[MAX_NAME - 1] = '\0';
-    user_cb_delete_variable_references(removed_name);
     for (int i = idx; i < g_user_cb_count - 1; i++)
         g_user_cb_entries[i] = g_user_cb_entries[i + 1];
     memset(&g_user_cb_entries[--g_user_cb_count], 0, sizeof(UserCBEntry));
+    user_cb_delete_variable_references(removed_name);
     user_cb_bump_layout_revision();
     app_request_scene_render();
 }

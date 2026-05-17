@@ -3,6 +3,7 @@
 #include "project.h"
 #include <d3d11sdklayers.h>
 #include <d3dcompiler.h>
+#include <math.h>
 #include <stdlib.h>
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -58,12 +59,32 @@ VSOut VSMain(VSIn v) {
 #ifndef LAZYTOOL_PLAYER_ONLY
 struct EditorGridCBData {
     float color[4];
-    float viewport[4];
+    float fade[4];
+    float camera[4];
+};
+
+struct EditorGridVertex {
+    float pos[3];
+    float alpha;
 };
 
 static ID3D11VertexShader* s_editor_grid_vs = nullptr;
 static ID3D11PixelShader*  s_editor_grid_ps = nullptr;
+static ID3D11InputLayout*  s_editor_grid_il = nullptr;
 static ID3D11Buffer*       s_editor_grid_cb = nullptr;
+static ID3D11Buffer*       s_editor_grid_vb = nullptr;
+static const int           EDITOR_GRID_MAX_VERTS = 16384;
+
+struct EditorGridCache {
+    bool valid;
+    float eye[3];
+    float fade_start;
+    float fade_end;
+    bool distance_fade;
+    int vertex_count;
+};
+
+static EditorGridCache s_editor_grid_cache = {};
 #endif
 
 static SceneCBData   s_uploaded_scene_cb = {};
@@ -75,25 +96,6 @@ static bool          s_uploaded_object_cb_valid = false;
 
 #ifndef LAZYTOOL_PLAYER_ONLY
 static const char* s_editor_grid_vs_src = R"HLSL(
-struct VSOut {
-    float4 pos : SV_POSITION;
-};
-
-VSOut VSMain(uint vid : SV_VertexID) {
-    float2 pos;
-    if (vid == 0) pos = float2(-1.0, -1.0);
-    else if (vid == 1) pos = float2(-1.0, 3.0);
-    else pos = float2(3.0, -1.0);
-
-    VSOut o;
-    o.pos = float4(pos, 0.0, 1.0);
-    return o;
-}
-)HLSL";
-#endif
-
-#ifndef LAZYTOOL_PLAYER_ONLY
-static const char* s_editor_grid_ps_src = R"HLSL(
 cbuffer SceneCB : register(b0)
 {
     float4x4 ViewProj;
@@ -113,84 +115,54 @@ cbuffer SceneCB : register(b0)
     float4x4 ShadowCascadeViewProj[4];
 };
 
+struct VSIn {
+    float3 pos   : POSITION;
+    float  alpha : TEXCOORD0;
+};
+
+struct VSOut {
+    float4 pos   : SV_POSITION;
+    float  alpha : TEXCOORD0;
+    float3 world : TEXCOORD1;
+};
+
+VSOut VSMain(VSIn v) {
+    VSOut o;
+    o.pos = mul(ViewProj, float4(v.pos, 1.0));
+    o.alpha = v.alpha;
+    o.world = v.pos;
+    return o;
+}
+)HLSL";
+#endif
+
+#ifndef LAZYTOOL_PLAYER_ONLY
+static const char* s_editor_grid_ps_src = R"HLSL(
 cbuffer EditorGridCB : register(b1)
 {
     float4 GridColor;
-    float4 Viewport;
+    float4 GridFade;
+    float4 GridCamera;
 };
 
-Texture2D<float> DepthTex : register(t0);
+struct PSIn {
+    float4 pos   : SV_POSITION;
+    float  alpha : TEXCOORD0;
+    float3 world : TEXCOORD1;
+};
 
-float2 pixel_to_uv(float2 pixel)
+float4 PSMain(PSIn i) : SV_Target
 {
-    return (pixel + 0.5) / Viewport.xy;
-}
-
-float3 reconstruct_world_far(float2 uv)
-{
-    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    float4 world = mul(InvViewProj, float4(ndc, 1.0, 1.0));
-    return world.xyz / max(abs(world.w), 1e-5);
-}
-
-float grid_line_mask(float2 world_xz, float cell_size)
-{
-    float2 coord = world_xz / max(cell_size, 1e-5);
-    float2 grid = abs(frac(coord - 0.5) - 0.5) / max(fwidth(coord), 1e-5);
-    return 1.0 - saturate(min(grid.x, grid.y));
-}
-
-float4 PSMain(float4 sv_pos : SV_POSITION) : SV_Target
-{
-    int2 pixel = int2(sv_pos.xy);
-    if (pixel.x < 0 || pixel.y < 0 || pixel.x >= (int)Viewport.x || pixel.y >= (int)Viewport.y)
-        return 0.0.xxxx;
-
-    float2 uv = pixel_to_uv(pixel);
-    float3 eye = CamPos.xyz;
-    float3 world_far = reconstruct_world_far(uv);
-    float3 ray_dir = normalize(world_far - eye);
-
-    if (abs(ray_dir.y) < 1e-4)
-        return 0.0.xxxx;
-
-    float hit_t = -eye.y / ray_dir.y;
-    if (hit_t <= 0.0)
-        return 0.0.xxxx;
-
-    float3 world_pos = eye + ray_dir * hit_t;
-    float4 clip = mul(ViewProj, float4(world_pos, 1.0));
-    if (clip.w <= 1e-5)
-        return 0.0.xxxx;
-
-    float grid_depth = clip.z / clip.w;
-    if (grid_depth < 0.0 || grid_depth > 1.0)
-        return 0.0.xxxx;
-
-    float scene_depth = DepthTex.Load(int3(pixel, 0));
-    if (scene_depth < 0.99999 && scene_depth + 2e-4 < grid_depth)
-        return 0.0.xxxx;
-
-    float focus_dist = abs(eye.y) / max(abs(CamDir.y), 0.15);
-    float scaled_focus = max(focus_dist * 0.2, 1e-4);
-    float level = floor(log10(scaled_focus));
-    float transition = saturate(log10(scaled_focus) - level);
-    float cell0 = pow(10.0, level);
-    float cell1 = cell0 * 10.0;
-    float cell2 = cell1 * 10.0;
-
-    float pair_a = saturate(
-        grid_line_mask(world_pos.xz, cell0) * (GridColor.a * 0.32) +
-        grid_line_mask(world_pos.xz, cell1) * GridColor.a);
-    float pair_b = saturate(
-        grid_line_mask(world_pos.xz, cell1) * (GridColor.a * 0.32) +
-        grid_line_mask(world_pos.xz, cell2) * GridColor.a);
-    float alpha = lerp(pair_a, pair_b, transition);
-    alpha *= pow(saturate(abs(ray_dir.y)), 0.35);
+    float alpha = saturate(GridColor.a * i.alpha);
+    if (GridFade.z > 0.5)
+    {
+        float dist_to_camera = distance(i.world, GridCamera.xyz);
+        float fade = 1.0 - saturate((dist_to_camera - GridFade.x) / max(GridFade.y - GridFade.x, 1e-4));
+        alpha *= fade;
+    }
     if (alpha <= 1e-4)
         return 0.0.xxxx;
-
-    return float4(GridColor.rgb, saturate(alpha));
+    return float4(GridColor.rgb, alpha);
 }
 )HLSL";
 #endif
@@ -217,7 +189,10 @@ static void safe_release_info_queue() {
 
 static void safe_release_editor_grid() {
 #ifndef LAZYTOOL_PLAYER_ONLY
+    s_editor_grid_cache = {};
+    if (s_editor_grid_vb) { s_editor_grid_vb->Release(); s_editor_grid_vb = nullptr; }
     if (s_editor_grid_cb) { s_editor_grid_cb->Release(); s_editor_grid_cb = nullptr; }
+    if (s_editor_grid_il) { s_editor_grid_il->Release(); s_editor_grid_il = nullptr; }
     if (s_editor_grid_ps) { s_editor_grid_ps->Release(); s_editor_grid_ps = nullptr; }
     if (s_editor_grid_vs) { s_editor_grid_vs->Release(); s_editor_grid_vs = nullptr; }
 #endif
@@ -370,9 +345,17 @@ static bool create_editor_grid_shader() {
     hr = g_dx.dev->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), nullptr, &s_editor_grid_vs);
     if (SUCCEEDED(hr))
         hr = g_dx.dev->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), nullptr, &s_editor_grid_ps);
+    if (SUCCEEDED(hr)) {
+        D3D11_INPUT_ELEMENT_DESC grid_ied[] = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD", 0, DXGI_FORMAT_R32_FLOAT,       0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        };
+        hr = g_dx.dev->CreateInputLayout(grid_ied, 2,
+            vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), &s_editor_grid_il);
+    }
     vs_blob->Release();
     ps_blob->Release();
-    if (FAILED(hr) || !s_editor_grid_vs || !s_editor_grid_ps) {
+    if (FAILED(hr) || !s_editor_grid_vs || !s_editor_grid_ps || !s_editor_grid_il) {
         log_error("Editor grid shader create failed: 0x%08X", hr);
         safe_release_editor_grid();
         return false;
@@ -386,6 +369,18 @@ static bool create_editor_grid_shader() {
     hr = g_dx.dev->CreateBuffer(&cbd, nullptr, &s_editor_grid_cb);
     if (FAILED(hr) || !s_editor_grid_cb) {
         log_error("Editor grid cbuffer create failed: 0x%08X", hr);
+        safe_release_editor_grid();
+        return false;
+    }
+
+    D3D11_BUFFER_DESC vbd = {};
+    vbd.ByteWidth = sizeof(EditorGridVertex) * EDITOR_GRID_MAX_VERTS;
+    vbd.Usage = D3D11_USAGE_DYNAMIC;
+    vbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    vbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = g_dx.dev->CreateBuffer(&vbd, nullptr, &s_editor_grid_vb);
+    if (FAILED(hr) || !s_editor_grid_vb) {
+        log_error("Editor grid vertex buffer create failed: 0x%08X", hr);
         safe_release_editor_grid();
         return false;
     }
@@ -749,13 +744,135 @@ void dx_end_scene() {
     g_dx.ctx->PSSetShaderResources(0, 8, null_srvs);
 }
 
+#ifndef LAZYTOOL_PLAYER_ONLY
+static void editor_grid_push_vertex(EditorGridVertex* verts, int* count,
+                                    float x, float z, float alpha) {
+    if (!verts || !count || *count >= EDITOR_GRID_MAX_VERTS)
+        return;
+    EditorGridVertex& v = verts[(*count)++];
+    v.pos[0] = x;
+    v.pos[1] = 0.0f;
+    v.pos[2] = z;
+    v.alpha = alpha;
+}
+
+static void editor_grid_push_line(EditorGridVertex* verts, int* count,
+                                  float x0, float z0, float x1, float z1,
+                                  float alpha) {
+    if (!verts || !count || *count + 2 > EDITOR_GRID_MAX_VERTS || alpha <= 0.001f)
+        return;
+    editor_grid_push_vertex(verts, count, x0, z0, alpha);
+    editor_grid_push_vertex(verts, count, x1, z1, alpha);
+}
+
+static void editor_grid_push_level(EditorGridVertex* verts, int* count,
+                                   float cell, float alpha, float center_x, float center_z,
+                                   float radius) {
+    if (cell <= 0.00001f || alpha <= 0.001f)
+        return;
+
+    int half_lines = (int)ceilf(radius / cell) + 2;
+    const int max_half_lines = 768;
+    if (half_lines > max_half_lines)
+        return;
+    if (half_lines < 2)
+        half_lines = 2;
+
+    float base_x = floorf(center_x / cell) * cell;
+    float base_z = floorf(center_z / cell) * cell;
+    float span = cell * (float)half_lines;
+    float min_x = base_x - span;
+    float max_x = base_x + span;
+    float min_z = base_z - span;
+    float max_z = base_z + span;
+
+    for (int i = -half_lines; i <= half_lines; i++) {
+        float x = base_x + (float)i * cell;
+        float z = base_z + (float)i * cell;
+        float axis_boost_x = fabsf(x) < cell * 0.001f ? 1.65f : 1.0f;
+        float axis_boost_z = fabsf(z) < cell * 0.001f ? 1.65f : 1.0f;
+        editor_grid_push_line(verts, count, x, min_z, x, max_z, alpha * axis_boost_x);
+        editor_grid_push_line(verts, count, min_x, z, max_x, z, alpha * axis_boost_z);
+    }
+}
+
+static int editor_grid_build_vertices(EditorGridVertex* verts) {
+    if (!verts)
+        return 0;
+
+    float eye_x = g_dx.scene_cb_data.cam_pos[0];
+    float eye_y = g_dx.scene_cb_data.cam_pos[1];
+    float eye_z = g_dx.scene_cb_data.cam_pos[2];
+    float scaled_focus = fmaxf(fabsf(eye_y) * 0.2f, 0.0001f);
+    float radius = g_dx.scene_grid_distance_fade ? g_dx.scene_grid_fade_end : 360.0f;
+    if (radius < 16.0f)
+        radius = 16.0f;
+    const float grid_ratio = 3.0f;
+    float log_focus = logf(scaled_focus) / logf(grid_ratio);
+    float level = floorf(log_focus);
+    float transition = log_focus - level;
+    float cell0 = powf(grid_ratio, level);
+    float cell1 = cell0 * grid_ratio;
+    float cell2 = cell1 * grid_ratio;
+
+    float alpha0 = (1.0f - transition) * 0.24f;
+    float alpha1 = 1.0f - transition * 0.64f;
+    float alpha2 = transition;
+
+    int count = 0;
+    editor_grid_push_level(verts, &count, cell0, alpha0, eye_x, eye_z, radius);
+    editor_grid_push_level(verts, &count, cell1, alpha1, eye_x, eye_z, radius);
+    editor_grid_push_level(verts, &count, cell2, alpha2, eye_x, eye_z, radius);
+    return count;
+}
+
+static bool editor_grid_cache_matches() {
+    if (!s_editor_grid_cache.valid)
+        return false;
+
+    const float eps = 0.0001f;
+    if (fabsf(s_editor_grid_cache.eye[0] - g_dx.scene_cb_data.cam_pos[0]) > eps) return false;
+    if (fabsf(s_editor_grid_cache.eye[1] - g_dx.scene_cb_data.cam_pos[1]) > eps) return false;
+    if (fabsf(s_editor_grid_cache.eye[2] - g_dx.scene_cb_data.cam_pos[2]) > eps) return false;
+    if (fabsf(s_editor_grid_cache.fade_start - g_dx.scene_grid_fade_start) > eps) return false;
+    if (fabsf(s_editor_grid_cache.fade_end - g_dx.scene_grid_fade_end) > eps) return false;
+    if (s_editor_grid_cache.distance_fade != g_dx.scene_grid_distance_fade) return false;
+    return true;
+}
+
+static void editor_grid_store_cache(int vertex_count) {
+    s_editor_grid_cache.valid = true;
+    s_editor_grid_cache.eye[0] = g_dx.scene_cb_data.cam_pos[0];
+    s_editor_grid_cache.eye[1] = g_dx.scene_cb_data.cam_pos[1];
+    s_editor_grid_cache.eye[2] = g_dx.scene_cb_data.cam_pos[2];
+    s_editor_grid_cache.fade_start = g_dx.scene_grid_fade_start;
+    s_editor_grid_cache.fade_end = g_dx.scene_grid_fade_end;
+    s_editor_grid_cache.distance_fade = g_dx.scene_grid_distance_fade;
+    s_editor_grid_cache.vertex_count = vertex_count;
+}
+#endif
+
 void dx_render_scene_grid_overlay() {
 #ifdef LAZYTOOL_PLAYER_ONLY
     return;
 #else
-    if (!g_dx.scene_grid_enabled || !g_dx.ctx || !g_dx.scene_rtv || !g_dx.depth_srv ||
-        !g_dx.scene_cb || !s_editor_grid_vs || !s_editor_grid_ps || !s_editor_grid_cb ||
+    if (!g_dx.scene_grid_enabled || !g_dx.ctx || !g_dx.scene_rtv ||
+        !g_dx.scene_cb || !s_editor_grid_vs || !s_editor_grid_ps || !s_editor_grid_il ||
+        !s_editor_grid_cb || !s_editor_grid_vb ||
         g_dx.scene_width <= 0 || g_dx.scene_height <= 0)
+        return;
+
+    int vertex_count = s_editor_grid_cache.vertex_count;
+    if (!editor_grid_cache_matches()) {
+        D3D11_MAPPED_SUBRESOURCE vms = {};
+        HRESULT hr = g_dx.ctx->Map(s_editor_grid_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &vms);
+        if (FAILED(hr) || !vms.pData)
+            return;
+        vertex_count = editor_grid_build_vertices((EditorGridVertex*)vms.pData);
+        g_dx.ctx->Unmap(s_editor_grid_vb, 0);
+        editor_grid_store_cache(vertex_count);
+    }
+    if (vertex_count <= 0)
         return;
 
     D3D11_MAPPED_SUBRESOURCE ms = {};
@@ -765,18 +882,22 @@ void dx_render_scene_grid_overlay() {
 
     EditorGridCBData* cbd = (EditorGridCBData*)ms.pData;
     memcpy(cbd->color, g_dx.scene_grid_color, sizeof(cbd->color));
-    cbd->viewport[0] = (float)g_dx.scene_width;
-    cbd->viewport[1] = (float)g_dx.scene_height;
-    cbd->viewport[2] = g_dx.scene_width > 0 ? (1.0f / (float)g_dx.scene_width) : 0.0f;
-    cbd->viewport[3] = g_dx.scene_height > 0 ? (1.0f / (float)g_dx.scene_height) : 0.0f;
+    cbd->fade[0] = g_dx.scene_grid_fade_start;
+    cbd->fade[1] = g_dx.scene_grid_fade_end;
+    cbd->fade[2] = g_dx.scene_grid_distance_fade ? 1.0f : 0.0f;
+    cbd->fade[3] = 0.0f;
+    cbd->camera[0] = g_dx.scene_cb_data.cam_pos[0];
+    cbd->camera[1] = g_dx.scene_cb_data.cam_pos[1];
+    cbd->camera[2] = g_dx.scene_cb_data.cam_pos[2];
+    cbd->camera[3] = 1.0f;
     g_dx.ctx->Unmap(s_editor_grid_cb, 0);
 
     D3D11_VIEWPORT vp = { 0, 0, (float)g_dx.scene_width, (float)g_dx.scene_height, 0, 1 };
     float blend_factor[4] = {};
     ID3D11RenderTargetView* scene_rtv = g_dx.scene_rtv;
-    ID3D11ShaderResourceView* depth_srv = g_dx.depth_srv;
-    ID3D11ShaderResourceView* null_srv = nullptr;
     ID3D11Buffer* ps_cbs[] = { g_dx.scene_cb, s_editor_grid_cb };
+    UINT stride = sizeof(EditorGridVertex);
+    UINT offset = 0;
 
     g_dx.ctx->OMSetRenderTargets(1, &scene_rtv, nullptr);
     g_dx.ctx->RSSetViewports(1, &vp);
@@ -784,17 +905,20 @@ void dx_render_scene_grid_overlay() {
     g_dx.ctx->OMSetDepthStencilState(g_dx.dss_depth_off, 0);
     g_dx.ctx->OMSetBlendState(g_dx.bs_alpha, blend_factor, 0xFFFFFFFF);
 
-    g_dx.ctx->IASetInputLayout(nullptr);
-    g_dx.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_dx.ctx->IASetInputLayout(s_editor_grid_il);
+    g_dx.ctx->IASetVertexBuffers(0, 1, &s_editor_grid_vb, &stride, &offset);
+    g_dx.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
     g_dx.ctx->VSSetShader(s_editor_grid_vs, nullptr, 0);
     g_dx.ctx->PSSetShader(s_editor_grid_ps, nullptr, 0);
     g_dx.ctx->GSSetShader(nullptr, nullptr, 0);
     g_dx.ctx->HSSetShader(nullptr, nullptr, 0);
     g_dx.ctx->DSSetShader(nullptr, nullptr, 0);
+    g_dx.ctx->VSSetConstantBuffers(0, 1, &g_dx.scene_cb);
     g_dx.ctx->PSSetConstantBuffers(0, 2, ps_cbs);
-    g_dx.ctx->PSSetShaderResources(0, 1, &depth_srv);
-    g_dx.ctx->Draw(3, 0);
-    g_dx.ctx->PSSetShaderResources(0, 1, &null_srv);
+    g_dx.ctx->Draw(vertex_count, 0);
+    ID3D11Buffer* null_vb = nullptr;
+    UINT null_stride = 0, null_offset = 0;
+    g_dx.ctx->IASetVertexBuffers(0, 1, &null_vb, &null_stride, &null_offset);
     g_dx.ctx->VSSetShader(nullptr, nullptr, 0);
     g_dx.ctx->PSSetShader(nullptr, nullptr, 0);
 #endif
