@@ -31,7 +31,7 @@ It does not try to hide the technical side. The goal is that you can open the to
 
 lazyTool can be useful if you are learning real-time rendering, prototyping visual effects, exploring procedural graphics, or working on compact executable demos.
 
-You do not need to understand the entire engine to start. A good first approach is to open a simple scene, select commands and resources, change values, and watch what happens in the viewport.
+You do not need to understand the entire engine to start. A good first approach is opening a simple scene, select commands and resources, change values, and watch what happens in the viewport.
 
 ## Interface Overview
 
