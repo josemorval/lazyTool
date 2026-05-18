@@ -12,12 +12,15 @@
 //   - draw_source procedural commands; the shader can synthesize positions from SV_VertexID.
 //   - render_texture resources; these become internal D3D11 render targets/SRVs.
 //   - scene_color, scene_depth and shadow_map builtins.
+//   - simple direct compute dispatches over internal render targets or structured
+//     buffers.
 //   - command parameters, user constant buffer values, timeline tracks and shadows.
 //
 // Explicitly not packed:
 //   - mesh_gltf / mesh files with a path.
 //   - texture2d files with a path.
 //   - arbitrary external binary buffers.
+//   - indirect compute/draw pipelines and OM UAV draw bindings.
 //
 // The code below favors being easy to inspect and extend over aggressive source
 // golfing. The generated .exe can be passed through UPX afterwards, so the C source
@@ -504,6 +507,11 @@ struct CommandDef {
     std::string clear_depth_source;
     int vertex_count = 3;
     int instance_count = 1;
+    int thread_x = 1;
+    int thread_y = 1;
+    int thread_z = 1;
+    bool compute_on_reset = false;
+    std::string dispatch_from;
     int repeat_count = 1;
     std::vector<SlotRef> textures;
     std::vector<SlotRef> srvs;
@@ -665,6 +673,11 @@ static Project parse_lt(const std::string& lt_path) {
                 r.ival[6] = toki(t,9,0); // UAV
             } else if (kind == "structured_buffer") {
                 r.kind = RK_BUFFER; r.name = t[2];
+                r.ival[0] = toki(t,3,1); // element stride in bytes
+                r.ival[1] = toki(t,4,1); // element count
+                r.ival[2] = toki(t,5,1); // SRV
+                r.ival[3] = toki(t,6,1); // UAV
+                r.ival[4] = toki(t,7,0); // indirect args buffer
             }
             if (!r.name.empty()) p.resources.push_back(r);
         } else if (tag == "user_var" && t.size() >= 4) {
@@ -728,6 +741,14 @@ static Project parse_lt(const std::string& lt_path) {
                 cur->vertex_count = toki(t,1,3);
             } else if (tag == "instance" && t.size() >= 2) {
                 cur->instance_count = toki(t,1,1);
+            } else if (tag == "threads" && t.size() >= 4) {
+                cur->thread_x = toki(t,1,1);
+                cur->thread_y = toki(t,2,1);
+                cur->thread_z = toki(t,3,1);
+            } else if (tag == "compute_on_reset" && t.size() >= 2) {
+                cur->compute_on_reset = toki(t,1,0) != 0;
+            } else if (tag == "dispatch_from" && t.size() >= 2) {
+                cur->dispatch_from = ref_name(t[1]);
             } else if (tag == "repeat" && t.size() >= 2) {
                 cur->repeat_count = std::max(1, toki(t,1,1));
             } else if (tag == "parent" && t.size() >= 2) {
@@ -749,10 +770,6 @@ static Project parse_lt(const std::string& lt_path) {
                 for (int i = 0; i < n; i++) {
                     size_t b = (size_t)2 + (size_t)i * 2;
                     if (b + 1 < t.size()) cur->uavs.push_back({ref_name(t[b]), toki(t,b+1,0)});
-                }
-                if (n > 0) {
-                    cur->unsupported_bindings = true;
-                    warnf("%s: UAV bindings are only exported for future compute/OM paths, not this VS/PS 64k player", cur->name.c_str());
                 }
             } else if (tag == "param" && t.size() >= 5) {
                 ParamDef pd;
@@ -854,6 +871,13 @@ static int rt_resource_index(const Project& p, const std::string& name, const st
     return -1;
 }
 
+static int buffer_resource_index(const Project& p, const std::string& name, const std::vector<int>& buffer_res_indices) {
+    int ri = find_res(p, name);
+    if (ri < 0) return -1;
+    for (size_t i = 0; i < buffer_res_indices.size(); i++) if (buffer_res_indices[i] == ri) return (int)i;
+    return -1;
+}
+
 static bool builtin_scene_color(const std::string& n) { return n == "scene_color" || n == "builtin_scene_color"; }
 static bool builtin_scene_depth(const std::string& n) { return n == "scene_depth" || n == "builtin_scene_depth"; }
 static bool builtin_shadow_map(const std::string& n) { return n == "shadow_map" || n == "builtin_shadow_map"; }
@@ -878,6 +902,20 @@ static int texture_source_code(const Project& p, const std::string& name, const 
     if (name.empty() || name == "-") return -1;
     if (builtin_scene_depth(name)) return -2;
     if (builtin_shadow_map(name)) return -3;
+    return rt_resource_index(p, name, rt_res_indices);
+}
+
+static int srv_source_code(const Project& p, const std::string& name, const std::vector<int>& rt_res_indices, const std::vector<int>& buffer_res_indices) {
+    int code = texture_source_code(p, name, rt_res_indices);
+    if (code != -1) return code;
+    int bi = buffer_resource_index(p, name, buffer_res_indices);
+    return bi >= 0 ? 1000 + bi : -1;
+}
+
+static int dispatch_source_code(const Project& p, const std::string& name, const std::vector<int>& rt_res_indices, const std::vector<int>& buffer_res_indices) {
+    if (name.empty() || name == "-") return -1;
+    int bi = buffer_resource_index(p, name, buffer_res_indices);
+    if (bi >= 0) return 1000 + bi;
     return rt_resource_index(p, name, rt_res_indices);
 }
 
@@ -1213,12 +1251,14 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     std::vector<int> shader_res_indices;
     std::vector<std::string> shader_sources;
     std::vector<std::string> shader_names;
+    std::vector<int> shader_is_cs;
     std::vector<size_t> shader_raw_sizes;
     std::vector<size_t> shader_min_sizes;
     std::vector<int> rt_res_indices;
+    std::vector<int> buffer_res_indices;
     for (size_t i = 0; i < p.resources.size(); i++) {
         const ResourceDef& r = p.resources[i];
-        if (r.kind == RK_SHADER_VSPS) {
+        if (r.kind == RK_SHADER_VSPS || r.kind == RK_SHADER_CS) {
             std::string sp = find_file_for_path(r.path, roots);
             if (sp.empty()) die("cannot find shader '%s' for resource '%s'", r.path.c_str(), r.name.c_str());
             std::string raw_src = expand_hlsl_includes(sp, roots);
@@ -1229,19 +1269,20 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
             std::string min_src = LT64K_MINIFY_HLSL ? minify_hlsl_for_64k(raw_src) : raw_src;
             shader_res_indices.push_back((int)i);
             shader_names.push_back(r.name);
+            shader_is_cs.push_back(r.kind == RK_SHADER_CS ? 1 : 0);
             shader_raw_sizes.push_back(raw_src.size());
             shader_min_sizes.push_back(min_src.size());
             shader_sources.push_back(min_src);
         } else if (r.kind == RK_RT) {
             rt_res_indices.push_back((int)i);
+        } else if (r.kind == RK_BUFFER) {
+            buffer_res_indices.push_back((int)i);
         } else if (r.kind == RK_RT3D) {
             warnf("resource '%s': render_texture3d is parsed, but the current 64k VS/PS player only instantiates 2D render targets", r.name.c_str());
         } else if (r.kind == RK_TEXTURE || r.kind == RK_MESH_FILE || r.kind == RK_GAUSSIAN_SPLAT) {
             warnf("resource '%s' is not part of the 64k path (%s)", r.name.c_str(), r.path.c_str());
         }
     }
-    if (shader_sources.empty()) die("no shader_vsps resources found");
-
     bool project_uses_shadows = false;
     for (size_t i = 0; i < p.commands.size(); i++) {
         if (p.commands[i].shadow_cast) { project_uses_shadows = true; break; }
@@ -1254,6 +1295,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
         builtin_shadow_shader_index = (int)shader_sources.size();
         shader_res_indices.push_back(-1);
         shader_names.push_back("__lt_builtin_primitive_shadow");
+        shader_is_cs.push_back(0);
         shader_raw_sizes.push_back(sh.size());
         shader_min_sizes.push_back(sh.size());
         shader_sources.push_back(sh);
@@ -1299,20 +1341,48 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
             }
         }
         for (size_t t = 0; t < c.srvs.size(); t++) {
-            int code = texture_source_code(p, c.srvs[t].name, rt_res_indices);
+            int code = srv_source_code(p, c.srvs[t].name, rt_res_indices, buffer_res_indices);
             if (code == -1 && !c.srvs[t].name.empty() && c.srvs[t].name != "-") {
-                warnf("skipping draw '%s': SRV '%s' is not an internal render target/builtin 64k source", c.name.c_str(), c.srvs[t].name.c_str());
+                warnf("skipping draw '%s': SRV '%s' is not an internal render target/structured buffer/builtin 64k source", c.name.c_str(), c.srvs[t].name.c_str());
                 return false;
             }
         }
         return true;
     };
 
+    auto compute_refs_ok = [&](const CommandDef& c) -> bool {
+        for (size_t t = 0; t < c.srvs.size(); t++) {
+            int code = srv_source_code(p, c.srvs[t].name, rt_res_indices, buffer_res_indices);
+            if (code == -1 && !c.srvs[t].name.empty() && c.srvs[t].name != "-") {
+                warnf("skipping compute '%s': SRV '%s' is not an internal render target/structured buffer/builtin 64k source", c.name.c_str(), c.srvs[t].name.c_str());
+                return false;
+            }
+        }
+        for (size_t t = 0; t < c.uavs.size(); t++) {
+            int code = srv_source_code(p, c.uavs[t].name, rt_res_indices, buffer_res_indices);
+            if (code == -1 && !c.uavs[t].name.empty() && c.uavs[t].name != "-") {
+                warnf("skipping compute '%s': UAV '%s' is not an internal render target/structured buffer 64k source", c.name.c_str(), c.uavs[t].name.c_str());
+                return false;
+            }
+        }
+        if (!c.dispatch_from.empty() && dispatch_source_code(p, c.dispatch_from, rt_res_indices, buffer_res_indices) == -1) {
+            warnf("skipping compute '%s': dispatch_from '%s' is not an internal render target/structured buffer 64k source", c.name.c_str(), c.dispatch_from.c_str());
+            return false;
+        }
+        return true;
+    };
+
     auto export_one = [&](CommandDef c) -> bool {
         if (c.type == CT_CLEAR) { out_cmds.push_back(c); return true; }
-        if (c.type == CT_DISPATCH) { warnf("skipping compute '%s': compute/UAV export is not in this tiny VS/PS player yet", c.name.c_str()); return false; }
+        if (c.type == CT_DISPATCH) {
+            int sh = shader_resource_index(p, c.shader, shader_res_indices);
+            if (sh < 0 || !shader_is_cs[(size_t)sh]) { warnf("skipping compute '%s': compute shader not found/supported", c.name.c_str()); return false; }
+            if (!compute_refs_ok(c)) return false;
+            out_cmds.push_back(c);
+            return true;
+        }
         if (!(c.type == CT_DRAW || c.type == CT_DRAW_INSTANCED)) return false;
-        if (c.unsupported_bindings) { warnf("skipping draw '%s': UAV/unsupported bindings are not exported by this VS/PS 64k player", c.name.c_str()); return false; }
+        if (!c.uavs.empty() || c.unsupported_bindings) { warnf("skipping draw '%s': OM UAV bindings are not exported by this 64k player", c.name.c_str()); return false; }
         if (!texture_refs_ok(c)) return false;
         int sh = shader_resource_index(p, c.shader, shader_res_indices);
         if (sh < 0) { warnf("skipping draw '%s': shader not found/supported", c.name.c_str()); return false; }
@@ -1396,6 +1466,109 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     std::map<std::string,int> cmd_out_index;
     for (size_t i = 0; i < out_cmds.size(); i++) cmd_out_index[out_cmds[i].name] = (int)i;
 
+    bool uses_draw = false;
+    bool uses_compute = false;
+    bool uses_shadows = false;
+    bool uses_depth = false;
+    bool uses_primitives = false;
+    bool uses_structured_buffers = false;
+    bool uses_rt_uavs = false;
+    for (size_t i = 0; i < out_cmds.size(); i++) {
+        const CommandDef& c = out_cmds[i];
+        if (c.type == CT_DRAW || c.type == CT_DRAW_INSTANCED) {
+            uses_draw = true;
+            if (c.mesh_kind > 0) uses_primitives = true;
+            if (depth_target_code(c.depth) == -2) uses_depth = true;
+            if (c.shadow_cast || c.shadow_receive) uses_shadows = true;
+        } else if (c.type == CT_DISPATCH) {
+            uses_compute = true;
+        } else if (c.type == CT_CLEAR) {
+            if (depth_target_code(c.depth) == -2 && c.clear_depth) uses_depth = true;
+        }
+    }
+    if (uses_shadows) uses_depth = true;
+    bool uses_shaders = uses_draw || uses_compute || uses_shadows;
+    bool clear_only = !uses_draw && !uses_compute;
+
+    // Specialize embedded resources to the exported command list.  A 64k build
+    // should not carry unused shaders or buffers just because they exist in the
+    // editor project.
+    if (uses_shaders) {
+        std::vector<char> used_shader(shader_sources.size(), 0);
+        int old_builtin_shadow_shader_index = builtin_shadow_shader_index;
+        for (size_t i = 0; i < out_cmds.size(); i++) {
+            const CommandDef& c = out_cmds[i];
+            if (c.type == CT_DRAW || c.type == CT_DRAW_INSTANCED || c.type == CT_DISPATCH) {
+                int si = shader_resource_index(p, c.shader, shader_res_indices);
+                if (si >= 0) used_shader[(size_t)si] = 1;
+            }
+            if (c.shadow_cast) {
+                if (c.builtin_shadow && old_builtin_shadow_shader_index >= 0)
+                    used_shader[(size_t)old_builtin_shadow_shader_index] = 1;
+                else {
+                    int si = shader_resource_index(p, c.shadow_shader, shader_res_indices);
+                    if (si >= 0) used_shader[(size_t)si] = 1;
+                }
+            }
+        }
+
+        std::vector<int> new_shader_res_indices;
+        std::vector<std::string> new_shader_sources;
+        std::vector<std::string> new_shader_names;
+        std::vector<int> new_shader_is_cs;
+        std::vector<size_t> new_shader_raw_sizes;
+        std::vector<size_t> new_shader_min_sizes;
+        builtin_shadow_shader_index = -1;
+        for (size_t i = 0; i < shader_sources.size(); i++) {
+            if (!used_shader[i]) continue;
+            if ((int)i == old_builtin_shadow_shader_index)
+                builtin_shadow_shader_index = (int)new_shader_sources.size();
+            new_shader_res_indices.push_back(shader_res_indices[i]);
+            new_shader_sources.push_back(shader_sources[i]);
+            new_shader_names.push_back(shader_names[i]);
+            new_shader_is_cs.push_back(shader_is_cs[i]);
+            new_shader_raw_sizes.push_back(shader_raw_sizes[i]);
+            new_shader_min_sizes.push_back(shader_min_sizes[i]);
+        }
+        shader_res_indices.swap(new_shader_res_indices);
+        shader_sources.swap(new_shader_sources);
+        shader_names.swap(new_shader_names);
+        shader_is_cs.swap(new_shader_is_cs);
+        shader_raw_sizes.swap(new_shader_raw_sizes);
+        shader_min_sizes.swap(new_shader_min_sizes);
+    } else {
+        shader_res_indices.clear();
+        shader_sources.clear();
+        shader_names.clear();
+        shader_is_cs.clear();
+        shader_raw_sizes.clear();
+        shader_min_sizes.clear();
+        builtin_shadow_shader_index = -1;
+    }
+
+    if (!buffer_res_indices.empty()) {
+        std::vector<char> used_buffer(buffer_res_indices.size(), 0);
+        auto mark_buffer_ref = [&](const std::string& name) {
+            int bi = buffer_resource_index(p, name, buffer_res_indices);
+            if (bi >= 0) used_buffer[(size_t)bi] = 1;
+        };
+        for (size_t i = 0; i < out_cmds.size(); i++) {
+            const CommandDef& c = out_cmds[i];
+            for (size_t k = 0; k < c.srvs.size(); k++) mark_buffer_ref(c.srvs[k].name);
+            for (size_t k = 0; k < c.uavs.size(); k++) mark_buffer_ref(c.uavs[k].name);
+            mark_buffer_ref(c.dispatch_from);
+        }
+        std::vector<int> new_buffer_res_indices;
+        for (size_t i = 0; i < buffer_res_indices.size(); i++)
+            if (used_buffer[i]) new_buffer_res_indices.push_back(buffer_res_indices[i]);
+        buffer_res_indices.swap(new_buffer_res_indices);
+    }
+    uses_structured_buffers = !buffer_res_indices.empty();
+    for (size_t i = 0; i < rt_res_indices.size(); i++) {
+        const ResourceDef& r = p.resources[(size_t)rt_res_indices[i]];
+        if (r.ival[5]) { uses_rt_uavs = true; break; }
+    }
+
     std::vector<int> cmd_clear_color_user(out_cmds.size(), -1);
     std::vector<int> cmd_clear_depth_user(out_cmds.size(), -1);
     for (size_t i = 0; i < out_cmds.size(); i++) {
@@ -1470,6 +1643,10 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
             flat_tracks.push_back(ft);
         }
     }
+    bool uses_timeline = !flat_tracks.empty() && (p.timeline_enabled || p.export_timeline_autoplay);
+    size_t emit_timeline_count = uses_timeline ? flat_timelines.size() : 0;
+    size_t emit_track_count = uses_timeline ? flat_tracks.size() : 0;
+    size_t emit_key_count = uses_timeline ? flat_key_frames.size() : 0;
     // Command parameters are stored sequentially and referenced by each command.
     // The shader reads them through UserCB slots 0..N, matching the editor model.
     struct FlatParam { int type, enabled, source_kind, source_cmd; int iv[4]; float fv[4]; };
@@ -1523,8 +1700,25 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     fprintf(f, "// This file is a procedural-only standalone player. It contains no model files,\n");
     fprintf(f, "// no texture files and no editor UI. Geometry is either produced by the shader\n");
     fprintf(f, "// from SV_VertexID or by the tiny built-in primitive vertex buffers below.\n");
-    fprintf(f, "// Shadows, render targets, value-backed parameters, scene-source parameters and timeline animation are kept.\n\n");
-    fprintf(f, "#define WIN32_LEAN_AND_MEAN\n#define COBJMACROS\n#include <windows.h>\n#include <stddef.h>\n#include <d3d11.h>\n#include <d3dcompiler.h>\n\n");
+    fprintf(f, "// Kept features:");
+    bool wrote_feature = false;
+    auto write_feature = [&](const char* name) {
+        fprintf(f, "%s %s", wrote_feature ? "," : "", name);
+        wrote_feature = true;
+    };
+    if (uses_draw) write_feature("draw");
+    if (uses_compute) write_feature("compute");
+    if (uses_shadows) write_feature("shadows");
+    if (!rt_res_indices.empty()) write_feature("render targets");
+    if (!buffer_res_indices.empty()) write_feature("structured buffers");
+    if (!flat_params.empty()) write_feature("parameters");
+    if (!p.user_vars.empty()) write_feature("user variables");
+    if (uses_timeline) write_feature("timeline animation");
+    if (!wrote_feature) fprintf(f, " clear-only command playback");
+    fprintf(f, ".\n\n");
+    fprintf(f, "#define WIN32_LEAN_AND_MEAN\n#define COBJMACROS\n#include <windows.h>\n#include <stddef.h>\n#include <d3d11.h>\n");
+    if (uses_shaders) fprintf(f, "#include <d3dcompiler.h>\n");
+    fprintf(f, "\n");
     fprintf(f, "#define LT_WNDCLS \"lt64k_window\"\n#define LT_PI 3.14159265358979323846f\n");
     int shadow_tex_w = (int)(p.dirlight[10] > 16.0f ? p.dirlight[10] : 16.0f);
     int shadow_tex_h = (int)(p.dirlight[11] > 16.0f ? p.dirlight[11] : 16.0f);
@@ -1553,61 +1747,102 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     fprintf(f, "// -----------------------------------------------------------------------------\n");
     fprintf(f, "#define LT_PROJECT_W %d\n#define LT_PROJECT_H %d\n#define LT_SHADOW_W %d\n#define LT_SHADOW_H %d\n#define LT_VSYNC %d\n#define LT_ESC_CLOSE %d\n#define LT_EXIT_AFTER_TIMELINE %d\n#define LT_SHOW_FPS_TITLE %d\n", project_w, project_h, shadow_tex_w, shadow_tex_h, p.export_vsync ? 1 : 0, p.export_escape_close ? 1 : 0, p.export_exit_after_timeline ? 1 : 0, p.export_show_fps_title ? 1 : 0);
     fprintf(f, "// Minimal CRT replacements and tiny math types. /NODEFAULTLIB builds need these.\n");
-    fprintf(f, "int _fltused=0; typedef unsigned int u32; typedef struct { float m[16]; } M4;\n");
+    fprintf(f, "int _fltused=0; typedef unsigned int u32;");
+    if (!clear_only) fprintf(f, " typedef struct { float m[16]; } M4;");
+    fprintf(f, "\n");
     fprintf(f, "void* __cdecl memset(void* d,int c,size_t n){ unsigned char* p=(unsigned char*)d; while(n--)*p++=(unsigned char)c; return d; }\n");
     fprintf(f, "void* __cdecl memcpy(void* d,const void* s,size_t n){ unsigned char* p=(unsigned char*)d; const unsigned char* q=(const unsigned char*)s; while(n--)*p++=*q++; return d; }\n");
-    fprintf(f, "// Constant buffers shared with the HLSL files. Keep layout in sync with shaders.\n");
-    fprintf(f, "typedef struct { float view_proj[16]; float time_vec[4]; float light_dir[4]; float light_color[4]; float cam_pos[4]; float shadow_view_proj[16]; float inv_view_proj[16]; float prev_view_proj[16]; float prev_inv_view_proj[16]; float prev_shadow_view_proj[16]; float cam_dir[4]; float shadow_cascade_splits[4]; float shadow_params[4]; float shadow_cascade_rects[4][4]; float shadow_cascade_view_proj[4][16]; } SceneCB;\n");
-    fprintf(f, "typedef union { float f[64][4]; int i[64][4]; } UserCB; typedef struct { float world[16]; } ObjectCB;\n");
+    if (!clear_only) {
+        fprintf(f, "// Constant buffers shared with the HLSL files. Keep layout in sync with shaders.\n");
+        fprintf(f, "typedef struct { float view_proj[16]; float time_vec[4]; float light_dir[4]; float light_color[4]; float cam_pos[4]; float shadow_view_proj[16]; float inv_view_proj[16]; float prev_view_proj[16]; float prev_inv_view_proj[16]; float prev_shadow_view_proj[16]; float cam_dir[4]; float shadow_cascade_splits[4]; float shadow_params[4]; float shadow_cascade_rects[4][4]; float shadow_cascade_view_proj[4][16]; } SceneCB;\n");
+        fprintf(f, "typedef union { float f[64][4]; int i[64][4]; } UserCB; typedef struct { float world[16]; } ObjectCB;\n");
+    }
     fprintf(f, "// Global D3D handles and runtime sizes. This player is fullscreen-only, so\n");
     fprintf(f, "// W/H are the monitor/backbuffer size and RW/RH intentionally equal W/H.\n");
     fprintf(f, "// Camera projection, scene depth and scene-scaled render textures all use\n");
     fprintf(f, "// this fullscreen size. Only fixed custom RTs keep their authored dimensions.\n");
-    fprintf(f, "static ID3D11Device* dev; static ID3D11DeviceContext* ctx; static IDXGISwapChain* swp; static ID3D11RenderTargetView* rtv; static ID3D11Texture2D* depth_tex; static ID3D11DepthStencilView* dsv; static ID3D11ShaderResourceView* depth_srv; static ID3D11Texture2D* shadow_tex; static ID3D11DepthStencilView* shadow_dsv; static ID3D11ShaderResourceView* shadow_srv; static ID3D11SamplerState* smp_lin; static ID3D11SamplerState* smp_cmp; static ID3D11DepthStencilState* ds[4]; static ID3D11RasterizerState* rs[2]; static ID3D11BlendState* bs[4]; static ID3D11Buffer* scene_cb; static ID3D11Buffer* object_cb; static ID3D11Buffer* user_cb; static ID3D11Buffer* prim_vb[6]; static HWND wh; static int W,H,RW,RH;\n");
-    fprintf(f, "typedef struct { const char* src; unsigned int len; ID3D11VertexShader* vs; ID3D11PixelShader* ps; ID3D11InputLayout* il; } Sh;\n");
-    fprintf(f, "typedef struct { int w,h,fmt,rtv,srv,uav,dsv,div; } Rtd;\n");
-
-    fprintf(f, "// Embedded shader source. It is compiled at startup so the player does not\n");
-    fprintf(f, "// need precompiled bytecode or any external shader files.\n");
-    for (size_t i = 0; i < shader_sources.size(); i++) {
-        fprintf(f, "static const char sh_src_%u[] =\n%s;\n\n", (unsigned)i, cstr_literal(shader_sources[i]).c_str());
+    if (clear_only) {
+        fprintf(f, "static ID3D11Device* dev; static ID3D11DeviceContext* ctx; static IDXGISwapChain* swp; static ID3D11RenderTargetView* rtv; static HWND wh; static int W,H;\n");
+    } else {
+        fprintf(f, "static ID3D11Device* dev; static ID3D11DeviceContext* ctx; static IDXGISwapChain* swp; static ID3D11RenderTargetView* rtv; static ID3D11Texture2D* depth_tex; static ID3D11DepthStencilView* dsv; static ID3D11ShaderResourceView* depth_srv; static ID3D11Texture2D* shadow_tex; static ID3D11DepthStencilView* shadow_dsv; static ID3D11ShaderResourceView* shadow_srv; static ID3D11SamplerState* smp_lin; static ID3D11SamplerState* smp_cmp; static ID3D11DepthStencilState* ds[4]; static ID3D11RasterizerState* rs[2]; static ID3D11BlendState* bs[4]; static ID3D11Buffer* scene_cb; static ID3D11Buffer* object_cb; static ID3D11Buffer* user_cb; static ID3D11Buffer* prim_vb[6]; static HWND wh; static int W,H,RW,RH;\n");
+        if (uses_compute)
+            fprintf(f, "typedef struct { const char* src; unsigned int len; int cs_kind; ID3D11VertexShader* vs; ID3D11PixelShader* ps; ID3D11ComputeShader* cs; ID3D11InputLayout* il; } Sh;\n");
+        else
+            fprintf(f, "typedef struct { const char* src; unsigned int len; ID3D11VertexShader* vs; ID3D11PixelShader* ps; ID3D11InputLayout* il; } Sh;\n");
+        fprintf(f, "typedef struct { int w,h,fmt,rtv,srv,uav,dsv,div; } Rtd;\n");
+        if (uses_structured_buffers)
+            fprintf(f, "typedef struct { int stride,count,srv,uav,indirect; } Sbd;\n");
     }
-    fprintf(f, "static Sh sh[%u] = {\n", (unsigned)shader_sources.size());
-    for (size_t i = 0; i < shader_sources.size(); i++) fprintf(f, " { sh_src_%u, sizeof(sh_src_%u)-1, 0, 0, 0 },\n", (unsigned)i, (unsigned)i);
-    fprintf(f, "};\n");
 
-    fprintf(f, "// Render texture descriptors copied from the project. Width/height 0 means\n");
-    fprintf(f, "// use the internal render size RW/RH; div is used by half/quarter-resolution passes.\n");
-    fprintf(f, "static Rtd rtd[%u] = {\n", (unsigned)(rt_res_indices.empty() ? 1 : rt_res_indices.size()));
-    if (rt_res_indices.empty()) fprintf(f, " {1,1,28,0,0,0,0,0},\n");
-    for (size_t i = 0; i < rt_res_indices.size(); i++) {
-        const ResourceDef& r = p.resources[(size_t)rt_res_indices[i]];
-        fprintf(f, " {%d,%d,%d,%d,%d,%d,%d,%d},\n", r.ival[0], r.ival[1], r.ival[2], r.ival[3], r.ival[4], r.ival[5], r.ival[6], r.ival[7]);
+    if (!clear_only) {
+        fprintf(f, "// Embedded shader source. It is compiled at startup so the player does not\n");
+        fprintf(f, "// need precompiled bytecode or any external shader files.\n");
+        for (size_t i = 0; i < shader_sources.size(); i++) {
+            fprintf(f, "static const char sh_src_%u[] =\n%s;\n\n", (unsigned)i, cstr_literal(shader_sources[i]).c_str());
+        }
+        fprintf(f, "static Sh sh[%u] = {\n", (unsigned)(shader_sources.empty() ? 1 : shader_sources.size()));
+        if (shader_sources.empty()) {
+            if (uses_compute) fprintf(f, " {0,0,0,0,0,0,0},\n");
+            else fprintf(f, " {0,0,0,0,0},\n");
+        }
+        for (size_t i = 0; i < shader_sources.size(); i++) {
+            if (uses_compute)
+                fprintf(f, " { sh_src_%u, sizeof(sh_src_%u)-1, %d, 0, 0, 0, 0 },\n", (unsigned)i, (unsigned)i, shader_is_cs[i]);
+            else
+                fprintf(f, " { sh_src_%u, sizeof(sh_src_%u)-1, 0, 0, 0 },\n", (unsigned)i, (unsigned)i);
+        }
+        fprintf(f, "};\n");
+
+        fprintf(f, "// Render texture descriptors copied from the project. Width/height 0 means\n");
+        fprintf(f, "// use the internal render size RW/RH; div is used by half/quarter-resolution passes.\n");
+        fprintf(f, "static Rtd rtd[%u] = {\n", (unsigned)(rt_res_indices.empty() ? 1 : rt_res_indices.size()));
+        if (rt_res_indices.empty()) fprintf(f, " {1,1,28,0,0,0,0,0},\n");
+        for (size_t i = 0; i < rt_res_indices.size(); i++) {
+            const ResourceDef& r = p.resources[(size_t)rt_res_indices[i]];
+            fprintf(f, " {%d,%d,%d,%d,%d,%d,%d,%d},\n", r.ival[0], r.ival[1], r.ival[2], r.ival[3], r.ival[4], r.ival[5], r.ival[6], r.ival[7]);
+        }
+        fprintf(f, "};\n");
+        fprintf(f, "static ID3D11Texture2D* rt_tex[%u]; static ID3D11RenderTargetView* rt_rtv[%u]; static ID3D11ShaderResourceView* rt_srv[%u];\n", (unsigned)(rt_res_indices.empty() ? 1 : rt_res_indices.size()), (unsigned)(rt_res_indices.empty() ? 1 : rt_res_indices.size()), (unsigned)(rt_res_indices.empty() ? 1 : rt_res_indices.size()));
+        if (uses_rt_uavs)
+            fprintf(f, "static ID3D11UnorderedAccessView* rt_uav[%u];\n", (unsigned)(rt_res_indices.empty() ? 1 : rt_res_indices.size()));
+
+        if (uses_structured_buffers) {
+            fprintf(f, "// Structured buffers used by compute shaders and procedural draw SRVs.\n");
+            fprintf(f, "static Sbd sbd[%u] = {\n", (unsigned)buffer_res_indices.size());
+            for (size_t i = 0; i < buffer_res_indices.size(); i++) {
+                const ResourceDef& r = p.resources[(size_t)buffer_res_indices[i]];
+                fprintf(f, " {%d,%d,%d,%d,%d},\n", std::max(1, r.ival[0]), std::max(1, r.ival[1]), r.ival[2] ? 1 : 0, r.ival[3] ? 1 : 0, r.ival[4] ? 1 : 0);
+            }
+            fprintf(f, "};\n");
+            fprintf(f, "static ID3D11Buffer* sb_buf[%u]; static ID3D11ShaderResourceView* sb_srv[%u]; static ID3D11UnorderedAccessView* sb_uav[%u];\n", (unsigned)buffer_res_indices.size(), (unsigned)buffer_res_indices.size(), (unsigned)buffer_res_indices.size());
+        }
     }
-    fprintf(f, "};\n");
-    fprintf(f, "static ID3D11Texture2D* rt_tex[%u]; static ID3D11RenderTargetView* rt_rtv[%u]; static ID3D11ShaderResourceView* rt_srv[%u];\n", (unsigned)(rt_res_indices.empty() ? 1 : rt_res_indices.size()), (unsigned)(rt_res_indices.empty() ? 1 : rt_res_indices.size()), (unsigned)(rt_res_indices.empty() ? 1 : rt_res_indices.size()));
 
     fprintf(f, "// Flattened render commands. Resource names are gone here; everything is a\n");
     fprintf(f, "// small integer code so the runtime can be straightforward and deterministic.\n");
-    fprintf(f, "typedef struct { int type,enabled,shader,shs,topology,mk,vc,ic,ccen,cden,ccs,dcs,rt,dep,dt,dw,ab,cb,cw,scast,srecv,pst,pc,tc,sc; int tex[8],tsl[8],srv[8],ssl[8]; float cc[4],dc,pos[3],q[4],scl[3]; } Cmd;\n");
+    fprintf(f, "typedef struct { int type,enabled,shader,shs,topology,mk,vc,ic,ccen,cden,ccs,dcs,rt,dep,dt,dw,ab,cb,cw,scast,srecv,pst,pc,tc,sc,uc,dispatch_src,tx,ty,tz,reset; int tex[8],tsl[8],srv[8],ssl[8],uav[8],usl[8]; float cc[4],dc,pos[3],q[4],scl[3]; } Cmd;\n");
     fprintf(f, "static Cmd cmd[%u] = {\n", (unsigned)(out_cmds.empty() ? 1 : out_cmds.size()));
-    if (out_cmds.empty()) fprintf(f, " {0,0,-1,-1,1,0,0,0,0,0,-1,-1,-1,-1,0,0,0,0,1,0,0,0,0,0,0,{-1,-1,-1,-1,-1,-1,-1,-1},{0,0,0,0,0,0,0,0},{-1,-1,-1,-1,-1,-1,-1,-1},{0,0,0,0,0,0,0,0},{0.0f,0.0f,0.0f,1.0f},1.0f,{0.0f,0.0f,0.0f},{0.0f,0.0f,0.0f,1.0f},{1.0f,1.0f,1.0f}},\n");
+    if (out_cmds.empty()) fprintf(f, " {0,0,-1,-1,1,0,0,0,0,0,-1,-1,-1,-1,0,0,0,0,1,0,0,0,0,0,0,0,-1,1,1,1,0,{-1,-1,-1,-1,-1,-1,-1,-1},{0,0,0,0,0,0,0,0},{-1,-1,-1,-1,-1,-1,-1,-1},{0,0,0,0,0,0,0,0},{-1,-1,-1,-1,-1,-1,-1,-1},{0,0,0,0,0,0,0,0},{0.0f,0.0f,0.0f,1.0f},1.0f,{0.0f,0.0f,0.0f},{0.0f,0.0f,0.0f,1.0f},{1.0f,1.0f,1.0f}},\n");
     for (size_t i = 0; i < out_cmds.size(); i++) {
         const CommandDef& c = out_cmds[i];
         int shidx = shader_resource_index(p, c.shader, shader_res_indices);
         int shadow_shidx = c.builtin_shadow ? builtin_shadow_shader_index : shader_resource_index(p, c.shadow_shader, shader_res_indices);
         int rtcode = rt_target_code(p, c.rt, rt_res_indices);
         int depcode = depth_target_code(c.depth);
-        int tex_src[8]; int tex_slot[8]; int srv_src[8]; int srv_slot[8];
-        for (int k = 0; k < 8; k++) { tex_src[k] = -1; tex_slot[k] = 0; srv_src[k] = -1; srv_slot[k] = 0; }
+        int tex_src[8]; int tex_slot[8]; int srv_src[8]; int srv_slot[8]; int uav_src[8]; int uav_slot[8];
+        for (int k = 0; k < 8; k++) { tex_src[k] = -1; tex_slot[k] = 0; srv_src[k] = -1; srv_slot[k] = 0; uav_src[k] = -1; uav_slot[k] = 0; }
         int texc = (int)std::min<size_t>(8, c.textures.size());
         int srvc = (int)std::min<size_t>(8, c.srvs.size());
+        int uavc = (int)std::min<size_t>(8, c.uavs.size());
         for (int k = 0; k < texc; k++) { tex_src[k] = texture_source_code(p, c.textures[(size_t)k].name, rt_res_indices); tex_slot[k] = c.textures[(size_t)k].slot; }
-        for (int k = 0; k < srvc; k++) { srv_src[k] = texture_source_code(p, c.srvs[(size_t)k].name, rt_res_indices); srv_slot[k] = c.srvs[(size_t)k].slot; }
-        fprintf(f, " {%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,",
-            (c.type == CT_CLEAR ? 1 : 2), c.enabled?1:0, shidx, shadow_shidx, c.topology, c.mesh_kind, c.vertex_count, c.instance_count, c.clear_color_enabled?1:0, c.clear_depth?1:0,
-            cmd_clear_color_user[i], cmd_clear_depth_user[i], rtcode, depcode, c.depth_test?1:0, c.depth_write?1:0, c.alpha_blend?1:0, c.cull_back?1:0, c.color_write?1:0, c.shadow_cast?1:0, c.shadow_receive?1:0, cmd_param_start[i], cmd_param_count[i], texc, srvc);
+        for (int k = 0; k < srvc; k++) { srv_src[k] = srv_source_code(p, c.srvs[(size_t)k].name, rt_res_indices, buffer_res_indices); srv_slot[k] = c.srvs[(size_t)k].slot; }
+        for (int k = 0; k < uavc; k++) { uav_src[k] = srv_source_code(p, c.uavs[(size_t)k].name, rt_res_indices, buffer_res_indices); uav_slot[k] = c.uavs[(size_t)k].slot; }
+        int ctype = c.type == CT_CLEAR ? 1 : (c.type == CT_DISPATCH ? 3 : 2);
+        fprintf(f, " {%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,",
+            ctype, c.enabled?1:0, shidx, shadow_shidx, c.topology, c.mesh_kind, c.vertex_count, c.instance_count, c.clear_color_enabled?1:0, c.clear_depth?1:0,
+            cmd_clear_color_user[i], cmd_clear_depth_user[i], rtcode, depcode, c.depth_test?1:0, c.depth_write?1:0, c.alpha_blend?1:0, c.cull_back?1:0, c.color_write?1:0, c.shadow_cast?1:0, c.shadow_receive?1:0, cmd_param_start[i], cmd_param_count[i], texc, srvc, uavc, dispatch_source_code(p, c.dispatch_from, rt_res_indices, buffer_res_indices), std::max(1, c.thread_x), std::max(1, c.thread_y), std::max(1, c.thread_z), c.compute_on_reset?1:0);
         fprintf(f, "{"); emit_int_array(f, tex_src, 8); fprintf(f, "},{"); emit_int_array(f, tex_slot, 8); fprintf(f, "},{"); emit_int_array(f, srv_src, 8); fprintf(f, "},{"); emit_int_array(f, srv_slot, 8); fprintf(f, "},{");
+        emit_int_array(f, uav_src, 8); fprintf(f, "},{"); emit_int_array(f, uav_slot, 8); fprintf(f, "},{");
         emit_float_array(f, c.clear_color, 4); fprintf(f, "},"); emit_float_literal(f, c.depth_clear); fprintf(f, ",{");
         emit_float_array(f, c.pos, 3); fprintf(f, "},{"); emit_float_array(f, c.rotq, 4); fprintf(f, "},{"); emit_float_array(f, c.scale, 3); fprintf(f, "}},\n");
     }
@@ -1646,35 +1881,77 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     }
     fprintf(f, "};\n");
 
-    fprintf(f, "// Timeline data. Frames are separate from values, and values are split into\n");
-    fprintf(f, "// int and float streams so a float track does not carry unused int/quaternion data.\n");
-    fprintf(f, "typedef struct { int fps,len,enabled,mode; } Tl; typedef struct { int tl,kind,target,type,integral,fs,ds,count,comp,enabled; } Tr;\n");
-    fprintf(f, "static Tl tls[%u]={\n", (unsigned)(flat_timelines.empty() ? 1 : flat_timelines.size()));
-    if (flat_timelines.empty()) fprintf(f, " {24,240,1,0},\n");
-    for (size_t i = 0; i < flat_timelines.size(); i++) {
-        const FlatTimeline& tl = flat_timelines[i];
-        fprintf(f, " {%d,%d,%d,%d},\n", tl.fps, tl.length, tl.enabled, tl.interpolation_mode);
+    if (uses_timeline) {
+        fprintf(f, "// Timeline data. Frames are separate from values, and values are split into\n");
+        fprintf(f, "// int and float streams so a float track does not carry unused int/quaternion data.\n");
+        fprintf(f, "typedef struct { int fps,len,enabled,mode; } Tl; typedef struct { int tl,kind,target,type,integral,fs,ds,count,comp,enabled; } Tr;\n");
+        fprintf(f, "static Tl tls[%u]={\n", (unsigned)flat_timelines.size());
+        for (size_t i = 0; i < flat_timelines.size(); i++) {
+            const FlatTimeline& tl = flat_timelines[i];
+            fprintf(f, " {%d,%d,%d,%d},\n", tl.fps, tl.length, tl.enabled, tl.interpolation_mode);
+        }
+        fprintf(f, "};\n");
+        fprintf(f, "static int kfr[%u]={", (unsigned)flat_key_frames.size());
+        for (size_t i = 0; i < flat_key_frames.size(); i++) { if (i) fprintf(f, ","); fprintf(f, "%d", flat_key_frames[i]); }
+        fprintf(f, "};\nstatic int ki[%u]={", (unsigned)(flat_key_ints.empty() ? 1 : flat_key_ints.size()));
+        if (flat_key_ints.empty()) fprintf(f, "0");
+        for (size_t i = 0; i < flat_key_ints.size(); i++) { if (i) fprintf(f, ","); fprintf(f, "%d", flat_key_ints[i]); }
+        fprintf(f, "};\nstatic float kf[%u]={", (unsigned)(flat_key_floats.empty() ? 1 : flat_key_floats.size()));
+        if (flat_key_floats.empty()) fprintf(f, "0.0f");
+        for (size_t i = 0; i < flat_key_floats.size(); i++) { if (i) fprintf(f, ","); emit_float_literal(f, flat_key_floats[i]); }
+        fprintf(f, "};\nstatic Tr tr[%u] = {\n", (unsigned)flat_tracks.size());
+        for (size_t i = 0; i < flat_tracks.size(); i++) {
+            const FlatTrack& t = flat_tracks[i];
+            fprintf(f, " {%d,%d,%d,%d,%d,%d,%d,%d,%d,%d},\n", t.timeline,t.kind,t.target,t.type,t.integral,t.frame_start,t.data_start,t.count,t.comp,t.enabled);
+        }
+        fprintf(f, "};\n");
     }
-    fprintf(f, "};\n");
-    fprintf(f, "static int kfr[%u]={", (unsigned)(flat_key_frames.empty() ? 1 : flat_key_frames.size()));
-    if (flat_key_frames.empty()) fprintf(f, "0");
-    for (size_t i = 0; i < flat_key_frames.size(); i++) { if (i) fprintf(f, ","); fprintf(f, "%d", flat_key_frames[i]); }
-    fprintf(f, "};\nstatic int ki[%u]={", (unsigned)(flat_key_ints.empty() ? 1 : flat_key_ints.size()));
-    if (flat_key_ints.empty()) fprintf(f, "0");
-    for (size_t i = 0; i < flat_key_ints.size(); i++) { if (i) fprintf(f, ","); fprintf(f, "%d", flat_key_ints[i]); }
-    fprintf(f, "};\nstatic float kf[%u]={", (unsigned)(flat_key_floats.empty() ? 1 : flat_key_floats.size()));
-    if (flat_key_floats.empty()) fprintf(f, "0.0f");
-    for (size_t i = 0; i < flat_key_floats.size(); i++) { if (i) fprintf(f, ","); emit_float_literal(f, flat_key_floats[i]); }
-    fprintf(f, "};\nstatic Tr tr[%u] = {\n", (unsigned)(flat_tracks.empty() ? 1 : flat_tracks.size()));
-    if (flat_tracks.empty()) fprintf(f, " {0,0,-1,0,0,0,0,0,0,0},\n");
-    for (size_t i = 0; i < flat_tracks.size(); i++) {
-        const FlatTrack& t = flat_tracks[i];
-        fprintf(f, " {%d,%d,%d,%d,%d,%d,%d,%d,%d,%d},\n", t.timeline,t.kind,t.target,t.type,t.integral,t.frame_start,t.data_start,t.count,t.comp,t.enabled);
+    if (!clear_only) {
+        fprintf(f, "static float cam0[8]={"); emit_float_array(f, p.camera, 8); fprintf(f, "}; static float dl0[39]={"); emit_float_array(f, p.dirlight, 39); fprintf(f, "}; static float cam[8],dl[39];\n");
     }
-    fprintf(f, "};\n");
-    fprintf(f, "static float cam0[8]={"); emit_float_array(f, p.camera, 8); fprintf(f, "}; static float dl0[39]={"); emit_float_array(f, p.dirlight, 39); fprintf(f, "}; static float cam[8],dl[39];\n");
-    fprintf(f, "enum{ CMDN=%u, SHN=%u, RTN=%u, UVN=%u, PN=%u, TLN=%u, TRN=%u, KEYN=%u, TL_LOOP=%d, TL_ON=%d };\n",
-            (unsigned)out_cmds.size(), (unsigned)shader_sources.size(), (unsigned)rt_res_indices.size(), (unsigned)p.user_vars.size(), (unsigned)flat_params.size(), (unsigned)flat_timelines.size(), (unsigned)flat_tracks.size(), (unsigned)flat_key_frames.size(), (p.timeline_loop && !p.export_exit_after_timeline)?1:0, (p.timeline_enabled || p.export_timeline_autoplay)?1:0);
+    fprintf(f, "enum{ CMDN=%u, SHN=%u, RTN=%u, SBN=%u, UVN=%u, PN=%u, TLN=%u, TRN=%u, KEYN=%u, TL_LOOP=%d, TL_ON=%d };\n",
+            (unsigned)out_cmds.size(), (unsigned)shader_sources.size(), (unsigned)rt_res_indices.size(), (unsigned)buffer_res_indices.size(), (unsigned)p.user_vars.size(), (unsigned)flat_params.size(), (unsigned)emit_timeline_count, (unsigned)emit_track_count, (unsigned)emit_key_count, (uses_timeline && p.timeline_loop && !p.export_exit_after_timeline)?1:0, uses_timeline?1:0);
+
+    if (clear_only) {
+        if (uses_timeline) {
+        fputs(R"LT64K(
+static void zmem(void* p,int n){ unsigned char* b=(unsigned char*)p; while(n--)*b++=0; }
+static float cl(float x,float a,float b){ return x<a?a:(x>b?b:x); }
+static float lerp(float a,float b,float t){return a+(b-a)*t;}
+static int comps(int t){ return (t==1||t==4)?1:((t==2||t==5)?2:((t==3||t==6)?3:(t==7?4:0))); }
+static int isint(int t){ return t>=1&&t<=3; }
+static int tr_frame(Tr* r,int k){ return kfr[r->fs+k]; }
+static float tr_f(Tr* r,int k,int c){ return kf[r->ds+k*r->comp+c]; }
+static int tr_i(Tr* r,int k,int c){ return ki[r->ds+k*r->comp+c]; }
+static float ease(int m,float t){ t=cl(t,0,1); if(m==2){ if(t<0.5f)return 2*t*t; float u=1-t; return 1-2*u*u; } return t; }
+static void apply_track(Tr* r,float fr){ if(r->kind!=1||r->target<0||r->target>=UVN)return; int a=-1,b=-1,i,n=r->count,mode=(r->tl>=0&&r->tl<TLN)?tls[r->tl].mode:1; for(i=0;i<n;i++){ int k0=tr_frame(r,i); if((float)k0<=fr)a=i; if((float)k0>=fr){b=i;break;} } if(a<0)a=b>=0?b:0; if(b<0)b=a; if(isint(uv[r->target].type)){ for(i=0;i<r->comp&&i<4;i++)uv[r->target].iv[i]=tr_i(r,a,i); return; } float o[4]={0,0,0,0}; for(i=0;i<r->comp&&i<4;i++)o[i]=tr_f(r,a,i); if(a!=b){ int fa=tr_frame(r,a),fb=tr_frame(r,b); float tt=fb>fa?(fr-(float)fa)/(float)(fb-fa):0,et=ease(mode,tt); for(i=0;i<r->comp&&i<4;i++)o[i]=lerp(tr_f(r,a,i),tr_f(r,b,i),et); } int c=comps(uv[r->target].type); for(i=0;i<c&&i<4;i++)uv[r->target].fv[i]=o[i]; }
+static float tldur(Tl* t){ if(!t->enabled||t->fps<=0||t->len<=0)return 0; return (float)t->len/(float)t->fps; }
+static float tltotal(void){ float total=0; int i; for(i=0;i<TLN;i++)total+=tldur(tls+i); return total; }
+static void timeline(float sec){ if(!TL_ON||TLN<1)return; float total=tltotal(),acc=0,local=0,fr=0,d; int i,ci=-1,last=-1; if(total<=0)return; if(TL_LOOP)while(sec>=total)sec-=total; else if(sec>total)sec=total; for(i=0;i<TLN;i++){ if(!tls[i].enabled)continue; last=i; d=tldur(tls+i); if(ci<0&&sec<acc+d){ci=i;local=sec-acc;break;} acc+=d; } if(ci<0&&last>=0){ci=last;local=tldur(tls+ci);} if(ci<0||tls[ci].fps<=0)return; fr=local*(float)tls[ci].fps; d=(float)(tls[ci].len-1); if(fr>d)fr=d; if(!tls[ci].mode)fr=(float)((int)(fr+0.0001f)); for(i=0;i<TRN;i++)if(tr[i].enabled&&tr[i].tl==ci)apply_track(tr+i,fr); }
+static void clear_vals(Cmd* c,float* cc){ int i; for(i=0;i<4;i++)cc[i]=c->cc[i]; if(c->ccs>=0&&c->ccs<UVN&&uv[c->ccs].type==7)for(i=0;i<4;i++)cc[i]=uv[c->ccs].fv[i]; }
+static void fps_title(void){}
+static void render(float sec){ timeline(sec); for(int i=0;i<CMDN;i++){ Cmd* c=cmd+i; if(c->enabled&&c->type==1&&c->rt==-2&&c->ccen){ float cc[4]; clear_vals(c,cc); ID3D11DeviceContext_ClearRenderTargetView(ctx,rtv,cc); } } IDXGISwapChain_Present(swp,LT_VSYNC?1:0,0); fps_title(); }
+static LRESULT CALLBACK wp(HWND h,UINT m,WPARAM w,LPARAM l){ if(LT_ESC_CLOSE&&m==WM_KEYDOWN&&w==VK_ESCAPE)PostQuitMessage(0); if(m==WM_CLOSE||m==WM_DESTROY){PostQuitMessage(0);return 0;} return DefWindowProcA(h,m,w,l); }
+static float qpcdt(LARGE_INTEGER* now,LARGE_INTEGER* prev,LARGE_INTEGER* freq){ unsigned int dt=(unsigned int)now->LowPart-(unsigned int)prev->LowPart; unsigned int fq=(unsigned int)freq->LowPart? (unsigned int)freq->LowPart:1; float s=(float)dt/(float)fq; if(s>0.10f)s=0.10f; return s; }
+void WINAPI WinMainCRTStartup(void){ WNDCLASSA wc; zmem(&wc,sizeof(wc)); wc.lpfnWndProc=wp; wc.hInstance=GetModuleHandleA(0); wc.hCursor=LoadCursorA(0,(LPCSTR)32512); wc.lpszClassName=LT_WNDCLS; RegisterClassA(&wc); W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); HWND hw=CreateWindowExA(WS_EX_TOPMOST,LT_WNDCLS,"lt64k",WS_POPUP|WS_VISIBLE,0,0,W,H,0,0,wc.hInstance,0); wh=hw; SetWindowPos(hw,HWND_TOPMOST,0,0,W,H,SWP_SHOWWINDOW); while(ShowCursor(FALSE)>=0); DXGI_SWAP_CHAIN_DESC sd; zmem(&sd,sizeof(sd)); sd.BufferCount=1; sd.BufferDesc.Width=W; sd.BufferDesc.Height=H; sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow=hw; sd.SampleDesc.Count=1; sd.Windowed=TRUE; if(FAILED(D3D11CreateDeviceAndSwapChain(0,D3D_DRIVER_TYPE_HARDWARE,0,0,0,0,D3D11_SDK_VERSION,&sd,&swp,&dev,0,&ctx)))ExitProcess(1); ID3D11Texture2D* bb=0; IDXGISwapChain_GetBuffer(swp,0,&IID_ID3D11Texture2D,(void**)&bb); ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)bb,0,&rtv); ID3D11Texture2D_Release(bb); LARGE_INTEGER fq,t0,tn; QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0); float sec=0; MSG msg; for(;;){ while(PeekMessageA(&msg,0,0,0,PM_REMOVE)){ if(msg.message==WM_QUIT)ExitProcess(0); TranslateMessage(&msg); DispatchMessageA(&msg);} QueryPerformanceCounter(&tn); sec+=qpcdt(&tn,&t0,&fq); t0=tn; render(sec); if(LT_EXIT_AFTER_TIMELINE&&TL_ON){float tt=tltotal(); if(tt>0&&sec>=tt)PostQuitMessage(0);} } }
+)LT64K", f);
+        } else {
+        fputs(R"LT64K(
+static void zmem(void* p,int n){ unsigned char* b=(unsigned char*)p; while(n--)*b++=0; }
+static void clear_vals(Cmd* c,float* cc){ int i; for(i=0;i<4;i++)cc[i]=c->cc[i]; if(c->ccs>=0&&c->ccs<UVN&&uv[c->ccs].type==7)for(i=0;i<4;i++)cc[i]=uv[c->ccs].fv[i]; }
+static void fps_title(void){}
+static void render(float sec){ (void)sec; for(int i=0;i<CMDN;i++){ Cmd* c=cmd+i; if(c->enabled&&c->type==1&&c->rt==-2&&c->ccen){ float cc[4]; clear_vals(c,cc); ID3D11DeviceContext_ClearRenderTargetView(ctx,rtv,cc); } } IDXGISwapChain_Present(swp,LT_VSYNC?1:0,0); fps_title(); }
+static LRESULT CALLBACK wp(HWND h,UINT m,WPARAM w,LPARAM l){ if(LT_ESC_CLOSE&&m==WM_KEYDOWN&&w==VK_ESCAPE)PostQuitMessage(0); if(m==WM_CLOSE||m==WM_DESTROY){PostQuitMessage(0);return 0;} return DefWindowProcA(h,m,w,l); }
+static float qpcdt(LARGE_INTEGER* now,LARGE_INTEGER* prev,LARGE_INTEGER* freq){ unsigned int dt=(unsigned int)now->LowPart-(unsigned int)prev->LowPart; unsigned int fq=(unsigned int)freq->LowPart? (unsigned int)freq->LowPart:1; float s=(float)dt/(float)fq; if(s>0.10f)s=0.10f; return s; }
+void WINAPI WinMainCRTStartup(void){ WNDCLASSA wc; zmem(&wc,sizeof(wc)); wc.lpfnWndProc=wp; wc.hInstance=GetModuleHandleA(0); wc.hCursor=LoadCursorA(0,(LPCSTR)32512); wc.lpszClassName=LT_WNDCLS; RegisterClassA(&wc); W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); HWND hw=CreateWindowExA(WS_EX_TOPMOST,LT_WNDCLS,"lt64k",WS_POPUP|WS_VISIBLE,0,0,W,H,0,0,wc.hInstance,0); wh=hw; SetWindowPos(hw,HWND_TOPMOST,0,0,W,H,SWP_SHOWWINDOW); while(ShowCursor(FALSE)>=0); DXGI_SWAP_CHAIN_DESC sd; zmem(&sd,sizeof(sd)); sd.BufferCount=1; sd.BufferDesc.Width=W; sd.BufferDesc.Height=H; sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow=hw; sd.SampleDesc.Count=1; sd.Windowed=TRUE; if(FAILED(D3D11CreateDeviceAndSwapChain(0,D3D_DRIVER_TYPE_HARDWARE,0,0,0,0,D3D11_SDK_VERSION,&sd,&swp,&dev,0,&ctx)))ExitProcess(1); ID3D11Texture2D* bb=0; IDXGISwapChain_GetBuffer(swp,0,&IID_ID3D11Texture2D,(void**)&bb); ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)bb,0,&rtv); ID3D11Texture2D_Release(bb); LARGE_INTEGER fq,t0,tn; QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0); float sec=0; MSG msg; for(;;){ while(PeekMessageA(&msg,0,0,0,PM_REMOVE)){ if(msg.message==WM_QUIT)ExitProcess(0); TranslateMessage(&msg); DispatchMessageA(&msg);} QueryPerformanceCounter(&tn); sec+=qpcdt(&tn,&t0,&fq); t0=tn; render(sec); } }
+)LT64K", f);
+        }
+        std::fclose(f);
+        pretty_format_c_file(out_c);
+        long long out_bytes = file_size_bytes(out_c);
+        if (out_bytes >= 0) fprintf(stderr, "generated %s\ncommands: %u, shaders: 0, user vars: %u, timelines: %u, timeline tracks: %u\n\n64k exporter size report (source-side, before MSVC/linker packing):\n  out64k.c:                 %lld bytes\n", out_c.c_str(), (unsigned)out_cmds.size(), (unsigned)p.user_vars.size(), (unsigned)emit_timeline_count, (unsigned)emit_track_count, out_bytes);
+        return;
+    }
 
     // Runtime support. Written as plain C and deliberately compact.
     fputs(R"LT64K(
@@ -1716,7 +1993,8 @@ static void shadowvp(SceneCB* sc){ float eye[3]={dl[0],dl[1],dl[2]},at[3]={dl[3]
 static int comps(int ty){ return (ty==1||ty==4)?1:(ty==2||ty==5)?2:(ty==3||ty==6)?3:(ty==7)?4:0; }
 static int isint(int ty){ return ty>=1&&ty<=3; }
 )LT64K", f);
-    fputs(R"LT64K(// Timeline evaluation for compact key streams.
+    if (uses_timeline) {
+        fputs(R"LT64K(// Timeline evaluation for compact key streams.
 // Each track points to frame numbers in kfr[] and to either ki[] or kf[].
 static int tr_frame(Tr* r,int k){ return kfr[r->fs+k]; }
 static int tr_i(Tr* r,int k,int c){ return ki[r->ds+k*r->comp+c]; }
@@ -1840,6 +2118,9 @@ static void timeline(float sec){
     if(!tls[ci].mode)fr=(float)((int)(fr+0.0001f));
     for(i=0;i<TRN;i++)if(tr[i].enabled&&tr[i].tl==ci)apply_track(tr+i,fr);
 }
+)LT64K", f);
+    }
+    fputs(R"LT64K(
 static int invm(M4* a,M4* o){ float* m=a->m; float v[16],d; v[0]=m[5]*m[10]*m[15]-m[5]*m[11]*m[14]-m[9]*m[6]*m[15]+m[9]*m[7]*m[14]+m[13]*m[6]*m[11]-m[13]*m[7]*m[10]; v[4]=-m[4]*m[10]*m[15]+m[4]*m[11]*m[14]+m[8]*m[6]*m[15]-m[8]*m[7]*m[14]-m[12]*m[6]*m[11]+m[12]*m[7]*m[10]; v[8]=m[4]*m[9]*m[15]-m[4]*m[11]*m[13]-m[8]*m[5]*m[15]+m[8]*m[7]*m[13]+m[12]*m[5]*m[11]-m[12]*m[7]*m[9]; v[12]=-m[4]*m[9]*m[14]+m[4]*m[10]*m[13]+m[8]*m[5]*m[14]-m[8]*m[6]*m[13]-m[12]*m[5]*m[10]+m[12]*m[6]*m[9]; v[1]=-m[1]*m[10]*m[15]+m[1]*m[11]*m[14]+m[9]*m[2]*m[15]-m[9]*m[3]*m[14]-m[13]*m[2]*m[11]+m[13]*m[3]*m[10]; v[5]=m[0]*m[10]*m[15]-m[0]*m[11]*m[14]-m[8]*m[2]*m[15]+m[8]*m[3]*m[14]+m[12]*m[2]*m[11]-m[12]*m[3]*m[10]; v[9]=-m[0]*m[9]*m[15]+m[0]*m[11]*m[13]+m[8]*m[1]*m[15]-m[8]*m[3]*m[13]-m[12]*m[1]*m[11]+m[12]*m[3]*m[9]; v[13]=m[0]*m[9]*m[14]-m[0]*m[10]*m[13]-m[8]*m[1]*m[14]+m[8]*m[2]*m[13]+m[12]*m[1]*m[10]-m[12]*m[2]*m[9]; v[2]=m[1]*m[6]*m[15]-m[1]*m[7]*m[14]-m[5]*m[2]*m[15]+m[5]*m[3]*m[14]+m[13]*m[2]*m[7]-m[13]*m[3]*m[6]; v[6]=-m[0]*m[6]*m[15]+m[0]*m[7]*m[14]+m[4]*m[2]*m[15]-m[4]*m[3]*m[14]-m[12]*m[2]*m[7]+m[12]*m[3]*m[6]; v[10]=m[0]*m[5]*m[15]-m[0]*m[7]*m[13]-m[4]*m[1]*m[15]+m[4]*m[3]*m[13]+m[12]*m[1]*m[7]-m[12]*m[3]*m[5]; v[14]=-m[0]*m[5]*m[14]+m[0]*m[6]*m[13]+m[4]*m[1]*m[14]-m[4]*m[2]*m[13]-m[12]*m[1]*m[6]+m[12]*m[2]*m[5]; v[3]=-m[1]*m[6]*m[11]+m[1]*m[7]*m[10]+m[5]*m[2]*m[11]-m[5]*m[3]*m[10]-m[9]*m[2]*m[7]+m[9]*m[3]*m[6]; v[7]=m[0]*m[6]*m[11]-m[0]*m[7]*m[10]-m[4]*m[2]*m[11]+m[4]*m[3]*m[10]+m[8]*m[2]*m[7]-m[8]*m[3]*m[6]; v[11]=-m[0]*m[5]*m[11]+m[0]*m[7]*m[9]+m[4]*m[1]*m[11]-m[4]*m[3]*m[9]-m[8]*m[1]*m[7]+m[8]*m[3]*m[5]; v[15]=m[0]*m[5]*m[10]-m[0]*m[6]*m[9]-m[4]*m[1]*m[10]+m[4]*m[2]*m[9]+m[8]*m[1]*m[6]-m[8]*m[2]*m[5]; d=m[0]*v[0]+m[1]*v[4]+m[2]*v[8]+m[3]*v[12]; if(d==0){mid(o);return 0;} d=1.0f/d; for(int i=0;i<16;i++)o->m[i]=v[i]*d; return 1; }
 // UserCB is rebuilt for each draw. Global user variables are written first;
 // command parameters can then override the first slots for material data.
@@ -1851,7 +2132,15 @@ static void clear_vals(Cmd* c,float* cc,float* dc){ int i; for(i=0;i<4;i++)cc[i]
     fputs(R"LT64K(static HRESULT compile(const char* src, unsigned int len, const char* e, const char* m, ID3DBlob** b){ ID3DBlob* er=0; HRESULT hr=D3DCompile(src,len,0,0,0,e,m,D3DCOMPILE_OPTIMIZATION_LEVEL3,0,b,&er); if(er)ID3D10Blob_Release(er); return hr; }
 // Compile embedded HLSL strings and create a POSITION/NORMAL/TEXCOORD layout
 // when the shader accepts primitive geometry.
-static void init_shaders(){ D3D11_INPUT_ELEMENT_DESC il[3]; zmem(il,sizeof(il)); il[0].SemanticName="POSITION";il[0].Format=DXGI_FORMAT_R32G32B32_FLOAT;il[0].AlignedByteOffset=0;il[0].InputSlotClass=D3D11_INPUT_PER_VERTEX_DATA; il[1].SemanticName="NORMAL";il[1].Format=DXGI_FORMAT_R32G32B32_FLOAT;il[1].AlignedByteOffset=12;il[1].InputSlotClass=D3D11_INPUT_PER_VERTEX_DATA; il[2].SemanticName="TEXCOORD";il[2].Format=DXGI_FORMAT_R32G32_FLOAT;il[2].AlignedByteOffset=24;il[2].InputSlotClass=D3D11_INPUT_PER_VERTEX_DATA; for(int i=0;i<SHN;i++){ ID3DBlob *vs=0,*ps=0; if(SUCCEEDED(compile(sh[i].src,sh[i].len,"VSMain","vs_5_0",&vs))&&SUCCEEDED(compile(sh[i].src,sh[i].len,"PSMain","ps_5_0",&ps))){ ID3D11Device_CreateVertexShader(dev,ID3D10Blob_GetBufferPointer(vs),ID3D10Blob_GetBufferSize(vs),0,&sh[i].vs); ID3D11Device_CreatePixelShader(dev,ID3D10Blob_GetBufferPointer(ps),ID3D10Blob_GetBufferSize(ps),0,&sh[i].ps); ID3D11Device_CreateInputLayout(dev,il,3,ID3D10Blob_GetBufferPointer(vs),ID3D10Blob_GetBufferSize(vs),&sh[i].il); } if(vs)ID3D10Blob_Release(vs); if(ps)ID3D10Blob_Release(ps); } }
+)LT64K", f);
+    if (uses_compute) {
+        fputs(R"LT64K(static void init_shaders(){ D3D11_INPUT_ELEMENT_DESC il[3]; zmem(il,sizeof(il)); il[0].SemanticName="POSITION";il[0].Format=DXGI_FORMAT_R32G32B32_FLOAT;il[0].AlignedByteOffset=0;il[0].InputSlotClass=D3D11_INPUT_PER_VERTEX_DATA; il[1].SemanticName="NORMAL";il[1].Format=DXGI_FORMAT_R32G32B32_FLOAT;il[1].AlignedByteOffset=12;il[1].InputSlotClass=D3D11_INPUT_PER_VERTEX_DATA; il[2].SemanticName="TEXCOORD";il[2].Format=DXGI_FORMAT_R32G32_FLOAT;il[2].AlignedByteOffset=24;il[2].InputSlotClass=D3D11_INPUT_PER_VERTEX_DATA; for(int i=0;i<SHN;i++){ ID3DBlob *vs=0,*ps=0,*cs=0; if(sh[i].cs_kind){ if(SUCCEEDED(compile(sh[i].src,sh[i].len,"CSMain","cs_5_0",&cs)))ID3D11Device_CreateComputeShader(dev,ID3D10Blob_GetBufferPointer(cs),ID3D10Blob_GetBufferSize(cs),0,&sh[i].cs); } else if(SUCCEEDED(compile(sh[i].src,sh[i].len,"VSMain","vs_5_0",&vs))&&SUCCEEDED(compile(sh[i].src,sh[i].len,"PSMain","ps_5_0",&ps))){ ID3D11Device_CreateVertexShader(dev,ID3D10Blob_GetBufferPointer(vs),ID3D10Blob_GetBufferSize(vs),0,&sh[i].vs); ID3D11Device_CreatePixelShader(dev,ID3D10Blob_GetBufferPointer(ps),ID3D10Blob_GetBufferSize(ps),0,&sh[i].ps); ID3D11Device_CreateInputLayout(dev,il,3,ID3D10Blob_GetBufferPointer(vs),ID3D10Blob_GetBufferSize(vs),&sh[i].il); } if(vs)ID3D10Blob_Release(vs); if(ps)ID3D10Blob_Release(ps); if(cs)ID3D10Blob_Release(cs); } }
+)LT64K", f);
+    } else {
+        fputs(R"LT64K(static void init_shaders(){ D3D11_INPUT_ELEMENT_DESC il[3]; zmem(il,sizeof(il)); il[0].SemanticName="POSITION";il[0].Format=DXGI_FORMAT_R32G32B32_FLOAT;il[0].AlignedByteOffset=0;il[0].InputSlotClass=D3D11_INPUT_PER_VERTEX_DATA; il[1].SemanticName="NORMAL";il[1].Format=DXGI_FORMAT_R32G32B32_FLOAT;il[1].AlignedByteOffset=12;il[1].InputSlotClass=D3D11_INPUT_PER_VERTEX_DATA; il[2].SemanticName="TEXCOORD";il[2].Format=DXGI_FORMAT_R32G32_FLOAT;il[2].AlignedByteOffset=24;il[2].InputSlotClass=D3D11_INPUT_PER_VERTEX_DATA; for(int i=0;i<SHN;i++){ ID3DBlob *vs=0,*ps=0; if(SUCCEEDED(compile(sh[i].src,sh[i].len,"VSMain","vs_5_0",&vs))&&SUCCEEDED(compile(sh[i].src,sh[i].len,"PSMain","ps_5_0",&ps))){ ID3D11Device_CreateVertexShader(dev,ID3D10Blob_GetBufferPointer(vs),ID3D10Blob_GetBufferSize(vs),0,&sh[i].vs); ID3D11Device_CreatePixelShader(dev,ID3D10Blob_GetBufferPointer(ps),ID3D10Blob_GetBufferSize(ps),0,&sh[i].ps); ID3D11Device_CreateInputLayout(dev,il,3,ID3D10Blob_GetBufferPointer(vs),ID3D10Blob_GetBufferSize(vs),&sh[i].il); } if(vs)ID3D10Blob_Release(vs); if(ps)ID3D10Blob_Release(ps); } }
+)LT64K", f);
+    }
+    fputs(R"LT64K(
 static void mkbuf(int id,float* v,unsigned int bytes){ D3D11_BUFFER_DESC d; D3D11_SUBRESOURCE_DATA s; zmem(&d,sizeof(d)); zmem(&s,sizeof(s)); d.ByteWidth=bytes; d.BindFlags=D3D11_BIND_VERTEX_BUFFER; s.pSysMem=v; ID3D11Device_CreateBuffer(dev,&d,&s,&prim_vb[id]); }
 static void pv(float* v,int* n,float x,float y,float z,float nx,float ny,float nz,float u,float vv){ int i=*n; v[i+0]=x;v[i+1]=y;v[i+2]=z;v[i+3]=nx;v[i+4]=ny;v[i+5]=nz;v[i+6]=u;v[i+7]=vv; *n=i+8; }
 // Create built-in procedural vertex buffers. Shader-only procedural draws use
@@ -1882,16 +2171,52 @@ static DXGI_FORMAT sfmt(DXGI_FORMAT f){ if(f==DXGI_FORMAT_D24_UNORM_S8_UINT||f==
 static DXGI_FORMAT srvfmt(DXGI_FORMAT f){ if(f==DXGI_FORMAT_D24_UNORM_S8_UINT||f==DXGI_FORMAT_R24G8_TYPELESS)return DXGI_FORMAT_R24_UNORM_X8_TYPELESS; if(f==DXGI_FORMAT_D32_FLOAT||f==DXGI_FORMAT_R32_TYPELESS)return DXGI_FORMAT_R32_FLOAT; return f; }
 // Allocate internal render textures requested by the project. They replace file
 // textures in the 64k path and support post-processing chains.
-static void init_rts(){ for(int i=0;i<RTN;i++){ D3D11_TEXTURE2D_DESC d; zmem(&d,sizeof(d)); d.Width=rtw(i); d.Height=rth(i); d.MipLevels=1; d.ArraySize=1; d.Format=sfmt((DXGI_FORMAT)rtd[i].fmt); d.SampleDesc.Count=1; d.BindFlags=(rtd[i].rtv?D3D11_BIND_RENDER_TARGET:0)|(rtd[i].srv?D3D11_BIND_SHADER_RESOURCE:0)|(rtd[i].uav?D3D11_BIND_UNORDERED_ACCESS:0); if(!d.BindFlags)d.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE; if(SUCCEEDED(ID3D11Device_CreateTexture2D(dev,&d,0,&rt_tex[i]))){ if(rtd[i].rtv)ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)rt_tex[i],0,&rt_rtv[i]); if(rtd[i].srv){ D3D11_SHADER_RESOURCE_VIEW_DESC sv; zmem(&sv,sizeof(sv)); sv.Format=srvfmt((DXGI_FORMAT)rtd[i].fmt); sv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels=1; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)rt_tex[i],&sv,&rt_srv[i]); } } } }
+)LT64K", f);
+    if (uses_rt_uavs) {
+        fputs(R"LT64K(static void init_rts(){ for(int i=0;i<RTN;i++){ D3D11_TEXTURE2D_DESC d; zmem(&d,sizeof(d)); d.Width=rtw(i); d.Height=rth(i); d.MipLevels=1; d.ArraySize=1; d.Format=sfmt((DXGI_FORMAT)rtd[i].fmt); d.SampleDesc.Count=1; d.BindFlags=(rtd[i].rtv?D3D11_BIND_RENDER_TARGET:0)|(rtd[i].srv?D3D11_BIND_SHADER_RESOURCE:0)|(rtd[i].uav?D3D11_BIND_UNORDERED_ACCESS:0); if(!d.BindFlags)d.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE; if(SUCCEEDED(ID3D11Device_CreateTexture2D(dev,&d,0,&rt_tex[i]))){ if(rtd[i].rtv)ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)rt_tex[i],0,&rt_rtv[i]); if(rtd[i].srv){ D3D11_SHADER_RESOURCE_VIEW_DESC sv; zmem(&sv,sizeof(sv)); sv.Format=srvfmt((DXGI_FORMAT)rtd[i].fmt); sv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels=1; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)rt_tex[i],&sv,&rt_srv[i]); } if(rtd[i].uav)ID3D11Device_CreateUnorderedAccessView(dev,(ID3D11Resource*)rt_tex[i],0,&rt_uav[i]); } } }
+)LT64K", f);
+    } else {
+        fputs(R"LT64K(static void init_rts(){ for(int i=0;i<RTN;i++){ D3D11_TEXTURE2D_DESC d; zmem(&d,sizeof(d)); d.Width=rtw(i); d.Height=rth(i); d.MipLevels=1; d.ArraySize=1; d.Format=sfmt((DXGI_FORMAT)rtd[i].fmt); d.SampleDesc.Count=1; d.BindFlags=(rtd[i].rtv?D3D11_BIND_RENDER_TARGET:0)|(rtd[i].srv?D3D11_BIND_SHADER_RESOURCE:0); if(!d.BindFlags)d.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE; if(SUCCEEDED(ID3D11Device_CreateTexture2D(dev,&d,0,&rt_tex[i]))){ if(rtd[i].rtv)ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)rt_tex[i],0,&rt_rtv[i]); if(rtd[i].srv){ D3D11_SHADER_RESOURCE_VIEW_DESC sv; zmem(&sv,sizeof(sv)); sv.Format=srvfmt((DXGI_FORMAT)rtd[i].fmt); sv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels=1; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)rt_tex[i],&sv,&rt_srv[i]); } } } }
+)LT64K", f);
+    }
+    if (uses_structured_buffers) {
+        fputs(R"LT64K(static void init_sbs(){ for(int i=0;i<SBN;i++){ D3D11_BUFFER_DESC bd; zmem(&bd,sizeof(bd)); bd.ByteWidth=(unsigned int)(sbd[i].stride*sbd[i].count); bd.Usage=D3D11_USAGE_DEFAULT; bd.BindFlags=(sbd[i].srv?D3D11_BIND_SHADER_RESOURCE:0)|(sbd[i].uav?D3D11_BIND_UNORDERED_ACCESS:0); bd.MiscFlags=sbd[i].indirect?D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS:D3D11_RESOURCE_MISC_BUFFER_STRUCTURED; bd.StructureByteStride=sbd[i].indirect?0:(unsigned int)sbd[i].stride; if(SUCCEEDED(ID3D11Device_CreateBuffer(dev,&bd,0,&sb_buf[i]))){ if(sbd[i].srv){ D3D11_SHADER_RESOURCE_VIEW_DESC sv; zmem(&sv,sizeof(sv)); sv.Format=sbd[i].indirect?DXGI_FORMAT_R32_UINT:DXGI_FORMAT_UNKNOWN; sv.ViewDimension=D3D11_SRV_DIMENSION_BUFFER; sv.Buffer.NumElements=sbd[i].indirect?(unsigned int)(bd.ByteWidth/4):(unsigned int)sbd[i].count; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)sb_buf[i],&sv,&sb_srv[i]); } if(sbd[i].uav){ D3D11_UNORDERED_ACCESS_VIEW_DESC uv; zmem(&uv,sizeof(uv)); uv.Format=sbd[i].indirect?DXGI_FORMAT_R32_UINT:DXGI_FORMAT_UNKNOWN; uv.ViewDimension=D3D11_UAV_DIMENSION_BUFFER; uv.Buffer.NumElements=sbd[i].indirect?(unsigned int)(bd.ByteWidth/4):(unsigned int)sbd[i].count; ID3D11Device_CreateUnorderedAccessView(dev,(ID3D11Resource*)sb_buf[i],&uv,&sb_uav[i]); } } } }
+)LT64K", f);
+    } else {
+        fputs("static void init_sbs(){}\n", f);
+    }
+    fputs(R"LT64K(
 // Create the main depth buffer and the shared shadow-map atlas. Both also have
 // SRVs so post effects and material shaders can sample them.
 static void init_depth_shadow(){ D3D11_TEXTURE2D_DESC d; D3D11_DEPTH_STENCIL_VIEW_DESC dv; D3D11_SHADER_RESOURCE_VIEW_DESC sv; zmem(&d,sizeof(d)); d.Width=RW;d.Height=RH;d.MipLevels=1;d.ArraySize=1;d.Format=DXGI_FORMAT_R24G8_TYPELESS;d.SampleDesc.Count=1;d.BindFlags=D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE; if(SUCCEEDED(ID3D11Device_CreateTexture2D(dev,&d,0,&depth_tex))){ zmem(&dv,sizeof(dv)); zmem(&sv,sizeof(sv)); dv.Format=DXGI_FORMAT_D24_UNORM_S8_UINT; dv.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2D; ID3D11Device_CreateDepthStencilView(dev,(ID3D11Resource*)depth_tex,&dv,&dsv); sv.Format=DXGI_FORMAT_R24_UNORM_X8_TYPELESS; sv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels=1; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)depth_tex,&sv,&depth_srv); } zmem(&d,sizeof(d)); d.Width=LT_SHADOW_W;d.Height=LT_SHADOW_H;d.MipLevels=1;d.ArraySize=1;d.Format=DXGI_FORMAT_R24G8_TYPELESS;d.SampleDesc.Count=1;d.BindFlags=D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE; if(SUCCEEDED(ID3D11Device_CreateTexture2D(dev,&d,0,&shadow_tex))){ zmem(&dv,sizeof(dv)); zmem(&sv,sizeof(sv)); dv.Format=DXGI_FORMAT_D24_UNORM_S8_UINT; dv.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2D; ID3D11Device_CreateDepthStencilView(dev,(ID3D11Resource*)shadow_tex,&dv,&shadow_dsv); sv.Format=DXGI_FORMAT_R24_UNORM_X8_TYPELESS; sv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels=1; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)shadow_tex,&sv,&shadow_srv); } }
 static void init_states(){ D3D11_SAMPLER_DESC sp; zmem(&sp,sizeof(sp)); sp.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR; sp.AddressU=sp.AddressV=sp.AddressW=D3D11_TEXTURE_ADDRESS_WRAP; sp.MaxLOD=3.402823466e38f; ID3D11Device_CreateSamplerState(dev,&sp,&smp_lin); sp.Filter=D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT; sp.ComparisonFunc=D3D11_COMPARISON_LESS_EQUAL; sp.AddressU=sp.AddressV=sp.AddressW=D3D11_TEXTURE_ADDRESS_BORDER; sp.BorderColor[0]=sp.BorderColor[1]=sp.BorderColor[2]=sp.BorderColor[3]=1.0f; ID3D11Device_CreateSamplerState(dev,&sp,&smp_cmp); for(int i=0;i<4;i++){ D3D11_DEPTH_STENCIL_DESC dd; zmem(&dd,sizeof(dd)); dd.DepthEnable=(i&1)!=0; dd.DepthWriteMask=(i&2)?D3D11_DEPTH_WRITE_MASK_ALL:D3D11_DEPTH_WRITE_MASK_ZERO; /* The tiny player keeps LESS_EQUAL depth testing because procedural primitives and generated shadow shaders can otherwise hit avoidable precision edge cases. */ dd.DepthFunc=D3D11_COMPARISON_LESS_EQUAL; ID3D11Device_CreateDepthStencilState(dev,&dd,&ds[i]); D3D11_BLEND_DESC bd; zmem(&bd,sizeof(bd)); bd.RenderTarget[0].BlendEnable=(i&1)!=0; bd.RenderTarget[0].SrcBlend=D3D11_BLEND_SRC_ALPHA; bd.RenderTarget[0].DestBlend=D3D11_BLEND_INV_SRC_ALPHA; bd.RenderTarget[0].BlendOp=D3D11_BLEND_OP_ADD; bd.RenderTarget[0].SrcBlendAlpha=D3D11_BLEND_ONE; bd.RenderTarget[0].DestBlendAlpha=D3D11_BLEND_INV_SRC_ALPHA; bd.RenderTarget[0].BlendOpAlpha=D3D11_BLEND_OP_ADD; bd.RenderTarget[0].RenderTargetWriteMask=(i&2)?D3D11_COLOR_WRITE_ENABLE_ALL:0; ID3D11Device_CreateBlendState(dev,&bd,&bs[i]); } for(int i=0;i<2;i++){ D3D11_RASTERIZER_DESC rd; zmem(&rd,sizeof(rd)); rd.FillMode=D3D11_FILL_SOLID; rd.CullMode=i?D3D11_CULL_BACK:D3D11_CULL_NONE; rd.DepthClipEnable=TRUE; ID3D11Device_CreateRasterizerState(dev,&rd,&rs[i]); } }
 static void cb_make(ID3D11Buffer** b, unsigned int sz){ D3D11_BUFFER_DESC d; zmem(&d,sizeof(d)); d.ByteWidth=(sz+15)&~15; d.Usage=D3D11_USAGE_DYNAMIC; d.BindFlags=D3D11_BIND_CONSTANT_BUFFER; d.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE; ID3D11Device_CreateBuffer(dev,&d,0,b); }
 static void cb_up(ID3D11Buffer* b, void* data, unsigned int sz){ D3D11_MAPPED_SUBRESOURCE m; if(SUCCEEDED(ID3D11DeviceContext_Map(ctx,(ID3D11Resource*)b,0,D3D11_MAP_WRITE_DISCARD,0,&m))){ cpy(m.pData,data,sz); ID3D11DeviceContext_Unmap(ctx,(ID3D11Resource*)b,0); } }
-static ID3D11ShaderResourceView* srvof(int s){ if(s>=0&&s<RTN)return rt_srv[s]; if(s==-2)return depth_srv; if(s==-3)return shadow_srv; return 0; }
-static ID3D11RenderTargetView* rtvof(int t){ if(t==-2)return rtv; if(t>=0&&t<RTN)return rt_rtv[t]; return 0; }
-static void set_target(Cmd* c){ ID3D11ShaderResourceView* nulls[16]; zmem(nulls,sizeof(nulls)); ID3D11DeviceContext_PSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_VSSetShaderResources(ctx,0,16,nulls); ID3D11RenderTargetView* rv=rtvof(c->rt); ID3D11DepthStencilView* dv=(c->dep==-2)?dsv:0; ID3D11DeviceContext_OMSetRenderTargets(ctx,rv?1:0,rv?&rv:0,dv); D3D11_VIEWPORT vp; zmem(&vp,sizeof(vp)); if(c->rt>=0&&c->rt<RTN){ vp.Width=(float)rtw(c->rt); vp.Height=(float)rth(c->rt); } else if(c->rt==-2){ vp.Width=(float)W; vp.Height=(float)H; } else { vp.Width=(float)RW; vp.Height=(float)RH; } vp.MinDepth=0;vp.MaxDepth=1; ID3D11DeviceContext_RSSetViewports(ctx,1,&vp); }
+)LT64K", f);
+    if (uses_structured_buffers)
+        fputs("static ID3D11ShaderResourceView* srvof(int s){ if(s>=1000&&s<1000+SBN)return sb_srv[s-1000]; if(s>=0&&s<RTN)return rt_srv[s]; if(s==-2)return depth_srv; if(s==-3)return shadow_srv; return 0; }\n", f);
+    else
+        fputs("static ID3D11ShaderResourceView* srvof(int s){ if(s>=0&&s<RTN)return rt_srv[s]; if(s==-2)return depth_srv; if(s==-3)return shadow_srv; return 0; }\n", f);
+    if (uses_compute) {
+        if (uses_structured_buffers && uses_rt_uavs)
+            fputs("static ID3D11UnorderedAccessView* uavof(int s){ if(s>=1000&&s<1000+SBN)return sb_uav[s-1000]; if(s>=0&&s<RTN)return rt_uav[s]; return 0; }\n", f);
+        else if (uses_structured_buffers)
+            fputs("static ID3D11UnorderedAccessView* uavof(int s){ if(s>=1000&&s<1000+SBN)return sb_uav[s-1000]; return 0; }\n", f);
+        else if (uses_rt_uavs)
+            fputs("static ID3D11UnorderedAccessView* uavof(int s){ if(s>=0&&s<RTN)return rt_uav[s]; return 0; }\n", f);
+        else
+            fputs("static ID3D11UnorderedAccessView* uavof(int s){ return 0; }\n", f);
+    }
+    fputs(R"LT64K(static ID3D11RenderTargetView* rtvof(int t){ if(t==-2)return rtv; if(t>=0&&t<RTN)return rt_rtv[t]; return 0; }
+)LT64K", f);
+    if (uses_compute) {
+        fputs(R"LT64K(static void set_target(Cmd* c){ ID3D11ShaderResourceView* nulls[16]; ID3D11UnorderedAccessView* nuavs[8]; zmem(nulls,sizeof(nulls)); zmem(nuavs,sizeof(nuavs)); ID3D11DeviceContext_PSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_VSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_CSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx,0,8,nuavs,0); ID3D11RenderTargetView* rv=rtvof(c->rt); ID3D11DepthStencilView* dv=(c->dep==-2)?dsv:0; ID3D11DeviceContext_OMSetRenderTargets(ctx,rv?1:0,rv?&rv:0,dv); D3D11_VIEWPORT vp; zmem(&vp,sizeof(vp)); if(c->rt>=0&&c->rt<RTN){ vp.Width=(float)rtw(c->rt); vp.Height=(float)rth(c->rt); } else if(c->rt==-2){ vp.Width=(float)W; vp.Height=(float)H; } else { vp.Width=(float)RW; vp.Height=(float)RH; } vp.MinDepth=0;vp.MaxDepth=1; ID3D11DeviceContext_RSSetViewports(ctx,1,&vp); }
+)LT64K", f);
+    } else {
+        fputs(R"LT64K(static void set_target(Cmd* c){ ID3D11ShaderResourceView* nulls[16]; zmem(nulls,sizeof(nulls)); ID3D11DeviceContext_PSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_VSSetShaderResources(ctx,0,16,nulls); ID3D11RenderTargetView* rv=rtvof(c->rt); ID3D11DepthStencilView* dv=(c->dep==-2)?dsv:0; ID3D11DeviceContext_OMSetRenderTargets(ctx,rv?1:0,rv?&rv:0,dv); D3D11_VIEWPORT vp; zmem(&vp,sizeof(vp)); if(c->rt>=0&&c->rt<RTN){ vp.Width=(float)rtw(c->rt); vp.Height=(float)rth(c->rt); } else if(c->rt==-2){ vp.Width=(float)W; vp.Height=(float)H; } else { vp.Width=(float)RW; vp.Height=(float)RH; } vp.MinDepth=0;vp.MaxDepth=1; ID3D11DeviceContext_RSSetViewports(ctx,1,&vp); }
+)LT64K", f);
+    }
+    fputs(R"LT64K(
 static void shadow_draw(Cmd* c){ if(!c->enabled||!c->scast||c->shs<0||c->shs>=SHN||!sh[c->shs].vs)return; UserCB uc; ObjectCB oc; M4 w; world(c,&w); cpy(oc.world,w.m,64); fill_user_cmd(&uc,c); cb_up(object_cb,&oc,sizeof(oc)); cb_up(user_cb,&uc,sizeof(uc)); ID3D11DeviceContext_RSSetState(ctx,rs[c->cb?1:0]); ID3D11DeviceContext_VSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,2,1,&user_cb); if(c->mk>0&&c->mk<6&&prim_vb[c->mk]){ unsigned int st=32,off=0; ID3D11DeviceContext_IASetInputLayout(ctx,sh[c->shs].il); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,1,&prim_vb[c->mk],&st,&off); } else { ID3D11DeviceContext_IASetInputLayout(ctx,0); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,0,0,0,0); } ID3D11DeviceContext_IASetIndexBuffer(ctx,0,DXGI_FORMAT_R32_UINT,0); ID3D11DeviceContext_IASetPrimitiveTopology(ctx,c->topology?D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST:D3D11_PRIMITIVE_TOPOLOGY_POINTLIST); ID3D11DeviceContext_VSSetShader(ctx,sh[c->shs].vs,0,0); ID3D11DeviceContext_PSSetShader(ctx,0,0,0); ID3D11DeviceContext_DrawInstanced(ctx,c->vc,c->ic,0,0); }
 // Render all shadow-casting commands into the atlas before the main pass.
 static void shadowpass(SceneCB* sc){ if(!shadow_dsv)return; int need=0; for(int i=0;i<CMDN;i++)if(cmd[i].enabled&&cmd[i].scast)need=1; if(!need)return; ID3D11ShaderResourceView* nulls[16]; zmem(nulls,sizeof(nulls)); ID3D11DeviceContext_PSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_VSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_OMSetRenderTargets(ctx,0,0,shadow_dsv); ID3D11DeviceContext_ClearDepthStencilView(ctx,shadow_dsv,D3D11_CLEAR_DEPTH,1,0); ID3D11DeviceContext_OMSetDepthStencilState(ctx,ds[3],0); float bf[4]={0,0,0,0}; ID3D11DeviceContext_OMSetBlendState(ctx,bs[0],bf,0xffffffff); int cc=(int)sc->shadow_params[0]; if(cc<1)cc=1;if(cc>4)cc=4; for(int ci=0;ci<cc;ci++){ float* r=sc->shadow_cascade_rects[ci]; D3D11_VIEWPORT vp; zmem(&vp,sizeof(vp)); vp.TopLeftX=r[2]*(float)LT_SHADOW_W;vp.TopLeftY=r[3]*(float)LT_SHADOW_H;vp.Width=(r[0]>0?r[0]:1)*(float)LT_SHADOW_W;vp.Height=(r[1]>0?r[1]:1)*(float)LT_SHADOW_H;vp.MinDepth=0;vp.MaxDepth=1; ID3D11DeviceContext_RSSetViewports(ctx,1,&vp); SceneCB t=*sc; cpy(t.shadow_view_proj,sc->shadow_cascade_view_proj[ci],64); cb_up(scene_cb,&t,sizeof(t)); for(int i=0;i<CMDN;i++)shadow_draw(cmd+i); } cb_up(scene_cb,sc,sizeof(*sc)); }
@@ -1904,7 +2229,20 @@ static void fps_title(void){ static DWORD t0=0; static unsigned int frames=0; DW
 #else
 static void fps_title(void){}
 #endif
-static void render(float sec){ cpy(cam,cam0,sizeof(cam));cpy(dl,dl0,sizeof(dl)); timeline(sec); float clr[4]={0,0,0,1},bf[4]={0,0,0,0}; SceneCB sc; ObjectCB oc; M4 vp,ivp; zmem(&sc,sizeof(sc)); viewproj(&vp,sec); invm(&vp,&ivp); cpy(sc.view_proj,vp.m,64); cpy(sc.prev_view_proj,vp.m,64); cpy(sc.inv_view_proj,ivp.m,64); cpy(sc.prev_inv_view_proj,ivp.m,64); shadowvp(&sc); sc.time_vec[0]=sec; sc.time_vec[2]=sec*60.0f; sc.cam_pos[0]=cam[0];sc.cam_pos[1]=cam[1];sc.cam_pos[2]=cam[2]; float cp=cs(cam[4]); sc.cam_dir[0]=sn(cam[3])*cp;sc.cam_dir[1]=sn(cam[4]);sc.cam_dir[2]=cs(cam[3])*cp; float ldx=dl[3]-dl[0],ldy=dl[4]-dl[1],ldz=dl[5]-dl[2],li=rsq(ldx*ldx+ldy*ldy+ldz*ldz); sc.light_dir[0]=ldx*li;sc.light_dir[1]=ldy*li;sc.light_dir[2]=ldz*li;sc.light_dir[3]=dl[9]; sc.light_color[0]=dl[6];sc.light_color[1]=dl[7];sc.light_color[2]=dl[8]; shadowpass(&sc); cb_up(scene_cb,&sc,sizeof(sc)); ID3D11DeviceContext_ClearRenderTargetView(ctx,rtv,clr); if(dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,1,0); for(int i=0;i<CMDN;i++){ Cmd* c=cmd+i; if(!c->enabled)continue; set_target(c); if(c->type==1){ ID3D11RenderTargetView* rv=rtvof(c->rt); float cc[4],dc; clear_vals(c,cc,&dc); if(c->ccen&&rv)ID3D11DeviceContext_ClearRenderTargetView(ctx,rv,cc); if(c->cden&&c->dep==-2&&dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,dc,0); } else if(c->type==2 && c->shader>=0&&c->shader<SHN&&sh[c->shader].vs&&sh[c->shader].ps){ UserCB uc; M4 w; world(c,&w); cpy(oc.world,w.m,64); fill_user_cmd(&uc,c); cb_up(object_cb,&oc,sizeof(oc)); cb_up(user_cb,&uc,sizeof(uc)); ID3D11DeviceContext_OMSetDepthStencilState(ctx,ds[(c->dt?1:0)|(c->dw?2:0)],0); ID3D11DeviceContext_RSSetState(ctx,rs[c->cb?1:0]); ID3D11DeviceContext_OMSetBlendState(ctx,bs[(c->ab?1:0)|(c->cw?2:0)],bf,0xffffffff); ID3D11DeviceContext_VSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetSamplers(ctx,0,1,&smp_lin); ID3D11DeviceContext_PSSetSamplers(ctx,1,1,&smp_cmp); for(int t=0;t<c->tc;t++){ ID3D11ShaderResourceView* sv=srvof(c->tex[t]); ID3D11DeviceContext_PSSetShaderResources(ctx,c->tsl[t],1,&sv); } if(c->srecv){ ID3D11ShaderResourceView* sv=shadow_srv; ID3D11DeviceContext_PSSetShaderResources(ctx,7,1,&sv); } for(int t=0;t<c->sc;t++){ ID3D11ShaderResourceView* sv=srvof(c->srv[t]); ID3D11DeviceContext_VSSetShaderResources(ctx,c->ssl[t],1,&sv); } if(c->mk>0&&c->mk<6&&prim_vb[c->mk]){ unsigned int st=32,off=0; ID3D11DeviceContext_IASetInputLayout(ctx,sh[c->shader].il); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,1,&prim_vb[c->mk],&st,&off); } else { ID3D11DeviceContext_IASetInputLayout(ctx,0); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,0,0,0,0); } ID3D11DeviceContext_IASetIndexBuffer(ctx,0,DXGI_FORMAT_R32_UINT,0); ID3D11DeviceContext_IASetPrimitiveTopology(ctx,c->topology?D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST:D3D11_PRIMITIVE_TOPOLOGY_POINTLIST); ID3D11DeviceContext_VSSetShader(ctx,sh[c->shader].vs,0,0); ID3D11DeviceContext_PSSetShader(ctx,sh[c->shader].ps,0,0); ID3D11DeviceContext_DrawInstanced(ctx,c->vc,c->ic,0,0); } } IDXGISwapChain_Present(swp,LT_VSYNC?1:0,0); fps_title(); }
+)LT64K", f);
+    if (uses_compute) {
+        fputs(R"LT64K(static void dispatch_dims(Cmd* c,unsigned int* x,unsigned int* y,unsigned int* z){ unsigned int sx=(unsigned int)(c->tx>0?c->tx:1),sy=(unsigned int)(c->ty>0?c->ty:1),sz=(unsigned int)(c->tz>0?c->tz:1),dx=sx,dy=sy,dz=sz; int s=c->dispatch_src; if(s>=1000&&s<1000+SBN){ dx=(unsigned int)sbd[s-1000].count; dy=1; dz=1; } else if(s>=0&&s<RTN){ dx=(unsigned int)rtw(s); dy=(unsigned int)rth(s); dz=1; } if(s!=-1){ dx=(dx+sx-1)/sx; dy=(dy+sy-1)/sy; dz=(dz+sz-1)/sz; } if(dx<1)dx=1;if(dy<1)dy=1;if(dz<1)dz=1; *x=dx;*y=dy;*z=dz; }
+static void run_compute(Cmd* c){ if(c->shader<0||c->shader>=SHN||!sh[c->shader].cs)return; UserCB uc; fill_user_cmd(&uc,c); cb_up(user_cb,&uc,sizeof(uc)); ID3D11DeviceContext_CSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_CSSetConstantBuffers(ctx,2,1,&user_cb); for(int t=0;t<c->sc;t++){ ID3D11ShaderResourceView* sv=srvof(c->srv[t]); ID3D11DeviceContext_CSSetShaderResources(ctx,c->ssl[t],1,&sv); } for(int t=0;t<c->uc;t++){ ID3D11UnorderedAccessView* uv=uavof(c->uav[t]); ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx,c->usl[t],1,&uv,0); } unsigned int x,y,z; dispatch_dims(c,&x,&y,&z); ID3D11DeviceContext_CSSetShader(ctx,sh[c->shader].cs,0,0); ID3D11DeviceContext_Dispatch(ctx,x,y,z); ID3D11DeviceContext_CSSetShader(ctx,0,0,0); }
+)LT64K", f);
+    } else {
+        fputs("static void run_compute(Cmd* c){ (void)c; }\n", f);
+    }
+    fputs(R"LT64K(
+static int reset_compute_done=0; static float prev_render_sec=0;
+static void render(float sec){ float dt=sec-prev_render_sec; if(dt<0)dt=0; if(dt>0.10f)dt=0.10f; prev_render_sec=sec; cpy(cam,cam0,sizeof(cam));cpy(dl,dl0,sizeof(dl));
+)LT64K", f);
+    if (uses_timeline) fputs(" timeline(sec);", f);
+    fputs(R"LT64K( float clr[4]={0,0,0,1},bf[4]={0,0,0,0}; SceneCB sc; ObjectCB oc; M4 vp,ivp; zmem(&sc,sizeof(sc)); viewproj(&vp,sec); invm(&vp,&ivp); cpy(sc.view_proj,vp.m,64); cpy(sc.prev_view_proj,vp.m,64); cpy(sc.inv_view_proj,ivp.m,64); cpy(sc.prev_inv_view_proj,ivp.m,64); shadowvp(&sc); sc.time_vec[0]=sec; sc.time_vec[1]=dt; sc.time_vec[2]=sec*60.0f; sc.cam_pos[0]=cam[0];sc.cam_pos[1]=cam[1];sc.cam_pos[2]=cam[2]; float cp=cs(cam[4]); sc.cam_dir[0]=sn(cam[3])*cp;sc.cam_dir[1]=sn(cam[4]);sc.cam_dir[2]=cs(cam[3])*cp; float ldx=dl[3]-dl[0],ldy=dl[4]-dl[1],ldz=dl[5]-dl[2],li=rsq(ldx*ldx+ldy*ldy+ldz*ldz); sc.light_dir[0]=ldx*li;sc.light_dir[1]=ldy*li;sc.light_dir[2]=ldz*li;sc.light_dir[3]=dl[9]; sc.light_color[0]=dl[6];sc.light_color[1]=dl[7];sc.light_color[2]=dl[8]; shadowpass(&sc); cb_up(scene_cb,&sc,sizeof(sc)); ID3D11DeviceContext_ClearRenderTargetView(ctx,rtv,clr); if(dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,1,0); for(int i=0;i<CMDN;i++){ Cmd* c=cmd+i; if(!c->enabled)continue; set_target(c); if(c->type==1){ ID3D11RenderTargetView* rv=rtvof(c->rt); float cc[4],dc; clear_vals(c,cc,&dc); if(c->ccen&&rv)ID3D11DeviceContext_ClearRenderTargetView(ctx,rv,cc); if(c->cden&&c->dep==-2&&dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,dc,0); } else if(c->type==3){ if(!c->reset||!reset_compute_done)run_compute(c); } else if(c->type==2 && c->shader>=0&&c->shader<SHN&&sh[c->shader].vs&&sh[c->shader].ps){ UserCB uc; M4 w; world(c,&w); cpy(oc.world,w.m,64); fill_user_cmd(&uc,c); cb_up(object_cb,&oc,sizeof(oc)); cb_up(user_cb,&uc,sizeof(uc)); ID3D11DeviceContext_OMSetDepthStencilState(ctx,ds[(c->dt?1:0)|(c->dw?2:0)],0); ID3D11DeviceContext_RSSetState(ctx,rs[c->cb?1:0]); ID3D11DeviceContext_OMSetBlendState(ctx,bs[(c->ab?1:0)|(c->cw?2:0)],bf,0xffffffff); ID3D11DeviceContext_VSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetSamplers(ctx,0,1,&smp_lin); ID3D11DeviceContext_PSSetSamplers(ctx,1,1,&smp_cmp); for(int t=0;t<c->tc;t++){ ID3D11ShaderResourceView* sv=srvof(c->tex[t]); ID3D11DeviceContext_PSSetShaderResources(ctx,c->tsl[t],1,&sv); } if(c->srecv){ ID3D11ShaderResourceView* sv=shadow_srv; ID3D11DeviceContext_PSSetShaderResources(ctx,7,1,&sv); } for(int t=0;t<c->sc;t++){ ID3D11ShaderResourceView* sv=srvof(c->srv[t]); ID3D11DeviceContext_VSSetShaderResources(ctx,c->ssl[t],1,&sv); ID3D11DeviceContext_PSSetShaderResources(ctx,c->ssl[t],1,&sv); } if(c->mk>0&&c->mk<6&&prim_vb[c->mk]){ unsigned int st=32,off=0; ID3D11DeviceContext_IASetInputLayout(ctx,sh[c->shader].il); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,1,&prim_vb[c->mk],&st,&off); } else { ID3D11DeviceContext_IASetInputLayout(ctx,0); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,0,0,0,0); } ID3D11DeviceContext_IASetIndexBuffer(ctx,0,DXGI_FORMAT_R32_UINT,0); ID3D11DeviceContext_IASetPrimitiveTopology(ctx,c->topology?D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST:D3D11_PRIMITIVE_TOPOLOGY_POINTLIST); ID3D11DeviceContext_VSSetShader(ctx,sh[c->shader].vs,0,0); ID3D11DeviceContext_PSSetShader(ctx,sh[c->shader].ps,0,0); ID3D11DeviceContext_DrawInstanced(ctx,c->vc,c->ic,0,0); } } reset_compute_done=1; IDXGISwapChain_Present(swp,LT_VSYNC?1:0,0); fps_title(); }
 static LRESULT CALLBACK wp(HWND h,UINT m,WPARAM w,LPARAM l){
     if(LT_ESC_CLOSE&&m==WM_KEYDOWN&&w==VK_ESCAPE)PostQuitMessage(0);
     if(m==WM_CLOSE||m==WM_DESTROY){PostQuitMessage(0);return 0;}
@@ -1916,9 +2254,12 @@ static LRESULT CALLBACK wp(HWND h,UINT m,WPARAM w,LPARAM l){
 // consecutive frames, so the unsigned 32-bit low-part difference is enough and is wrap-safe as
 // long as a single frame does not last several minutes.
 static float qpcdt(LARGE_INTEGER* now,LARGE_INTEGER* prev,LARGE_INTEGER* freq){ unsigned int dt=(unsigned int)now->LowPart-(unsigned int)prev->LowPart; unsigned int fq=(unsigned int)freq->LowPart? (unsigned int)freq->LowPart:1; float s=(float)dt/(float)fq; if(s>0.10f)s=0.10f; return s; }
-void WINAPI WinMainCRTStartup(void){ WNDCLASSA wc; zmem(&wc,sizeof(wc)); wc.lpfnWndProc=wp; wc.hInstance=GetModuleHandleA(0); wc.lpszClassName=LT_WNDCLS; RegisterClassA(&wc); // FPS-in-title builds use a maximized overlapped window so the title bar is visible.
+void WINAPI WinMainCRTStartup(void){ WNDCLASSA wc; zmem(&wc,sizeof(wc)); wc.lpfnWndProc=wp; wc.hInstance=GetModuleHandleA(0); wc.hCursor=LoadCursorA(0,(LPCSTR)32512); wc.lpszClassName=LT_WNDCLS; RegisterClassA(&wc); // FPS-in-title builds use a maximized overlapped window so the title bar is visible.
 // Otherwise the tiny player uses borderless desktop fullscreen.
-W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); DWORD st=LT_SHOW_FPS_TITLE?WS_OVERLAPPEDWINDOW:(WS_POPUP|WS_VISIBLE); DWORD ex=LT_SHOW_FPS_TITLE?0:WS_EX_TOPMOST; HWND hw=CreateWindowExA(ex,LT_WNDCLS,"lt64k",st,0,0,W,H,0,0,wc.hInstance,0); wh=hw; if(LT_SHOW_FPS_TITLE){ShowWindow(hw,SW_SHOWMAXIMIZED); RECT rc; GetClientRect(hw,&rc); W=rc.right-rc.left; H=rc.bottom-rc.top;}else{SetWindowPos(hw,HWND_TOPMOST,0,0,W,H,SWP_SHOWWINDOW); ShowCursor(FALSE);} RW=W; RH=H; DXGI_SWAP_CHAIN_DESC sd; zmem(&sd,sizeof(sd)); sd.BufferCount=1; sd.BufferDesc.Width=W; sd.BufferDesc.Height=H; sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow=hw; sd.SampleDesc.Count=1; sd.Windowed=TRUE; if(FAILED(D3D11CreateDeviceAndSwapChain(0,D3D_DRIVER_TYPE_HARDWARE,0,0,0,0,D3D11_SDK_VERSION,&sd,&swp,&dev,0,&ctx)))ExitProcess(1); ID3D11Texture2D* bb=0; IDXGISwapChain_GetBuffer(swp,0,&IID_ID3D11Texture2D,(void**)&bb); ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)bb,0,&rtv); ID3D11Texture2D_Release(bb); init_depth_shadow(); init_rts(); init_states(); cb_make(&scene_cb,sizeof(SceneCB)); cb_make(&object_cb,sizeof(ObjectCB)); cb_make(&user_cb,sizeof(UserCB)); init_shaders(); init_prims(); LARGE_INTEGER fq,t0,tn; QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0); float sec=0; MSG msg; for(;;){ while(PeekMessageA(&msg,0,0,0,PM_REMOVE)){ if(msg.message==WM_QUIT)ExitProcess(0); TranslateMessage(&msg); DispatchMessageA(&msg);} QueryPerformanceCounter(&tn); sec+=qpcdt(&tn,&t0,&fq); t0=tn; render(sec); if(LT_EXIT_AFTER_TIMELINE&&TL_ON){float tt=tltotal(); if(tt>0&&sec>=tt)PostQuitMessage(0);} } }
+W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); DWORD st=LT_SHOW_FPS_TITLE?WS_OVERLAPPEDWINDOW:(WS_POPUP|WS_VISIBLE); DWORD ex=LT_SHOW_FPS_TITLE?0:WS_EX_TOPMOST; HWND hw=CreateWindowExA(ex,LT_WNDCLS,"lt64k",st,0,0,W,H,0,0,wc.hInstance,0); wh=hw; if(LT_SHOW_FPS_TITLE){ShowWindow(hw,SW_SHOWMAXIMIZED); RECT rc; GetClientRect(hw,&rc); W=rc.right-rc.left; H=rc.bottom-rc.top;}else{SetWindowPos(hw,HWND_TOPMOST,0,0,W,H,SWP_SHOWWINDOW); while(ShowCursor(FALSE)>=0);} RW=W; RH=H; DXGI_SWAP_CHAIN_DESC sd; zmem(&sd,sizeof(sd)); sd.BufferCount=1; sd.BufferDesc.Width=W; sd.BufferDesc.Height=H; sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow=hw; sd.SampleDesc.Count=1; sd.Windowed=TRUE; if(FAILED(D3D11CreateDeviceAndSwapChain(0,D3D_DRIVER_TYPE_HARDWARE,0,0,0,0,D3D11_SDK_VERSION,&sd,&swp,&dev,0,&ctx)))ExitProcess(1); ID3D11Texture2D* bb=0; IDXGISwapChain_GetBuffer(swp,0,&IID_ID3D11Texture2D,(void**)&bb); ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)bb,0,&rtv); ID3D11Texture2D_Release(bb); init_depth_shadow(); init_rts(); init_sbs(); init_states(); cb_make(&scene_cb,sizeof(SceneCB)); cb_make(&object_cb,sizeof(ObjectCB)); cb_make(&user_cb,sizeof(UserCB)); init_shaders(); init_prims(); LARGE_INTEGER fq,t0,tn; QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0); float sec=0; MSG msg; for(;;){ while(PeekMessageA(&msg,0,0,0,PM_REMOVE)){ if(msg.message==WM_QUIT)ExitProcess(0); TranslateMessage(&msg); DispatchMessageA(&msg);} QueryPerformanceCounter(&tn); sec+=qpcdt(&tn,&t0,&fq); t0=tn; render(sec);
+)LT64K", f);
+    if (uses_timeline) fputs(" if(LT_EXIT_AFTER_TIMELINE&&TL_ON){float tt=tltotal(); if(tt>0&&sec>=tt)PostQuitMessage(0);}", f);
+    fputs(R"LT64K( } }
 )LT64K", f);
 
     std::fclose(f);
@@ -1932,15 +2273,17 @@ W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); DWORD st=LT_SH
     }
     size_t cmd_bytes = out_cmds.size() * sizeof(CommandDef);
     size_t param_bytes = flat_params.size() * sizeof(FlatParam);
-    size_t key_bytes = flat_key_frames.size() * sizeof(int) + flat_key_ints.size() * sizeof(int) + flat_key_floats.size() * sizeof(float);
+    size_t key_bytes = uses_timeline ? (flat_key_frames.size() * sizeof(int) + flat_key_ints.size() * sizeof(int) + flat_key_floats.size() * sizeof(float)) : 0;
     size_t rt_bytes = rt_res_indices.size() * sizeof(ResourceDef);
     float timeline_total_seconds_for_report = 0.0f;
-    for (size_t i = 0; i < flat_timelines.size(); i++) {
-        if (flat_timelines[i].enabled && flat_timelines[i].fps > 0 && flat_timelines[i].length > 0)
-            timeline_total_seconds_for_report += (float)flat_timelines[i].length / (float)flat_timelines[i].fps;
+    if (uses_timeline) {
+        for (size_t i = 0; i < flat_timelines.size(); i++) {
+            if (flat_timelines[i].enabled && flat_timelines[i].fps > 0 && flat_timelines[i].length > 0)
+                timeline_total_seconds_for_report += (float)flat_timelines[i].length / (float)flat_timelines[i].fps;
+        }
     }
     fprintf(stderr, "generated %s\n", out_c.c_str());
-    fprintf(stderr, "commands: %u, shaders: %u, user vars: %u, timelines: %u, timeline tracks: %u\n", (unsigned)out_cmds.size(), (unsigned)shader_sources.size(), (unsigned)p.user_vars.size(), (unsigned)flat_timelines.size(), (unsigned)flat_tracks.size());
+    fprintf(stderr, "commands: %u, shaders: %u, user vars: %u, timelines: %u, timeline tracks: %u\n", (unsigned)out_cmds.size(), (unsigned)shader_sources.size(), (unsigned)p.user_vars.size(), (unsigned)emit_timeline_count, (unsigned)emit_track_count);
     fprintf(stderr, "timeline sequence: loop=%s enabled=%s autoplay=%s exit_after=%s fps_title=%s duration=%.3fs\n", p.timeline_loop?"on":"off", (p.timeline_enabled || p.export_timeline_autoplay)?"on":"off", p.export_timeline_autoplay?"on":"off", p.export_exit_after_timeline?"on":"off", p.export_show_fps_title?"on":"off", timeline_total_seconds_for_report);
     fprintf(stderr, "\n64k exporter size report (source-side, before MSVC/linker packing):\n");
     if (out_bytes >= 0) fprintf(stderr, "  out64k.c:                 %lld bytes\n", out_bytes);
@@ -1949,7 +2292,7 @@ W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); DWORD st=LT_SH
     fprintf(stderr, "  HLSL as C string literal: %u bytes\n", (unsigned)lit_hlsl);
     fprintf(stderr, "  command defs estimate:    %u bytes\n", (unsigned)cmd_bytes);
     fprintf(stderr, "  param defs estimate:      %u bytes\n", (unsigned)param_bytes);
-    fprintf(stderr, "  timeline data estimate:   %u bytes  (%u frames, %u ints, %u floats)\n", (unsigned)key_bytes, (unsigned)flat_key_frames.size(), (unsigned)flat_key_ints.size(), (unsigned)flat_key_floats.size());
+    fprintf(stderr, "  timeline data estimate:   %u bytes  (%u frames, %u ints, %u floats)\n", (unsigned)key_bytes, uses_timeline ? (unsigned)flat_key_frames.size() : 0, uses_timeline ? (unsigned)flat_key_ints.size() : 0, uses_timeline ? (unsigned)flat_key_floats.size() : 0);
     fprintf(stderr, "  render targets estimate:  %u bytes\n", (unsigned)rt_bytes);
     fprintf(stderr, "  shaders by expanded/embedded bytes:\n");
     for (size_t i = 0; i < shader_sources.size(); i++)

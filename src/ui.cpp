@@ -14,6 +14,7 @@
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 #include "nanosvg/nanosvg.h"
+#include "stb_image.h"
 #include <d3dcompiler.h>
 #include <psapi.h>
 #include <float.h>
@@ -67,6 +68,9 @@ static UiProfileEntry s_ui_profile[UI_PROFILE_COUNT] = {
 
 static LARGE_INTEGER s_ui_profile_freq = {};
 static bool s_ui_profile_display_valid = false;
+
+static ID3D11Texture2D*          s_app_icon_tex = nullptr;
+static ID3D11ShaderResourceView* s_app_icon_srv = nullptr;
 
 static void ui_profile_ensure_freq() {
     if (s_ui_profile_freq.QuadPart == 0)
@@ -122,6 +126,62 @@ struct UiProfileScope {
 #define UI_PROFILE_CONCAT_INNER(a, b) a##b
 #define UI_PROFILE_CONCAT(a, b) UI_PROFILE_CONCAT_INNER(a, b)
 #define UI_PROFILE_SCOPE(section) UiProfileScope UI_PROFILE_CONCAT(_ui_profile_scope_, __LINE__)(section)
+
+static void ui_release_app_icon_texture() {
+    if (s_app_icon_srv) { s_app_icon_srv->Release(); s_app_icon_srv = nullptr; }
+    if (s_app_icon_tex) { s_app_icon_tex->Release(); s_app_icon_tex = nullptr; }
+}
+
+static ID3D11ShaderResourceView* ui_app_icon_srv() {
+    if (s_app_icon_srv)
+        return s_app_icon_srv;
+
+    void* bytes = nullptr;
+    size_t byte_count = 0;
+    if (!lt_read_file("assets/brand/lazytool_icon.png", &bytes, &byte_count))
+        return nullptr;
+    if (byte_count > (size_t)INT_MAX) {
+        lt_free_file(bytes);
+        return nullptr;
+    }
+
+    int w = 0, h = 0, ch = 0;
+    unsigned char* pixels = stbi_load_from_memory((const stbi_uc*)bytes, (int)byte_count, &w, &h, &ch, 4);
+    lt_free_file(bytes);
+    if (!pixels || w <= 0 || h <= 0) {
+        if (pixels) stbi_image_free(pixels);
+        return nullptr;
+    }
+
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = (UINT)w;
+    td.Height = (UINT)h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA sd = {};
+    sd.pSysMem = pixels;
+    sd.SysMemPitch = (UINT)(w * 4);
+
+    HRESULT hr = g_dx.dev->CreateTexture2D(&td, &sd, &s_app_icon_tex);
+    stbi_image_free(pixels);
+    if (FAILED(hr) || !s_app_icon_tex) {
+        ui_release_app_icon_texture();
+        return nullptr;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+    sv.Format = td.Format;
+    sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sv.Texture2D.MipLevels = 1;
+    hr = g_dx.dev->CreateShaderResourceView(s_app_icon_tex, &sv, &s_app_icon_srv);
+    if (FAILED(hr) || !s_app_icon_srv)
+        ui_release_app_icon_texture();
+    return s_app_icon_srv;
+}
 
 // The UI module is the editor shell. It presents resources, commands,
 // inspectors, logs, and the live scene view on top of the runtime state.
@@ -1865,39 +1925,22 @@ static const char* user_cb_hlsl_type(ResType type) {
     }
 }
 
-static bool ui_float_value_editor_with_rgb_toggle(const char* label, ResType type, float* fval, float width) {
-    bool changed = false;
-    if (type == RES_FLOAT3 || type == RES_FLOAT4) {
-        ImGui::PushID(fval);
-        ImGuiStorage* storage = ImGui::GetStateStorage();
-        ImGuiID mode_id = ImGui::GetID("##rgb_mode");
-        bool rgb_mode = storage->GetBool(mode_id, false);
-        if (ImGui::SmallButton(rgb_mode ? "RGB" : "float")) {
-            rgb_mode = !rgb_mode;
-            storage->SetBool(mode_id, rgb_mode);
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(rgb_mode ? "Edit as numeric vector" : "Edit as RGB color");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(width);
-        if (rgb_mode) {
-            changed = type == RES_FLOAT3
-                ? ImGui::ColorEdit3(label, fval)
-                : ImGui::ColorEdit4(label, fval);
-        } else {
-            changed = type == RES_FLOAT3
-                ? ImGui::DragFloat3(label, fval, 0.01f)
-                : ImGui::DragFloat4(label, fval, 0.01f);
-        }
-        ImGui::PopID();
-        return changed;
-    }
-
+static bool ui_float_value_editor(const char* label, ResType type, float* fval, float width) {
     ImGui::SetNextItemWidth(width);
     switch (type) {
-    case RES_FLOAT:  return ImGui::DragFloat(label,  &fval[0], 0.01f);
-    case RES_FLOAT2: return ImGui::DragFloat2(label,  fval,    0.01f);
-    default:         return false;
+    case RES_FLOAT:
+        return ImGui::SliderFloat(label, &fval[0], 0.0f, 1.0f, "%.3f");
+    case RES_FLOAT2:
+        return ImGui::SliderFloat2(label, fval, 0.0f, 1.0f, "%.3f");
+    case RES_FLOAT3:
+        // Use ImGui's native color editor again. The default display mode is set
+        // once in ui_init() to Float, so right-click keeps the built-in
+        // ColorEdit options menu instead of the custom RGB/float toggle.
+        return ImGui::ColorEdit3(label, fval);
+    case RES_FLOAT4:
+        return ImGui::ColorEdit4(label, fval);
+    default:
+        return false;
     }
 }
 
@@ -1908,7 +1951,7 @@ static bool ui_user_cb_value_editor(ResType type, int* ival, float* fval, float 
     case RES_FLOAT2:
     case RES_FLOAT3:
     case RES_FLOAT4:
-        return ui_float_value_editor_with_rgb_toggle("##v", type, fval, width);
+        return ui_float_value_editor("##v", type, fval, width);
     case RES_INT:    ImGui::SetNextItemWidth(width); return ImGui::InputInt("##v",   &ival[0]);
     case RES_INT2:   ImGui::SetNextItemWidth(width); return ImGui::InputInt2("##v",   ival);
     case RES_INT3:   ImGui::SetNextItemWidth(width); return ImGui::InputInt3("##v",   ival);
@@ -6429,8 +6472,8 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
     case RES_FLOAT2:
     case RES_FLOAT3:
     case RES_FLOAT4:
-        value_changed = ui_float_value_editor_with_rgb_toggle("value", r->type, r->fval,
-                                                              ui_labeled_item_compact_width("value"));
+        value_changed = ui_float_value_editor("value", r->type, r->fval,
+                                              ui_labeled_item_compact_width("value"));
         break;
 
     case RES_RENDER_TEXTURE2D: {
@@ -12610,6 +12653,19 @@ static void ui_top_bar() {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.92f, 0.91f, 1.0f));
     ImGui::TextUnformatted("lazyTool");
     ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        if (ID3D11ShaderResourceView* app_icon = ui_app_icon_srv()) {
+            ImVec2 title_min = ImGui::GetItemRectMin();
+            ImVec2 title_max = ImGui::GetItemRectMax();
+            ImGui::SetNextWindowPos(ImVec2(title_min.x, title_max.y + ui_margin_px(8.0f)), ImGuiCond_Always);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_margin_px(10.0f), ui_margin_px(10.0f)));
+            ImGui::BeginTooltip();
+            float icon_size = ui_px(128.0f);
+            ImGui::Image((ImTextureID)app_icon, ImVec2(icon_size, icon_size));
+            ImGui::EndTooltip();
+            ImGui::PopStyleVar();
+        }
+    }
     ImGui::SameLine(0.0f, ui_margin_px(12.0f));
     ui_align_frame_row(row_y);
 
@@ -13008,6 +13064,7 @@ void ui_init() {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     ImGui::StyleColorsDark();
+    ImGui::SetColorEditOptions(ImGuiColorEditFlags_Float);
 
     ImFont* ui_font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 18.0f);
     if (ui_font)
@@ -13126,6 +13183,7 @@ void ui_draw() {
 }
 
 void ui_shutdown() {
+    ui_release_app_icon_texture();
     ui_release_rt3d_preview_pipeline();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
