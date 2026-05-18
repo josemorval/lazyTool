@@ -1,8 +1,9 @@
 <p>
-  <sub><sub>
-    <img src="assets/brand/lazytool_icon.png" width="80" alt="lazyTool icon">
-  </sub></sub>
-  <h1>lazyTool</h1>
+  <sub>
+    <img src="assets/brand/lazytool_icon.png" width="110" alt="lazyTool icon">
+  </sub>
+  &nbsp;&nbsp;
+  <strong><font size="7">lazyTool</font></strong>
 </p>
 
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
