@@ -1,107 +1,109 @@
-# <img src="assets/brand/lazytool_icon.png" width="100" alt="lazyTool icon"> lazyTool
+<h1>
+  <img src="assets/brand/lazytool_icon.png" width="90" align="middle" alt="lazyTool icon">lazyTool
+</h1>
 
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
 ![Windows](https://img.shields.io/badge/platform-Windows-0078D4)
 ![DirectX 11](https://img.shields.io/badge/graphics-DirectX%2011-lightgrey)
 ![Dear ImGui](https://img.shields.io/badge/UI-Dear%20ImGui-ff69b4)
 
-**lazyTool** es un editor experimental para crear escenas graficas en DirectX 11. Esta pensado para personas que quieren construir una imagen paso a paso, ver que recursos usa cada paso, ajustar parametros en directo y exportar el resultado como ejecutable.
+**lazyTool** is an experimental DirectX 11 editor for building real-time graphics scenes. It is made for people who want to assemble an image step by step, see which resources each step uses, tweak values live, and export the result as a standalone executable.
 
-No intenta esconder la parte tecnica. La idea es que puedas abrir la herramienta, mirar la lista de recursos, mirar la lista de comandos, seleccionar algo y entender que esta pasando.
+It does not try to hide the technical side. The goal is that you can open the tool, look at the resource list, look at the command list, select something, and understand what is happening.
 
 ![lazyTool editor screenshot](docs/images/editor-main.png)
 
-## Que puedes hacer
+## What You Can Do
 
-- Ver una escena en tiempo real dentro del viewport.
-- Crear recursos visuales y buffers internos.
-- Encadenar comandos de render en una lista ordenada.
-- Limpiar targets, dibujar, despachar compute y organizar comandos en grupos.
-- Editar parametros desde paneles sin recompilar toda la aplicacion.
-- Mover la camara, activar rejilla, encuadrar objetos y usar controles de transformacion.
-- Ver avisos, errores y mensajes en el log.
-- Revisar relaciones entre comandos y recursos en una vista de grafo.
-- Animar valores, camara, luces y estados con una timeline.
-- Exportar una escena como ejecutable standalone.
-- Generar una version 64k/procedural mas estricta cuando el contenido lo permite.
+- View a live scene in the viewport.
+- Create visual resources and internal GPU buffers.
+- Chain render commands in an ordered frame pipeline.
+- Clear targets, draw, run compute work, and organize commands into groups.
+- Edit parameters from panels without rebuilding the whole application.
+- Move the camera, enable a grid, frame objects, and use transform controls.
+- Read warnings, errors, and useful messages in the log.
+- Inspect relationships between commands and resources in a graph view.
+- Animate values, camera state, lights, and command state with a timeline.
+- Export a scene as a standalone executable.
+- Generate a stricter 64k/procedural build when the content allows it.
 
-## Para quien es
+## Who It Is For
 
-lazyTool puede ser util si estas aprendiendo rendering, si quieres prototipar efectos visuales, si te gustan las demos procedurales o si prefieres una herramienta donde el pipeline sea visible.
+lazyTool can be useful if you are learning real-time rendering, prototyping visual effects, exploring procedural graphics, or working on compact executable demos.
 
-No necesitas conocer todo el motor para empezar. Lo normal es abrir una escena sencilla, seleccionar comandos y recursos, cambiar valores y observar que ocurre en el viewport.
+You do not need to understand the entire engine to start. A good first approach is to open a simple scene, select commands and resources, change values, and watch what happens in the viewport.
 
-## Como se organiza la interfaz
+## Interface Overview
 
-| Zona | Para que sirve |
+| Area | What It Does |
 |---|---|
-| **Viewport** | Muestra la imagen final y los controles visuales de camara, rejilla y transformacion. |
-| **Resources** | Contiene texturas, render targets, buffers, meshes, valores y recursos internos. |
-| **Command Pipeline** | Es la lista de pasos que se ejecutan cada frame. |
-| **Inspector** | Cambia las opciones del recurso o comando seleccionado. |
-| **User CB** | Edita valores que se envian a la GPU como parametros. |
-| **Render Graph** | Ayuda a entender que comando lee o escribe cada recurso. |
-| **Timeline** | Permite animar valores y estados con claves en el tiempo. |
-| **Log** | Muestra errores, advertencias y mensajes importantes. |
+| **Viewport** | Shows the final image, camera controls, grid, and transform helpers. |
+| **Resources** | Holds textures, render targets, buffers, meshes, values, and built-in resources. |
+| **Command Pipeline** | Lists the steps that run every frame. |
+| **Inspector** | Edits the selected resource or command. |
+| **User CB** | Edits values sent to the GPU as parameters. |
+| **Render Graph** | Helps you see which command reads or writes each resource. |
+| **Timeline** | Animates values and states with keyed clips. |
+| **Log** | Shows errors, warnings, validation messages, and export output. |
 
-## Flujo de trabajo basico
+## Basic Workflow
 
-1. Abre lazyTool.
-2. Mira el viewport para ver el resultado actual.
-3. Selecciona un recurso o comando.
-4. Cambia valores desde el Inspector.
-5. Usa el log si algo no se ve como esperas.
-6. Guarda el archivo `.lt`.
-7. Exporta un ejecutable cuando quieras compartir la escena.
+1. Open lazyTool.
+2. Look at the viewport to see the current result.
+3. Select a resource or command.
+4. Change values in the Inspector.
+5. Use the log if something does not look right.
+6. Save the `.lt` file.
+7. Export an executable when you want to share the scene.
 
-El archivo `.lt` es texto plano. Eso facilita revisar cambios, versionar escenas y entender que ha guardado el editor.
+The `.lt` file is plain text. That makes scenes easier to review, version, and understand.
 
-## Recursos
+## Resources
 
-Los recursos son las piezas que usa la escena. Pueden ser valores simples, texturas, targets internos, buffers, meshes o recursos incorporados como color de escena, profundidad, tiempo o mapa de sombras.
+Resources are the pieces used by the scene. They can be simple values, textures, internal targets, buffers, meshes, or built-in data such as scene color, depth, time, and shadow maps.
 
-La ventaja de tenerlos visibles es que puedes saber rapidamente que existe en la escena y que esta usando cada comando.
+Keeping resources visible makes it easier to answer simple questions: what exists in the scene, what is selected, and what a command is using.
 
-## Comandos
+## Commands
 
-Los comandos son los pasos del frame. Se ejecutan en orden y forman el pipeline principal.
+Commands are the steps of the frame. They run in order and form the main pipeline.
 
-Algunos comandos limpian una textura, otros dibujan, otros ejecutan trabajo de compute y otros agrupan o repiten pasos. Esta estructura hace que el frame sea facil de inspeccionar: si algo sale mal, puedes buscar el paso exacto que produce el problema.
+Some commands clear a texture, some draw, some run compute work, and some group or repeat other steps. This makes the frame easier to inspect: if something goes wrong, you can usually find the exact step that produced it.
 
 ## Timeline
 
-La timeline permite animar valores sin escribir codigo nuevo para cada cambio. Puedes usarla para variar parametros, activar o desactivar comandos, mover transformaciones, cambiar la camara o ajustar la luz direccional.
+The timeline lets you animate values without writing new code for every change. It can drive parameters, command on/off state, transforms, camera state, and directional light state.
 
-Esta pensada para iterar rapido: pones claves, reproduces la escena y ajustas.
+It is meant for quick iteration: add keys, play the scene, adjust, and repeat.
 
 ## Render Graph
 
-El Render Graph no es el editor principal de la escena. Es una vista de ayuda.
+The Render Graph is not the main way to edit a scene. It is a debugging view.
 
-Sirve para ver dependencias: que comando escribe un recurso, que comando lo lee despues, donde aparece una textura intermedia o por que un paso puede estar usando algo inesperado.
+It shows dependencies: which command writes a resource, which command reads it later, where an intermediate texture appears, and why a pass may be using something unexpected.
 
-## Exportacion
+## Export
 
-lazyTool tiene dos caminos de salida:
+lazyTool has two output paths:
 
-| Salida | Uso |
+| Output | Use |
 |---|---|
-| **Export normal** | Crea un ejecutable standalone con los datos necesarios. |
-| **build64k** | Genera un player C compacto para escenas procedurales y elimina codigo de features que no se usan. |
+| **Normal export** | Creates a standalone executable with the required data. |
+| **build64k** | Generates a compact C player for procedural scenes and removes unused runtime features. |
 
-El camino 64k es mas limitado a proposito. Esta pensado para reducir tamano y mantener solo lo necesario: si una escena no usa timeline, compute, buffers o draw, esas partes no tienen por que entrar en el player generado.
+The 64k path is intentionally stricter. It is designed to reduce size and keep only what is needed. If a scene does not use timeline data, compute work, buffers, or draw commands, those parts do not need to be included in the generated player.
 
-## Compilar
+## Building
 
-Necesitas Windows, Visual Studio con MSVC, Windows SDK y una GPU compatible con DirectX 11.
+You need Windows, Visual Studio with MSVC, the Windows SDK, and a DirectX 11 capable GPU.
 
-Abre una **Developer Command Prompt for Visual Studio** en la carpeta del repositorio y ejecuta:
+Open a **Developer Command Prompt for Visual Studio** in the repository folder and run:
 
 ```bat
 build.bat
 ```
 
-Tambien puedes elegir perfil:
+You can also choose a build profile:
 
 ```bat
 build.bat fast
@@ -109,35 +111,35 @@ build.bat profile
 build.bat release
 ```
 
-El build genera los ejecutables en `bin/` y lanza el editor.
+The build writes executables to `bin/` and launches the editor.
 
-## Atajos utiles
+## Useful Shortcuts
 
-| Atajo | Accion |
+| Shortcut | Action |
 |---|---|
-| `F5` | Recompilar todo lo necesario para refrescar la escena. |
-| `Ctrl+S` | Abrir guardado del archivo actual. |
-| `Space` | Pausar o reproducir la escena. |
-| `F6` | Reiniciar el tiempo de escena. |
-| `F11` | Alternar fullscreen del viewport. |
-| `Delete` | Borrar el elemento seleccionado. |
+| `F5` | Recompile what is needed to refresh the scene. |
+| `Ctrl+S` | Open saving for the current file. |
+| `Space` | Pause or play the scene. |
+| `F6` | Restart scene time. |
+| `F11` | Toggle viewport fullscreen. |
+| `Delete` | Delete the selected item. |
 
-## Estado actual
+## Current State
 
-lazyTool es una herramienta experimental. Algunas partes son muy directas y tecnicas porque el objetivo es aprender, iterar y mantener el pipeline visible.
+lazyTool is experimental. Some parts are intentionally direct and technical because the goal is to learn, iterate, and keep the rendering pipeline visible.
 
-Si estas empezando, lo mejor es tocar pocos parametros cada vez y mirar el resultado. El editor esta pensado para que puedas explorar sin tener que entender todo desde el primer dia.
+If you are just starting, change a few values at a time and watch the result. The editor is designed so you can explore without understanding every system on day one.
 
-## Carpetas importantes
+## Important Folders
 
-| Carpeta | Contenido |
+| Folder | Contents |
 |---|---|
-| `src/` | Codigo del editor, runtime y sistemas principales. |
-| `assets/` | Recursos usados por la aplicacion. |
-| `docs/` | Capturas y documentacion auxiliar. |
-| `build64k/` | Generador y player compacto para export 64k/procedural. |
-| `external/` | Dependencias de terceros incluidas en el repositorio. |
+| `src/` | Editor, runtime, and core systems. |
+| `assets/` | Assets used by the application. |
+| `docs/` | Screenshots and supporting documentation. |
+| `build64k/` | Compact procedural exporter and generated-player code. |
+| `external/` | Third-party dependencies included with the repository. |
 
-## Licencias y dependencias
+## Licenses And Dependencies
 
-El codigo usa varias librerias conocidas del ecosistema C/C++ grafico, incluyendo Dear ImGui, stb, cgltf y NanoSVG. Los iconos de la interfaz usan Lucide; su licencia esta en `assets/icons/LUCIDE-LICENSE.txt`.
+The code uses common C/C++ graphics libraries including Dear ImGui, stb, cgltf, and NanoSVG. The interface icons use Lucide; its license is in `assets/icons/LUCIDE-LICENSE.txt`.
