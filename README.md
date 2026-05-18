@@ -1,5 +1,5 @@
 <p>
-    <img src="assets/brand/lazytool_logo.png" width="300" alt="lazyTool icon">
+    <img src="assets/brand/lazytool_log.png" width="300" alt="lazyTool icon">
 </p>
 
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
