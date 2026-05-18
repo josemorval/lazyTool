@@ -1,4 +1,4 @@
-# <img src="assets/brand/lazytool_icon.png" width="38" alt="lazyTool icon"> lazyTool
+# <img src="assets/brand/lazytool_icon.png" width="100" alt="lazyTool icon"> lazyTool
 
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
 ![Windows](https://img.shields.io/badge/platform-Windows-0078D4)
