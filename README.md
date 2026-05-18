@@ -1,6 +1,9 @@
-<img src="assets/brand/lazytool_icon.png" width="64" alt="lazyTool icon" align="left">
+<img src="assets/brand/lazytool_icon.png" width="80" alt="lazyTool icon" align="left">
+
 <br>
+
 ### lazyTool
+
 <br clear="left">
 
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
