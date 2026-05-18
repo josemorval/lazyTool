@@ -1,9 +1,8 @@
-<table>
-  <tr>
-    <td width="90"><img src="assets/brand/lazytool_icon.png" width="90" alt="lazyTool icon"></td>
-    <td><h1 style="margin-left: -8px;">lazyTool</h1></td>
-  </tr>
-</table>
+<div align="left">
+  <img src="assets/brand/lazytool_icon.png" width="110" alt="lazyTool icon" align="left">
+  <h1><br>lazyTool</h1>
+</div>
+<br clear="left">
 
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
 ![Windows](https://img.shields.io/badge/platform-Windows-0078D4)
