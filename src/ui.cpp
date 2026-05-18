@@ -17,6 +17,7 @@
 #include <d3dcompiler.h>
 #include <psapi.h>
 #include <float.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <direct.h>
 #include <vector>
@@ -182,6 +183,8 @@ static bool s_shader_source_editor_focused = false;
 static bool s_show_inspector_notes = false;
 static bool s_inspector_resource_note_open[MAX_RESOURCES] = {};
 static bool s_inspector_command_note_open[MAX_COMMANDS] = {};
+static bool s_inspector_resource_note_editing[MAX_RESOURCES] = {};
+static bool s_inspector_command_note_editing[MAX_COMMANDS] = {};
 
 static ResHandle ui_resource_handle_from_ptr(const Resource* r);
 
@@ -1018,11 +1021,21 @@ static const char* ui_draw_source_name(int source) {
     }
 }
 
+static float ui_labeled_item_compact_width(const char* label, float max_w = 360.0f, float min_w = 96.0f);
+
+static float ui_current_vertical_scroll_margin(float extra = 8.0f) {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (!window || !window->ScrollbarY)
+        return 0.0f;
+    return ImGui::GetStyle().ScrollbarSize + ui_margin_px(extra);
+}
+
 static bool ui_draw_source_combo(const char* label, int* source) {
     if (!source)
         return false;
 
     bool changed = false;
+    ImGui::SetNextItemWidth(ui_labeled_item_compact_width(label));
     if (ImGui::BeginCombo(label, ui_draw_source_name(*source))) {
         const DrawSourceType options[] = { DRAW_SOURCE_MESH, DRAW_SOURCE_PROCEDURAL };
         for (int i = 0; i < 2; i++) {
@@ -1052,6 +1065,7 @@ static bool ui_draw_topology_combo(const char* label, int* topology) {
         return false;
 
     bool changed = false;
+    ImGui::SetNextItemWidth(ui_labeled_item_compact_width(label));
     if (ImGui::BeginCombo(label, ui_draw_topology_name(*topology))) {
         const DrawTopologyType options[] = { DRAW_TOPOLOGY_TRIANGLE_LIST, DRAW_TOPOLOGY_POINT_LIST };
         for (int i = 0; i < 2; i++) {
@@ -1336,10 +1350,32 @@ static void ui_resource_size_source_label(const Resource& owner, const Resource&
     out[out_sz - 1] = '\0';
 }
 
+static float ui_labeled_item_compact_width(const char* label, float max_w, float min_w) {
+    ImGuiStyle& style = ImGui::GetStyle();
+    const char* visible_label_end = label ? strstr(label, "##") : nullptr;
+    ImVec2 label_size = label && label[0] ? ImGui::CalcTextSize(label, visible_label_end) : ImVec2(0.0f, 0.0f);
+    float right_margin = ui_current_vertical_scroll_margin(10.0f);
+    float label_reserve = label_size.x > 0.0f ? label_size.x + style.ItemInnerSpacing.x : 0.0f;
+    float avail = ImGui::GetContentRegionAvail().x;
+    float width = avail - label_reserve - right_margin;
+    if (width > ui_px(max_w))
+        width = ui_px(max_w);
+    if (width < ui_px(min_w))
+        width = ui_px(min_w);
+
+    float hard_max = avail - label_reserve - right_margin;
+    if (width > hard_max && hard_max > ui_px(64.0f))
+        width = hard_max;
+    if (width < ui_px(64.0f))
+        width = ui_px(64.0f);
+    return width;
+}
+
 static void res_combo(const char* label, ResHandle* h, ResType filter, bool allow_invalid = true,
                       ResType filter2 = RES_NONE, ResType filter3 = RES_NONE) {
     Resource* cur     = res_get(*h);
     const char* prev  = cur ? ui_resource_display_name(*cur) : "(none)";
+    ImGui::SetNextItemWidth(ui_labeled_item_compact_width(label));
     if (ImGui::BeginCombo(label, prev)) {
         if (allow_invalid && ImGui::Selectable("(none)", *h == INVALID_HANDLE))
             *h = INVALID_HANDLE;
@@ -1829,13 +1865,50 @@ static const char* user_cb_hlsl_type(ResType type) {
     }
 }
 
+static bool ui_float_value_editor_with_rgb_toggle(const char* label, ResType type, float* fval, float width) {
+    bool changed = false;
+    if (type == RES_FLOAT3 || type == RES_FLOAT4) {
+        ImGui::PushID(fval);
+        ImGuiStorage* storage = ImGui::GetStateStorage();
+        ImGuiID mode_id = ImGui::GetID("##rgb_mode");
+        bool rgb_mode = storage->GetBool(mode_id, false);
+        if (ImGui::SmallButton(rgb_mode ? "RGB" : "float")) {
+            rgb_mode = !rgb_mode;
+            storage->SetBool(mode_id, rgb_mode);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(rgb_mode ? "Edit as numeric vector" : "Edit as RGB color");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(width);
+        if (rgb_mode) {
+            changed = type == RES_FLOAT3
+                ? ImGui::ColorEdit3(label, fval)
+                : ImGui::ColorEdit4(label, fval);
+        } else {
+            changed = type == RES_FLOAT3
+                ? ImGui::DragFloat3(label, fval, 0.01f)
+                : ImGui::DragFloat4(label, fval, 0.01f);
+        }
+        ImGui::PopID();
+        return changed;
+    }
+
+    ImGui::SetNextItemWidth(width);
+    switch (type) {
+    case RES_FLOAT:  return ImGui::DragFloat(label,  &fval[0], 0.01f);
+    case RES_FLOAT2: return ImGui::DragFloat2(label,  fval,    0.01f);
+    default:         return false;
+    }
+}
+
 static bool ui_user_cb_value_editor(ResType type, int* ival, float* fval, float reserve = 78.0f) {
     float width = reserve > 0.0f ? -reserve : -1.0f;
     switch (type) {
-    case RES_FLOAT:  ImGui::SetNextItemWidth(width); return ImGui::DragFloat("##v",  &fval[0], 0.01f);
-    case RES_FLOAT2: ImGui::SetNextItemWidth(width); return ImGui::DragFloat2("##v",  fval,    0.01f);
-    case RES_FLOAT3: ImGui::SetNextItemWidth(width); return ImGui::ColorEdit3("##v",  fval);
-    case RES_FLOAT4: ImGui::SetNextItemWidth(width); return ImGui::ColorEdit4("##v",  fval);
+    case RES_FLOAT:
+    case RES_FLOAT2:
+    case RES_FLOAT3:
+    case RES_FLOAT4:
+        return ui_float_value_editor_with_rgb_toggle("##v", type, fval, width);
     case RES_INT:    ImGui::SetNextItemWidth(width); return ImGui::InputInt("##v",   &ival[0]);
     case RES_INT2:   ImGui::SetNextItemWidth(width); return ImGui::InputInt2("##v",   ival);
     case RES_INT3:   ImGui::SetNextItemWidth(width); return ImGui::InputInt3("##v",   ival);
@@ -2005,31 +2078,90 @@ static void ui_inspector_section(const char* title) {
     ImGui::Separator();
 }
 
-static bool ui_inspector_note_editor(char* note, int note_size, bool* note_open) {
-    if (!note || note_size <= 0 || !note_open)
+static void ui_inspector_text_disabled_wrapped(const char* fmt, ...) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    float wrap_pos = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - ui_current_vertical_scroll_margin(10.0f);
+    if (wrap_pos < ImGui::GetCursorPosX() + ui_px(48.0f))
+        wrap_pos = ImGui::GetCursorPosX() + ui_px(48.0f);
+    ImGui::PushTextWrapPos(wrap_pos);
+    va_list args;
+    va_start(args, fmt);
+    ImGui::TextV(fmt, args);
+    va_end(args);
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+}
+
+static void ui_inspector_note_preview(const char* note, ImVec2 size) {
+    ImGuiStyle& style = ImGui::GetStyle();
+    ImVec2 min = ImGui::GetItemRectMin();
+    ImVec2 max = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 bg_col = ImGui::GetColorU32(ImVec4(0.185f, 0.116f, 0.070f, 0.92f));
+    ImU32 border_col = ImGui::GetColorU32(ImVec4(0.82f, 0.43f, 0.18f, 0.78f));
+    ImU32 text_col = ImGui::GetColorU32(note && note[0]
+        ? ImVec4(1.00f, 0.77f, 0.48f, 1.00f)
+        : ImVec4(0.92f, 0.58f, 0.34f, 0.72f));
+
+    dl->AddRectFilled(min, max, bg_col, style.FrameRounding);
+    dl->AddRect(min, max, border_col, style.FrameRounding);
+
+    const char* display = (note && note[0]) ? note : "Click to add a note.";
+    float pad_x = style.FramePadding.x + ui_px(2.0f);
+    float pad_y = style.FramePadding.y + ui_px(2.0f);
+    ImVec2 text_pos(min.x + pad_x, min.y + pad_y);
+    float wrap_width = size.x - pad_x * 2.0f;
+    dl->PushClipRect(min, max, true);
+    dl->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.12f,
+                text_pos, text_col, display, nullptr, wrap_width);
+    dl->PopClipRect();
+}
+
+static bool ui_inspector_note_editor(char* note, int note_size, bool* note_open, bool* note_editing) {
+    if (!note || note_size <= 0 || !note_open || !note_editing)
         return false;
     if (!s_show_inspector_notes)
         return false;
 
     ui_inspector_section("NOTES");
-    ImGui::Checkbox("Show note", note_open);
-    if (!*note_open)
+    ImGui::Checkbox("Show", note_open);
+    if (!*note_open) {
+        *note_editing = false;
         return false;
+    }
 
-    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
-    if (note[0])
-        ImGui::TextUnformatted(note);
-    else
-        ImGui::TextDisabled("No note yet.");
-    ImGui::PopTextWrapPos();
-
-    ImGui::Spacing();
-    ImGui::TextDisabled("Edit note");
+    bool changed = false;
     ImGui::SetNextItemWidth(-FLT_MIN);
-    return ImGui::InputTextMultiline("##inspector_note", note, (size_t)note_size,
-                                     ImVec2(-FLT_MIN, ui_px(84.0f)),
-                                     ImGuiInputTextFlags_AllowTabInput |
-                                     ImGuiInputTextFlags_NoHorizontalScroll);
+    float note_w = ImGui::GetContentRegionAvail().x - ui_current_vertical_scroll_margin(10.0f) - ui_margin_px(6.0f);
+    if (note_w < ui_px(24.0f))
+        note_w = ui_px(24.0f);
+    ImVec2 note_size_px(note_w, ui_px(84.0f));
+    if (*note_editing) {
+        if (ImGui::GetIO().MouseWheel != 0.0f && ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows)) {
+            float wheel = ImGui::GetIO().MouseWheel;
+            ImGui::SetScrollY(ImGui::GetScrollY() - wheel * ImGui::GetTextLineHeight() * 5.0f);
+            *note_editing = false;
+            ImGui::ClearActiveID();
+        }
+    }
+    if (*note_editing) {
+        ImGui::SetKeyboardFocusHere();
+        changed = ImGui::InputTextMultiline("##inspector_note", note, (size_t)note_size,
+                                            note_size_px,
+                                            ImGuiInputTextFlags_AllowTabInput |
+                                            ImGuiInputTextFlags_NoHorizontalScroll |
+                                            ImGuiInputTextFlags_WordWrap);
+        if (ImGui::IsItemDeactivated())
+            *note_editing = false;
+    } else {
+        ImGui::InvisibleButton("##inspector_note_preview", note_size_px);
+        bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+        ImVec2 actual_size = ImGui::GetItemRectSize();
+        ui_inspector_note_preview(note, actual_size);
+        if (clicked)
+            *note_editing = true;
+    }
+    return changed;
 }
 
 static bool ui_ascii_ident_start(char c) {
@@ -4463,13 +4595,13 @@ static void ui_shader_source_editor_toolbar(UiShaderSourceEditor* ed, ResHandle 
             s_shader_editor_floating_h = selected_h;
         }
 
-        ImGui::TextDisabled("%s%s  |  %zu bytes%s  |  Ln %d, Col %d  |  Ctrl+S save, Ctrl+D compile root, Ctrl+Z/Y undo/redo",
+        ui_inspector_text_disabled_wrapped("%s%s  |  %zu bytes%s  |  Ln %d, Col %d  |  Ctrl+S save, Ctrl+D compile root, Ctrl+Z/Y undo/redo",
                             ed->viewing_include ? "include " : "root ",
                             ed->path[0] ? ed->path : "(no file)",
                             ed->text ? strlen(ed->text) : 0, ed->dirty ? "  modified" : "",
                             cursor_line, cursor_col);
     } else {
-        ImGui::TextDisabled("%s%s  |  %zu bytes%s  |  Ln %d, Col %d  |  Ctrl+S save, Ctrl+D compile root, Ctrl+Z/Y undo/redo",
+        ui_inspector_text_disabled_wrapped("%s%s  |  %zu bytes%s  |  Ln %d, Col %d  |  Ctrl+S save, Ctrl+D compile root, Ctrl+Z/Y undo/redo",
                             ed->viewing_include ? "include " : "root ",
                             ed->path[0] ? ed->path : "(no file)",
                             ed->text ? strlen(ed->text) : 0, ed->dirty ? "  modified" : "",
@@ -4489,7 +4621,7 @@ static void ui_shader_source_editor_body(UiShaderSourceEditor* ed, ResHandle h, 
 
 static void ui_shader_source_viewer(ResHandle h, Resource* r) {
     if (s_shader_editor_floating) {
-        ImGui::TextDisabled("Shader source is open in the floating Shader Editor panel.");
+        ui_inspector_text_disabled_wrapped("Shader source is open in the floating Shader Editor panel.");
         if (ImGui::Button("Return to Inspector", ImVec2(-1.0f, 0.0f)))
             ui_shader_editor_close_floating(false);
         return;
@@ -4508,13 +4640,13 @@ static void ui_shader_source_viewer(ResHandle h, Resource* r) {
     }
 
     if (!ed.path[0]) {
-        ImGui::TextDisabled("No shader path.");
+        ui_inspector_text_disabled_wrapped("No shader path.");
         return;
     }
     if (!ed.ok || !ed.text) {
         if (ImGui::Button("Reload Source", ImVec2(-1.0f, 0.0f)))
             ui_shader_editor_load(&ed, h, path);
-        ImGui::TextDisabled("Could not read source: %s", ed.path);
+        ui_inspector_text_disabled_wrapped("Could not read source: %s", ed.path);
         return;
     }
 
@@ -4548,9 +4680,9 @@ static bool ui_tinted_transform_row(const char* label, float* v, float speed,
 }
 
 static void ui_key_value(const char* key, const char* value) {
-    ImGui::TextDisabled("%s", key);
+    ui_inspector_text_disabled_wrapped("%s", key);
     ImGui::SameLine(120.0f);
-    ImGui::TextUnformatted(value ? value : "-");
+    ImGui::TextWrapped("%s", value ? value : "-");
 }
 
 static void ui_key_value_handle(const char* key, ResHandle h) {
@@ -4563,16 +4695,16 @@ static void ui_command_shader_params(Command* c, Resource* shader) {
         return;
 
     if (!shader->shader_cb.active) {
-        ImGui::TextDisabled("No UserCB cbuffer reflected. Recommended: register(b2).");
+        ui_inspector_text_disabled_wrapped("No UserCB cbuffer reflected. Recommended: register(b2).");
         return;
     }
 
     user_cb_sync_command_params(c, shader);
-    ImGui::TextDisabled("%s: register(b%u), %u bytes",
+    ui_inspector_text_disabled_wrapped("%s: register(b%u), %u bytes",
         shader->shader_cb.name, shader->shader_cb.bind_slot, shader->shader_cb.size);
 
     if (shader->shader_cb.var_count == 0) {
-        ImGui::TextDisabled("No supported scalar/vector variables found.");
+        ui_inspector_text_disabled_wrapped("No supported scalar/vector variables found.");
         return;
     }
 
@@ -4589,23 +4721,23 @@ static void ui_command_shader_params(Command* c, Resource* shader) {
         ImGui::SameLine();
         ImGui::TextUnformatted(p.name);
         ImGui::SameLine();
-        ImGui::TextDisabled("%s", res_type_str(p.type));
+        ui_inspector_text_disabled_wrapped("%s", res_type_str(p.type));
 
         if (!p.enabled)
             ImGui::BeginDisabled();
 
-        ImGui::TextDisabled("Source");
+        ui_inspector_text_disabled_wrapped("Source");
         ImGui::SameLine(96.0f);
         ImGui::SetNextItemWidth(-1.0f);
         ui_command_param_source_combo(&p);
 
-        ImGui::TextDisabled("Value");
+        ui_inspector_text_disabled_wrapped("Value");
         ImGui::SameLine(96.0f);
         UserCBSourceKind source_kind = p.source_kind;
         if (source_kind == USER_CB_SOURCE_NONE && p.source != INVALID_HANDLE)
             source_kind = USER_CB_SOURCE_RESOURCE;
         if (source_kind != USER_CB_SOURCE_NONE) {
-            ImGui::TextDisabled("(source driven)");
+            ui_inspector_text_disabled_wrapped("(source driven)");
         } else if (src && src->type == p.type) {
             ui_user_cb_value_editor(p.type, src->ival, src->fval, 0.0f);
         } else {
@@ -5089,7 +5221,9 @@ static bool ui_resource_row(int index, Resource& r) {
     }
 
     const float row_h = ImGui::GetTextLineHeight() + 10.0f;
-    float width = ImGui::GetContentRegionAvail().x;
+    float width = ImGui::GetContentRegionAvail().x - ui_current_vertical_scroll_margin(8.0f);
+    if (width < ui_px(48.0f))
+        width = ui_px(48.0f);
     ImGui::InvisibleButton("##res_row", ImVec2(width, row_h));
     bool hovered = ImGui::IsItemHovered();
     if (ImGui::IsItemClicked()) {
@@ -5279,7 +5413,9 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
     }
 
     const float row_h = c.type == CMD_GROUP ? (ImGui::GetTextLineHeight() + 8.0f) : (ImGui::GetTextLineHeight() + 12.0f);
-    float width = ImGui::GetContentRegionAvail().x;
+    float width = ImGui::GetContentRegionAvail().x - ui_current_vertical_scroll_margin(8.0f);
+    if (width < ui_px(48.0f))
+        width = ui_px(48.0f);
     ImGui::InvisibleButton("##cmd_row", ImVec2(width, row_h));
     bool hovered = ImGui::IsItemHovered();
     if (ImGui::IsItemClicked()) {
@@ -6282,17 +6418,20 @@ static void ui_timeline_capture_user_vars_for_resource(ResHandle h) {
 }
 
 static void ui_inspector_resource(Resource* r, ResHandle h) {
-    if (r->is_builtin) ImGui::TextDisabled("(built-in - read only name)");
+    if (r->is_builtin) ui_inspector_text_disabled_wrapped("(built-in - read only name)");
 
     bool value_changed = false;
     switch (r->type) {
     case RES_INT:    value_changed = ImGui::InputInt("value",   &r->ival[0]);       break;
     case RES_INT2:   value_changed = ImGui::InputInt2("value",   r->ival);          break;
     case RES_INT3:   value_changed = ImGui::InputInt3("value",   r->ival);          break;
-    case RES_FLOAT:  value_changed = ImGui::DragFloat("value",  &r->fval[0], 0.01f); break;
-    case RES_FLOAT2: value_changed = ImGui::DragFloat2("value",  r->fval,    0.01f); break;
-    case RES_FLOAT3: value_changed = ImGui::ColorEdit3("value",  r->fval);          break;
-    case RES_FLOAT4: value_changed = ImGui::ColorEdit4("value",  r->fval);          break;
+    case RES_FLOAT:
+    case RES_FLOAT2:
+    case RES_FLOAT3:
+    case RES_FLOAT4:
+        value_changed = ui_float_value_editor_with_rgb_toggle("value", r->type, r->fval,
+                                                              ui_labeled_item_compact_width("value"));
+        break;
 
     case RES_RENDER_TEXTURE2D: {
         static ResHandle s_edit_rt = INVALID_HANDLE;
@@ -6314,7 +6453,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             if (s_w < 1) s_w = 1;
             if (s_h < 1) s_h = 1;
         } else {
-            ImGui::TextDisabled("Scene-scaled: %s", ui_rt_scene_scale_name(s_scene_div));
+            ui_inspector_text_disabled_wrapped("Scene-scaled: %s", ui_rt_scene_scale_name(s_scene_div));
         }
         if (ui_rt_format_combo("Format", &s_fmt))
             ui_clamp_rt_flags(s_fmt, &s_rtv, &s_srv, &s_uav, &s_dsv);
@@ -6343,7 +6482,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         }
         ImGui::Text("Current: %dx%d, %s", r->width, r->height, ui_rt_format_name(r->tex_fmt));
         if (r->scene_scale_divisor > 0)
-            ImGui::TextDisabled("Mode: %s", ui_rt_scene_scale_name(r->scene_scale_divisor));
+            ui_inspector_text_disabled_wrapped("Mode: %s", ui_rt_scene_scale_name(r->scene_scale_divisor));
         ImGui::Text("RTV:%s SRV:%s UAV:%s DSV:%s",
             r->has_rtv?"Y":"N", r->has_srv?"Y":"N",
             r->has_uav?"Y":"N", r->has_dsv?"Y":"N");
@@ -6387,7 +6526,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         if (is_depth || !supports_uav) ImGui::EndDisabled();
         ui_clamp_rt3d_flags(s_fmt, &s_rtv, &s_srv, &s_uav);
         if (is_depth)
-            ImGui::TextDisabled("Depth formats are only supported by RenderTexture2D.");
+            ui_inspector_text_disabled_wrapped("Depth formats are only supported by RenderTexture2D.");
 
         if (is_depth) ImGui::BeginDisabled();
         if (ImGui::Button("Recreate")) {
@@ -6400,11 +6539,11 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         ImGui::Text("RTV:%s SRV:%s UAV:%s",
             r->has_rtv?"Y":"N", r->has_srv?"Y":"N", r->has_uav?"Y":"N");
         if (!r->srv) {
-            ImGui::TextDisabled("Preview requires SRV enabled.");
+            ui_inspector_text_disabled_wrapped("Preview requires SRV enabled.");
             break;
         }
         if (!ui_rt3d_preview_supported_format(r->tex_fmt)) {
-            ImGui::TextDisabled("Preview is not available for this format yet.");
+            ui_inspector_text_disabled_wrapped("Preview is not available for this format yet.");
             break;
         }
         if (s_preview_slice >= r->depth) s_preview_slice = r->depth - 1;
@@ -6420,13 +6559,13 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         if (ID3D11ShaderResourceView* preview_srv = ui_render_texture3d_preview_slice(r, s_preview_slice))
             ui_image_fit_panel(preview_srv, r->width, r->height);
         else
-            ImGui::TextDisabled("3D texture preview is unavailable.");
+            ui_inspector_text_disabled_wrapped("3D texture preview is unavailable.");
         break;
     }
 
     case RES_TEXTURE2D: {
         ImGui::Text("Size: %dx%d", r->width, r->height);
-        ImGui::Text("Path: %s", r->path);
+        ImGui::TextWrapped("Path: %s", r->path);
         static ResHandle tex_edit = INVALID_HANDLE;
         static char tex_path[MAX_PATH_LEN] = {};
         if (tex_edit != h) {
@@ -6470,13 +6609,13 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         if (s_indirect_args) s_stride = 4;
         if (s_stride < 1) s_stride = 1;
         if (s_count < 1) s_count = 1;
-        ImGui::TextDisabled("Total: %d bytes", s_stride * s_count);
+        ui_inspector_text_disabled_wrapped("Total: %d bytes", s_stride * s_count);
         ImGui::Checkbox("SRV", &s_srv);
         ImGui::SameLine();
         ImGui::Checkbox("UAV", &s_uav);
         ImGui::Checkbox("Indirect Args", &s_indirect_args);
         if (s_indirect_args)
-            ImGui::TextDisabled("Indirect args use typed uint views for D3D11 compatibility.");
+            ui_inspector_text_disabled_wrapped("Indirect args use typed uint views for D3D11 compatibility.");
         if (ImGui::Button("Recreate")) {
             if (res_recreate_structured_buffer(h, s_stride, s_count, s_srv, s_uav, s_indirect_args))
                 log_info("StructuredBuffer recreated: %s (%d x %d bytes)", r->name, s_count, s_stride);
@@ -6503,7 +6642,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         } else if (r->path[0]) {
             ImGui::TextColored({1, 0.35f, 0.3f, 1}, "Status: ERROR");
         } else {
-            ImGui::TextDisabled("Status: no file loaded");
+            ui_inspector_text_disabled_wrapped("Status: no file loaded");
         }
         if (r->compile_err[0])
             ImGui::TextWrapped("%s", r->compile_err);
@@ -6528,8 +6667,8 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         ImGui::Text("Stride: %d bytes", r->elem_size);
         ImGui::Text("GPU: %.3f MB", (double)res_estimate_gpu_bytes(*r) / (1024.0 * 1024.0));
         ImGui::Text("SRV:%s UAV:%s", r->has_srv ? "Y" : "N", r->has_uav ? "Y" : "N");
-        ImGui::TextDisabled("Read-only StructuredBuffer SRV; bind it in SRV slots for draw/compute shaders.");
-        ImGui::TextDisabled("GPU layout: float4 pos_opacity, float4 quat_xyzw, float4 scale, float4 color.");
+        ui_inspector_text_disabled_wrapped("Read-only StructuredBuffer SRV; bind it in SRV slots for draw/compute shaders.");
+        ui_inspector_text_disabled_wrapped("GPU layout: float4 pos_opacity, float4 quat_xyzw, float4 scale, float4 color.");
 
         ImGui::Separator();
         ImGui::Text("Bounds min: %.4g %.4g %.4g",
@@ -6541,7 +6680,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         if (r->splat_sh_degree > 0)
             ImGui::Text("Detected SH degree: %d", r->splat_sh_degree);
         else
-            ImGui::TextDisabled("Detected SH degree: none/DC only");
+            ui_inspector_text_disabled_wrapped("Detected SH degree: none/DC only");
 
         if (r->size_handle != INVALID_HANDLE) {
             if (Resource* sr = res_get(r->size_handle)) {
@@ -6552,7 +6691,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
                     g_sel_res = r->size_handle;
                     g_sel_cmd = INVALID_HANDLE;
                 }
-                ImGui::TextDisabled("Use this int resource for cbuffer params or dispatch counts.");
+                ui_inspector_text_disabled_wrapped("Use this int resource for cbuffer params or dispatch counts.");
             }
         }
         break;
@@ -6564,7 +6703,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         ImGui::Text("Stride:   %d bytes", r->vert_stride);
         ImGui::Text("Parts:    %d", r->mesh_part_count);
         ImGui::Text("Materials:%d", r->mesh_material_count);
-        ImGui::Text("Path: %s", r->path);
+        ImGui::TextWrapped("Path: %s", r->path);
         if (r->mesh_bounds_valid) {
             ImGui::Separator();
             ui_draw_bounds_values("Mesh bounds", r->mesh_bounds_min, r->mesh_bounds_max);
@@ -6578,8 +6717,11 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         }
         if (r->using_fallback) {
             ImGui::TextColored({1, 0.35f, 0.3f, 1}, "Status: FALLBACK CUBE");
-            if (r->compile_err[0])
-                ImGui::TextColored({1, 0.35f, 0.3f, 1}, "%s", r->compile_err);
+            if (r->compile_err[0]) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.35f, 0.3f, 1));
+                ImGui::TextWrapped("%s", r->compile_err);
+                ImGui::PopStyleColor();
+            }
         } else if (r->vb) {
             ImGui::TextColored({0.35f, 1, 0.45f, 1}, "Status: OK");
         }
@@ -6594,7 +6736,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
                 ImGui::Text("%s", part.name[0] ? part.name : "(part)");
                 if (part.material_index >= 0 && part.material_index < r->mesh_material_count) {
                     ImGui::SameLine();
-                    ImGui::TextDisabled("mat %s", r->mesh_materials[part.material_index].name);
+                    ui_inspector_text_disabled_wrapped("mat %s", r->mesh_materials[part.material_index].name);
                 }
                 if (part.bounds_valid && ImGui::TreeNodeEx("Bounds", ImGuiTreeNodeFlags_None)) {
                     ui_draw_bounds_values(nullptr, part.bounds_min, part.bounds_max);
@@ -6611,9 +6753,9 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
                 ImGui::PushID(1000 + mi);
                 if (ImGui::TreeNodeEx(mat.name[0] ? mat.name : "(material)", ImGuiTreeNodeFlags_DefaultOpen)) {
                     if (mat.double_sided)
-                        ImGui::TextDisabled("Double-sided");
+                ui_inspector_text_disabled_wrapped("Double-sided");
                     else
-                        ImGui::TextDisabled("Backface culled by default");
+                ui_inspector_text_disabled_wrapped("Backface culled by default");
                     for (int slot = 0; slot < MAX_MESH_MATERIAL_TEXTURES; slot++) {
                         ResHandle tex_h = mat.textures[slot];
                         Resource* tr = res_get(tex_h);
@@ -6713,14 +6855,14 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
                 r->shader_cb.name, r->shader_cb.bind_slot, r->shader_cb.size);
             for (int i = 0; i < r->shader_cb.var_count; i++) {
                 const ShaderCBVar& v = r->shader_cb.vars[i];
-                ImGui::TextDisabled("%s %s @ %u", res_type_str(v.type), v.name, v.offset);
+                ui_inspector_text_disabled_wrapped("%s %s @ %u", res_type_str(v.type), v.name, v.offset);
             }
             if (r->object_cb_active)
-                ImGui::TextDisabled("ObjectCB slot: b%u", r->object_cb_bind_slot);
+                ui_inspector_text_disabled_wrapped("ObjectCB slot: b%u", r->object_cb_bind_slot);
         } else {
-            ImGui::TextDisabled("No UserCB cbuffer reflected. Recommended: register(b2).");
+            ui_inspector_text_disabled_wrapped("No UserCB cbuffer reflected. Recommended: register(b2).");
             if (r->object_cb_active)
-                ImGui::TextDisabled("ObjectCB slot: b%u", r->object_cb_bind_slot);
+                ui_inspector_text_disabled_wrapped("ObjectCB slot: b%u", r->object_cb_bind_slot);
         }
         break;
     }
@@ -6796,7 +6938,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
                 ImGui::PushID(cascade);
                 if (cascade > 0)
                     ImGui::Separator();
-                ImGui::TextDisabled("Cascade %d", cascade + 1);
+                ui_inspector_text_disabled_wrapped("Cascade %d", cascade + 1);
                 ImGui::DragFloat("Split Far", &r->shadow_cascade_split[cascade], 0.05f, 0.0f, 1000.0f);
                 ImGui::DragFloat2("Ortho Size", r->shadow_cascade_extent[cascade], 0.01f, 0.01f, 100.0f);
                 ImGui::DragFloat("Near", &r->shadow_cascade_near[cascade], 0.001f, 0.0001f, 100.0f);
@@ -6804,14 +6946,14 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
                 ImGui::PopID();
             }
             ui_validate_dirlight_cascades(r);
-            ImGui::TextDisabled("Each cascade uses a manual ortho box and manual split distance.");
+            ui_inspector_text_disabled_wrapped("Each cascade uses a manual ortho box and manual split distance.");
         } else {
             ImGui::DragFloat2("Shadow Ortho Size", r->shadow_extent, 0.01f, 0.01f, 100.0f);
             ImGui::DragFloat("Shadow Near", &r->shadow_near, 0.001f, 0.0001f, 100.0f);
             ImGui::DragFloat("Shadow Far", &r->shadow_far, 0.01f, 0.001f, 1000.0f);
             if (r->shadow_far <= r->shadow_near + 0.001f)
                 r->shadow_far = r->shadow_near + 0.001f;
-            ImGui::TextDisabled("Single-cascade mode uses the manual ortho box above.");
+            ui_inspector_text_disabled_wrapped("Single-cascade mode uses the manual ortho box above.");
         }
         ImGui::Separator();
         if (Resource* shadow_map = res_get(g_builtin_shadow_map)) {
@@ -6854,7 +6996,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             dx_create_shadow_map(shadow_size[0], shadow_size[1]);
         }
         if (dl) {
-            ImGui::TextDisabled("%d cascades%s",
+            ui_inspector_text_disabled_wrapped("%d cascades%s",
                                 dl->shadow_cascade_count > 0 ? dl->shadow_cascade_count : 1,
                                 dl->shadow_cascade_count > 1 ? " (atlas)" : "");
         }
@@ -6873,7 +7015,9 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
     if (!r->is_builtin) {
         int note_idx = (int)h - 1;
         if (note_idx >= 0 && note_idx < MAX_RESOURCES)
-            ui_inspector_note_editor(r->note, MAX_NOTE, &s_inspector_resource_note_open[note_idx]);
+            ui_inspector_note_editor(r->note, MAX_NOTE,
+                                     &s_inspector_resource_note_open[note_idx],
+                                     &s_inspector_resource_note_editing[note_idx]);
     }
 }
 
@@ -7012,7 +7156,7 @@ static bool ui_clear_resource_source_combo(const char* label, char* source_name,
     }
 
     bool changed = false;
-    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::SetNextItemWidth(ui_labeled_item_compact_width(label));
     if (ImGui::BeginCombo(label, preview)) {
         bool hardcoded = source_name[0] == '\0';
         if (ImGui::Selectable("(hardcoded)", hardcoded)) {
@@ -7020,7 +7164,7 @@ static bool ui_clear_resource_source_combo(const char* label, char* source_name,
             changed = true;
         }
         ImGui::Separator();
-        ImGui::TextDisabled("Resources");
+        ui_inspector_text_disabled_wrapped("Resources");
         bool any_resource = false;
         for (int i = 0; i < MAX_RESOURCES; i++) {
             Resource& r = g_resources[i];
@@ -7037,7 +7181,7 @@ static bool ui_clear_resource_source_combo(const char* label, char* source_name,
             ImGui::PopID();
         }
         if (!any_resource)
-            ImGui::TextDisabled("No %s resources.", res_type_str(type));
+            ui_inspector_text_disabled_wrapped("No %s resources.", res_type_str(type));
         ImGui::EndCombo();
     }
     return changed;
@@ -7058,7 +7202,7 @@ static void ui_command_compute_resource_bindings(Command* c, const char* id_suff
         return;
 
     ui_inspector_section("BINDINGS");
-    ImGui::TextDisabled("SRVs are bound to t# in CS. UAVs are bound to u# in CS.");
+    ui_inspector_text_disabled_wrapped("SRVs are bound to t# in CS. UAVs are bound to u# in CS.");
     ImGui::Text("SRV Slots t# (%d / %d):", c->srv_count, MAX_SRV_SLOTS);
     for (int s = 0; s < c->srv_count; s++) {
         ImGui::PushID(srv_id_base + s);
@@ -7124,7 +7268,7 @@ static void ui_inspector_command(Command* c) {
                 s_cmd_nav = g_sel_cmd;
             }
             ImGui::SameLine();
-            ImGui::TextDisabled("%s", cmd_type_str(child.type));
+            ui_inspector_text_disabled_wrapped("%s", cmd_type_str(child.type));
             ImGui::PopID();
         }
         break;
@@ -7167,7 +7311,7 @@ static void ui_inspector_command(Command* c) {
                 s_cmd_nav = g_sel_cmd;
             }
             ImGui::SameLine();
-            ImGui::TextDisabled("%s", cmd_type_str(child.type));
+            ui_inspector_text_disabled_wrapped("%s", cmd_type_str(child.type));
             ImGui::PopID();
         }
         break;
@@ -7187,7 +7331,9 @@ static void ui_inspector_command(Command* c) {
             } else {
                 if (c->clear_color_source[0])
                     ImGui::TextWrapped("Selected color source is missing or not float4; using the hardcoded fallback value.");
-                clear_changed |= ImGui::ColorEdit4("Clear Color Value", c->clear_color);
+                ui_inspector_text_disabled_wrapped("Clear Color Value");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                clear_changed |= ImGui::ColorEdit4("##clear_color_value", c->clear_color);
             }
         }
         clear_changed |= ImGui::Checkbox("Clear Depth", &c->clear_depth);
@@ -7201,7 +7347,9 @@ static void ui_inspector_command(Command* c) {
             } else {
                 if (c->clear_depth_source[0])
                     ImGui::TextWrapped("Selected depth source is missing or not float; using the hardcoded fallback value.");
-                clear_changed |= ImGui::DragFloat("Depth Value", &c->depth_clear_val, 0.01f, 0.f, 1.f);
+                ui_inspector_text_disabled_wrapped("Depth Value");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                clear_changed |= ImGui::DragFloat("##depth_value", &c->depth_clear_val, 0.01f, 0.f, 1.f);
             }
         }
         if (clear_changed)
@@ -7223,7 +7371,7 @@ static void ui_inspector_command(Command* c) {
             ui_draw_topology_combo("Topology##dm", &c->draw_topology);
             ImGui::InputInt("Vertex Count", &c->vertex_count);
             if (c->vertex_count < 0) c->vertex_count = 0;
-            ImGui::TextDisabled("No mesh is bound. The VS should use SV_VertexID / VS SRVs.");
+            ui_inspector_text_disabled_wrapped("No mesh is bound. The VS should use SV_VertexID / VS SRVs.");
         } else {
             res_combo("Mesh##dm", &c->mesh, RES_MESH, false);
         }
@@ -7266,8 +7414,8 @@ static void ui_inspector_command(Command* c) {
             ImGui::InputInt("Instance Count", &c->instance_count);
 
         ui_inspector_section("SRV BINDINGS");
-        ImGui::TextDisabled("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
-        ImGui::TextDisabled("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
+        ui_inspector_text_disabled_wrapped("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
+        ui_inspector_text_disabled_wrapped("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
         if (ImGui::TreeNodeEx("Slot Reference##draw_slots", ImGuiTreeNodeFlags_None)) {
             ui_draw_texture_slot_reference("##draw_slot_reference");
             ImGui::TreePop();
@@ -7287,8 +7435,8 @@ static void ui_inspector_command(Command* c) {
 
         ui_inspector_section("PIXEL UAV OUTPUTS");
         UINT draw_rtv_count = ui_draw_command_rtv_count(*c);
-        ImGui::TextDisabled("DX11 output slots are shared by RTVs and PS UAVs.");
-        ImGui::TextDisabled("With %u RTV%s active, the first valid UAV slot is u%u.",
+        ui_inspector_text_disabled_wrapped("DX11 output slots are shared by RTVs and PS UAVs.");
+        ui_inspector_text_disabled_wrapped("With %u RTV%s active, the first valid UAV slot is u%u.",
             draw_rtv_count, draw_rtv_count == 1 ? "" : "s", draw_rtv_count);
         ImGui::Text("UAV Slots (%d / %d):", c->uav_count, MAX_UAV_SLOTS);
         for (int u = 0; u < c->uav_count; u++) {
@@ -7312,7 +7460,7 @@ static void ui_inspector_command(Command* c) {
         res_combo_dispatch_source("Dispatch From##dp", &c->dispatch_size_source);
         if (c->dispatch_size_source != INVALID_HANDLE) {
             ImGui::InputInt3("Divisor XYZ", &c->thread_x);
-            ImGui::TextDisabled("Dispatch = ceil(source_size / divisor)");
+            ui_inspector_text_disabled_wrapped("Dispatch = ceil(source_size / divisor)");
         } else {
             ImGui::InputInt3("Dispatch XYZ", &c->thread_x);
         }
@@ -7332,10 +7480,10 @@ static void ui_inspector_command(Command* c) {
         Resource* mesh = res_get(c->mesh);
         if (ui_command_uses_procedural_draw(*c)) {
             ui_draw_topology_combo("Topology##id", &c->draw_topology);
-            ImGui::TextDisabled("Uses DrawInstancedIndirect args.");
+            ui_inspector_text_disabled_wrapped("Uses DrawInstancedIndirect args.");
         } else {
             res_combo("Mesh##id", &c->mesh, RES_MESH, false);
-            ImGui::TextDisabled("%s",
+            ui_inspector_text_disabled_wrapped("%s",
                 (mesh && mesh->ib) ? "Uses DrawIndexedInstancedIndirect args."
                                    : "Uses DrawInstancedIndirect args.");
         }
@@ -7373,8 +7521,8 @@ static void ui_inspector_command(Command* c) {
             res_combo("Shadow Shader##id", &c->shadow_shader, RES_SHADER);
 
         ui_inspector_section("SRV BINDINGS");
-        ImGui::TextDisabled("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
-        ImGui::TextDisabled("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
+        ui_inspector_text_disabled_wrapped("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
+        ui_inspector_text_disabled_wrapped("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
         if (ImGui::TreeNodeEx("Slot Reference##indirect_draw_slots", ImGuiTreeNodeFlags_None)) {
             ui_draw_texture_slot_reference("##indirect_draw_slot_reference");
             ImGui::TreePop();
@@ -7394,8 +7542,8 @@ static void ui_inspector_command(Command* c) {
 
         ui_inspector_section("PIXEL UAV OUTPUTS");
         UINT draw_rtv_count = ui_draw_command_rtv_count(*c);
-        ImGui::TextDisabled("DX11 output slots are shared by RTVs and PS UAVs.");
-        ImGui::TextDisabled("With %u RTV%s active, the first valid UAV slot is u%u.",
+        ui_inspector_text_disabled_wrapped("DX11 output slots are shared by RTVs and PS UAVs.");
+        ui_inspector_text_disabled_wrapped("With %u RTV%s active, the first valid UAV slot is u%u.",
             draw_rtv_count, draw_rtv_count == 1 ? "" : "s", draw_rtv_count);
         ImGui::Text("UAV Slots (%d / %d):", c->uav_count, MAX_UAV_SLOTS);
         for (int u = 0; u < c->uav_count; u++) {
@@ -7433,7 +7581,9 @@ static void ui_inspector_command(Command* c) {
     }
 
     if (inspected_idx >= 0 && inspected_idx < MAX_COMMANDS)
-        ui_inspector_note_editor(c->note, MAX_NOTE, &s_inspector_command_note_open[inspected_idx]);
+        ui_inspector_note_editor(c->note, MAX_NOTE,
+                                 &s_inspector_command_note_open[inspected_idx],
+                                 &s_inspector_command_note_editing[inspected_idx]);
 
     if (inspected_h != INVALID_HANDLE && memcmp(&before_edit, c, sizeof(Command)) != 0) {
         bool graph_changed = before_edit.parent != c->parent ||
@@ -7448,8 +7598,6 @@ static void ui_inspector_command(Command* c) {
 
 static void ui_panel_inspector(bool embedded = false) {
     if (!embedded) ImGui::Begin("Inspector");
-    ImGui::Checkbox("Notes", &s_show_inspector_notes);
-    ImGui::Separator();
     if (g_sel_res != INVALID_HANDLE) {
         Resource* r = res_get(g_sel_res);
         if (r) {
@@ -7457,15 +7605,15 @@ static void ui_panel_inspector(bool embedded = false) {
             ui_inspector_resource(r, g_sel_res);
             ImGui::PopID();
         } else {
-            ImGui::TextDisabled("(stale selection)");
+            ui_inspector_text_disabled_wrapped("(stale selection)");
         }
     } else if (g_sel_cmd != INVALID_HANDLE) {
         Command* c = cmd_get(g_sel_cmd);
         if (c) ui_inspector_command(c);
-        else   ImGui::TextDisabled("(stale selection)");
+        else   ui_inspector_text_disabled_wrapped("(stale selection)");
     } else {
-        ImGui::TextDisabled("Nothing selected.");
-        ImGui::TextDisabled("Right-click Resources or Commands panels to create items.");
+        ui_inspector_text_disabled_wrapped("Nothing selected.");
+        ui_inspector_text_disabled_wrapped("Right-click Resources or Commands panels to create items.");
     }
     if (!embedded) ImGui::End();
 }
@@ -7484,10 +7632,10 @@ static void ui_binding_row(const char* role, const char* stage, int slot, ResHan
 
     ImGui::TextUnformatted(role);
     ImGui::SameLine();
-    ImGui::TextDisabled("%s", stage ? stage : "-");
+    ui_inspector_text_disabled_wrapped("%s", stage ? stage : "-");
     if (slot >= 0) {
         ImGui::SameLine();
-        ImGui::TextDisabled("slot %d", slot);
+        ui_inspector_text_disabled_wrapped("slot %d", slot);
     }
 
     if (r) {
@@ -7495,9 +7643,9 @@ static void ui_binding_row(const char* role, const char* stage, int slot, ResHan
         ImGui::TextUnformatted(ui_resource_display_name(*r));
         ImGui::PopStyleColor();
         ImGui::SameLine();
-        ImGui::TextDisabled("%s", ui_resource_display_type(*r));
+        ui_inspector_text_disabled_wrapped("%s", ui_resource_display_type(*r));
     } else {
-        ImGui::TextDisabled("(none)");
+        ui_inspector_text_disabled_wrapped("(none)");
     }
 
     ImGui::EndChild();
@@ -7515,7 +7663,7 @@ static void ui_panel_bindings(bool embedded = false) {
     if (g_sel_cmd != INVALID_HANDLE) {
         Command* c = cmd_get(g_sel_cmd);
         if (!c) {
-            ImGui::TextDisabled("(stale command)");
+            ui_inspector_text_disabled_wrapped("(stale command)");
         } else {
             switch (c->type) {
             case CMD_CLEAR:
@@ -7527,7 +7675,7 @@ static void ui_panel_bindings(bool embedded = false) {
             case CMD_DRAW_INSTANCED:
                 ui_inspector_section("PIPELINE");
                 if (ui_command_uses_procedural_draw(*c))
-                    ImGui::TextDisabled("Source: Procedural (%s)", ui_draw_topology_name(c->draw_topology));
+                    ui_inspector_text_disabled_wrapped("Source: Procedural (%s)", ui_draw_topology_name(c->draw_topology));
                 else
                     ui_binding_row("Mesh", "IA", -1, c->mesh);
                 ui_binding_row("Shader", "VS/PS", -1, c->shader);
@@ -7563,7 +7711,7 @@ static void ui_panel_bindings(bool embedded = false) {
             case CMD_INDIRECT_DRAW:
                 ui_inspector_section("PIPELINE");
                 if (ui_command_uses_procedural_draw(*c))
-                    ImGui::TextDisabled("Source: Procedural (%s)", ui_draw_topology_name(c->draw_topology));
+                    ui_inspector_text_disabled_wrapped("Source: Procedural (%s)", ui_draw_topology_name(c->draw_topology));
                 else
                     ui_binding_row("Mesh", "IA", -1, c->mesh);
                 ui_binding_row("Shader", "VS/PS", -1, c->shader);
@@ -7607,10 +7755,10 @@ static void ui_panel_bindings(bool embedded = false) {
     } else if (g_sel_res != INVALID_HANDLE) {
         Resource* r = res_get(g_sel_res);
         if (!r) {
-            ImGui::TextDisabled("(stale resource)");
+            ui_inspector_text_disabled_wrapped("(stale resource)");
         } else if (r->type == RES_SHADER && r->shader_cb.active) {
             ui_inspector_section("REFLECTED CBUFFER");
-            ImGui::TextDisabled("%s: register(b%u), %u bytes",
+            ui_inspector_text_disabled_wrapped("%s: register(b%u), %u bytes",
                 r->shader_cb.name, r->shader_cb.bind_slot, r->shader_cb.size);
             for (int i = 0; i < r->shader_cb.var_count; i++) {
                 const ShaderCBVar& v = r->shader_cb.vars[i];
@@ -7620,8 +7768,8 @@ static void ui_panel_bindings(bool embedded = false) {
                 ImGui::BeginChild("##shader_var_card", ImVec2(0.0f, 58.0f), true);
                 ImGui::TextUnformatted(v.name);
                 ImGui::SameLine();
-                ImGui::TextDisabled("%s", res_type_str(v.type));
-                ImGui::TextDisabled("offset %u  size %u", v.offset, v.size);
+                ui_inspector_text_disabled_wrapped("%s", res_type_str(v.type));
+                ui_inspector_text_disabled_wrapped("offset %u  size %u", v.offset, v.size);
                 ImGui::EndChild();
                 ImGui::PopStyleVar();
                 ImGui::PopStyleColor();
@@ -7639,7 +7787,7 @@ static void ui_panel_bindings(bool embedded = false) {
                 ui_inspector_section("MESH MATERIALS");
                 for (int mi = 0; mi < r->mesh_material_count; mi++) {
                     MeshMaterial& mat = r->mesh_materials[mi];
-                    ImGui::TextDisabled("%s", mat.name[0] ? mat.name : "(material)");
+                    ui_inspector_text_disabled_wrapped("%s", mat.name[0] ? mat.name : "(material)");
                     for (int slot = 0; slot < MAX_MESH_MATERIAL_TEXTURES; slot++) {
                         if (mat.textures[slot] != INVALID_HANDLE)
                             ui_key_value_handle(ui_mesh_material_slot_name(slot), mat.textures[slot]);
@@ -7654,7 +7802,7 @@ static void ui_panel_bindings(bool embedded = false) {
             ImGui::Text("DSV: %s", r->has_dsv ? "yes" : "no");
         }
     } else {
-        ImGui::TextDisabled("Nothing selected.");
+        ui_inspector_text_disabled_wrapped("Nothing selected.");
     }
 
     if (!embedded) ImGui::End();
@@ -7666,7 +7814,7 @@ static void ui_panel_selection_state(bool embedded = false) {
     if (g_sel_cmd != INVALID_HANDLE) {
         Command* c = cmd_get(g_sel_cmd);
         if (!c) {
-            ImGui::TextDisabled("(stale command)");
+            ui_inspector_text_disabled_wrapped("(stale command)");
         } else {
             ui_inspector_section("COMMAND STATE");
             ImGui::Text("Enabled: %s", c->enabled ? "yes" : "no");
@@ -7698,7 +7846,7 @@ static void ui_panel_selection_state(bool embedded = false) {
     } else if (g_sel_res != INVALID_HANDLE) {
         Resource* r = res_get(g_sel_res);
         if (!r) {
-            ImGui::TextDisabled("(stale resource)");
+            ui_inspector_text_disabled_wrapped("(stale resource)");
         } else {
             ui_inspector_section("RESOURCE STATE");
             ImGui::Text("Type: %s", ui_resource_display_type(*r));
@@ -7722,7 +7870,7 @@ static void ui_panel_selection_state(bool embedded = false) {
                 ImGui::Text("Geometry: %d verts, %d indices", r->vert_count, r->idx_count);
         }
     } else {
-        ImGui::TextDisabled("Nothing selected.");
+        ui_inspector_text_disabled_wrapped("Nothing selected.");
     }
 
     if (!embedded) ImGui::End();
@@ -7732,7 +7880,7 @@ static void ui_panel_user_cb() {
     ImGui::Begin("User CB (b2)");
     user_cb_enforce_unique_names();
 
-    ImGui::TextDisabled("Slot = 16 bytes (float4). Recommended: cbuffer UserCB : register(b2).");
+    ui_inspector_text_disabled_wrapped("Slot = 16 bytes (float4). Recommended: cbuffer UserCB : register(b2).");
     ImGui::Separator();
 
     if (ImGui::BeginTable("ucb", 6,
@@ -7809,7 +7957,7 @@ static void ui_panel_user_cb() {
                     user_changed = true;
                 }
                 ImGui::Separator();
-                ImGui::TextDisabled("Resources");
+                ui_inspector_text_disabled_wrapped("Resources");
                 for (int r_i = 0; r_i < MAX_RESOURCES; r_i++) {
                     Resource& r = g_resources[r_i];
                     if (!r.active || r.is_builtin || ui_resource_is_size_source_resource(r) || r.type != e.type) continue;
@@ -7826,7 +7974,7 @@ static void ui_panel_user_cb() {
                     // Integral variables can be driven by resource dimensions:
                     // int = count, int2 = width/height, int3 = width/height/depth.
                     ImGui::Separator();
-                    ImGui::TextDisabled("Resource sizes");
+                    ui_inspector_text_disabled_wrapped("Resource sizes");
                     for (int r_i = 0; r_i < MAX_RESOURCES; r_i++) {
                         Resource& owner = g_resources[r_i];
                         if (!owner.active || owner.is_generated || !ui_resource_size_source_matches_type(owner, e.type))
@@ -7848,7 +7996,7 @@ static void ui_panel_user_cb() {
                 }
                 if (e.type == RES_FLOAT3 || e.type == RES_FLOAT4) {
                     ImGui::Separator();
-                    ImGui::TextDisabled("Scene transforms");
+                    ui_inspector_text_disabled_wrapped("Scene transforms");
                     if (ImGui::Selectable("Camera Position", e.source_kind == USER_CB_SOURCE_CAMERA_POSITION)) {
                         user_changed |= user_cb_set_scene_source(i, USER_CB_SOURCE_CAMERA_POSITION, "camera");
                     }
@@ -7890,7 +8038,7 @@ static void ui_panel_user_cb() {
             ImGui::TableSetColumnIndex(5);
             src = e.source_kind == USER_CB_SOURCE_RESOURCE ? res_get(e.source) : nullptr;
             if (e.source_kind != USER_CB_SOURCE_NONE)
-                ImGui::TextDisabled("(source driven)");
+                ui_inspector_text_disabled_wrapped("(source driven)");
             else
                 user_changed |= ui_user_cb_value_editor(e.type, e.ival, e.fval);
             if (user_changed)
@@ -8010,6 +8158,13 @@ static void ui_panel_general(bool embedded = false) {
             settings_dirty = true;
         }
         ImGui::TextDisabled("Scales fonts and layout globally without changing project data.");
+
+        bool show_inspector_notes = ui_show_inspector_notes();
+        if (ImGui::Checkbox("Show Inspector Notes", &show_inspector_notes)) {
+            ui_set_show_inspector_notes(show_inspector_notes);
+            settings_dirty = true;
+        }
+        ImGui::TextDisabled("Controls whether per-resource and per-command notes appear in the Inspector.");
     }
 
     if (ImGui::CollapsingHeader("Shader Editor", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -8909,9 +9064,9 @@ static void ui_draw_command_bounds_inspector(Command* c, CmdHandle h) {
     cmd_refresh_draw_bounds(h);
     ui_inspector_section("BOUNDING BOX");
     if (c->bbox_identity)
-        ImGui::TextDisabled("Identity/unit bounds are being used because this draw has no mesh geometry available.");
+        ui_inspector_text_disabled_wrapped("Identity/unit bounds are being used because this draw has no mesh geometry available.");
     else
-        ImGui::TextDisabled("Auto bounds from the draw mesh geometry. Used by Alt+LMB orbit, F frame, and debug draw.");
+        ui_inspector_text_disabled_wrapped("Auto bounds from the draw mesh geometry. Used by Alt+LMB orbit, F frame, and debug draw.");
     float wmin[3] = {};
     float wmax[3] = {};
     if (cmd_compute_world_bounds(h, wmin, wmax))
@@ -9309,6 +9464,16 @@ static void ui_push_panel_focus(bool focused) {
 static void ui_pop_panel_focus() {
     if (s_panel_focus_count > 0)
         s_panel_focus_count--;
+}
+
+static void ui_focus_current_panel_window() {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (!window)
+        return;
+
+    s_focused_panel_id = window->ID;
+    if (s_panel_focus_count > 0)
+        s_panel_focus_stack[s_panel_focus_count - 1] = true;
 }
 
 static bool ui_update_panel_focus_from_current_window(bool accept_imgui_focus = true) {
@@ -9783,11 +9948,20 @@ static void ui_panel_header(const char* title, const char* detail = nullptr,
     float header_h = ImGui::GetTextLineHeight() + ui_margin_px(10.0f);
     ImDrawList* header_dl = ImGui::GetWindowDrawList();
     float header_right = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
-    header_dl->AddRectFilled(ImVec2(header_pos.x - ui_margin_px(3.0f), header_pos.y - ui_margin_px(2.0f)),
-        ImVec2(header_right, header_pos.y + header_h + ui_margin_px(2.0f)),
+    ImVec2 header_min(header_pos.x - ui_margin_px(3.0f), header_pos.y - ui_margin_px(2.0f));
+    ImVec2 header_max(header_right, header_pos.y + header_h + ui_margin_px(2.0f));
+    ImVec2 mouse = ImGui::GetMousePos();
+    bool header_clicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+        mouse.x >= header_min.x && mouse.x <= header_max.x &&
+        mouse.y >= header_min.y && mouse.y <= header_max.y;
+    if (header_clicked) {
+        ui_focus_current_panel_window();
+        focused = true;
+    }
+
+    header_dl->AddRectFilled(header_min, header_max,
         ImGui::GetColorU32(ui_with_alpha(accent, focused ? 0.075f : 0.035f)), 3.0f);
-    header_dl->AddRectFilled(ImVec2(header_pos.x - ui_margin_px(3.0f), header_pos.y - ui_margin_px(2.0f)),
-        ImVec2(header_pos.x, header_pos.y + header_h + ui_margin_px(2.0f)),
+    header_dl->AddRectFilled(header_min, ImVec2(header_pos.x, header_max.y),
         ImGui::GetColorU32(ui_with_alpha(accent, focused ? 0.86f : 0.50f)), 1.5f);
 
     float button_size = ui_px(22.0f);
@@ -9928,7 +10102,7 @@ static void ui_draw_shader_editor_window() {
     ImGui::Spacing();
 
     if (!r) {
-        ImGui::TextDisabled("No shader resources in the current project.");
+        ui_inspector_text_disabled_wrapped("No shader resources in the current project.");
     } else {
         UiShaderSourceEditor& ed = s_shader_source_ed;
         const char* path = r->path;
@@ -9942,11 +10116,11 @@ static void ui_draw_shader_editor_window() {
         }
 
         if (!ed.path[0]) {
-            ImGui::TextDisabled("No shader path.");
+            ui_inspector_text_disabled_wrapped("No shader path.");
         } else if (!ed.ok || !ed.text) {
             if (ImGui::Button("Reload Source", ImVec2(-1.0f, 0.0f)))
                 ui_shader_editor_load(&ed, s_shader_editor_floating_h, path);
-            ImGui::TextDisabled("Could not read source: %s", ed.path);
+            ui_inspector_text_disabled_wrapped("Could not read source: %s", ed.path);
             ui_shader_template_buttons(s_shader_editor_floating_h, r, path);
         } else {
             ui_shader_source_editor_body(&ed, s_shader_editor_floating_h, r, true);
@@ -10465,9 +10639,9 @@ static void ui_draw_shortcuts_popup() {
         }
 
         ui_inspector_section("DRAW SRV SLOTS");
-        ImGui::TextDisabled("Common shader t# convention used by mesh materials and PBR shaders.");
+        ui_inspector_text_disabled_wrapped("Common shader t# convention used by mesh materials and PBR shaders.");
         ui_draw_texture_slot_reference("##shortcuts_draw_slots");
-        ImGui::TextDisabled("Manual SRV bindings in a draw command override mesh material textures on the same slot.");
+        ui_inspector_text_disabled_wrapped("Manual SRV bindings in a draw command override mesh material textures on the same slot.");
 
         ImGui::PopStyleVar();
     }
@@ -12436,13 +12610,6 @@ static void ui_top_bar() {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.92f, 0.91f, 1.0f));
     ImGui::TextUnformatted("lazyTool");
     ImGui::PopStyleColor();
-    ImGui::SameLine(0.0f, ui_margin_px(8.0f));
-    ui_align_text_row(row_y);
-    ImGui::TextDisabled("workspace");
-    ImGui::SameLine(0.0f, ui_margin_px(8.0f));
-    ui_align_frame_row(row_y);
-    ui_inline_badge("##project_name_badge", project_current_name() ? project_current_name() : "untitled",
-                    ImVec4(0.74f, 0.53f, 0.42f, 1.0f), row_h);
     ImGui::SameLine(0.0f, ui_margin_px(12.0f));
     ui_align_frame_row(row_y);
 
@@ -12511,6 +12678,13 @@ static void ui_top_bar() {
     ui_align_frame_row(row_y);
     if (ui_icon_button("##shortcuts_button", UI_ICON_HELP, ImVec2(ui_px(28.0f), 0.0f), "Shortcuts"))
         s_shortcuts_popup_open = !s_shortcuts_popup_open;
+    ImGui::SameLine(0.0f, ui_margin_px(8.0f));
+    ui_align_text_row(row_y);
+    ImGui::TextDisabled("workspace");
+    ImGui::SameLine(0.0f, ui_margin_px(8.0f));
+    ui_align_frame_row(row_y);
+    ui_inline_badge("##project_name_badge", project_current_name() ? project_current_name() : "untitled",
+                    ImVec4(0.74f, 0.53f, 0.42f, 1.0f), row_h);
 
     char summary[256] = {};
     static bool s_frame_ms_display_valid = false;
@@ -12814,6 +12988,18 @@ void ui_set_code_font_size(float size) {
 
 float ui_code_font_size() {
     return s_code_font_size;
+}
+
+void ui_set_show_inspector_notes(bool show) {
+    s_show_inspector_notes = show;
+    if (!show) {
+        memset(s_inspector_resource_note_editing, 0, sizeof(s_inspector_resource_note_editing));
+        memset(s_inspector_command_note_editing, 0, sizeof(s_inspector_command_note_editing));
+    }
+}
+
+bool ui_show_inspector_notes() {
+    return s_show_inspector_notes;
 }
 
 void ui_init() {

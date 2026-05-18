@@ -42,6 +42,8 @@ void ui_set_global_scale(float scale);
 float ui_global_scale();
 void ui_set_code_font_size(float size);
 float ui_code_font_size();
+void ui_set_show_inspector_notes(bool show);
+bool ui_show_inspector_notes();
 int ui_top_toolbar_height_px();
 bool ui_scene_view_contains_screen_point(int x, int y);
 bool ui_scene_view_screen_rect(RECT* out_rect);

@@ -769,6 +769,22 @@ static ID3D11RenderTargetView* get_optional_rtv(ResHandle h) {
     return r->rtv;
 }
 
+static ID3D11ShaderResourceView* get_resource_srv(Resource* r) {
+    if (!r)
+        return nullptr;
+    if (r->type == RES_BUILTIN_SCENE_COLOR) return g_dx.scene_srv;
+    if (r->type == RES_BUILTIN_SCENE_DEPTH) return g_dx.depth_srv;
+    if (r->type == RES_BUILTIN_SHADOW_MAP)  return g_dx.shadow_srv;
+    return r->srv;
+}
+
+static ID3D11UnorderedAccessView* get_resource_uav(Resource* r) {
+    if (!r)
+        return nullptr;
+    if (r->type == RES_BUILTIN_SCENE_COLOR) return g_dx.scene_uav;
+    return r->uav;
+}
+
 static ID3D11DepthStencilView* get_dsv(ResHandle h) {
     if (h == INVALID_HANDLE) return g_dx.depth_dsv;
     Resource* r = res_get(h);
@@ -956,7 +972,7 @@ static void bind_srv_slot_list(SrvBindStage stage, const ResHandle* handles, con
         if (slot >= MAX_SRV_SLOTS)
             continue;
         Resource* r = res_get(handles[i]);
-        srvs[slot] = r ? r->srv : nullptr;
+        srvs[slot] = get_resource_srv(r);
         present[slot] = true;
     }
 
@@ -1008,7 +1024,7 @@ static void bind_compute_uav_slot_list(const ResHandle* handles, const uint32_t*
         if (slot >= MAX_UAV_SLOTS)
             continue;
         Resource* r = res_get(handles[i]);
-        uavs[slot] = r ? r->uav : nullptr;
+        uavs[slot] = get_resource_uav(r);
         present[slot] = true;
     }
 
@@ -1713,7 +1729,7 @@ static UINT collect_draw_uavs(const Command& c, UINT rtv_count, UINT* out_start_
         if (slot < rtv_count || slot >= max_uavs)
             continue;
         Resource* ur = res_get(c.uav_handles[i]);
-        ID3D11UnorderedAccessView* uav = ur ? ur->uav : nullptr;
+        ID3D11UnorderedAccessView* uav = get_resource_uav(ur);
         if (!uav)
             continue;
 
