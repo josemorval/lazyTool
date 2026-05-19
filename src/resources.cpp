@@ -12,6 +12,7 @@
 #include <limits.h>
 #include <ctype.h>
 #include <float.h>
+#include <stdint.h>
 
 // This module owns all editor/runtime resources: textures, meshes, shaders,
 // render targets, and the built-in handles that expose engine state to users.
@@ -2331,6 +2332,114 @@ static bool res_ply_parse_header(const unsigned char* bytes, size_t byte_count,
     return false;
 }
 
+static bool res_file_size_u64(FILE* f, unsigned long long* out_size) {
+    if (!f || !out_size)
+        return false;
+#if defined(_WIN32)
+    __int64 pos = _ftelli64(f);
+    if (pos < 0)
+        return false;
+    if (_fseeki64(f, 0, SEEK_END) != 0)
+        return false;
+    __int64 end = _ftelli64(f);
+    if (end < 0)
+        return false;
+    if (_fseeki64(f, pos, SEEK_SET) != 0)
+        return false;
+    *out_size = (unsigned long long)end;
+#else
+    long pos = ftell(f);
+    if (pos < 0)
+        return false;
+    if (fseek(f, 0, SEEK_END) != 0)
+        return false;
+    long end = ftell(f);
+    if (end < 0)
+        return false;
+    if (fseek(f, pos, SEEK_SET) != 0)
+        return false;
+    *out_size = (unsigned long long)end;
+#endif
+    return true;
+}
+
+static bool res_file_seek_u64(FILE* f, unsigned long long pos) {
+    if (!f)
+        return false;
+#if defined(_WIN32)
+    return _fseeki64(f, (__int64)pos, SEEK_SET) == 0;
+#else
+    return pos <= (unsigned long long)LONG_MAX && fseek(f, (long)pos, SEEK_SET) == 0;
+#endif
+}
+
+static bool res_ply_buffer_has_end_header(const unsigned char* bytes, size_t n) {
+    static const char marker[] = "end_header";
+    const size_t marker_len = sizeof(marker) - 1;
+    if (!bytes || n < marker_len)
+        return false;
+    for (size_t i = 0; i + marker_len <= n; i++) {
+        if (memcmp(bytes + i, marker, marker_len) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool res_ply_read_disk_header(FILE* f, PlyHeaderInfo* out, char* err, int err_sz) {
+    if (!f || !out) {
+        snprintf(err, err_sz, "PLY open failed.");
+        return false;
+    }
+
+    const size_t max_header = 4u * 1024u * 1024u;
+    size_t cap = 64u * 1024u;
+    size_t len = 0;
+    unsigned char* header = (unsigned char*)malloc(cap);
+    if (!header) {
+        snprintf(err, err_sz, "out of memory while reading PLY header.");
+        return false;
+    }
+
+    bool found = false;
+    while (len < max_header) {
+        if (len == cap) {
+            size_t new_cap = cap * 2;
+            if (new_cap > max_header)
+                new_cap = max_header;
+            unsigned char* next = (unsigned char*)realloc(header, new_cap);
+            if (!next) {
+                free(header);
+                snprintf(err, err_sz, "out of memory while reading PLY header.");
+                return false;
+            }
+            header = next;
+            cap = new_cap;
+        }
+
+        size_t want = cap - len;
+        if (want > 64u * 1024u)
+            want = 64u * 1024u;
+        size_t got = fread(header + len, 1, want, f);
+        len += got;
+        if (res_ply_buffer_has_end_header(header, len)) {
+            found = true;
+            break;
+        }
+        if (got == 0)
+            break;
+    }
+
+    if (!found) {
+        free(header);
+        snprintf(err, err_sz, "PLY is missing end_header.");
+        return false;
+    }
+
+    bool ok = res_ply_parse_header(header, len, out, err, err_sz);
+    free(header);
+    return ok;
+}
+
 static int res_ply_find_prop(const PlyHeaderInfo& hdr, const char* name) {
     for (int i = 0; i < hdr.prop_count; i++)
         if (strcmp(hdr.props[i].name, name) == 0)
@@ -2369,6 +2478,71 @@ static void res_normalize_quat_xyzw(float q[4]) {
     }
     float inv = 1.0f / len;
     q[0] *= inv; q[1] *= inv; q[2] *= inv; q[3] *= inv;
+}
+
+static void res_decode_gaussian_splat_values(const float* vals,
+                                             int ix, int iy, int iz,
+                                             int is0, int is1, int is2,
+                                             int ir0, int ir1, int ir2, int ir3,
+                                             int io, int idc0, int idc1, int idc2,
+                                             GaussianSplatGPU* out,
+                                             float bounds_min[3], float bounds_max[3],
+                                             double* scale_sum)
+{
+    if (!vals || !out || !bounds_min || !bounds_max || !scale_sum)
+        return;
+
+    memset(out, 0, sizeof(*out));
+    float x = vals[ix], y = vals[iy], z = vals[iz];
+    out->pos_opacity[0] = x;
+    out->pos_opacity[1] = y;
+    out->pos_opacity[2] = z;
+    out->pos_opacity[3] = io >= 0 ? clampf(res_sigmoid_stable(vals[io]), 0.0f, 1.0f) : 1.0f;
+
+    float sx = is0 >= 0 ? expf(vals[is0]) : 0.01f;
+    float sy = is1 >= 0 ? expf(vals[is1]) : sx;
+    float sz = is2 >= 0 ? expf(vals[is2]) : sx;
+    out->scale[0] = sx;
+    out->scale[1] = sy;
+    out->scale[2] = sz;
+    out->scale[3] = 0.0f;
+    float max_scale = sx;
+    if (sy > max_scale) max_scale = sy;
+    if (sz > max_scale) max_scale = sz;
+    *scale_sum += (double)max_scale;
+
+    // Common 3DGS PLY stores rot_0..3 as WXYZ. Store XYZW for HLSL helpers.
+    float q[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    if (ir0 >= 0 && ir1 >= 0 && ir2 >= 0 && ir3 >= 0) {
+        q[0] = vals[ir1];
+        q[1] = vals[ir2];
+        q[2] = vals[ir3];
+        q[3] = vals[ir0];
+    }
+    res_normalize_quat_xyzw(q);
+    out->quat[0] = q[0];
+    out->quat[1] = q[1];
+    out->quat[2] = q[2];
+    out->quat[3] = q[3];
+
+    const float sh_c0 = 0.28209479177387814f;
+    if (idc0 >= 0 && idc1 >= 0 && idc2 >= 0) {
+        out->color[0] = clampf(0.5f + sh_c0 * vals[idc0], 0.0f, 1.0f);
+        out->color[1] = clampf(0.5f + sh_c0 * vals[idc1], 0.0f, 1.0f);
+        out->color[2] = clampf(0.5f + sh_c0 * vals[idc2], 0.0f, 1.0f);
+    } else {
+        out->color[0] = 1.0f;
+        out->color[1] = 1.0f;
+        out->color[2] = 1.0f;
+    }
+    out->color[3] = out->pos_opacity[3];
+
+    if (x < bounds_min[0]) bounds_min[0] = x;
+    if (y < bounds_min[1]) bounds_min[1] = y;
+    if (z < bounds_min[2]) bounds_min[2] = z;
+    if (x > bounds_max[0]) bounds_max[0] = x;
+    if (y > bounds_max[1]) bounds_max[1] = y;
+    if (z > bounds_max[2]) bounds_max[2] = z;
 }
 
 static void res_set_splat_err(Resource* r, const char* msg) {
@@ -2446,13 +2620,150 @@ static bool res_upload_gaussian_splat_buffer(Resource* r, const GaussianSplatGPU
     return true;
 }
 
+static bool res_load_gaussian_splat_disk_binary_into(Resource* r, const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f)
+        return false;
+
+    char err[512] = {};
+    PlyHeaderInfo hdr = {};
+    if (!res_ply_read_disk_header(f, &hdr, err, sizeof(err))) {
+        fclose(f);
+        res_set_splat_err(r, err);
+        return false;
+    }
+    if (!hdr.binary_little) {
+        fclose(f);
+        res_set_splat_err(r, "large Gaussian splat streaming currently requires binary_little_endian PLY.");
+        return false;
+    }
+
+    int ix = res_ply_find_prop(hdr, "x");
+    int iy = res_ply_find_prop(hdr, "y");
+    int iz = res_ply_find_prop(hdr, "z");
+    if (ix < 0 || iy < 0 || iz < 0) {
+        fclose(f);
+        res_set_splat_err(r, "PLY is missing x/y/z vertex properties.");
+        return false;
+    }
+
+    int is0 = res_ply_find_prop(hdr, "scale_0");
+    int is1 = res_ply_find_prop(hdr, "scale_1");
+    int is2 = res_ply_find_prop(hdr, "scale_2");
+    int ir0 = res_ply_find_prop(hdr, "rot_0");
+    int ir1 = res_ply_find_prop(hdr, "rot_1");
+    int ir2 = res_ply_find_prop(hdr, "rot_2");
+    int ir3 = res_ply_find_prop(hdr, "rot_3");
+    int io = res_ply_find_prop(hdr, "opacity");
+    int idc0 = res_ply_find_prop(hdr, "f_dc_0");
+    int idc1 = res_ply_find_prop(hdr, "f_dc_1");
+    int idc2 = res_ply_find_prop(hdr, "f_dc_2");
+
+    int stride = 0;
+    for (int i = 0; i < hdr.prop_count; i++)
+        stride += hdr.props[i].size;
+    if (stride <= 0) {
+        fclose(f);
+        res_set_splat_err(r, "PLY vertex stride is invalid.");
+        return false;
+    }
+
+    unsigned long long file_size = 0;
+    if (res_file_size_u64(f, &file_size)) {
+        unsigned long long needed = (unsigned long long)hdr.data_offset +
+                                    (unsigned long long)stride * (unsigned long long)hdr.vertex_count;
+        if (needed > file_size) {
+            fclose(f);
+            res_set_splat_err(r, "PLY binary vertex data is truncated.");
+            return false;
+        }
+    }
+
+    GaussianSplatGPU* splats = (GaussianSplatGPU*)malloc(sizeof(GaussianSplatGPU) * (size_t)hdr.vertex_count);
+    if (!splats) {
+        fclose(f);
+        res_set_splat_err(r, "out of memory while allocating decoded Gaussian splats.");
+        return false;
+    }
+
+    unsigned char* row = (unsigned char*)malloc((size_t)stride);
+    if (!row) {
+        free(splats);
+        fclose(f);
+        res_set_splat_err(r, "out of memory while reading Gaussian splat rows.");
+        return false;
+    }
+    if (!res_file_seek_u64(f, (unsigned long long)hdr.data_offset)) {
+        free(row);
+        free(splats);
+        fclose(f);
+        res_set_splat_err(r, "failed to seek to PLY vertex data.");
+        return false;
+    }
+
+    float bounds_min[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
+    float bounds_max[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+    double scale_sum = 0.0;
+    float vals[128] = {};
+
+    for (int vi = 0; vi < hdr.vertex_count; vi++) {
+        if (fread(row, 1, (size_t)stride, f) != (size_t)stride) {
+            free(row);
+            free(splats);
+            fclose(f);
+            res_set_splat_err(r, "PLY binary vertex data is truncated.");
+            return false;
+        }
+
+        const unsigned char* pcur = row;
+        for (int pi = 0; pi < hdr.prop_count; pi++) {
+            vals[pi] = res_ply_read_binary_scalar(pcur, hdr.props[pi].type);
+            pcur += hdr.props[pi].size;
+        }
+
+        res_decode_gaussian_splat_values(vals, ix, iy, iz, is0, is1, is2, ir0, ir1, ir2, ir3,
+                                         io, idc0, idc1, idc2, &splats[vi],
+                                         bounds_min, bounds_max, &scale_sum);
+    }
+
+    free(row);
+    fclose(f);
+
+    float avg_scale = hdr.vertex_count > 0 ? (float)(scale_sum / (double)hdr.vertex_count) : 0.0f;
+    bool ok = res_upload_gaussian_splat_buffer(r, splats, hdr.vertex_count, path, hdr.rest_count,
+                                               avg_scale, bounds_min, bounds_max);
+    free(splats);
+    if (ok) {
+        log_info("GaussianSplat loaded: %s (%d splats, %d bytes/elem)",
+                 r->name, r->elem_count, r->elem_size);
+    }
+    return ok;
+}
+
 static bool res_load_gaussian_splat_file_into(Resource* r, const char* path) {
     if (!r || !path || !path[0])
         return false;
+    res_store_path(r->path, MAX_PATH_LEN, path);
+
+    FILE* disk_probe = fopen(path, "rb");
+    if (disk_probe) {
+        unsigned long long disk_size = 0;
+        bool have_disk_size = res_file_size_u64(disk_probe, &disk_size);
+        fclose(disk_probe);
+        if (have_disk_size && disk_size > 256ull * 1024ull * 1024ull)
+            return res_load_gaussian_splat_disk_binary_into(r, path);
+    }
 
     void* bytes_v = nullptr;
     size_t byte_count = 0;
     if (!lt_read_file(path, &bytes_v, &byte_count)) {
+        if (res_load_gaussian_splat_disk_binary_into(r, path))
+            return true;
+        FILE* exists = fopen(path, "rb");
+        if (exists) {
+            fclose(exists);
+            return false;
+        }
         char msg[512] = {};
         snprintf(msg, sizeof(msg), "file not found: %s", path);
         res_set_splat_err(r, msg);

@@ -56,6 +56,7 @@ struct DX11Ctx {
     bool                     scene_orientation_gizmo_enabled;
     bool                     scene_bounds_debug_enabled;
     float                    scene_grid_color[4];
+    float                    scene_grid_level_alpha[3];
     bool                     scene_grid_distance_fade;
     float                    scene_grid_fade_start;
     float                    scene_grid_fade_end;

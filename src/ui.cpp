@@ -72,6 +72,11 @@ static bool s_ui_profile_display_valid = false;
 static ID3D11Texture2D*          s_app_icon_tex = nullptr;
 static ID3D11ShaderResourceView* s_app_icon_srv = nullptr;
 
+static ID3D11Texture2D*          s_app_logo_text_tex = nullptr;
+static ID3D11ShaderResourceView* s_app_logo_text_srv = nullptr;
+static int                       s_app_logo_text_w = 0;
+static int                       s_app_logo_text_h = 0;
+
 static void ui_profile_ensure_freq() {
     if (s_ui_profile_freq.QuadPart == 0)
         QueryPerformanceFrequency(&s_ui_profile_freq);
@@ -132,6 +137,13 @@ static void ui_release_app_icon_texture() {
     if (s_app_icon_tex) { s_app_icon_tex->Release(); s_app_icon_tex = nullptr; }
 }
 
+static void ui_release_app_logo_text_texture() {
+    if (s_app_logo_text_srv) { s_app_logo_text_srv->Release(); s_app_logo_text_srv = nullptr; }
+    if (s_app_logo_text_tex) { s_app_logo_text_tex->Release(); s_app_logo_text_tex = nullptr; }
+    s_app_logo_text_w = 0;
+    s_app_logo_text_h = 0;
+}
+
 static ID3D11ShaderResourceView* ui_app_icon_srv() {
     if (s_app_icon_srv)
         return s_app_icon_srv;
@@ -181,6 +193,71 @@ static ID3D11ShaderResourceView* ui_app_icon_srv() {
     if (FAILED(hr) || !s_app_icon_srv)
         ui_release_app_icon_texture();
     return s_app_icon_srv;
+}
+
+static ID3D11ShaderResourceView* ui_app_logo_text_srv(int* out_w = nullptr, int* out_h = nullptr) {
+    if (s_app_logo_text_srv) {
+        if (out_w) *out_w = s_app_logo_text_w;
+        if (out_h) *out_h = s_app_logo_text_h;
+        return s_app_logo_text_srv;
+    }
+
+    void* bytes = nullptr;
+    size_t byte_count = 0;
+    if (!lt_read_file("assets/brand/lazytool_onlytext.png", &bytes, &byte_count))
+        return nullptr;
+    if (byte_count > (size_t)INT_MAX) {
+        lt_free_file(bytes);
+        return nullptr;
+    }
+
+    int w = 0, h = 0, ch = 0;
+    unsigned char* pixels = stbi_load_from_memory((const stbi_uc*)bytes, (int)byte_count, &w, &h, &ch, 4);
+    lt_free_file(bytes);
+    if (!pixels || w <= 0 || h <= 0) {
+        if (pixels) stbi_image_free(pixels);
+        return nullptr;
+    }
+
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = (UINT)w;
+    td.Height = (UINT)h;
+    td.MipLevels = 0;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+
+    HRESULT hr = g_dx.dev->CreateTexture2D(&td, nullptr, &s_app_logo_text_tex);
+    if (FAILED(hr) || !s_app_logo_text_tex) {
+        stbi_image_free(pixels);
+        ui_release_app_logo_text_texture();
+        return nullptr;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+    sv.Format = td.Format;
+    sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sv.Texture2D.MostDetailedMip = 0;
+    sv.Texture2D.MipLevels = (UINT)-1;
+    hr = g_dx.dev->CreateShaderResourceView(s_app_logo_text_tex, &sv, &s_app_logo_text_srv);
+    if (FAILED(hr) || !s_app_logo_text_srv) {
+        stbi_image_free(pixels);
+        ui_release_app_logo_text_texture();
+        return nullptr;
+    }
+
+    g_dx.ctx->UpdateSubresource(s_app_logo_text_tex, 0, nullptr, pixels, (UINT)(w * 4), 0);
+    g_dx.ctx->GenerateMips(s_app_logo_text_srv);
+    stbi_image_free(pixels);
+
+    s_app_logo_text_w = w;
+    s_app_logo_text_h = h;
+    if (out_w) *out_w = s_app_logo_text_w;
+    if (out_h) *out_h = s_app_logo_text_h;
+    return s_app_logo_text_srv;
 }
 
 // The UI module is the editor shell. It presents resources, commands,
@@ -8291,6 +8368,19 @@ static void ui_panel_general(bool embedded = false) {
             settings_dirty = true;
             app_request_scene_render();
         }
+        ImGui::TextDisabled("Grid level opacity");
+        if (ImGui::SliderFloat("Fine##grid_level_alpha", &g_dx.scene_grid_level_alpha[0], 0.0f, 1.0f, "%.2f")) {
+            settings_dirty = true;
+            app_request_scene_render();
+        }
+        if (ImGui::SliderFloat("Medium##grid_level_alpha", &g_dx.scene_grid_level_alpha[1], 0.0f, 1.0f, "%.2f")) {
+            settings_dirty = true;
+            app_request_scene_render();
+        }
+        if (ImGui::SliderFloat("Coarse##grid_level_alpha", &g_dx.scene_grid_level_alpha[2], 0.0f, 1.0f, "%.2f")) {
+            settings_dirty = true;
+            app_request_scene_render();
+        }
         if (ImGui::Checkbox("Grid Distance Fade", &g_dx.scene_grid_distance_fade)) {
             settings_dirty = true;
             app_request_scene_render();
@@ -8312,7 +8402,7 @@ static void ui_panel_general(bool embedded = false) {
             settings_dirty = true;
             app_request_scene_render();
         }
-        ImGui::TextDisabled("Infinite grid overlay on y=0. Alpha controls overall intensity. Bounds debug draws command AABBs over the viewport.");
+        ImGui::TextDisabled("Infinite grid overlay on y=0. Color alpha controls overall intensity; level opacity balances fine/medium/coarse lines.");
     }
 
     if (ImGui::CollapsingHeader("Diagnostics", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -12650,9 +12740,22 @@ static void ui_top_bar() {
     float row_h = ImGui::GetFrameHeight();
     float row_y = floorf((toolbar_h - row_h) * 0.5f);
     ui_align_text_row(row_y);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.92f, 0.91f, 1.0f));
-    ImGui::TextUnformatted("lazyTool");
-    ImGui::PopStyleColor();
+    int logo_w = 0;
+    int logo_h = 0;
+    if (ID3D11ShaderResourceView* logo_text = ui_app_logo_text_srv(&logo_w, &logo_h)) {
+        const float logo_x_offset = ui_margin_px(4.0f);
+        const float logo_y_offset = ui_px(1.5f);
+        const float logo_max_h = toolbar_h - ui_px(6.0f);
+        float logo_h_px = ImMin(logo_max_h, row_h * 1.16f);
+        float logo_w_px = logo_h_px * ((float)logo_w / (float)logo_h);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + logo_x_offset);
+        ImGui::SetCursorPosY(floorf((toolbar_h - logo_h_px) * 0.5f + logo_y_offset));
+        ImGui::Image((ImTextureID)logo_text, ImVec2(logo_w_px, logo_h_px));
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.92f, 0.91f, 1.0f));
+        ImGui::TextUnformatted("lazyTool");
+        ImGui::PopStyleColor();
+    }
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         if (ID3D11ShaderResourceView* app_icon = ui_app_icon_srv()) {
             ImVec2 title_min = ImGui::GetItemRectMin();
@@ -12660,7 +12763,7 @@ static void ui_top_bar() {
             ImGui::SetNextWindowPos(ImVec2(title_min.x, title_max.y + ui_margin_px(8.0f)), ImGuiCond_Always);
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_margin_px(10.0f), ui_margin_px(10.0f)));
             ImGui::BeginTooltip();
-            float icon_size = ui_px(128.0f);
+            float icon_size = ui_px(64.0f);
             ImGui::Image((ImTextureID)app_icon, ImVec2(icon_size, icon_size));
             ImGui::EndTooltip();
             ImGui::PopStyleVar();
@@ -13184,6 +13287,7 @@ void ui_draw() {
 
 void ui_shutdown() {
     ui_release_app_icon_texture();
+    ui_release_app_logo_text_texture();
     ui_release_rt3d_preview_pipeline();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

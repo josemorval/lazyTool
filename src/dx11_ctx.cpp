@@ -80,6 +80,7 @@ struct EditorGridCache {
     float eye[3];
     float fade_start;
     float fade_end;
+    float level_alpha[3];
     bool distance_fade;
     int vertex_count;
 };
@@ -815,9 +816,9 @@ static int editor_grid_build_vertices(EditorGridVertex* verts) {
     float cell1 = cell0 * grid_ratio;
     float cell2 = cell1 * grid_ratio;
 
-    float alpha0 = (1.0f - transition) * 0.24f;
-    float alpha1 = 1.0f - transition * 0.64f;
-    float alpha2 = transition;
+    float alpha0 = (1.0f - transition) * g_dx.scene_grid_level_alpha[0];
+    float alpha1 = (1.0f - transition * 0.64f) * g_dx.scene_grid_level_alpha[1];
+    float alpha2 = transition * g_dx.scene_grid_level_alpha[2];
 
     int count = 0;
     editor_grid_push_level(verts, &count, cell0, alpha0, eye_x, eye_z, radius);
@@ -836,6 +837,9 @@ static bool editor_grid_cache_matches() {
     if (fabsf(s_editor_grid_cache.eye[2] - g_dx.scene_cb_data.cam_pos[2]) > eps) return false;
     if (fabsf(s_editor_grid_cache.fade_start - g_dx.scene_grid_fade_start) > eps) return false;
     if (fabsf(s_editor_grid_cache.fade_end - g_dx.scene_grid_fade_end) > eps) return false;
+    if (fabsf(s_editor_grid_cache.level_alpha[0] - g_dx.scene_grid_level_alpha[0]) > eps) return false;
+    if (fabsf(s_editor_grid_cache.level_alpha[1] - g_dx.scene_grid_level_alpha[1]) > eps) return false;
+    if (fabsf(s_editor_grid_cache.level_alpha[2] - g_dx.scene_grid_level_alpha[2]) > eps) return false;
     if (s_editor_grid_cache.distance_fade != g_dx.scene_grid_distance_fade) return false;
     return true;
 }
@@ -847,6 +851,9 @@ static void editor_grid_store_cache(int vertex_count) {
     s_editor_grid_cache.eye[2] = g_dx.scene_cb_data.cam_pos[2];
     s_editor_grid_cache.fade_start = g_dx.scene_grid_fade_start;
     s_editor_grid_cache.fade_end = g_dx.scene_grid_fade_end;
+    s_editor_grid_cache.level_alpha[0] = g_dx.scene_grid_level_alpha[0];
+    s_editor_grid_cache.level_alpha[1] = g_dx.scene_grid_level_alpha[1];
+    s_editor_grid_cache.level_alpha[2] = g_dx.scene_grid_level_alpha[2];
     s_editor_grid_cache.distance_fade = g_dx.scene_grid_distance_fade;
     s_editor_grid_cache.vertex_count = vertex_count;
 }

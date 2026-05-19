@@ -27,17 +27,20 @@ static void app_settings_apply_defaults() {
     g_dx.scene_grid_color[1] = 0.50f;
     g_dx.scene_grid_color[2] = 0.01f;
     g_dx.scene_grid_color[3] = 0.5f;
+    g_dx.scene_grid_level_alpha[0] = 0.6f;
+    g_dx.scene_grid_level_alpha[1] = 0.8f;
+    g_dx.scene_grid_level_alpha[2] = 1.00f;
     g_dx.scene_grid_distance_fade = true;
-    g_dx.scene_grid_fade_start = 80.0f;
-    g_dx.scene_grid_fade_end = 260.0f;
+    g_dx.scene_grid_fade_start = 0.0f;
+    g_dx.scene_grid_fade_end = 60.0f;
     g_profiler_enabled = false;
-    app_set_editor_frame_cap_fps(120.0f);
+    app_set_editor_frame_cap_fps(30.0f);
 
     g_camera_controls.enabled = true;
     g_camera_controls.mouse_look = true;
     g_camera_controls.invert_y = false;
     g_camera_controls.mode = CAMERA_MODE_HORIZON_LOCKED;
-    g_camera_controls.move_speed = 6.0f;
+    g_camera_controls.move_speed = 1.0f;
     g_camera_controls.fast_mult = 4.0f;
     g_camera_controls.slow_mult = 0.25f;
     g_camera_controls.mouse_sensitivity = 0.0025f;
@@ -68,6 +71,9 @@ void app_settings_save() {
     fprintf(f, "scene_grid_color_g %.9g\n", g_dx.scene_grid_color[1]);
     fprintf(f, "scene_grid_color_b %.9g\n", g_dx.scene_grid_color[2]);
     fprintf(f, "scene_grid_color_a %.9g\n", g_dx.scene_grid_color[3]);
+    fprintf(f, "scene_grid_level_alpha_fine %.9g\n", g_dx.scene_grid_level_alpha[0]);
+    fprintf(f, "scene_grid_level_alpha_mid %.9g\n", g_dx.scene_grid_level_alpha[1]);
+    fprintf(f, "scene_grid_level_alpha_coarse %.9g\n", g_dx.scene_grid_level_alpha[2]);
     fprintf(f, "scene_grid_distance_fade %d\n", g_dx.scene_grid_distance_fade ? 1 : 0);
     fprintf(f, "scene_grid_fade_start %.9g\n", g_dx.scene_grid_fade_start);
     fprintf(f, "scene_grid_fade_end %.9g\n", g_dx.scene_grid_fade_end);
@@ -114,6 +120,9 @@ void app_settings_load_or_create() {
         else if (strcmp(key, "scene_grid_color_g") == 0) g_dx.scene_grid_color[1] = (float)atof(value);
         else if (strcmp(key, "scene_grid_color_b") == 0) g_dx.scene_grid_color[2] = (float)atof(value);
         else if (strcmp(key, "scene_grid_color_a") == 0) g_dx.scene_grid_color[3] = (float)atof(value);
+        else if (strcmp(key, "scene_grid_level_alpha_fine") == 0) g_dx.scene_grid_level_alpha[0] = (float)atof(value);
+        else if (strcmp(key, "scene_grid_level_alpha_mid") == 0) g_dx.scene_grid_level_alpha[1] = (float)atof(value);
+        else if (strcmp(key, "scene_grid_level_alpha_coarse") == 0) g_dx.scene_grid_level_alpha[2] = (float)atof(value);
         else if (strcmp(key, "scene_grid_distance_fade") == 0) g_dx.scene_grid_distance_fade = atoi(value) != 0;
         else if (strcmp(key, "scene_grid_fade_start") == 0) g_dx.scene_grid_fade_start = (float)atof(value);
         else if (strcmp(key, "scene_grid_fade_end") == 0) g_dx.scene_grid_fade_end = (float)atof(value);
@@ -139,6 +148,9 @@ void app_settings_load_or_create() {
     g_dx.scene_grid_color[1] = clampf(g_dx.scene_grid_color[1], 0.0f, 1.0f);
     g_dx.scene_grid_color[2] = clampf(g_dx.scene_grid_color[2], 0.0f, 1.0f);
     g_dx.scene_grid_color[3] = clampf(g_dx.scene_grid_color[3], 0.0f, 1.0f);
+    g_dx.scene_grid_level_alpha[0] = clampf(g_dx.scene_grid_level_alpha[0], 0.0f, 1.0f);
+    g_dx.scene_grid_level_alpha[1] = clampf(g_dx.scene_grid_level_alpha[1], 0.0f, 1.0f);
+    g_dx.scene_grid_level_alpha[2] = clampf(g_dx.scene_grid_level_alpha[2], 0.0f, 1.0f);
     if (g_dx.scene_grid_fade_start < 0.0f) g_dx.scene_grid_fade_start = 0.0f;
     if (g_dx.scene_grid_fade_end < g_dx.scene_grid_fade_start + 1.0f)
         g_dx.scene_grid_fade_end = g_dx.scene_grid_fade_start + 1.0f;

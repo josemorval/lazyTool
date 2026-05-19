@@ -84,7 +84,7 @@ static const ProjectViewDefaults k_project_view_defaults = {
     /* view_dir            */ { -0.57735026919f, -0.57735026919f, -0.57735026919f },
     /* camera_fov_y        */ 1.047f,
     /* camera_near_z       */ 0.001f,
-    /* camera_far_z        */ 100.0f,
+    /* camera_far_z        */ 1000.0f,
 
     /* light_pos           */ { 5.0f, 5.0f, 5.0f },
     /* light_target_dist   */ 8.66025403784f,
