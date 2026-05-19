@@ -3,6 +3,7 @@
 #include "project.h"
 #include <d3d11sdklayers.h>
 #include <d3dcompiler.h>
+#include <dxgi1_5.h>
 #include <math.h>
 #include <stdlib.h>
 #pragma comment(lib, "d3d11.lib")
@@ -13,6 +14,19 @@
 // swap chain, scene targets, depth buffers, samplers, and shared CBs.
 
 DX11Ctx g_dx = {};
+
+static bool dx_check_present_allow_tearing() {
+    IDXGIFactory5* factory5 = nullptr;
+    HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory5), (void**)&factory5);
+    if (FAILED(hr) || !factory5)
+        return false;
+
+    BOOL allow_tearing = FALSE;
+    hr = factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                                       &allow_tearing, sizeof(allow_tearing));
+    factory5->Release();
+    return SUCCEEDED(hr) && allow_tearing == TRUE;
+}
 
 static const char* s_shadow_vs_src = R"HLSL(
 cbuffer SceneCB : register(b0)
@@ -407,6 +421,9 @@ bool dx_init(HWND hwnd, int w, int h) {
     scd.SampleDesc.Count                   = 1;
     scd.Windowed                           = TRUE;
     scd.SwapEffect                         = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    g_dx.present_allow_tearing             = dx_check_present_allow_tearing();
+    if (g_dx.present_allow_tearing)
+        scd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
     UINT flags = 0;
@@ -450,6 +467,8 @@ bool dx_init(HWND hwnd, int w, int h) {
     if (FAILED(hr)) { log_error("D3D11CreateDeviceAndSwapChain failed: 0x%08X", hr); return false; }
     g_dx.d3d11_validation_active = g_dx.d3d11_validation && g_dx.d3d11_validation_supported;
     store_active_adapter_info();
+    if (g_dx.present_allow_tearing)
+        log_info("DXGI present tearing enabled for VSync-off presentation.");
 
     if (g_dx.d3d11_validation_active) {
         HRESULT info_hr = g_dx.dev->QueryInterface(__uuidof(ID3D11InfoQueue), (void**)&g_dx.info_queue);
@@ -461,10 +480,11 @@ bool dx_init(HWND hwnd, int w, int h) {
 
     IDXGIDevice1* dxgi_dev1 = nullptr;
     hr = g_dx.dev->QueryInterface(__uuidof(IDXGIDevice1), (void**)&dxgi_dev1);
-    if (SUCCEEDED(hr) && dxgi_dev1) {
-        dxgi_dev1->SetMaximumFrameLatency(1);
+    /* This is how many frames are enqueued*/
+    /*if (SUCCEEDED(hr) && dxgi_dev1) {
+        dxgi_dev1->SetMaximumFrameLatency(g_dx.present_allow_tearing ? 16 : 1);
         dxgi_dev1->Release();
-    }
+    }*/
 
     ID3D11Texture2D* bb = nullptr;
     g_dx.sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb);
@@ -649,7 +669,8 @@ void dx_resize(int w, int h) {
     g_dx.width = w; g_dx.height = h;
     g_dx.ctx->OMSetRenderTargets(0, nullptr, nullptr);
     if (g_dx.back_rtv) { g_dx.back_rtv->Release(); g_dx.back_rtv = nullptr; }
-    g_dx.sc->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+    UINT resize_flags = g_dx.present_allow_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u;
+    g_dx.sc->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, resize_flags);
     ID3D11Texture2D* bb = nullptr;
     g_dx.sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb);
     g_dx.dev->CreateRenderTargetView(bb, nullptr, &g_dx.back_rtv);

@@ -17,6 +17,7 @@ struct DX11Ctx {
     bool                     d3d11_validation_active;
     bool                     d3d11_validation_supported;
     bool                     shader_validation_warnings;
+    bool                     present_allow_tearing;
     ID3D11InfoQueue*         info_queue;
     char                     adapter_name[128];
     unsigned int             adapter_vendor_id;

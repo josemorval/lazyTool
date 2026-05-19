@@ -30,6 +30,8 @@ float app_cpu_frame_ms();
 float app_cpu_scene_ms();
 float app_cpu_ui_build_ms();
 float app_cpu_ui_render_ms();
+float app_imgui_gpu_ms();
+bool app_imgui_gpu_ready();
 float app_cpu_present_ms();
 float app_cpu_other_ms();
 float app_editor_frame_cap_fps();

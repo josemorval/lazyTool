@@ -289,7 +289,7 @@ static ProjectFileMode s_project_file_mode = PROJECT_FILE_NONE;
 static bool s_project_path_focus = false;
 static bool s_viewport_fullscreen = false;
 static bool s_right_panel_general_open = false;
-static bool s_shortcuts_popup_open = false;
+static bool s_help_popup_open = false;
 static bool s_timeline_window_open = false;
 static bool s_render_graph_window_open = false;
 static bool s_render_graph_center_next = true;
@@ -390,6 +390,7 @@ enum UiIconKind : int {
 
 static bool ui_begin_shortcut_section(const char* id, const char* title, ImGuiTableFlags table_flags);
 static void ui_draw_shortcut_row(const char* key, const char* desc);
+static void ui_help_marker(const char* desc);
 static Mat4 ui_mat4_from_raw(const float raw[16]);
 static bool ui_project_world_to_screen(const Mat4& view_proj, ImVec2 rect_min, ImVec2 rect_max,
                                        Vec3 world, ImVec2* out_screen);
@@ -3580,38 +3581,7 @@ static bool ui_shader_code_editor_handle_input(UiShaderSourceEditor* ed,
         ed->autocomplete_open = false;
         return ui_shader_editor_undo(ed);
     }
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Space)) {
-        ed->autocomplete_open = true;
-        ui_shader_autocomplete_refresh(ed, true);
-        return false;
-    }
-
-    if (ed->autocomplete_open) {
-        char prefix[64] = {};
-        int start = 0;
-        int prefix_len = ui_shader_autocomplete_prefix(ed, &start, prefix, sizeof(prefix));
-        int count = ui_shader_autocomplete_count(prefix, prefix_len);
-        if (count <= 0) {
-            ed->autocomplete_open = false;
-        } else {
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-                ed->autocomplete_open = false;
-                return false;
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) {
-                ed->autocomplete_index = (ed->autocomplete_index + 1) % count;
-                return false;
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) {
-                ed->autocomplete_index = (ed->autocomplete_index + count - 1) % count;
-                return false;
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false) ||
-                ImGui::IsKeyPressed(ImGuiKey_Tab, false)) {
-                return ui_shader_autocomplete_accept(ed);
-            }
-        }
-    }
+    ed->autocomplete_open = false;
 
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_A)) {
         ed->select_anchor = 0;
@@ -3682,8 +3652,6 @@ static bool ui_shader_code_editor_handle_input(UiShaderSourceEditor* ed,
                 changed |= ui_shader_editor_insert_bytes(ed, utf8, len);
         }
     }
-    if (changed)
-        ui_shader_autocomplete_refresh(ed, true);
     io.InputQueueCharacters.resize(0);
     return changed;
 }
@@ -3968,19 +3936,6 @@ static bool ui_shader_code_editor(UiShaderSourceEditor* ed, const Resource* shad
         }
     }
 
-    if (ed->autocomplete_open) {
-        float ac_x = origin.x + gutter_w;
-        if (!lines.empty()) {
-            const UiCodeLine& line = lines[cursor_line];
-            const char* cursor_ptr = line.begin + (ed->cursor - line.offset);
-            if (cursor_ptr < line.begin) cursor_ptr = line.begin;
-            if (cursor_ptr > line.end) cursor_ptr = line.end;
-            ac_x += ui_code_x_from_ptr(line.begin, cursor_ptr, char_w);
-        }
-        ImVec2 ac_pos = ImVec2(ac_x,
-                               origin.y + (float)(cursor_line + 1) * line_h + ui_px(2.0f));
-        ui_shader_autocomplete_draw(ed, dl, ac_pos, line_h, char_w, clip);
-    }
     dl->PopClipRect();
 
     if (include_to_open[0])
@@ -6757,8 +6712,14 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             gs_path[MAX_PATH_LEN - 1] = '\0';
         }
 
+        ResourceLoadProgress load_progress = {};
+        bool loading_this = res_get_load_progress(&load_progress) && load_progress.active &&
+                            strcmp(load_progress.path, r->path) == 0 &&
+                            strcmp(load_progress.label, r->name) == 0;
         if (r->srv && r->compiled_ok) {
             ImGui::TextColored({0.35f, 1, 0.45f, 1}, "Status: OK");
+        } else if (loading_this) {
+            ImGui::TextColored({1.0f, 0.55f, 0.22f, 1.0f}, "Status: LOADING %.0f%%", load_progress.fraction * 100.0f);
         } else if (r->path[0]) {
             ImGui::TextColored({1, 0.35f, 0.3f, 1}, "Status: ERROR");
         } else {
@@ -6775,12 +6736,16 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
                 gs_path[MAX_PATH_LEN - 1] = '\0';
             }
         }
-        if (ImGui::Button(r->srv ? "Reload PLY" : "Load PLY")) {
+        if (loading_this)
+            ImGui::BeginDisabled();
+        if (ImGui::Button(loading_this ? "Loading PLY" : (r->srv ? "Reload PLY" : "Load PLY"))) {
             if (res_reload_gaussian_splat(r, gs_path)) {
                 strncpy(gs_path, r->path, MAX_PATH_LEN - 1);
                 gs_path[MAX_PATH_LEN - 1] = '\0';
             }
         }
+        if (loading_this)
+            ImGui::EndDisabled();
 
         ImGui::Separator();
         ImGui::Text("Splats: %d", r->elem_count);
@@ -8299,7 +8264,8 @@ static void ui_panel_general(bool embedded = false) {
     if (ImGui::CollapsingHeader("Application", ImGuiTreeNodeFlags_DefaultOpen)) {
         settings_dirty |= ImGui::Checkbox("VSync", &g_dx.vsync);
         ImGui::SameLine();
-        ImGui::TextDisabled("%s", g_dx.vsync ? "Present interval 1" : "Present immediate");
+        ImGui::TextDisabled("%s", g_dx.vsync ? "Present interval 1" :
+            (g_dx.present_allow_tearing ? "Present immediate + tearing" : "Present immediate"));
 
         float frame_cap = app_editor_frame_cap_fps();
         if (ImGui::SliderFloat("Editor Frame Cap", &frame_cap, 0.0f, 240.0f, frame_cap <= 0.0f ? "uncapped" : "%.0f fps")) {
@@ -8444,17 +8410,25 @@ static void ui_panel_general(bool embedded = false) {
             ui_refresh_profiler_readout_cache();
             ImGui::SeparatorText("CPU");
             ImGui::Text("CPU frame: %.3f ms", app_cpu_frame_ms());
+            ui_help_marker("Total measured CPU time for one editor frame, from the start of the main-loop iteration until Present returns. It includes scene work, ImGui build, ImGui backend draw submission, Present blocking, and small miscellaneous work.");
             ImGui::Text("Scene CPU: %.3f ms", app_cpu_scene_ms());
+            ui_help_marker("CPU time spent updating scene constants and executing lazyTool scene commands. When the scene is paused and no redraw is requested this should be near zero.");
             ImGui::Text("ImGui build CPU: %.3f ms", app_cpu_ui_build_ms());
+            ui_help_marker("CPU time spent constructing the editor UI for this frame: ImGui::NewFrame, all lazyTool panel/window/widget code, layout, text formatting, visible lists, and ImGui::Render. This is the main immediate-mode UI cost.");
             ImGui::Text("ImGui render CPU: %.3f ms", app_cpu_ui_render_ms());
+            ui_help_marker("CPU time spent in the Dear ImGui DirectX 11 backend submitting already-built draw lists to D3D11. This is command submission, not the GPU time needed to rasterize the UI.");
             ImGui::Text("Present CPU: %.3f ms", app_cpu_present_ms());
+            ui_help_marker("CPU time spent inside IDXGISwapChain::Present. Even with VSync off, this can block on DWM, the driver, or the swapchain queue, so it is not necessarily CPU work done by lazyTool.");
             ImGui::Text("Other CPU: %.3f ms", app_cpu_other_ms());
+            ui_help_marker("Everything in the measured frame not attributed to scene, ImGui build, ImGui render, or Present. Ideally small; includes message handling and loop overhead.");
             ImGuiIO& profiler_io = ImGui::GetIO();
             ImGui::Text("ImGui output: %d verts, %d indices, %d windows",
                 profiler_io.MetricsRenderVertices,
                 profiler_io.MetricsRenderIndices,
                 profiler_io.MetricsRenderWindows);
+            ui_help_marker("Final draw-list size generated by Dear ImGui. Vertices/indices affect UI GPU cost; windows approximates how many ImGui windows/child windows are active.");
             if (ImGui::TreeNodeEx("ImGui build breakdown", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ui_help_marker("Breakdown of the ImGui build CPU time by lazyTool UI section. Percentages are relative to ImGui build CPU, not total frame time.");
                 float total = app_cpu_ui_build_ms();
                 if (total <= 0.0001f) total = 1.0f;
                 for (int i = 0; i < UI_PROFILE_COUNT; i++) {
@@ -8465,17 +8439,26 @@ static void ui_panel_general(bool embedded = false) {
             }
 
             ImGui::SeparatorText("GPU");
-            if (cmd_profile_total_ready())
+            if (app_imgui_gpu_ready()) {
+                ImGui::Text("ImGui render GPU: %.3f ms", app_imgui_gpu_ms());
+                ui_help_marker("GPU timestamp duration for rasterizing the Dear ImGui draw lists into the backbuffer. This is separate from ImGui render CPU, which only measures D3D11 backend submission on the CPU.");
+            } else {
+                ImGui::TextDisabled("ImGui render GPU: warming up...");
+            }
+            if (cmd_profile_total_ready()) {
                 ImGui::Text("Frame GPU time: %.3f ms", cmd_profile_total_frame_ms());
-            else
+                ui_help_marker("GPU timestamp duration for the whole rendered scene frame captured by lazyTool. This is GPU execution time, not CPU frame time.");
+            } else
                 ImGui::TextDisabled("Frame GPU time: warming up...");
-            if (cmd_profile_ready())
+            if (cmd_profile_ready()) {
                 ImGui::Text("Command GPU time: %.3f ms", cmd_profile_frame_ms());
-            else
+                ui_help_marker("GPU timestamp duration of lazyTool command execution. Groups and repeats include their children.");
+            } else
                 ImGui::TextDisabled("Command GPU time: warming up...");
-            if (cmd_profile_ready())
+            if (cmd_profile_ready()) {
                 ImGui::Text("Shadow prepass GPU: %.3f ms", cmd_profile_shadow_ms());
-            else
+                ui_help_marker("GPU time spent rendering the shadow map prepass for commands that cast shadows.");
+            } else
                 ImGui::TextDisabled("Shadow prepass GPU: warming up...");
             ui_draw_profiler_gpu_command_table();
 
@@ -10688,95 +10671,216 @@ UiWindowControlHit ui_hit_test_window_control_client(int x, int y, int client_w)
     return UI_WINDOW_CONTROL_NONE;
 }
 
-static void ui_draw_shortcuts_popup() {
-    if (!s_shortcuts_popup_open)
+static void ui_draw_help_shortcuts_tab() {
+    ImGuiTableFlags table_flags =
+        ImGuiTableFlags_SizingStretchProp |
+        ImGuiTableFlags_BordersInnerV |
+        ImGuiTableFlags_PadOuterX;
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(6.0f, 5.0f));
+
+    if (ui_begin_shortcut_section("##help_shortcuts_execution", "EXECUTION", table_flags)) {
+        ui_draw_shortcut_row("Space", "Pause / resume scene execution");
+        ui_draw_shortcut_row("F6", "Restart scene from frame 0");
+        ui_draw_shortcut_row("F11", "Toggle viewport fullscreen");
+        ImGui::EndTable();
+    }
+
+    if (ui_begin_shortcut_section("##help_shortcuts_project", "PROJECT", table_flags)) {
+        ui_draw_shortcut_row("F5", "Compile all shaders");
+        ui_draw_shortcut_row("Ctrl+D", "Compile edited/selected shader");
+        ui_draw_shortcut_row("Ctrl+S", "Save shader source or project");
+        ui_draw_shortcut_row("F1", "Toggle this help panel");
+        ImGui::EndTable();
+    }
+
+    if (ui_begin_shortcut_section("##help_shortcuts_timeline", "TIMELINE", table_flags)) {
+        ui_draw_shortcut_row("Click", "Select slot and move current frame");
+        ui_draw_shortcut_row("Arrows", "Move selected slot / current frame");
+        ui_draw_shortcut_row("Shift+Arrows", "Move selected slot by 10 frames");
+        ui_draw_shortcut_row("I", "Insert or update key on selected slot");
+        ui_draw_shortcut_row("Delete", "Delete key on selected slot");
+        ui_draw_shortcut_row("Ctrl+C", "Copy selected key");
+        ui_draw_shortcut_row("Ctrl+X", "Cut selected key");
+        ui_draw_shortcut_row("Ctrl+V", "Paste key into compatible selected slot");
+        ImGui::EndTable();
+    }
+
+    if (ui_begin_shortcut_section("##help_shortcuts_selection", "SELECTION", table_flags)) {
+        ui_draw_shortcut_row("Arrows", "Move in Resources / Commands");
+        ui_draw_shortcut_row("Enter", "Select focused item");
+        ui_draw_shortcut_row("F2", "Rename selected resource / command");
+        ui_draw_shortcut_row("Delete", "Remove selected item");
+        ui_draw_shortcut_row("X", "Toggle selected command enabled");
+        ui_draw_shortcut_row("Ctrl+C", "Copy the selected command subtree");
+        ui_draw_shortcut_row("Ctrl+V", "Paste commands after the selection or inside a selected container");
+        ui_draw_shortcut_row("1 / 2 / 3", "Toggle Move / Rotate / Scale gizmo while hovering the viewport");
+        ui_draw_shortcut_row("Esc", "Disable the active viewport gizmo");
+        ImGui::EndTable();
+    }
+
+    if (ui_begin_shortcut_section("##help_shortcuts_camera", "CAMERA", table_flags)) {
+        ui_draw_shortcut_row("RMB", "Mouse look");
+        ui_draw_shortcut_row("WASD", "Move on camera forward/right axes");
+        ui_draw_shortcut_row("R / T", "Move up / down on camera up axis");
+        ui_draw_shortcut_row("Q / E", "Roll left / right");
+        ui_draw_shortcut_row("Alt + LMB", "Orbit selected/scene bounding box");
+        ui_draw_shortcut_row("F", "Frame selected/scene bounding box");
+        ui_draw_shortcut_row("Shift", "Faster movement");
+        ui_draw_shortcut_row("Ctrl", "Slower movement");
+        ui_draw_shortcut_row("L", "Orbit directional light");
+        ImGui::EndTable();
+    }
+
+    ui_inspector_section("DRAW SRV SLOTS");
+    ui_inspector_text_disabled_wrapped("Common shader t# convention used by mesh materials and PBR shaders.");
+    ui_draw_texture_slot_reference("##help_draw_slots");
+    ui_inspector_text_disabled_wrapped("Manual SRV bindings in a draw command override mesh material textures on the same slot.");
+
+    ImGui::PopStyleVar();
+}
+
+static void ui_draw_common_function_row(const char* signature, const char* args, const char* desc) {
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::TextWrapped("%s", signature);
+    ImGui::TableSetColumnIndex(1);
+    ImGui::TextWrapped("%s", args);
+    ImGui::TableSetColumnIndex(2);
+    ImGui::TextWrapped("%s", desc);
+}
+
+static void ui_draw_help_common_section(const char* title) {
+    ui_inspector_section(title);
+}
+
+static void ui_draw_help_common_tab() {
+    ui_inspector_text_disabled_wrapped("Reference for shaders/common.hlsl. Include it with #include \"common.hlsl\" from shaders in the root folder, or adjust the relative path from subfolders.");
+    ui_inspector_text_disabled_wrapped("Define LT_NO_DEFAULT_SHADOWMAP before including it if you want to bind your own shadow map and comparison sampler.");
+    ImGui::Spacing();
+
+    ImGuiTableFlags flags =
+        ImGuiTableFlags_SizingStretchProp |
+        ImGuiTableFlags_BordersInnerV |
+        ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_PadOuterX;
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(7.0f, 5.0f));
+
+    ui_draw_help_common_section("CAMERA / TRANSFORM");
+    if (ImGui::BeginTable("##help_common_camera", 3, flags)) {
+        ImGui::TableSetupColumn("Signature", ImGuiTableColumnFlags_WidthStretch, 1.35f);
+        ImGui::TableSetupColumn("Arguments", ImGuiTableColumnFlags_WidthStretch, 1.00f);
+        ImGui::TableSetupColumn("Use", ImGuiTableColumnFlags_WidthStretch, 1.35f);
+        ImGui::TableHeadersRow();
+        ui_draw_common_function_row("float3 lt_camera_position_ws()", "-", "Camera position in world space.");
+        ui_draw_common_function_row("float3 lt_camera_forward_ws()", "-", "Normalized camera forward vector.");
+        ui_draw_common_function_row("float3 lt_vector_to_camera_ws(float3 world_pos)", "world_pos: position in world space.", "Direction from a point toward the camera.");
+        ui_draw_common_function_row("float3 lt_ray_from_camera_ws(float3 world_pos)", "world_pos: position in world space.", "Direction from the camera through a world point.");
+        ui_draw_common_function_row("float4 lt_object_to_world(float3 object_pos)", "object_pos: local/object position.", "Transforms local position with ObjectCB.World.");
+        ui_draw_common_function_row("float3 lt_object_normal_to_world(float3 object_normal)", "object_normal: local/object normal.", "Transforms and normalizes a local normal.");
+        ui_draw_common_function_row("float4 lt_world_to_clip(float3 world_pos)", "world_pos: position in world space.", "Projects a world point with SceneCB.ViewProj.");
+        ui_draw_common_function_row("float3 lt_clip_to_ndc(float4 clip_pos)", "clip_pos: homogeneous clip position.", "Divides xyz by w.");
+        ui_draw_common_function_row("float2 lt_ndc_to_uv(float2 ndc)", "ndc: xy in -1..1 clip space.", "Converts NDC to texture UV with D3D y flip.");
+        ui_draw_common_function_row("float2 lt_clip_to_uv(float4 clip_pos)", "clip_pos: homogeneous clip position.", "Projects clip space directly to UV.");
+        ImGui::EndTable();
+    }
+
+    ui_draw_help_common_section("DEPTH / SCREEN");
+    if (ImGui::BeginTable("##help_common_depth", 3, flags)) {
+        ImGui::TableSetupColumn("Signature", ImGuiTableColumnFlags_WidthStretch, 1.35f);
+        ImGui::TableSetupColumn("Arguments", ImGuiTableColumnFlags_WidthStretch, 1.00f);
+        ImGui::TableSetupColumn("Use", ImGuiTableColumnFlags_WidthStretch, 1.35f);
+        ImGui::TableHeadersRow();
+        ui_draw_common_function_row("float4 lt_uv_depth_to_clip(float2 uv, float depth01)", "uv: texture coordinates. depth01: hardware depth.", "Builds D3D clip position for reconstruction.");
+        ui_draw_common_function_row("float3 lt_scene_depth_to_world(float2 uv, float depth01)", "uv: texture coordinates. depth01: sampled scene depth.", "Reconstructs world position using InvViewProj.");
+        ui_draw_common_function_row("float lt_view_depth_from_world(float3 world_pos)", "world_pos: position in world space.", "Signed camera-forward distance.");
+        ui_draw_common_function_row("float lt_scene_depth_to_view_depth(float2 uv, float depth01)", "uv/depth01: sampled depth pixel.", "Reconstructs world and returns view depth.");
+        ui_draw_common_function_row("float lt_depth01_to_view_depth(float depth01)", "depth01: D3D hardware depth.", "Approximate linear depth using near/far from ShadowParams.y/z.");
+        ui_draw_common_function_row("float lt_view_depth_to_depth01(float view_depth)", "view_depth: camera-forward distance.", "Converts linear view depth back to hardware depth.");
+        ui_draw_common_function_row("float2 lt_sv_position_to_uv(float4 sv_position, float2 render_size)", "sv_position: pixel position. render_size: target size.", "Pixel shader SV_POSITION to UV.");
+        ui_draw_common_function_row("float2 lt_uv_to_pixel(float2 uv, float2 render_size)", "uv, render_size.", "UV to pixel coordinates.");
+        ui_draw_common_function_row("float2 lt_pixel_to_uv(float2 pixel, float2 render_size)", "pixel, render_size.", "Pixel coordinates to UV.");
+        ui_draw_common_function_row("float2 lt_viewport_uv_to_ndc(float2 uv)", "uv: texture coordinates.", "UV to NDC with D3D y direction.");
+        ui_draw_common_function_row("float2 lt_motion_vector_uv(float3 world_pos)", "world_pos: current world position.", "Current UV minus previous-frame UV.");
+        ImGui::EndTable();
+    }
+
+    ui_draw_help_common_section("SHADOW");
+    if (ImGui::BeginTable("##help_common_shadow", 3, flags)) {
+        ImGui::TableSetupColumn("Signature", ImGuiTableColumnFlags_WidthStretch, 1.35f);
+        ImGui::TableSetupColumn("Arguments", ImGuiTableColumnFlags_WidthStretch, 1.00f);
+        ImGui::TableSetupColumn("Use", ImGuiTableColumnFlags_WidthStretch, 1.35f);
+        ImGui::TableHeadersRow();
+        ui_draw_common_function_row("int lt_shadow_cascade_count()", "-", "Cascade count clamped to 1..4.");
+        ui_draw_common_function_row("int lt_select_shadow_cascade(float3 world_pos)", "world_pos: position in world space.", "Selects cascade from camera-forward depth.");
+        ui_draw_common_function_row("float4 lt_shadow_clip(int cascade_index, float3 world_pos)", "cascade_index, world_pos.", "Projects to cascade clip space.");
+        ui_draw_common_function_row("float3 lt_shadow_ndc(int cascade_index, float3 world_pos)", "cascade_index, world_pos.", "Cascade projection divided by w.");
+        ui_draw_common_function_row("float2 lt_shadow_local_uv_from_ndc(float3 shadow_ndc)", "shadow_ndc: cascade NDC.", "Cascade-local shadow UV.");
+        ui_draw_common_function_row("float2 lt_shadow_atlas_uv(int cascade_index, float2 local_uv)", "cascade_index, local_uv.", "Maps cascade-local UV into atlas UV.");
+        ui_draw_common_function_row("bool lt_shadow_inside(float3 shadow_ndc, float2 local_uv)", "shadow_ndc, local_uv.", "Checks cascade UV and depth bounds.");
+        ui_draw_common_function_row("float lt_shadow_bias(float ndl)", "ndl: normal dot light.", "Default slope-ish bias used by PCF helpers.");
+        ui_draw_common_function_row("float lt_sample_shadow_cascade_pcf3x3(int cascade_index, float3 world_pos, float ndl)", "cascade_index, world_pos, ndl.", "Samples default ShadowMap/ShadowSampler at one cascade.");
+        ui_draw_common_function_row("float lt_sample_shadow_pcf3x3(float3 world_pos, float3 normal_ws, float3 light_dir_ws)", "world_pos, normal_ws, light_dir_ws.", "Selects cascade and samples default 3x3 PCF.");
+        ui_draw_common_function_row("float lt_sample_shadow_cascade_pcf3x3(Texture2D shadow_map, SamplerComparisonState shadow_sampler, int cascade_index, float3 world_pos, float ndl)", "custom shadow map/sampler plus cascade data.", "Expert overload for custom bindings.");
+        ui_draw_common_function_row("float lt_sample_shadow_pcf3x3(Texture2D shadow_map, SamplerComparisonState shadow_sampler, float3 world_pos, float3 normal_ws, float3 light_dir_ws)", "custom shadow map/sampler plus surface data.", "Expert overload with custom bindings.");
+        ImGui::EndTable();
+    }
+
+    ui_draw_help_common_section("UTILITY");
+    if (ImGui::BeginTable("##help_common_utility", 3, flags)) {
+        ImGui::TableSetupColumn("Signature", ImGuiTableColumnFlags_WidthStretch, 1.35f);
+        ImGui::TableSetupColumn("Arguments", ImGuiTableColumnFlags_WidthStretch, 1.00f);
+        ImGui::TableSetupColumn("Use", ImGuiTableColumnFlags_WidthStretch, 1.35f);
+        ImGui::TableHeadersRow();
+        ui_draw_common_function_row("float/float2/float3 lt_square(x)", "x: scalar/vector.", "Returns x*x.");
+        ui_draw_common_function_row("float2/float3 lt_safe_normalize(v)", "v: vector.", "Normalize with a small length guard.");
+        ui_draw_common_function_row("float lt_luminance(float3 c)", "c: linear RGB color.", "Rec.709 luminance.");
+        ui_draw_common_function_row("float3 lt_aces_fitted(float3 color)", "color: HDR linear RGB.", "Simple fitted ACES tone map.");
+        ui_draw_common_function_row("float3 lt_decode_normal_rgb(float4 enc)", "enc: normal encoded in 0..1 RGB.", "Decodes to normalized -1..1 normal.");
+        ImGui::EndTable();
+    }
+
+    ImGui::PopStyleVar();
+}
+
+static void ui_draw_help_popup() {
+    if (!s_help_popup_open)
         return;
 
-    ImGui::SetNextWindowSize(ImVec2(492.0f, 430.0f), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(760.0f, 560.0f), ImGuiCond_Appearing);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ui_panel_bg(UI_PANEL_GENERAL));
     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.220f, 0.205f, 0.200f, 1.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 5.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 8.0f));
-    if (ImGui::Begin("Shortcuts", &s_shortcuts_popup_open,
-        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar))
+    if (ImGui::Begin("Help", &s_help_popup_open,
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar))
     {
         bool close_clicked = false;
         bool focused = ui_update_panel_focus_from_current_window();
         ui_push_panel_focus(focused);
         if (focused)
             ui_draw_panel_focus_bg(UI_PANEL_GENERAL);
-        ui_panel_header("SHORTCUTS", "F1", "Close##shortcuts_close", &close_clicked);
+        ui_panel_header("HELP", "F1", "Close##help_close", &close_clicked);
         ui_pop_panel_focus();
         if (close_clicked)
-            s_shortcuts_popup_open = false;
-        ImGui::TextDisabled("Viewport, runtime and editor controls in one place.");
-        ImGui::Spacing();
+            s_help_popup_open = false;
 
-        ImGuiTableFlags table_flags =
-            ImGuiTableFlags_SizingStretchProp |
-            ImGuiTableFlags_BordersInnerV |
-            ImGuiTableFlags_PadOuterX;
-        ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(6.0f, 5.0f));
-
-        if (ui_begin_shortcut_section("##shortcuts_execution", "EXECUTION", table_flags)) {
-            ui_draw_shortcut_row("Space", "Pause / resume scene execution");
-            ui_draw_shortcut_row("F6", "Restart scene from frame 0");
-            ui_draw_shortcut_row("F11", "Toggle viewport fullscreen");
-            ImGui::EndTable();
+        if (ImGui::BeginTabBar("##help_tabs")) {
+            if (ImGui::BeginTabItem("Shortcuts")) {
+                ImGui::BeginChild("##help_shortcuts_scroll", ImVec2(0.0f, 0.0f), false,
+                    ImGuiWindowFlags_AlwaysVerticalScrollbar);
+                ui_draw_help_shortcuts_tab();
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Common HLSL")) {
+                ImGui::BeginChild("##help_common_scroll", ImVec2(0.0f, 0.0f), false,
+                    ImGuiWindowFlags_AlwaysVerticalScrollbar);
+                ui_draw_help_common_tab();
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
         }
-
-        if (ui_begin_shortcut_section("##shortcuts_project", "PROJECT", table_flags)) {
-            ui_draw_shortcut_row("F5", "Compile all shaders");
-            ui_draw_shortcut_row("Ctrl+D", "Compile edited/selected shader");
-            ui_draw_shortcut_row("Ctrl+S", "Save shader source or project");
-            ui_draw_shortcut_row("F1", "Toggle this shortcuts panel");
-            ImGui::EndTable();
-        }
-
-        if (ui_begin_shortcut_section("##shortcuts_timeline", "TIMELINE", table_flags)) {
-            ui_draw_shortcut_row("Click", "Select slot and move current frame");
-            ui_draw_shortcut_row("Arrows", "Move selected slot / current frame");
-            ui_draw_shortcut_row("Shift+Arrows", "Move selected slot by 10 frames");
-            ui_draw_shortcut_row("I", "Insert or update key on selected slot");
-            ui_draw_shortcut_row("Delete", "Delete key on selected slot");
-            ui_draw_shortcut_row("Ctrl+C", "Copy selected key");
-            ui_draw_shortcut_row("Ctrl+X", "Cut selected key");
-            ui_draw_shortcut_row("Ctrl+V", "Paste key into compatible selected slot");
-            ImGui::EndTable();
-        }
-
-        if (ui_begin_shortcut_section("##shortcuts_selection", "SELECTION", table_flags)) {
-            ui_draw_shortcut_row("Arrows", "Move in Resources / Commands");
-            ui_draw_shortcut_row("Enter", "Select focused item");
-            ui_draw_shortcut_row("F2", "Rename selected resource / command");
-            ui_draw_shortcut_row("Delete", "Remove selected item");
-            ui_draw_shortcut_row("X", "Toggle selected command enabled");
-            ui_draw_shortcut_row("Ctrl+C", "Copy the selected command subtree");
-            ui_draw_shortcut_row("Ctrl+V", "Paste commands after the selection or inside a selected container");
-            ui_draw_shortcut_row("1 / 2 / 3", "Toggle Move / Rotate / Scale gizmo while hovering the viewport");
-            ui_draw_shortcut_row("Esc", "Disable the active viewport gizmo");
-            ImGui::EndTable();
-        }
-
-        if (ui_begin_shortcut_section("##shortcuts_camera", "CAMERA", table_flags)) {
-            ui_draw_shortcut_row("RMB", "Mouse look");
-            ui_draw_shortcut_row("WASD", "Move on camera forward/right axes");
-            ui_draw_shortcut_row("R / T", "Move up / down on camera up axis");
-            ui_draw_shortcut_row("Q / E", "Roll left / right");
-            ui_draw_shortcut_row("Alt + LMB", "Orbit selected/scene bounding box");
-            ui_draw_shortcut_row("F", "Frame selected/scene bounding box");
-            ui_draw_shortcut_row("Shift", "Faster movement");
-            ui_draw_shortcut_row("Ctrl", "Slower movement");
-            ui_draw_shortcut_row("L", "Orbit directional light");
-            ImGui::EndTable();
-        }
-
-        ui_inspector_section("DRAW SRV SLOTS");
-        ui_inspector_text_disabled_wrapped("Common shader t# convention used by mesh materials and PBR shaders.");
-        ui_draw_texture_slot_reference("##shortcuts_draw_slots");
-        ui_inspector_text_disabled_wrapped("Manual SRV bindings in a draw command override mesh material textures on the same slot.");
-
-        ImGui::PopStyleVar();
     }
     ImGui::End();
     ImGui::PopStyleVar(2);
@@ -10800,6 +10904,18 @@ static void ui_draw_shortcut_row(const char* key, const char* desc) {
     ui_inline_badge(badge_id, key, ImVec4(0.74f, 0.53f, 0.42f, 1.0f));
     ImGui::TableSetColumnIndex(1);
     ImGui::TextUnformatted(desc);
+}
+
+static void ui_help_marker(const char* desc) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 36.0f);
+        ImGui::TextUnformatted(desc);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
 }
 
 static void ui_align_frame_row(float row_y) {
@@ -12718,6 +12834,29 @@ static void ui_draw_render_graph_window() {
     ImGui::End();
 }
 
+static void ui_top_bar_load_progress(float row_y, float row_h) {
+    ResourceLoadProgress progress = {};
+    if (!res_get_load_progress(&progress) || !progress.active)
+        return;
+
+    ImGui::SameLine(0.0f, ui_margin_px(10.0f));
+    ui_align_frame_row(row_y);
+    const float w = ui_px(132.0f);
+    const float h = ImMax(2.0f, ui_px(3.0f));
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##resource_load_progress", ImVec2(w, row_h));
+    ImVec2 bar_min(p0.x, p0.y + floorf((row_h - h) * 0.5f));
+    ImVec2 bar_max(p0.x + w, bar_min.y + h);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(bar_min, bar_max, IM_COL32(58, 48, 42, 255), h * 0.5f);
+    dl->AddRectFilled(bar_min, ImVec2(bar_min.x + w * progress.fraction, bar_max.y),
+                      IM_COL32(230, 116, 47, 255), h * 0.5f);
+    if (ImGui::IsItemHovered()) {
+        int pct = (int)(progress.fraction * 100.0f + 0.5f);
+        ImGui::SetTooltip("Loading %s  %d%%\n%s", progress.label, pct, progress.path);
+    }
+}
+
 static void ui_top_bar() {
     for (int i = 0; i < 3; i++)
         s_ui_window_control_screen_rects_valid[i] = false;
@@ -12746,7 +12885,7 @@ static void ui_top_bar() {
         const float logo_x_offset = ui_margin_px(4.0f);
         const float logo_y_offset = ui_px(1.5f);
         const float logo_max_h = toolbar_h - ui_px(6.0f);
-        float logo_h_px = ImMin(logo_max_h, row_h * 1.16f);
+        float logo_h_px = ImMin(logo_max_h, row_h * 0.9f);
         float logo_w_px = logo_h_px * ((float)logo_w / (float)logo_h);
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + logo_x_offset);
         ImGui::SetCursorPosY(floorf((toolbar_h - logo_h_px) * 0.5f + logo_y_offset));
@@ -12835,8 +12974,8 @@ static void ui_top_bar() {
         ui_export_current_project_single_exe();
     ImGui::SameLine(0.0f, ui_margin_px(6.0f));
     ui_align_frame_row(row_y);
-    if (ui_icon_button("##shortcuts_button", UI_ICON_HELP, ImVec2(ui_px(28.0f), 0.0f), "Shortcuts"))
-        s_shortcuts_popup_open = !s_shortcuts_popup_open;
+    if (ui_icon_button("##help_button", UI_ICON_HELP, ImVec2(ui_px(28.0f), 0.0f), "Help"))
+        s_help_popup_open = !s_help_popup_open;
     ImGui::SameLine(0.0f, ui_margin_px(8.0f));
     ui_align_text_row(row_y);
     ImGui::TextDisabled("workspace");
@@ -12844,6 +12983,7 @@ static void ui_top_bar() {
     ui_align_frame_row(row_y);
     ui_inline_badge("##project_name_badge", project_current_name() ? project_current_name() : "untitled",
                     ImVec4(0.74f, 0.53f, 0.42f, 1.0f), row_h);
+    ui_top_bar_load_progress(row_y, row_h);
 
     char summary[256] = {};
     static bool s_frame_ms_display_valid = false;
@@ -12856,6 +12996,8 @@ static void ui_top_bar() {
         s_frame_ms_display_valid = true;
     }
     float frame_ms = s_frame_ms_display;
+    const char* present_mode_label = g_dx.vsync ? "vsync" :
+        (g_dx.present_allow_tearing ? "tearing" : "no-vsync");
     if (g_profiler_enabled) {
         ui_refresh_profiler_readout_cache();
         if (cmd_profile_total_ready() && cmd_profile_ready()) {
@@ -12865,7 +13007,7 @@ static void ui_top_bar() {
                 app_cpu_present_ms(), app_cpu_other_ms(),
                 cmd_profile_total_frame_ms(), cmd_profile_frame_ms(),
                 s_profiler_readout_cache.app_memory, s_profiler_readout_cache.gpu_memory,
-                g_dx.vsync ? "vsync" : "no-vsync", LAZYTOOL_BUILD_CONFIG);
+                present_mode_label, LAZYTOOL_BUILD_CONFIG);
         } else if (cmd_profile_total_ready()) {
             snprintf(summary, sizeof(summary),
                 "dt %.2f ms  cpu %.2f ms  ui %.2f+%.2f ms  present %.2f ms  other %.2f ms  gpu %.3f ms  cmds ...  app %s  vram %s  %s  cfg %s",
@@ -12873,7 +13015,7 @@ static void ui_top_bar() {
                 app_cpu_present_ms(), app_cpu_other_ms(),
                 cmd_profile_total_frame_ms(),
                 s_profiler_readout_cache.app_memory, s_profiler_readout_cache.gpu_memory,
-                g_dx.vsync ? "vsync" : "no-vsync", LAZYTOOL_BUILD_CONFIG);
+                present_mode_label, LAZYTOOL_BUILD_CONFIG);
         } else if (cmd_profile_ready()) {
             snprintf(summary, sizeof(summary),
                 "dt %.2f ms  cpu %.2f ms  ui %.2f+%.2f ms  present %.2f ms  other %.2f ms  gpu ...  cmds %.3f ms  app %s  vram %s  %s  cfg %s",
@@ -12881,18 +13023,18 @@ static void ui_top_bar() {
                 app_cpu_present_ms(), app_cpu_other_ms(),
                 cmd_profile_frame_ms(),
                 s_profiler_readout_cache.app_memory, s_profiler_readout_cache.gpu_memory,
-                g_dx.vsync ? "vsync" : "no-vsync", LAZYTOOL_BUILD_CONFIG);
+                present_mode_label, LAZYTOOL_BUILD_CONFIG);
         } else {
             snprintf(summary, sizeof(summary),
                 "dt %.2f ms  cpu %.2f ms  ui %.2f+%.2f ms  present %.2f ms  other %.2f ms  gpu ...  cmds ...  app %s  vram %s  %s  cfg %s",
                 frame_ms, app_cpu_frame_ms(), app_cpu_ui_build_ms(), app_cpu_ui_render_ms(),
                 app_cpu_present_ms(), app_cpu_other_ms(),
                 s_profiler_readout_cache.app_memory, s_profiler_readout_cache.gpu_memory,
-                g_dx.vsync ? "vsync" : "no-vsync", LAZYTOOL_BUILD_CONFIG);
+                present_mode_label, LAZYTOOL_BUILD_CONFIG);
         }
     } else {
         snprintf(summary, sizeof(summary), "dt %.2f ms  cmds %d  %s  cfg %s",
-            frame_ms, ui_active_command_count(), g_dx.vsync ? "vsync" : "no-vsync", LAZYTOOL_BUILD_CONFIG);
+            frame_ms, ui_active_command_count(), present_mode_label, LAZYTOOL_BUILD_CONFIG);
     }
 
     float content_max_x = ImGui::GetWindowContentRegionMax().x;
@@ -13221,7 +13363,7 @@ void ui_draw() {
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false) && !shader_editor_was_focused)
         s_project_file_mode = PROJECT_FILE_SAVE;
     if (hotkeys_ok && ImGui::IsKeyPressed(ImGuiKey_F1, false))
-        s_shortcuts_popup_open = !s_shortcuts_popup_open;
+        s_help_popup_open = !s_help_popup_open;
     if (hotkeys_ok && ImGui::IsKeyPressed(ImGuiKey_Space, false))
         app_set_scene_paused(!app_scene_paused());
     if (hotkeys_ok && ImGui::IsKeyPressed(ImGuiKey_F6, false))
@@ -13268,7 +13410,7 @@ void ui_draw() {
     ImGui::PopStyleVar();
     {
         UI_PROFILE_SCOPE(UI_PROFILE_FLOATING_WINDOWS);
-        ui_draw_shortcuts_popup();
+        ui_draw_help_popup();
     }
     ImGui::End();
 

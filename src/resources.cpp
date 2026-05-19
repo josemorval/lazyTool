@@ -13,6 +13,10 @@
 #include <ctype.h>
 #include <float.h>
 #include <stdint.h>
+#ifndef LAZYTOOL_PLAYER_ONLY
+#include <atomic>
+#include <thread>
+#endif
 
 // This module owns all editor/runtime resources: textures, meshes, shaders,
 // render targets, and the built-in handles that expose engine state to users.
@@ -26,6 +30,10 @@ ResHandle g_builtin_scene_color = INVALID_HANDLE;
 ResHandle g_builtin_scene_depth = INVALID_HANDLE;
 ResHandle g_builtin_shadow_map  = INVALID_HANDLE;
 ResHandle g_builtin_dirlight    = INVALID_HANDLE;
+
+#ifndef LAZYTOOL_PLAYER_ONLY
+static void res_finish_async_loads(bool wait);
+#endif
 
 // Resource paths are stored with forward slashes so inspectors and project
 // files use one stable convention regardless of how the path was typed.
@@ -658,6 +666,9 @@ void res_init() {
 }
 
 void res_shutdown() {
+#ifndef LAZYTOOL_PLAYER_ONLY
+    res_finish_async_loads(true);
+#endif
     for (int i = 0; i < MAX_RESOURCES; i++)
         if (g_resources[i].active && !g_resources[i].is_builtin) res_release_gpu(&g_resources[i]);
 }
@@ -2156,6 +2167,39 @@ struct GaussianSplatGPU {
     float color[4];       // rgb base SH/DC color, a duplicate alpha for convenience
 };
 
+struct GaussianSplatLoadData {
+    GaussianSplatGPU* splats;
+    int splat_count;
+    int rest_count;
+    float bounds_min[3];
+    float bounds_max[3];
+    float avg_scale;
+};
+
+#ifndef LAZYTOOL_PLAYER_ONLY
+struct GaussianSplatAsyncJob {
+    std::thread worker;
+    std::atomic<bool> done;
+    std::atomic<int> progress_permille;
+    ResHandle target;
+    char resource_name[MAX_NAME];
+    char path[MAX_PATH_LEN];
+    char err[512];
+    GaussianSplatLoadData data;
+    bool ok;
+
+    GaussianSplatAsyncJob()
+        : done(false), progress_permille(0), target(INVALID_HANDLE), ok(false) {
+        resource_name[0] = '\0';
+        path[0] = '\0';
+        err[0] = '\0';
+        memset(&data, 0, sizeof(data));
+    }
+};
+
+static GaussianSplatAsyncJob* s_gaussian_splat_async_job = nullptr;
+#endif
+
 struct PlyPropertyDesc {
     char name[64];
     int  type;
@@ -2620,21 +2664,63 @@ static bool res_upload_gaussian_splat_buffer(Resource* r, const GaussianSplatGPU
     return true;
 }
 
-static bool res_load_gaussian_splat_disk_binary_into(Resource* r, const char* path) {
-    FILE* f = fopen(path, "rb");
-    if (!f)
-        return false;
+typedef void (*ResProgressFn)(void* user, int permille);
 
-    char err[512] = {};
-    PlyHeaderInfo hdr = {};
-    if (!res_ply_read_disk_header(f, &hdr, err, sizeof(err))) {
-        fclose(f);
-        res_set_splat_err(r, err);
+static void res_progress_store(void* user, int permille) {
+    if (!user)
+        return;
+    int* value = (int*)user;
+    *value = permille;
+}
+
+#ifndef LAZYTOOL_PLAYER_ONLY
+static void res_progress_store_atomic(void* user, int permille) {
+    if (!user)
+        return;
+    std::atomic<int>* value = (std::atomic<int>*)user;
+    value->store(permille, std::memory_order_relaxed);
+}
+#endif
+
+static void res_free_gaussian_splat_load_data(GaussianSplatLoadData* data) {
+    if (!data)
+        return;
+    if (data->splats) {
+        free(data->splats);
+        data->splats = nullptr;
+    }
+    data->splat_count = 0;
+    data->rest_count = 0;
+    data->avg_scale = 0.0f;
+}
+
+static bool res_decode_gaussian_splat_disk_binary(const char* path, GaussianSplatLoadData* out,
+                                                  char* err, int err_sz,
+                                                  ResProgressFn progress_fn, void* progress_user) {
+    if (!path || !out) {
+        snprintf(err, err_sz, "Gaussian splat load request is invalid.");
         return false;
     }
+    memset(out, 0, sizeof(*out));
+    if (progress_fn)
+        progress_fn(progress_user, 10);
+
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        snprintf(err, err_sz, "file not found: %s", path);
+        return false;
+    }
+
+    PlyHeaderInfo hdr = {};
+    if (!res_ply_read_disk_header(f, &hdr, err, err_sz)) {
+        fclose(f);
+        return false;
+    }
+    if (progress_fn)
+        progress_fn(progress_user, 20);
     if (!hdr.binary_little) {
         fclose(f);
-        res_set_splat_err(r, "large Gaussian splat streaming currently requires binary_little_endian PLY.");
+        snprintf(err, err_sz, "large Gaussian splat streaming currently requires binary_little_endian PLY.");
         return false;
     }
 
@@ -2643,7 +2729,7 @@ static bool res_load_gaussian_splat_disk_binary_into(Resource* r, const char* pa
     int iz = res_ply_find_prop(hdr, "z");
     if (ix < 0 || iy < 0 || iz < 0) {
         fclose(f);
-        res_set_splat_err(r, "PLY is missing x/y/z vertex properties.");
+        snprintf(err, err_sz, "PLY is missing x/y/z vertex properties.");
         return false;
     }
 
@@ -2664,7 +2750,7 @@ static bool res_load_gaussian_splat_disk_binary_into(Resource* r, const char* pa
         stride += hdr.props[i].size;
     if (stride <= 0) {
         fclose(f);
-        res_set_splat_err(r, "PLY vertex stride is invalid.");
+        snprintf(err, err_sz, "PLY vertex stride is invalid.");
         return false;
     }
 
@@ -2674,7 +2760,7 @@ static bool res_load_gaussian_splat_disk_binary_into(Resource* r, const char* pa
                                     (unsigned long long)stride * (unsigned long long)hdr.vertex_count;
         if (needed > file_size) {
             fclose(f);
-            res_set_splat_err(r, "PLY binary vertex data is truncated.");
+            snprintf(err, err_sz, "PLY binary vertex data is truncated.");
             return false;
         }
     }
@@ -2682,22 +2768,24 @@ static bool res_load_gaussian_splat_disk_binary_into(Resource* r, const char* pa
     GaussianSplatGPU* splats = (GaussianSplatGPU*)malloc(sizeof(GaussianSplatGPU) * (size_t)hdr.vertex_count);
     if (!splats) {
         fclose(f);
-        res_set_splat_err(r, "out of memory while allocating decoded Gaussian splats.");
+        snprintf(err, err_sz, "out of memory while allocating decoded Gaussian splats.");
         return false;
     }
+    if (progress_fn)
+        progress_fn(progress_user, 26);
 
     unsigned char* row = (unsigned char*)malloc((size_t)stride);
     if (!row) {
         free(splats);
         fclose(f);
-        res_set_splat_err(r, "out of memory while reading Gaussian splat rows.");
+        snprintf(err, err_sz, "out of memory while reading Gaussian splat rows.");
         return false;
     }
     if (!res_file_seek_u64(f, (unsigned long long)hdr.data_offset)) {
         free(row);
         free(splats);
         fclose(f);
-        res_set_splat_err(r, "failed to seek to PLY vertex data.");
+        snprintf(err, err_sz, "failed to seek to PLY vertex data.");
         return false;
     }
 
@@ -2711,7 +2799,7 @@ static bool res_load_gaussian_splat_disk_binary_into(Resource* r, const char* pa
             free(row);
             free(splats);
             fclose(f);
-            res_set_splat_err(r, "PLY binary vertex data is truncated.");
+            snprintf(err, err_sz, "PLY binary vertex data is truncated.");
             return false;
         }
 
@@ -2724,21 +2812,151 @@ static bool res_load_gaussian_splat_disk_binary_into(Resource* r, const char* pa
         res_decode_gaussian_splat_values(vals, ix, iy, iz, is0, is1, is2, ir0, ir1, ir2, ir3,
                                          io, idc0, idc1, idc2, &splats[vi],
                                          bounds_min, bounds_max, &scale_sum);
+
+        if (progress_fn && ((vi & 16383) == 0 || vi + 1 == hdr.vertex_count)) {
+            int p = 26;
+            if (hdr.vertex_count > 0)
+                p += (int)(((long long)(vi + 1) * 660ll) / (long long)hdr.vertex_count);
+            progress_fn(progress_user, p);
+        }
     }
 
     free(row);
     fclose(f);
 
-    float avg_scale = hdr.vertex_count > 0 ? (float)(scale_sum / (double)hdr.vertex_count) : 0.0f;
-    bool ok = res_upload_gaussian_splat_buffer(r, splats, hdr.vertex_count, path, hdr.rest_count,
-                                               avg_scale, bounds_min, bounds_max);
-    free(splats);
+    out->splats = splats;
+    out->splat_count = hdr.vertex_count;
+    out->rest_count = hdr.rest_count;
+    out->avg_scale = hdr.vertex_count > 0 ? (float)(scale_sum / (double)hdr.vertex_count) : 0.0f;
+    memcpy(out->bounds_min, bounds_min, sizeof(bounds_min));
+    memcpy(out->bounds_max, bounds_max, sizeof(bounds_max));
+    if (progress_fn)
+        progress_fn(progress_user, 900);
+    return true;
+}
+
+static bool res_load_gaussian_splat_disk_binary_into(Resource* r, const char* path) {
+    char err[512] = {};
+    GaussianSplatLoadData data = {};
+    int progress = 0;
+    if (!res_decode_gaussian_splat_disk_binary(path, &data, err, sizeof(err),
+                                               res_progress_store, &progress)) {
+        res_set_splat_err(r, err);
+        return false;
+    }
+
+    bool ok = res_upload_gaussian_splat_buffer(r, data.splats, data.splat_count, path, data.rest_count,
+                                               data.avg_scale, data.bounds_min, data.bounds_max);
+    res_free_gaussian_splat_load_data(&data);
     if (ok) {
         log_info("GaussianSplat loaded: %s (%d splats, %d bytes/elem)",
                  r->name, r->elem_count, r->elem_size);
     }
     return ok;
 }
+
+#ifndef LAZYTOOL_PLAYER_ONLY
+static void res_gaussian_splat_async_worker(GaussianSplatAsyncJob* job) {
+    if (!job) return;
+    job->ok = res_decode_gaussian_splat_disk_binary(job->path, &job->data, job->err, sizeof(job->err),
+                                                    res_progress_store_atomic, &job->progress_permille);
+    job->done.store(true, std::memory_order_release);
+}
+
+static bool res_start_gaussian_splat_async(Resource* r, const char* path) {
+    if (!r || !path || !path[0])
+        return false;
+    res_finish_async_loads(false);
+    if (s_gaussian_splat_async_job) {
+        res_set_splat_err(r, "another large resource load is already running.");
+        return false;
+    }
+
+    GaussianSplatAsyncJob* job = new GaussianSplatAsyncJob();
+    job->target = res_handle_from_ptr(r);
+    strncpy(job->resource_name, r->name, MAX_NAME - 1);
+    job->resource_name[MAX_NAME - 1] = '\0';
+    res_store_path(job->path, MAX_PATH_LEN, path);
+    r->compiled_ok = false;
+    r->using_fallback = false;
+    snprintf(r->compile_err, sizeof(r->compile_err), "loading %s", job->path);
+    s_gaussian_splat_async_job = job;
+
+    try {
+        job->worker = std::thread(res_gaussian_splat_async_worker, job);
+    } catch (...) {
+        s_gaussian_splat_async_job = nullptr;
+        res_free_gaussian_splat_load_data(&job->data);
+        delete job;
+        res_set_splat_err(r, "failed to start Gaussian splat load worker.");
+        return false;
+    }
+
+    log_info("GaussianSplat loading: %s", job->path);
+    return true;
+}
+
+static void res_finish_async_loads(bool wait) {
+    GaussianSplatAsyncJob* job = s_gaussian_splat_async_job;
+    if (!job)
+        return;
+    if (wait && job->worker.joinable())
+        job->worker.join();
+    if (!job->done.load(std::memory_order_acquire))
+        return;
+    if (job->worker.joinable())
+        job->worker.join();
+
+    Resource* r = res_get(job->target);
+    bool target_matches = r && r->active && r->type == RES_GAUSSIAN_SPLAT &&
+                          strcmp(r->path, job->path) == 0;
+    if (target_matches) {
+        if (job->ok) {
+            job->progress_permille.store(960, std::memory_order_relaxed);
+            if (res_upload_gaussian_splat_buffer(r, job->data.splats, job->data.splat_count,
+                                                 job->path, job->data.rest_count,
+                                                 job->data.avg_scale,
+                                                 job->data.bounds_min, job->data.bounds_max)) {
+                log_info("GaussianSplat loaded: %s (%d splats, %d bytes/elem)",
+                         r->name, r->elem_count, r->elem_size);
+            }
+        } else {
+            res_set_splat_err(r, job->err[0] ? job->err : "Gaussian splat load failed.");
+        }
+    }
+
+    res_free_gaussian_splat_load_data(&job->data);
+    s_gaussian_splat_async_job = nullptr;
+    delete job;
+}
+
+void res_update_async_loads() {
+    res_finish_async_loads(false);
+}
+
+bool res_get_load_progress(ResourceLoadProgress* out) {
+    if (!out)
+        return false;
+    memset(out, 0, sizeof(*out));
+    GaussianSplatAsyncJob* job = s_gaussian_splat_async_job;
+    if (!job)
+        return false;
+    out->active = true;
+    out->fraction = clampf((float)job->progress_permille.load(std::memory_order_relaxed) / 1000.0f, 0.0f, 1.0f);
+    strncpy(out->label, job->resource_name, MAX_NAME - 1);
+    out->label[MAX_NAME - 1] = '\0';
+    strncpy(out->path, job->path, MAX_PATH_LEN - 1);
+    out->path[MAX_PATH_LEN - 1] = '\0';
+    return true;
+}
+#else
+void res_update_async_loads() {}
+bool res_get_load_progress(ResourceLoadProgress* out) {
+    if (out)
+        memset(out, 0, sizeof(*out));
+    return false;
+}
+#endif
 
 static bool res_load_gaussian_splat_file_into(Resource* r, const char* path) {
     if (!r || !path || !path[0])
@@ -2750,13 +2968,25 @@ static bool res_load_gaussian_splat_file_into(Resource* r, const char* path) {
         unsigned long long disk_size = 0;
         bool have_disk_size = res_file_size_u64(disk_probe, &disk_size);
         fclose(disk_probe);
-        if (have_disk_size && disk_size > 256ull * 1024ull * 1024ull)
+        if (have_disk_size && disk_size > 256ull * 1024ull * 1024ull) {
+#ifndef LAZYTOOL_PLAYER_ONLY
+            return res_start_gaussian_splat_async(r, path);
+#else
             return res_load_gaussian_splat_disk_binary_into(r, path);
+#endif
+        }
     }
 
     void* bytes_v = nullptr;
     size_t byte_count = 0;
     if (!lt_read_file(path, &bytes_v, &byte_count)) {
+#ifndef LAZYTOOL_PLAYER_ONLY
+        FILE* exists = fopen(path, "rb");
+        if (exists) {
+            fclose(exists);
+            return res_start_gaussian_splat_async(r, path);
+        }
+#else
         if (res_load_gaussian_splat_disk_binary_into(r, path))
             return true;
         FILE* exists = fopen(path, "rb");
@@ -2764,6 +2994,7 @@ static bool res_load_gaussian_splat_file_into(Resource* r, const char* path) {
             fclose(exists);
             return false;
         }
+#endif
         char msg[512] = {};
         snprintf(msg, sizeof(msg), "file not found: %s", path);
         res_set_splat_err(r, msg);

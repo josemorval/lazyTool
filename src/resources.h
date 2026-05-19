@@ -13,6 +13,13 @@ extern ResHandle g_builtin_scene_depth;
 extern ResHandle g_builtin_shadow_map;
 extern ResHandle g_builtin_dirlight;
 
+struct ResourceLoadProgress {
+    bool  active;
+    float fraction;
+    char  label[MAX_NAME];
+    char  path[MAX_PATH_LEN];
+};
+
 typedef enum {
     MESH_PRIM_CUBE = 0,
     MESH_PRIM_QUAD,
@@ -23,6 +30,8 @@ typedef enum {
 
 void      res_init();
 void      res_shutdown();
+void      res_update_async_loads();
+bool      res_get_load_progress(ResourceLoadProgress* out);
 
 ResHandle res_alloc(const char* name, ResType type);
 void      res_free(ResHandle h);

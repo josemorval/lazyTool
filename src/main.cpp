@@ -794,6 +794,22 @@ static float    g_cpu_present_display_ms = 0.0f;
 static float    g_cpu_other_display_ms = 0.0f;
 static bool     g_cpu_profile_display_valid = false;
 
+static const int APP_IMGUI_GPU_PROFILE_LATENCY = 4;
+struct AppImGuiGpuProfileSlot {
+    ID3D11Query* disjoint;
+    ID3D11Query* begin;
+    ID3D11Query* end;
+    bool issued;
+};
+static AppImGuiGpuProfileSlot s_imgui_gpu_slots[APP_IMGUI_GPU_PROFILE_LATENCY] = {};
+static bool s_imgui_gpu_profile_initialized = false;
+static bool s_imgui_gpu_profile_ok = false;
+static bool s_imgui_gpu_profile_ready = false;
+static bool s_imgui_gpu_profile_display_valid = false;
+static bool s_imgui_gpu_prev_enabled = false;
+static int s_imgui_gpu_submit_frame = 0;
+static float s_imgui_gpu_ms = 0.0f;
+
 static float qpc_elapsed_ms(const LARGE_INTEGER& a, const LARGE_INTEGER& b, const LARGE_INTEGER& freq) {
     return (float)(((double)(b.QuadPart - a.QuadPart) * 1000.0) / (double)freq.QuadPart);
 }
@@ -826,12 +842,122 @@ static void app_cpu_profile_publish_frame() {
     g_cpu_other_display_ms += (g_cpu_other_ms - g_cpu_other_display_ms) * a;
 }
 
+static void app_imgui_gpu_profile_reset_results() {
+    s_imgui_gpu_profile_ready = false;
+    s_imgui_gpu_profile_display_valid = false;
+    s_imgui_gpu_ms = 0.0f;
+    for (int i = 0; i < APP_IMGUI_GPU_PROFILE_LATENCY; i++)
+        s_imgui_gpu_slots[i].issued = false;
+    s_imgui_gpu_submit_frame = 0;
+}
+
+static void app_imgui_gpu_profile_shutdown() {
+    for (int i = 0; i < APP_IMGUI_GPU_PROFILE_LATENCY; i++) {
+        AppImGuiGpuProfileSlot& slot = s_imgui_gpu_slots[i];
+        if (slot.disjoint) { slot.disjoint->Release(); slot.disjoint = nullptr; }
+        if (slot.begin) { slot.begin->Release(); slot.begin = nullptr; }
+        if (slot.end) { slot.end->Release(); slot.end = nullptr; }
+        slot.issued = false;
+    }
+    s_imgui_gpu_profile_initialized = false;
+    s_imgui_gpu_profile_ok = false;
+    app_imgui_gpu_profile_reset_results();
+}
+
+static void app_imgui_gpu_profile_ensure() {
+    if (s_imgui_gpu_profile_initialized)
+        return;
+    s_imgui_gpu_profile_initialized = true;
+    s_imgui_gpu_profile_ok = g_dx.dev != nullptr;
+
+    D3D11_QUERY_DESC timestamp_desc = {};
+    timestamp_desc.Query = D3D11_QUERY_TIMESTAMP;
+    D3D11_QUERY_DESC disjoint_desc = {};
+    disjoint_desc.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+
+    for (int i = 0; i < APP_IMGUI_GPU_PROFILE_LATENCY && s_imgui_gpu_profile_ok; i++) {
+        AppImGuiGpuProfileSlot& slot = s_imgui_gpu_slots[i];
+        if (FAILED(g_dx.dev->CreateQuery(&disjoint_desc, &slot.disjoint))) s_imgui_gpu_profile_ok = false;
+        if (FAILED(g_dx.dev->CreateQuery(&timestamp_desc, &slot.begin))) s_imgui_gpu_profile_ok = false;
+        if (FAILED(g_dx.dev->CreateQuery(&timestamp_desc, &slot.end))) s_imgui_gpu_profile_ok = false;
+    }
+    if (!s_imgui_gpu_profile_ok)
+        log_warn("ImGui GPU profiler disabled: failed to create D3D11 timestamp queries.");
+}
+
+static bool app_imgui_gpu_get_data(ID3D11Query* query, void* out, UINT out_sz) {
+    if (!query || !g_dx.ctx)
+        return false;
+    return g_dx.ctx->GetData(query, out, out_sz, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+}
+
+static void app_imgui_gpu_collect_slot(AppImGuiGpuProfileSlot& slot) {
+    if (!slot.issued)
+        return;
+
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint = {};
+    UINT64 begin = 0;
+    UINT64 end = 0;
+    if (!app_imgui_gpu_get_data(slot.disjoint, &disjoint, sizeof(disjoint))) return;
+    if (!app_imgui_gpu_get_data(slot.begin, &begin, sizeof(begin))) return;
+    if (!app_imgui_gpu_get_data(slot.end, &end, sizeof(end))) return;
+
+    slot.issued = false;
+    if (disjoint.Disjoint || disjoint.Frequency == 0 || end < begin)
+        return;
+
+    float ms = (float)((double)(end - begin) * 1000.0 / (double)disjoint.Frequency);
+    const float a = 0.04f;
+    if (!s_imgui_gpu_profile_display_valid) {
+        s_imgui_gpu_ms = ms;
+        s_imgui_gpu_profile_display_valid = true;
+    } else {
+        s_imgui_gpu_ms += (ms - s_imgui_gpu_ms) * a;
+    }
+    s_imgui_gpu_profile_ready = true;
+}
+
+static AppImGuiGpuProfileSlot* app_imgui_gpu_profile_begin() {
+    if (g_profiler_enabled != s_imgui_gpu_prev_enabled) {
+        app_imgui_gpu_profile_reset_results();
+        s_imgui_gpu_prev_enabled = g_profiler_enabled;
+    }
+    if (!g_profiler_enabled || !g_dx.ctx)
+        return nullptr;
+
+    app_imgui_gpu_profile_ensure();
+    if (!s_imgui_gpu_profile_ok)
+        return nullptr;
+
+    AppImGuiGpuProfileSlot& slot = s_imgui_gpu_slots[s_imgui_gpu_submit_frame % APP_IMGUI_GPU_PROFILE_LATENCY];
+    if (slot.issued) {
+        app_imgui_gpu_collect_slot(slot);
+        if (slot.issued)
+            return nullptr;
+    }
+
+    s_imgui_gpu_submit_frame++;
+    slot.issued = true;
+    g_dx.ctx->Begin(slot.disjoint);
+    g_dx.ctx->End(slot.begin);
+    return &slot;
+}
+
+static void app_imgui_gpu_profile_end(AppImGuiGpuProfileSlot* slot) {
+    if (!slot || !g_dx.ctx)
+        return;
+    g_dx.ctx->End(slot->end);
+    g_dx.ctx->End(slot->disjoint);
+}
+
 float app_cpu_frame_ms() { return g_cpu_frame_display_ms; }
 float app_cpu_scene_ms() { return g_cpu_scene_display_ms; }
 float app_cpu_ui_build_ms() { return g_cpu_ui_build_display_ms; }
 float app_cpu_ui_render_ms() { return g_cpu_ui_render_display_ms; }
 float app_cpu_present_ms() { return g_cpu_present_display_ms; }
 float app_cpu_other_ms() { return g_cpu_other_display_ms; }
+float app_imgui_gpu_ms() { return s_imgui_gpu_ms; }
+bool app_imgui_gpu_ready() { return s_imgui_gpu_profile_ready; }
 float app_editor_frame_cap_fps() { return g_editor_frame_cap_fps; }
 void app_set_editor_frame_cap_fps(float fps) {
     if (fps < 1.0f) fps = 0.0f;
@@ -1427,6 +1553,21 @@ static void editor_wait_for_frame_cap(const LARGE_INTEGER& frame_begin, const LA
 // Win32
 #ifndef LAZYTOOL_PLAYER_ONLY
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+
+static void app_adjust_maximized_client_rect(HWND hwnd, RECT* rc) {
+    if (!hwnd || !rc || !IsZoomed(hwnd))
+        return;
+
+    int frame_x = GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+    int frame_y = GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+    if (frame_x < 0) frame_x = 0;
+    if (frame_y < 0) frame_y = 0;
+
+    rc->left += frame_x;
+    rc->right -= frame_x;
+    rc->top += frame_y;
+    rc->bottom -= frame_y;
+}
 #endif
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1454,15 +1595,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 #ifndef LAZYTOOL_PLAYER_ONLY
     switch (msg) {
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO* mmi = (MINMAXINFO*)lp;
+        MONITORINFO mi = {};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+            RECT work = mi.rcWork;
+            RECT monitor = mi.rcMonitor;
+            mmi->ptMaxPosition.x = work.left - monitor.left;
+            mmi->ptMaxPosition.y = work.top - monitor.top;
+            mmi->ptMaxSize.x = work.right - work.left;
+            mmi->ptMaxSize.y = work.bottom - work.top;
+        }
+        return 0;
+    }
     case WM_NCCALCSIZE:
         if (wp) {
             NCCALCSIZE_PARAMS* params = (NCCALCSIZE_PARAMS*)lp;
-            if (IsZoomed(hwnd)) {
-                MONITORINFO mi = {};
-                mi.cbSize = sizeof(mi);
-                if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi))
-                    params->rgrc[0] = mi.rcWork;
-            }
+            app_adjust_maximized_client_rect(hwnd, &params->rgrc[0]);
             return 0;
         }
         return 0;
@@ -1994,6 +2144,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             g_pending_scene_surface_resize = false;
             force_scene_render = true;
         }
+        res_update_async_loads();
 
         LARGE_INTEGER now_t;
         QueryPerformanceCounter(&now_t);
@@ -2126,7 +2277,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             ui_draw();
             if (profile_cpu)
                 QueryPerformanceCounter(&ui_build_end);
+            AppImGuiGpuProfileSlot* imgui_gpu_slot = app_imgui_gpu_profile_begin();
             ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+            app_imgui_gpu_profile_end(imgui_gpu_slot);
             if (profile_cpu) {
                 LARGE_INTEGER ui_render_end;
                 QueryPerformanceCounter(&ui_render_end);
@@ -2140,7 +2293,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         LARGE_INTEGER present_begin = {};
         if (profile_cpu)
             QueryPerformanceCounter(&present_begin);
-        g_dx.sc->Present(g_dx.vsync ? 1 : 0, 0);
+        UINT present_sync = g_dx.vsync ? 1u : 0u;
+        UINT present_flags = (!g_dx.vsync && g_dx.present_allow_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+        g_dx.sc->Present(present_sync, present_flags);
         LARGE_INTEGER present_end = {};
         if (profile_cpu) {
             QueryPerformanceCounter(&present_end);
@@ -2164,6 +2319,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 #ifndef LAZYTOOL_PLAYER_ONLY
     if (!g_player_mode)
         ui_shutdown();
+    app_imgui_gpu_profile_shutdown();
 #endif
     cmd_shutdown();
     res_shutdown();
