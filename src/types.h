@@ -44,6 +44,7 @@ typedef enum {
     RES_RENDER_TEXTURE3D,
     RES_STRUCTURED_BUFFER,
     RES_GAUSSIAN_SPLAT,
+    RES_NANOVDB,
     RES_MESH,
     RES_SHADER,
     RES_BUILTIN_TIME,
@@ -212,6 +213,8 @@ struct Resource {
     float splat_bounds_min[3];
     float splat_bounds_max[3];
     float splat_avg_scale;
+    uint64_t nanovdb_byte_count;
+    uint32_t nanovdb_grid_byte_offset;
     int  vert_count, idx_count, vert_stride;
     MeshPart     mesh_parts[MAX_MESH_PARTS];
     int          mesh_part_count;

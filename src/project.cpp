@@ -138,6 +138,7 @@ static const char* res_type_token(ResType t) {
     case RES_RENDER_TEXTURE3D:    return "render_texture3d";
     case RES_STRUCTURED_BUFFER:   return "structured_buffer";
     case RES_GAUSSIAN_SPLAT:      return "gaussian_splat";
+    case RES_NANOVDB:             return "nanovdb";
     case RES_MESH:                return "mesh";
     case RES_SHADER:              return "shader";
     case RES_BUILTIN_TIME:        return "builtin_time";
@@ -163,6 +164,7 @@ static ResType res_type_from_token(const char* name) {
     if (strcmp(name, "render_texture3d") == 0) return RES_RENDER_TEXTURE3D;
     if (strcmp(name, "structured_buffer") == 0) return RES_STRUCTURED_BUFFER;
     if (strcmp(name, "gaussian_splat") == 0) return RES_GAUSSIAN_SPLAT;
+    if (strcmp(name, "nanovdb") == 0) return RES_NANOVDB;
     if (strcmp(name, "mesh") == 0) return RES_MESH;
     if (strcmp(name, "shader") == 0) return RES_SHADER;
     if (strcmp(name, "builtin_time") == 0) return RES_BUILTIN_TIME;
@@ -773,6 +775,9 @@ bool project_save_text(const char* path) {
         } else if (r.type == RES_GAUSSIAN_SPLAT) {
             char path_ref[MAX_PATH_LEN] = {};
             fprintf(f, "resource gaussian_splat %s %s\n", r.name, project_path_token(r.path, path_ref, MAX_PATH_LEN));
+        } else if (r.type == RES_NANOVDB) {
+            char path_ref[MAX_PATH_LEN] = {};
+            fprintf(f, "resource nanovdb %s %s\n", r.name, project_path_token(r.path, path_ref, MAX_PATH_LEN));
         } else if (r.type == RES_MESH) {
             if (r.path[0]) {
                 char path_ref[MAX_PATH_LEN] = {};
@@ -1318,6 +1323,9 @@ bool project_load_text(const char* path) {
             } else if (strcmp(kind, "gaussian_splat") == 0) {
                 char* p = strtok(nullptr, " \t\r\n");
                 res_load_gaussian_splat(name, p && strcmp(p, "-") != 0 ? p : "");
+            } else if (strcmp(kind, "nanovdb") == 0) {
+                char* p = strtok(nullptr, " \t\r\n");
+                res_load_nanovdb(name, p && strcmp(p, "-") != 0 ? p : "");
             } else if (strcmp(kind, "mesh_primitive") == 0) {
                 char* prim = strtok(nullptr, " \t\r\n");
                 res_create_mesh_primitive(name, mesh_prim_from_name(prim ? prim : "cube"));

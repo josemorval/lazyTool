@@ -1983,6 +1983,7 @@ static void resolve_dispatch_counts(const Command& c, UINT* out_x, UINT* out_y, 
             break;
         case RES_STRUCTURED_BUFFER:
         case RES_GAUSSIAN_SPLAT:
+        case RES_NANOVDB:
             src_x = explicit_src->elem_count;
             break;
         default:

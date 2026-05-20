@@ -480,11 +480,10 @@ bool dx_init(HWND hwnd, int w, int h) {
 
     IDXGIDevice1* dxgi_dev1 = nullptr;
     hr = g_dx.dev->QueryInterface(__uuidof(IDXGIDevice1), (void**)&dxgi_dev1);
-    /* This is how many frames are enqueued*/
-    /*if (SUCCEEDED(hr) && dxgi_dev1) {
-        dxgi_dev1->SetMaximumFrameLatency(g_dx.present_allow_tearing ? 16 : 1);
+    if (SUCCEEDED(hr) && dxgi_dev1) {
+        dxgi_dev1->SetMaximumFrameLatency(1);
         dxgi_dev1->Release();
-    }*/
+    }
 
     ID3D11Texture2D* bb = nullptr;
     g_dx.sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb);

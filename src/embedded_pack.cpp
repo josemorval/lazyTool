@@ -852,6 +852,7 @@ static bool collect_project_refs(ExportList* list, const char* project_path, cha
                 (strcmp(kind, "mesh_gltf") == 0 ||
                  strcmp(kind, "texture2d") == 0 ||
                  strcmp(kind, "gaussian_splat") == 0 ||
+                 strcmp(kind, "nanovdb") == 0 ||
                  strcmp(kind, "shader_vsps") == 0 ||
                  strcmp(kind, "shader_cs") == 0);
             if (file_resource && path && strcmp(path, "-") != 0) {

@@ -64,6 +64,8 @@ bool      res_reload_texture(Resource* r, const char* path);
 ResHandle res_load_mesh(const char* name, const char* path);
 ResHandle res_load_gaussian_splat(const char* name, const char* path);
 bool      res_reload_gaussian_splat(Resource* r, const char* path);
+ResHandle res_load_nanovdb(const char* name, const char* path);
+bool      res_reload_nanovdb(Resource* r, const char* path);
 ResHandle res_create_mesh_primitive(const char* name, MeshPrimitiveType type);
 bool      res_set_mesh_primitive(Resource* r, MeshPrimitiveType type);
 void      res_sync_size_resource(ResHandle h);

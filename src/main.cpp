@@ -33,6 +33,10 @@ extern "C" {
 ResHandle g_sel_res = INVALID_HANDLE;
 CmdHandle g_sel_cmd = INVALID_HANDLE;
 bool g_scene_view_hovered = false;
+bool g_scene_view_focused = true;
+bool g_scene_view_pointer_over = true;
+bool g_viewport_manual_camera_active = false;
+bool g_viewport_manual_light_active = false;
 #endif
 
 // main.cpp ties the whole application together: math helpers, global runtime
@@ -546,7 +550,22 @@ struct CameraViewPivot {
 static CameraViewPivot s_camera_view_pivot = {};
 
 static float camera_default_orbit_distance() {
+    float bmin[3] = {};
+    float bmax[3] = {};
     float d = 6.0f;
+    if (selected_or_default_focus_bounds(bmin, bmax)) {
+        float radius = bounds_radius(bmin, bmax);
+        float half_fov_y = g_camera.fov_y * 0.5f;
+        if (half_fov_y < 0.05f) half_fov_y = 0.05f;
+        float aspect = g_dx.scene_height > 0 ? (float)g_dx.scene_width / (float)g_dx.scene_height : 1.0f;
+        if (aspect < 0.05f) aspect = 1.0f;
+        float half_fov_x = atanf(tanf(half_fov_y) * aspect);
+        float limiting_half_fov = half_fov_x < half_fov_y ? half_fov_x : half_fov_y;
+        if (limiting_half_fov < 0.05f) limiting_half_fov = 0.05f;
+        d = (radius / sinf(limiting_half_fov)) * 1.20f;
+        if (d < radius + 0.25f)
+            d = radius + 0.25f;
+    }
     if (g_camera.near_z > 0.0f)
         d = fmaxf(d, g_camera.near_z * 12.0f);
     return d;
@@ -594,9 +613,14 @@ static bool camera_frame_bounds(const float bmin[3], const float bmax[3], bool u
 
     Vec3 center = bounds_center(bmin, bmax);
     float radius = bounds_radius(bmin, bmax);
-    float half_fov = g_camera.fov_y * 0.5f;
-    if (half_fov < 0.05f) half_fov = 0.05f;
-    float distance = (radius / sinf(half_fov)) * 1.35f;
+    float half_fov_y = g_camera.fov_y * 0.5f;
+    if (half_fov_y < 0.05f) half_fov_y = 0.05f;
+    float aspect = g_dx.scene_height > 0 ? (float)g_dx.scene_width / (float)g_dx.scene_height : 1.0f;
+    if (aspect < 0.05f) aspect = 1.0f;
+    float half_fov_x = atanf(tanf(half_fov_y) * aspect);
+    float limiting_half_fov = half_fov_x < half_fov_y ? half_fov_x : half_fov_y;
+    if (limiting_half_fov < 0.05f) limiting_half_fov = 0.05f;
+    float distance = (radius / sinf(limiting_half_fov)) * 1.20f;
     if (distance < radius + 0.5f)
         distance = radius + 0.5f;
 
@@ -774,6 +798,7 @@ static bool     g_scene_render_requested = false;
 static bool     g_scene_reset_execution_pending = true;
 static CmdHandle g_default_pixelize_cmd = INVALID_HANDLE;
 static bool     g_player_mode = false;
+static bool     g_editor_preview_no_ui = false;
 static bool     g_player_exit_after_present = false;
 static HWND     g_main_hwnd = nullptr;
 // CPU profiler values are double-buffered. The UI is drawn before the
@@ -793,6 +818,8 @@ static float    g_cpu_ui_render_display_ms = 0.0f;
 static float    g_cpu_present_display_ms = 0.0f;
 static float    g_cpu_other_display_ms = 0.0f;
 static bool     g_cpu_profile_display_valid = false;
+static int      g_imgui_draw_list_count = 0;
+static int      g_imgui_draw_cmd_count = 0;
 
 static const int APP_IMGUI_GPU_PROFILE_LATENCY = 4;
 struct AppImGuiGpuProfileSlot {
@@ -956,6 +983,8 @@ float app_cpu_ui_build_ms() { return g_cpu_ui_build_display_ms; }
 float app_cpu_ui_render_ms() { return g_cpu_ui_render_display_ms; }
 float app_cpu_present_ms() { return g_cpu_present_display_ms; }
 float app_cpu_other_ms() { return g_cpu_other_display_ms; }
+int app_imgui_draw_list_count() { return g_imgui_draw_list_count; }
+int app_imgui_draw_command_count() { return g_imgui_draw_cmd_count; }
 float app_imgui_gpu_ms() { return s_imgui_gpu_ms; }
 bool app_imgui_gpu_ready() { return s_imgui_gpu_profile_ready; }
 float app_editor_frame_cap_fps() { return g_editor_frame_cap_fps; }
@@ -964,6 +993,21 @@ void app_set_editor_frame_cap_fps(float fps) {
     if (fps > 1000.0f) fps = 1000.0f;
     g_editor_frame_cap_fps = fps;
 }
+
+#ifndef LAZYTOOL_PLAYER_ONLY
+static void app_update_imgui_draw_stats(ImDrawData* draw_data) {
+    g_imgui_draw_list_count = 0;
+    g_imgui_draw_cmd_count = 0;
+    if (!draw_data)
+        return;
+    g_imgui_draw_list_count = draw_data->CmdListsCount;
+    for (int i = 0; i < draw_data->CmdListsCount; i++) {
+        const ImDrawList* list = draw_data->CmdLists[i];
+        if (list)
+            g_imgui_draw_cmd_count += list->CmdBuffer.Size;
+    }
+}
+#endif
 
 static void app_update_player_title_fps(float dt) {
     if (!g_player_mode || !g_main_hwnd)
@@ -1013,6 +1057,22 @@ void app_request_scene_surface_resize(int w, int h) {
     g_pending_scene_surface_w = w;
     g_pending_scene_surface_h = h;
     g_pending_scene_surface_resize = true;
+}
+
+static void app_set_editor_preview_no_ui(bool enabled) {
+#ifdef LAZYTOOL_PLAYER_ONLY
+    (void)enabled;
+#else
+    if (g_player_mode)
+        return;
+    if (g_editor_preview_no_ui == enabled)
+        return;
+    g_editor_preview_no_ui = enabled;
+    ui_request_scene_surface_layout_refresh();
+    if (enabled)
+        app_request_scene_surface_resize(g_dx.width, g_dx.height);
+    app_request_scene_render();
+#endif
 }
 
 void app_request_scene_render() {
@@ -1147,7 +1207,9 @@ struct ViewportMouseGesture {
 
 static ViewportMouseGesture s_camera_mouse_gesture = {};
 static ViewportMouseGesture s_camera_orbit_gesture = {};
+static ViewportMouseGesture s_camera_dolly_gesture = {};
 static ViewportMouseGesture s_light_orbit_gesture = {};
+static float s_camera_wheel_zoom_units = 0.0f;
 
 struct CameraOrbitState {
     bool active;
@@ -1161,6 +1223,8 @@ static bool imgui_keyboard_capture_requested() {
 #ifdef LAZYTOOL_PLAYER_ONLY
     return false;
 #else
+    if (g_editor_preview_no_ui)
+        return false;
     if (!ImGui::GetCurrentContext())
         return false;
     ImGuiIO& io = ImGui::GetIO();
@@ -1172,6 +1236,8 @@ static bool imgui_mouse_capture_requested() {
 #ifdef LAZYTOOL_PLAYER_ONLY
     return false;
 #else
+    if (g_editor_preview_no_ui)
+        return false;
     if (!ImGui::GetCurrentContext())
         return false;
     return g_editor_mouse_capture || ImGui::IsAnyItemActive();
@@ -1196,6 +1262,72 @@ static bool cursor_over_editor_scene_view() {
     POINT p = {};
     GetCursorPos(&p);
     return ui_scene_view_contains_screen_point((int)p.x, (int)p.y);
+#endif
+}
+
+static bool scene_view_accepts_camera_mouse() {
+#ifdef LAZYTOOL_PLAYER_ONLY
+    return true;
+#else
+    return g_scene_view_focused && (g_scene_view_pointer_over || g_scene_view_hovered);
+#endif
+}
+
+static bool scene_view_accepts_camera_keyboard() {
+#ifdef LAZYTOOL_PLAYER_ONLY
+    return true;
+#else
+    return g_scene_view_focused && (g_scene_view_pointer_over || g_scene_view_hovered || key_down(VK_RBUTTON) || key_down(VK_MBUTTON));
+#endif
+}
+
+static bool viewport_gesture_trigger_down() {
+    return key_down(VK_RBUTTON) || key_down(VK_MBUTTON) ||
+           (key_down(VK_MENU) && key_down(VK_LBUTTON));
+}
+
+static bool imgui_mouse_capture_blocks_viewport_gesture() {
+#ifdef LAZYTOOL_PLAYER_ONLY
+    return false;
+#else
+    if (g_editor_preview_no_ui)
+        return false;
+    if (!ImGui::GetCurrentContext())
+        return false;
+    if (g_editor_mouse_capture)
+        return true;
+    if (scene_view_accepts_camera_mouse() && viewport_gesture_trigger_down())
+        return false;
+    return ImGui::IsAnyItemActive();
+#endif
+}
+
+static bool scene_view_pointer_can_take_focus() {
+#ifdef LAZYTOOL_PLAYER_ONLY
+    return true;
+#else
+    if (g_editor_mouse_capture)
+        return false;
+    if (g_scene_view_pointer_over)
+        return true;
+    if (!cursor_over_editor_scene_view())
+        return false;
+    if (ImGui::GetCurrentContext()) {
+        ImGuiIO& io = ImGui::GetIO();
+        if (io.WantCaptureMouse)
+            return false;
+    }
+    return true;
+#endif
+}
+
+static void scene_view_focus_from_pointer_if_allowed() {
+#ifndef LAZYTOOL_PLAYER_ONLY
+    if (!scene_view_pointer_can_take_focus())
+        return;
+    g_scene_view_focused = true;
+    g_scene_view_hovered = true;
+    g_scene_view_pointer_over = true;
 #endif
 }
 
@@ -1244,7 +1376,7 @@ static bool begin_or_update_viewport_mouse_gesture(
 // integrate deltas from the window center. That removes the screen-edge limit
 // without needing raw-input plumbing yet.
 static void update_camera_mouse() {
-    if (imgui_mouse_capture_requested()) {
+    if (imgui_mouse_capture_blocks_viewport_gesture()) {
         end_viewport_mouse_gesture(&s_camera_mouse_gesture);
         return;
     }
@@ -1254,9 +1386,9 @@ static void update_camera_mouse() {
     bool active = begin_or_update_viewport_mouse_gesture(
         &s_camera_mouse_gesture,
         key_down(VK_RBUTTON),
-        g_scene_view_hovered || cursor_over_editor_scene_view(),
+        scene_view_accepts_camera_mouse(),
         g_camera_controls.enabled && g_camera_controls.mouse_look &&
-            !imgui_keyboard_capture_requested() && !imgui_mouse_capture_requested(),
+            !imgui_keyboard_capture_requested() && !imgui_mouse_capture_blocks_viewport_gesture(),
         &dx, &dy);
     if (!active)
         return;
@@ -1294,7 +1426,7 @@ static void update_camera_mouse() {
 
 
 static bool update_camera_orbit() {
-    if (imgui_mouse_capture_requested()) {
+    if (imgui_mouse_capture_blocks_viewport_gesture()) {
         end_viewport_mouse_gesture(&s_camera_orbit_gesture);
         s_camera_orbit_state.active = false;
         return false;
@@ -1307,8 +1439,8 @@ static bool update_camera_orbit() {
     bool active = begin_or_update_viewport_mouse_gesture(
         &s_camera_orbit_gesture,
         trigger,
-        g_scene_view_hovered || cursor_over_editor_scene_view(),
-        g_camera_controls.enabled && !imgui_keyboard_capture_requested() && !imgui_mouse_capture_requested(),
+        scene_view_accepts_camera_mouse(),
+        g_camera_controls.enabled && !imgui_keyboard_capture_requested() && !imgui_mouse_capture_blocks_viewport_gesture(),
         &dx, &dy);
     if (!active) {
         s_camera_orbit_state.active = false;
@@ -1316,6 +1448,7 @@ static bool update_camera_orbit() {
     }
 
     end_viewport_mouse_gesture(&s_camera_mouse_gesture);
+    end_viewport_mouse_gesture(&s_camera_dolly_gesture);
 
     if (!was_active || !s_camera_orbit_state.active) {
         s_camera_orbit_state.target = camera_orbit_target();
@@ -1377,6 +1510,86 @@ static bool update_camera_orbit() {
     camera_look_at(&g_camera, target, up_axis);
     camera_set_view_pivot(target);
     return true;
+}
+
+static bool camera_zoom_about_orbit_target(float zoom_units) {
+    if (zoom_units == 0.0f)
+        return false;
+
+    Vec3 target = camera_orbit_target();
+    Vec3 eye = camera_eye(g_camera);
+    Vec3 offset = v3_sub(eye, target);
+    float dist = sqrtf(v3_dot(offset, offset));
+    if (dist < 0.05f) {
+        dist = camera_default_orbit_distance();
+        offset = v3_scale(camera_forward(g_camera), -dist);
+    }
+
+    Vec3 dir = v3_scale(offset, 1.0f / dist);
+    float sens = g_camera_controls.mouse_sensitivity;
+    if (sens < 0.0001f) sens = 0.0001f;
+    float zoom_step = sens * 4.0f;
+    float min_dist = g_camera.near_z > 0.0f ? g_camera.near_z * 2.0f : 0.02f;
+    if (min_dist < 0.02f) min_dist = 0.02f;
+    float new_dist = clampf(dist * expf(zoom_units * zoom_step), min_dist, 100000.0f);
+    Vec3 new_eye = v3_add(target, v3_scale(dir, new_dist));
+    Vec3 up_axis = camera_up(g_camera);
+    float fixed_roll = 0.0f;
+    if (g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED) {
+        camera_sync_euler_from_quat(&g_camera);
+        fixed_roll = g_camera.roll;
+    }
+
+    g_camera.position[0] = new_eye.x;
+    g_camera.position[1] = new_eye.y;
+    g_camera.position[2] = new_eye.z;
+    camera_look_at(&g_camera, target,
+        g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED ? v3(0.0f, 1.0f, 0.0f) : up_axis);
+    if (g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED) {
+        camera_set_euler(&g_camera, g_camera.yaw, g_camera.pitch, fixed_roll);
+        camera_apply_horizon_lock(&g_camera);
+    }
+    camera_set_view_pivot(target);
+    return true;
+}
+
+static bool update_camera_dolly() {
+    if (imgui_mouse_capture_blocks_viewport_gesture()) {
+        end_viewport_mouse_gesture(&s_camera_dolly_gesture);
+        return false;
+    }
+
+    float dx = 0.0f;
+    float dy = 0.0f;
+    bool active = begin_or_update_viewport_mouse_gesture(
+        &s_camera_dolly_gesture,
+        key_down(VK_MBUTTON),
+        scene_view_accepts_camera_mouse(),
+        g_camera_controls.enabled && !imgui_keyboard_capture_requested() && !imgui_mouse_capture_blocks_viewport_gesture(),
+        &dx, &dy);
+    if (!active)
+        return false;
+
+    end_viewport_mouse_gesture(&s_camera_mouse_gesture);
+    end_viewport_mouse_gesture(&s_camera_orbit_gesture);
+    s_camera_orbit_state.active = false;
+
+    if (dy == 0.0f)
+        return true;
+
+    return camera_zoom_about_orbit_target(dy);
+}
+
+static bool update_camera_wheel_zoom() {
+    float units = s_camera_wheel_zoom_units;
+    s_camera_wheel_zoom_units = 0.0f;
+    if (units == 0.0f)
+        return false;
+    if (!g_camera_controls.enabled || !scene_view_accepts_camera_mouse())
+        return false;
+    if (imgui_keyboard_capture_requested() || imgui_mouse_capture_blocks_viewport_gesture())
+        return false;
+    return camera_zoom_about_orbit_target(units);
 }
 
 // Holding L rotates the built-in directional light around its target. The edit
@@ -1444,11 +1657,11 @@ static void update_camera_keyboard(float dt) {
     if (!g_camera_controls.enabled)
         return;
 
-    bool viewport_active = g_scene_view_hovered || cursor_over_editor_scene_view() || key_down(VK_RBUTTON);
+    bool viewport_active = scene_view_accepts_camera_keyboard();
     if (!viewport_active)
         return;
 
-    if (imgui_keyboard_capture_requested() || imgui_mouse_capture_requested())
+    if (imgui_keyboard_capture_requested() || imgui_mouse_capture_blocks_viewport_gesture())
         return;
 
     static bool s_f_was_down = false;
@@ -1522,7 +1735,13 @@ static void update_camera_controls(float dt) {
         return;
 
     bool orbiting = update_camera_orbit();
+    bool dollying = false;
+    bool wheel_zooming = false;
     if (!orbiting)
+        dollying = update_camera_dolly();
+    if (!orbiting && !dollying)
+        wheel_zooming = update_camera_wheel_zoom();
+    if (!orbiting && !dollying && !wheel_zooming)
         update_camera_mouse();
     update_camera_keyboard(dt);
 }
@@ -1537,16 +1756,22 @@ static void editor_wait_for_frame_cap(const LARGE_INTEGER& frame_begin, const LA
     if (g_player_mode || g_dx.vsync || g_editor_frame_cap_fps <= 0.0f)
         return;
 
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    double elapsed_ms = ((double)(now.QuadPart - frame_begin.QuadPart) * 1000.0) / (double)freq.QuadPart;
     double target_ms = 1000.0 / (double)g_editor_frame_cap_fps;
-    if (elapsed_ms >= target_ms)
-        return;
-
-    DWORD wait_ms = (DWORD)(target_ms - elapsed_ms);
-    if (wait_ms > 0)
-        MsgWaitForMultipleObjectsEx(0, nullptr, wait_ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    for (;;) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        double elapsed_ms = ((double)(now.QuadPart - frame_begin.QuadPart) * 1000.0) / (double)freq.QuadPart;
+        double remaining_ms = target_ms - elapsed_ms;
+        if (remaining_ms <= 0.0)
+            return;
+        if (remaining_ms > 2.0) {
+            Sleep((DWORD)(remaining_ms - 1.0));
+        } else if (remaining_ms > 0.35) {
+            Sleep(0);
+        } else {
+            YieldProcessor();
+        }
+    }
 #endif
 }
 
@@ -1668,8 +1893,33 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DestroyWindow(hwnd);
             return 0;
         }
+        POINT p = { client_x, client_y };
+        ClientToScreen(hwnd, &p);
+        scene_view_focus_from_pointer_if_allowed();
+        (void)p;
         break;
     }
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN: {
+        scene_view_focus_from_pointer_if_allowed();
+        break;
+    }
+    case WM_MOUSEWHEEL: {
+        POINT p = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        if (ui_scene_view_contains_screen_point((int)p.x, (int)p.y) && scene_view_pointer_can_take_focus()) {
+            scene_view_focus_from_pointer_if_allowed();
+            s_camera_wheel_zoom_units -= ((float)GET_WHEEL_DELTA_WPARAM(wp) / (float)WHEEL_DELTA) * 10.0f;
+            return 0;
+        }
+        break;
+    }
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        if (wp == VK_F10) {
+            app_set_editor_preview_no_ui(!g_editor_preview_no_ui);
+            return 0;
+        }
+        break;
     }
 
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return true;
@@ -2189,13 +2439,29 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             g_dt = 0.0f;
         }
 
+        // Runtime playback is a continuous renderer even when no editor input,
+        // timeline key, resize or resource event invalidates the scene. This is
+        // important for effects that converge over frames, such as temporal
+        // volume accumulation, stochastic sampling and animated shader time.
+        if (!g_scene_paused)
+            force_scene_render = true;
+
         // Pause freezes the scene texture by default. Explicit editor actions
         // can still request one render so reset, scrubbing and key edits stay
         // visible without advancing runtime time. While paused and idle we do
         // not update SceneCB/UserCB or execute draw/dispatch commands.
         bool light_orbit_active = false;
+        g_viewport_manual_camera_active = false;
+        g_viewport_manual_light_active = false;
         if (g_player_mode)
             g_scene_view_hovered = true;
+#ifndef LAZYTOOL_PLAYER_ONLY
+        if (g_editor_preview_no_ui) {
+            g_scene_view_focused = true;
+            g_scene_view_hovered = true;
+            g_scene_view_pointer_over = true;
+        }
+#endif
         bool scene_will_render = !g_scene_paused || force_scene_render;
         if (timeline_enabled() && scene_will_render) {
             bool timeline_was_running = !g_scene_paused;
@@ -2211,10 +2477,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             update_camera_controls(g_scene_paused ? editor_dt : g_dt);
         if (memcmp(&camera_before_controls, &g_camera, sizeof(g_camera)) != 0) {
             force_scene_render = true;
+            g_viewport_manual_camera_active = true;
             timeline_capture_if_tracked(TIMELINE_TRACK_CAMERA, "camera", RES_NONE);
         }
         if (light_orbit_active) {
             force_scene_render = true;
+            g_viewport_manual_light_active = true;
             timeline_capture_if_tracked(TIMELINE_TRACK_DIRLIGHT, "dirlight", RES_NONE);
         }
         if (force_scene_render)
@@ -2260,7 +2528,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         if (g_player_exit_after_present)
             PostQuitMessage(0);
 #else
-        if (g_player_mode) {
+        if (g_player_mode || g_editor_preview_no_ui) {
             dx_present_scene_to_backbuffer();
             cmd_profile_end_frame_capture();
             if (g_player_exit_after_present)
@@ -2277,8 +2545,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             ui_draw();
             if (profile_cpu)
                 QueryPerformanceCounter(&ui_build_end);
+            ImDrawData* imgui_draw_data = ImGui::GetDrawData();
+            app_update_imgui_draw_stats(imgui_draw_data);
             AppImGuiGpuProfileSlot* imgui_gpu_slot = app_imgui_gpu_profile_begin();
-            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+            ImGui_ImplDX11_RenderDrawData(imgui_draw_data);
             app_imgui_gpu_profile_end(imgui_gpu_slot);
             if (profile_cpu) {
                 LARGE_INTEGER ui_render_end;

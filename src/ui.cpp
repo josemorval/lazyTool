@@ -266,6 +266,10 @@ static ID3D11ShaderResourceView* ui_app_logo_text_srv(int* out_w = nullptr, int*
 ResHandle g_sel_res = INVALID_HANDLE;
 CmdHandle g_sel_cmd = INVALID_HANDLE;
 bool g_scene_view_hovered = false;
+bool g_scene_view_focused = false;
+bool g_scene_view_pointer_over = false;
+bool g_viewport_manual_camera_active = false;
+bool g_viewport_manual_light_active = false;
 bool g_editor_mouse_capture = false;
 static RECT s_scene_view_screen_rect = {};
 static bool s_scene_view_screen_rect_valid = false;
@@ -290,8 +294,17 @@ enum ProjectFileMode {
 
 static ProjectFileMode s_project_file_mode = PROJECT_FILE_NONE;
 static bool s_project_path_focus = false;
+static bool s_project_load_queued = false;
+static bool s_project_load_modal_visible = false;
+static bool s_project_load_result_ok = false;
+static int s_project_load_defer_frames = 0;
+static int s_project_load_done_frames = 0;
+static char s_project_load_path[MAX_PATH_LEN] = {};
+static char s_project_load_status[160] = {};
 static bool s_viewport_fullscreen = false;
 static bool s_right_panel_general_open = false;
+static bool s_focus_inspector_panel_next = false;
+static bool s_focus_general_panel_next = false;
 static bool s_help_popup_open = false;
 static bool s_timeline_window_open = false;
 static bool s_render_graph_window_open = false;
@@ -310,7 +323,7 @@ static RECT s_ui_top_toolbar_screen_rect = {};
 static bool s_ui_top_toolbar_screen_rect_valid = false;
 static RECT s_ui_window_control_screen_rects[3] = {};
 static bool s_ui_window_control_screen_rects_valid[3] = {};
-static const float k_ui_scale_default = 1.06f;
+static const float k_ui_scale_default = 1.10f;
 static const float k_ui_scale_min = 0.75f;
 static const float k_ui_scale_max = 1.25f;
 static float s_ui_global_scale = k_ui_scale_default;
@@ -318,13 +331,14 @@ static bool s_ui_scale_dirty = false;
 static ImGuiStyle s_ui_base_style = {};
 static bool s_ui_base_style_valid = false;
 static ImFont* s_code_font = nullptr;
-static float s_code_font_size = 16.0f;
+static float s_code_font_size = 14.0f;
 static bool s_shader_source_editor_focused = false;
 static bool s_show_inspector_notes = false;
 static bool s_inspector_resource_note_open[MAX_RESOURCES] = {};
 static bool s_inspector_command_note_open[MAX_COMMANDS] = {};
 static bool s_inspector_resource_note_editing[MAX_RESOURCES] = {};
 static bool s_inspector_command_note_editing[MAX_COMMANDS] = {};
+static int s_render_target_preview_columns = 4;
 
 static ResHandle ui_resource_handle_from_ptr(const Resource* r);
 
@@ -409,6 +423,9 @@ static void ui_align_frame_row(float row_y);
 static void ui_align_text_row(float row_y);
 static float ui_px(float v);
 static void ui_draw_profiler_gpu_command_table();
+static void ui_fit_text_ellipsis(const char* text, float max_w, char* out, int out_sz);
+static bool ui_current_panel_focused();
+static void ui_focus_current_panel_window();
 
 struct UiProfilerReadoutCache {
     double next_update_time = -1.0;
@@ -674,6 +691,111 @@ static bool ui_dir_exists(const char* path) {
     ui_path_to_win32_pattern(path, win32_path, MAX_PATH_LEN);
     DWORD attrs = GetFileAttributesA(win32_path);
     return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static void ui_finish_project_load_camera_sync() {
+    if (g_camera_controls.mode != CAMERA_MODE_HORIZON_LOCKED)
+        return;
+    camera_sync_euler_from_quat(&g_camera);
+    camera_set_euler(&g_camera, g_camera.yaw, clampf(g_camera.pitch, -1.55334f, 1.55334f), g_camera.roll);
+}
+
+static void ui_queue_project_load(const char* path) {
+    if (!path || !path[0])
+        return;
+
+    strncpy(s_project_load_path, path, MAX_PATH_LEN - 1);
+    s_project_load_path[MAX_PATH_LEN - 1] = '\0';
+    snprintf(s_project_load_status, sizeof(s_project_load_status), "Preparing %s", s_project_load_path);
+    s_project_load_queued = true;
+    s_project_load_modal_visible = true;
+    s_project_load_result_ok = false;
+    s_project_load_defer_frames = 1;
+    s_project_load_done_frames = 0;
+    s_project_file_mode = PROJECT_FILE_NONE;
+}
+
+static void ui_update_project_load_request() {
+    if (!s_project_load_queued)
+        return;
+    if (s_project_load_defer_frames > 0) {
+        s_project_load_defer_frames--;
+        return;
+    }
+
+    char path[MAX_PATH_LEN] = {};
+    strncpy(path, s_project_load_path, MAX_PATH_LEN - 1);
+    path[MAX_PATH_LEN - 1] = '\0';
+    snprintf(s_project_load_status, sizeof(s_project_load_status), "Opening %s", path);
+
+    bool ok = project_load_text(path);
+    if (ok)
+        ui_finish_project_load_camera_sync();
+
+    s_project_load_result_ok = ok;
+    s_project_load_queued = false;
+    snprintf(s_project_load_status, sizeof(s_project_load_status),
+             ok ? "Project opened" : "Project load failed");
+
+    ResourceLoadProgress progress = {};
+    if (ok && res_get_load_progress(&progress) && progress.active)
+        s_project_load_done_frames = 0;
+    else
+        s_project_load_done_frames = 45;
+}
+
+static void ui_draw_project_load_progress_window() {
+    ResourceLoadProgress progress = {};
+    bool resource_loading = res_get_load_progress(&progress) && progress.active;
+    bool visible = s_project_load_modal_visible;
+    if (!visible)
+        return;
+
+    if (!s_project_load_queued && !resource_loading && s_project_load_done_frames <= 0)
+        s_project_load_done_frames = 45;
+    if (!s_project_load_queued && !resource_loading && s_project_load_done_frames > 0) {
+        s_project_load_done_frames--;
+        if (s_project_load_done_frames <= 0) {
+            s_project_load_modal_visible = false;
+            return;
+        }
+    }
+
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f,
+                                   vp->WorkPos.y + vp->WorkSize.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(ui_px(420.0f), 0.0f), ImGuiCond_Always);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_AlwaysAutoResize;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_margin_px(16.0f), ui_margin_px(14.0f)));
+    ImGui::Begin("Opening Project", nullptr, flags);
+
+    const char* title = (resource_loading && !s_project_load_queued) ? "Loading resource data" :
+        (s_project_load_queued ? "Opening project" : (s_project_load_result_ok ? "Project opened" : "Project load failed"));
+    ImGui::TextUnformatted(title);
+    ImGui::Spacing();
+
+    float fraction = 0.08f;
+    const char* detail = s_project_load_status;
+    if (resource_loading && !s_project_load_queued) {
+        fraction = progress.fraction;
+        detail = progress.label[0] ? progress.label : progress.path;
+    } else if (!s_project_load_queued) {
+        fraction = s_project_load_result_ok ? 1.0f : 0.0f;
+    }
+
+    ImGui::ProgressBar(clampf(fraction, 0.0f, 1.0f), ImVec2(ui_px(388.0f), ui_px(7.0f)), "");
+    ImGui::Spacing();
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ui_px(388.0f));
+    ImGui::TextDisabled("%s", detail && detail[0] ? detail : "Preparing");
+    if (resource_loading && !s_project_load_queued && progress.path[0])
+        ImGui::TextDisabled("%s", progress.path);
+    ImGui::PopTextWrapPos();
+
+    ImGui::End();
+    ImGui::PopStyleVar();
 }
 
 static void ui_path_parent_dir(const char* path, char* out, int out_sz) {
@@ -1360,12 +1482,7 @@ static void ui_project_file_bar() {
             project_save_text(s_project_path);
             s_project_file_mode = PROJECT_FILE_NONE;
         } else if (ui_file_exists(s_project_path)) {
-            project_load_text(s_project_path);
-            if (g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED) {
-                camera_sync_euler_from_quat(&g_camera);
-                camera_set_euler(&g_camera, g_camera.yaw, clampf(g_camera.pitch, -1.55334f, 1.55334f), g_camera.roll);
-            }
-            s_project_file_mode = PROJECT_FILE_NONE;
+            ui_queue_project_load(s_project_path);
         }
     }
     ImGui::SameLine();
@@ -1373,14 +1490,10 @@ static void ui_project_file_bar() {
     if (ImGui::Button(save ? "Save" : "Load")) {
         if (save)
             project_save_text(s_project_path);
-        else {
-            project_load_text(s_project_path);
-            if (g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED) {
-                camera_sync_euler_from_quat(&g_camera);
-                camera_set_euler(&g_camera, g_camera.yaw, clampf(g_camera.pitch, -1.55334f, 1.55334f), g_camera.roll);
-            }
-        }
-        s_project_file_mode = PROJECT_FILE_NONE;
+        else
+            ui_queue_project_load(s_project_path);
+        if (save)
+            s_project_file_mode = PROJECT_FILE_NONE;
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel"))
@@ -1399,6 +1512,7 @@ static bool ui_resource_has_implicit_size_source(const Resource& r) {
     case RES_RENDER_TEXTURE3D:
     case RES_STRUCTURED_BUFFER:
     case RES_GAUSSIAN_SPLAT:
+    case RES_NANOVDB:
     case RES_BUILTIN_SCENE_COLOR:
     case RES_BUILTIN_SCENE_DEPTH:
     case RES_BUILTIN_SHADOW_MAP:
@@ -1447,7 +1561,7 @@ static void ui_resource_display_name_buf(const Resource& r, char* out, int out_s
     Resource* owner = nullptr;
     if (ui_resource_is_implicit_size_resource(r, &owner)) {
         const char* owner_name = ui_resource_base_display_name(*owner);
-        if (owner->type == RES_STRUCTURED_BUFFER || owner->type == RES_GAUSSIAN_SPLAT)
+        if (owner->type == RES_STRUCTURED_BUFFER || owner->type == RES_GAUSSIAN_SPLAT || owner->type == RES_NANOVDB)
             snprintf(out, out_sz, "%s Count", owner_name);
         else
             snprintf(out, out_sz, "%s Size", owner_name);
@@ -1474,6 +1588,7 @@ static const char* ui_resource_display_type(const Resource& r) {
     case RES_BUILTIN_SCENE_COLOR: return "RenderTexture2D";
     case RES_BUILTIN_SCENE_DEPTH: return "DepthTexture2D";
     case RES_GAUSSIAN_SPLAT:      return "GaussianSplat";
+    case RES_NANOVDB:             return "NanoVDB";
     case RES_BUILTIN_SHADOW_MAP:  return "DepthTexture2D";
     case RES_BUILTIN_DIRLIGHT:    return "DirectionalLight";
     default:                      return res_type_str(r.type);
@@ -2203,12 +2318,111 @@ static void ui_command_param_source_combo(CommandParam* p) {
     }
 }
 
-static void ui_inspector_section(const char* title) {
+static bool ui_title_case_keep_upper(const char* word, int len) {
+    if (!word || len <= 0)
+        return false;
+    static const char* acronyms[] = {
+        "SRV", "UAV", "RTV", "DSV", "GPU", "CPU", "HLSL", "DX11", "MRT", "CB", "CBUFFER"
+    };
+    for (int i = 0; i < (int)(sizeof(acronyms) / sizeof(acronyms[0])); i++) {
+        if ((int)strlen(acronyms[i]) == len && _strnicmp(word, acronyms[i], len) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void ui_title_case_label(const char* in, char* out, int out_sz) {
+    if (!out || out_sz <= 0)
+        return;
+    out[0] = '\0';
+    if (!in)
+        return;
+
+    int oi = 0;
+    bool word_start = true;
+    for (int i = 0; in[i] && oi < out_sz - 1;) {
+        if ((in[i] >= 'A' && in[i] <= 'Z') || (in[i] >= 'a' && in[i] <= 'z') || (in[i] >= '0' && in[i] <= '9')) {
+            int start = i;
+            while ((in[i] >= 'A' && in[i] <= 'Z') || (in[i] >= 'a' && in[i] <= 'z') || (in[i] >= '0' && in[i] <= '9'))
+                i++;
+            int len = i - start;
+            bool keep_upper = ui_title_case_keep_upper(in + start, len);
+            for (int j = 0; j < len && oi < out_sz - 1; j++) {
+                char ch = in[start + j];
+                if (keep_upper) {
+                    if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+                } else if (word_start && j == 0) {
+                    if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+                } else {
+                    if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+                }
+                out[oi++] = ch;
+            }
+            word_start = false;
+        } else {
+            out[oi++] = in[i++];
+            word_start = true;
+        }
+    }
+    out[oi] = '\0';
+}
+
+static bool ui_inspector_section(const char* title, bool default_open = true) {
+    char label[128] = {};
+    ui_title_case_label(title, label, sizeof(label));
+
     ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.57f, 0.55f, 1.0f));
-    ImGui::TextUnformatted(title);
-    ImGui::PopStyleColor();
-    ImGui::Separator();
+    ImGuiID id = ImGui::GetID(title);
+    bool open = ImGui::GetStateStorage()->GetBool(id, default_open);
+    float header_h = ImGui::GetTextLineHeight() + ui_margin_px(10.0f);
+    float header_w = ImGui::GetContentRegionAvail().x - ui_current_vertical_scroll_margin(8.0f);
+    if (header_w < ui_px(48.0f))
+        header_w = ui_px(48.0f);
+    ImGui::PushID(title);
+    ImGui::InvisibleButton("##section_header", ImVec2(header_w, header_h));
+    bool hovered = ImGui::IsItemHovered();
+    bool held = hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+        open = !open;
+        ImGui::GetStateStorage()->SetBool(id, open);
+    }
+    ImVec2 min = ImGui::GetItemRectMin();
+    ImVec2 max = ImGui::GetItemRectMax();
+    ImGui::PopID();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec4 bg = held ? ImVec4(0.205f, 0.138f, 0.124f, 1.00f) :
+        (hovered ? ImVec4(0.160f, 0.132f, 0.126f, 1.00f) : ImVec4(0.120f, 0.116f, 0.120f, 1.00f));
+    dl->AddRectFilled(min, max, ImGui::GetColorU32(bg), ui_margin_px(4.0f));
+    dl->AddRect(min, max, ImGui::GetColorU32(ImVec4(0.245f, 0.225f, 0.220f, 0.72f)), ui_margin_px(4.0f));
+    dl->AddRectFilled(min, ImVec2(min.x + ui_px(2.0f), max.y),
+        ImGui::GetColorU32(ImVec4(0.78f, 0.42f, 0.32f, 1.0f)), ui_margin_px(1.5f));
+    dl->AddLine(
+        ImVec2(min.x, max.y), ImVec2(max.x, max.y),
+        ImGui::GetColorU32(ImVec4(0.245f, 0.225f, 0.220f, 0.70f)), 1.0f);
+
+    ImU32 text_col = ImGui::GetColorU32(ImVec4(0.88f, 0.86f, 0.84f, 1.0f));
+    ImU32 arrow_col = ImGui::GetColorU32(ImVec4(0.86f, 0.84f, 0.82f, 1.0f));
+    float cy = (min.y + max.y) * 0.5f;
+    float ax = min.x + ui_px(10.0f);
+    float arrow = ui_px(4.2f);
+    if (open) {
+        dl->AddTriangleFilled(ImVec2(ax - arrow, cy - arrow * 0.55f),
+                              ImVec2(ax + arrow, cy - arrow * 0.55f),
+                              ImVec2(ax, cy + arrow * 0.75f), arrow_col);
+    } else {
+        dl->AddTriangleFilled(ImVec2(ax - arrow * 0.55f, cy - arrow),
+                              ImVec2(ax - arrow * 0.55f, cy + arrow),
+                              ImVec2(ax + arrow * 0.75f, cy), arrow_col);
+    }
+    const char* display = label[0] ? label : title;
+    ImVec2 ts = ImGui::CalcTextSize(display);
+    dl->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.06f,
+                ImVec2(min.x + ui_px(20.0f), floorf(cy - ts.y * 0.5f)), text_col, display);
+
+    if (open)
+        ImGui::Spacing();
+    return open;
 }
 
 static void ui_inspector_text_disabled_wrapped(const char* fmt, ...) {
@@ -2256,12 +2470,11 @@ static bool ui_inspector_note_editor(char* note, int note_size, bool* note_open,
     if (!s_show_inspector_notes)
         return false;
 
-    ui_inspector_section("NOTES");
-    ImGui::Checkbox("Show", note_open);
-    if (!*note_open) {
+    if (!ui_inspector_section("NOTES", false)) {
         *note_editing = false;
         return false;
     }
+    *note_open = true;
 
     bool changed = false;
     ImGui::SetNextItemWidth(-FLT_MIN);
@@ -4921,6 +5134,7 @@ static ImVec4 ui_type_color(ResType type) {
     case RES_BUILTIN_SHADOW_MAP:  return ImVec4(0.72f, 0.58f, 0.42f, 1.0f);
     case RES_STRUCTURED_BUFFER:
     case RES_GAUSSIAN_SPLAT:
+    case RES_NANOVDB:
     case RES_BUILTIN_SCENE_DEPTH: return ImVec4(0.46f, 0.66f, 0.61f, 1.0f);
     case RES_INT:
     case RES_INT2:
@@ -4973,7 +5187,8 @@ static bool ui_rt_scene_scale_combo(const char* label, int* divisor) {
 static bool ui_resource_has_warning(const Resource& r) {
     return (r.type == RES_SHADER && !r.compiled_ok) ||
            (r.type == RES_MESH && r.using_fallback) ||
-           (r.type == RES_GAUSSIAN_SPLAT && r.path[0] && !r.compiled_ok);
+           (r.type == RES_GAUSSIAN_SPLAT && r.path[0] && !r.compiled_ok) ||
+           (r.type == RES_NANOVDB && r.path[0] && !r.compiled_ok);
 }
 
 static bool ui_resource_filter_match(const Resource& r, int filter) {
@@ -4984,11 +5199,30 @@ static bool ui_resource_filter_match(const Resource& r, int filter) {
                    r.type == RES_RENDER_TEXTURE3D ||
                    r.type == RES_BUILTIN_SCENE_COLOR || r.type == RES_BUILTIN_SHADOW_MAP;
     case 4: return r.type == RES_STRUCTURED_BUFFER || r.type == RES_GAUSSIAN_SPLAT ||
-                   r.type == RES_BUILTIN_SCENE_DEPTH;
+                   r.type == RES_NANOVDB || r.type == RES_BUILTIN_SCENE_DEPTH;
     case 5: return r.type == RES_INT || r.type == RES_INT2 || r.type == RES_INT3 || r.type == RES_FLOAT ||
                    r.type == RES_FLOAT2 || r.type == RES_FLOAT3 || r.type == RES_FLOAT4 ||
-                   r.type == RES_BUILTIN_TIME;
+                   r.type == RES_BUILTIN_TIME || r.type == RES_BUILTIN_DIRLIGHT;
     default: return true;
+    }
+}
+
+static bool ui_resource_is_variable_inspector_candidate(const Resource& r) {
+    if (!r.active || r.is_generated)
+        return false;
+    switch (r.type) {
+    case RES_INT:
+    case RES_INT2:
+    case RES_INT3:
+    case RES_FLOAT:
+    case RES_FLOAT2:
+    case RES_FLOAT3:
+    case RES_FLOAT4:
+    case RES_BUILTIN_TIME:
+    case RES_BUILTIN_DIRLIGHT:
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -5412,6 +5646,15 @@ static CmdHandle ui_find_last_command_child(CmdHandle parent) {
     return last;
 }
 
+static int ui_command_direct_child_count(CmdHandle parent) {
+    int count = 0;
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        if (g_commands[i].active && g_commands[i].parent == parent)
+            count++;
+    }
+    return count;
+}
+
 static CmdHandle ui_paste_command_clipboard(CmdHandle target_h) {
     CmdHandle mapped[MAX_COMMANDS] = {};
     CmdHandle allocated[MAX_COMMANDS] = {};
@@ -5499,7 +5742,8 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
         return false;
     }
 
-    const float row_h = c.type == CMD_GROUP ? (ImGui::GetTextLineHeight() + 8.0f) : (ImGui::GetTextLineHeight() + 12.0f);
+    bool container = c.type == CMD_REPEAT || c.type == CMD_GROUP;
+    const float row_h = container ? (ImGui::GetTextLineHeight() + 8.0f) : (ImGui::GetTextLineHeight() + 10.0f);
     float width = ImGui::GetContentRegionAvail().x - ui_current_vertical_scroll_margin(8.0f);
     if (width < ui_px(48.0f))
         width = ui_px(48.0f);
@@ -5527,10 +5771,15 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
     ImVec2 max = ImGui::GetItemRectMax();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ui_draw_command_row_bg(min, max, selected, hovered, nav_target, index, inside_group);
+    if (container && !selected) {
+        ImVec4 fill = hovered ? ImVec4(0.168f, 0.154f, 0.150f, 0.92f) : ImVec4(0.135f, 0.128f, 0.130f, 0.92f);
+        dl->AddRectFilled(min, max, ImGui::GetColorU32(fill), 4.0f);
+        dl->AddRect(min, max, ImGui::GetColorU32(ImVec4(0.245f, 0.225f, 0.220f, 0.64f)), 4.0f);
+    }
 
     float cy = (min.y + max.y) * 0.5f;
     float row_x = min.x + indent;
-    if (c.type == CMD_REPEAT || c.type == CMD_GROUP) {
+    if (container) {
         ImU32 arrow_col = ImGui::GetColorU32(c.enabled ?
             ImVec4(0.72f, 0.74f, 0.78f, 1.0f) : ImVec4(0.42f, 0.43f, 0.45f, 1.0f));
         ImVec2 center = ImVec2(row_x + 13.0f, cy);
@@ -5564,7 +5813,7 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
     float badge_h = badge_ts.y + 6.0f;
     float text_y = floorf(cy - ImGui::GetTextLineHeight() * 0.5f);
     float right_x = max.x - (warning ? 24.0f : 6.0f);
-    bool show_type_badge = c.type != CMD_GROUP;
+    bool show_type_badge = !container;
     char profile_buf[32] = {};
     if (g_profiler_enabled) {
         if (cmd_profile_ready())
@@ -5576,16 +5825,38 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
             ImGui::GetColorU32(ImVec4(0.54f, 0.56f, 0.60f, 1.0f)), profile_buf);
         right_x -= ts.x + 10.0f;
     }
+
+    char count_buf[16] = {};
+    if (container) {
+        snprintf(count_buf, sizeof(count_buf), "%d", ui_command_direct_child_count(h));
+        ImVec2 count_ts = ImGui::CalcTextSize(count_buf);
+        float count_w = count_ts.x + 12.0f;
+        float count_h = count_ts.y + 5.0f;
+        ImVec2 count_min = ImVec2(right_x - count_w, floorf(cy - count_h * 0.5f));
+        ImVec2 count_max = ImVec2(count_min.x + count_w, count_min.y + count_h);
+        ImVec4 count_tint = c.type == CMD_REPEAT ? ImVec4(0.92f, 0.66f, 0.38f, 1.0f) : ImVec4(0.70f, 0.64f, 0.56f, 1.0f);
+        dl->AddRectFilled(count_min, count_max, ImGui::GetColorU32(ImVec4(0.120f, 0.108f, 0.102f, 1.0f)), 3.0f);
+        dl->AddRect(count_min, count_max, ImGui::GetColorU32(ImVec4(count_tint.x * 0.55f, count_tint.y * 0.55f, count_tint.z * 0.55f, 0.95f)), 3.0f);
+        dl->AddText(ImVec2(count_min.x + 6.0f, count_min.y + 2.0f), ImGui::GetColorU32(count_tint), count_buf);
+        right_x -= count_w + 8.0f;
+    }
     ImVec2 badge_min = ImVec2(right_x - badge_w, floorf(cy - badge_h * 0.5f));
     if (show_type_badge && badge_min.x > row_x + 96.0f)
         ui_draw_badge(dl, badge_min, type, ui_command_type_color(c.type));
 
     ImU32 name_col = ImGui::GetColorU32(c.enabled ? ImVec4(0.92f, 0.93f, 0.94f, 1.0f) :
         ImVec4(0.48f, 0.49f, 0.51f, 1.0f));
+    char display_name[MAX_NAME + 48] = {};
+    if (c.type == CMD_GROUP)
+        snprintf(display_name, sizeof(display_name), "Group · %s", c.name);
+    else if (c.type == CMD_REPEAT)
+        snprintf(display_name, sizeof(display_name), "Repeat x%d · %s", c.repeat_count, c.name);
+    else
+        snprintf(display_name, sizeof(display_name), "%s", c.name);
     ImVec2 name_pos = ImVec2(row_x + 28.0f, text_y);
     float clip_right = show_type_badge ? (badge_min.x - 6.0f) : (right_x - 6.0f);
     dl->PushClipRect(name_pos, ImVec2(clip_right, max.y), true);
-    dl->AddText(name_pos, name_col, c.name);
+    dl->AddText(name_pos, name_col, display_name);
     dl->PopClipRect();
 
     if (warning)
@@ -5745,6 +6016,17 @@ static int ui_collect_visible_resources_uncached(bool builtins, int filter, ResH
     return count;
 }
 
+static int ui_collect_variable_inspector_resources(ResHandle* out, int max_count) {
+    int count = 0;
+    for (int i = 0; i < MAX_RESOURCES && count < max_count; i++) {
+        Resource& r = g_resources[i];
+        if (!ui_resource_is_variable_inspector_candidate(r))
+            continue;
+        out[count++] = (ResHandle)(i + 1);
+    }
+    return count;
+}
+
 static const UiVisibleResourceCache* ui_visible_resources(bool builtins, int filter) {
     UiVisibleResourceCache& cache = s_visible_resource_cache[builtins ? 1 : 0];
     uint64_t revision = res_revision();
@@ -5789,7 +6071,7 @@ static int ui_collect_visible_commands_recursive_uncached(CmdHandle parent, int 
         if (depths)
             depths[count - 1] = (unsigned char)(depth < 255 ? depth : 255);
         if ((c.type == CMD_REPEAT || c.type == CMD_GROUP) && c.repeat_expanded)
-            count += ui_collect_visible_commands_recursive_uncached(h, depth + (c.type == CMD_GROUP ? 0 : 1),
+            count += ui_collect_visible_commands_recursive_uncached(h, depth + 1,
                                                                     out + count, depths ? depths + count : nullptr,
                                                                     max_count - count);
     }
@@ -5940,6 +6222,11 @@ static void ui_panel_resources(bool embedded = false) {
             if (ImGui::MenuItem("Load Gaussian Splat PLY... (set path in Inspector)")) {
                 res_make_unique_name("splat_0", uname, MAX_NAME);
                 g_sel_res = res_load_gaussian_splat(uname, "");
+                g_sel_cmd = INVALID_HANDLE;
+            }
+            if (ImGui::MenuItem("Load NanoVDB... (set path in Inspector)")) {
+                res_make_unique_name("nvdb_0", uname, MAX_NAME);
+                g_sel_res = res_load_nanovdb(uname, "");
                 g_sel_cmd = INVALID_HANDLE;
             }
             if (ImGui::BeginMenu("Mesh Primitive")) {
@@ -6252,7 +6539,9 @@ static void ui_panel_resources(bool embedded = false) {
 // -- commands panel --------------------------------------------------------
 
 static float ui_command_tree_row_height(const Command& c) {
-    return c.type == CMD_GROUP ? (ImGui::GetTextLineHeight() + 8.0f) : (ImGui::GetTextLineHeight() + 12.0f);
+    return (c.type == CMD_GROUP || c.type == CMD_REPEAT)
+        ? (ImGui::GetTextLineHeight() + 8.0f)
+        : (ImGui::GetTextLineHeight() + 10.0f);
 }
 
 static float ui_command_visible_subtree_height(const UiVisibleCommandCache* cache, int parent_index) {
@@ -6302,7 +6591,9 @@ static void ui_draw_command_tree_cached(const UiVisibleCommandCache* cache) {
                     ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x - inset_r,
                     child_min.y + child_h - 1.0f);
                 dl->AddRectFilled(block_min, block_max,
-                    ImGui::GetColorU32(ImVec4(0.245f, 0.188f, 0.118f, 0.58f)), 5.0f);
+                    ImGui::GetColorU32(ImVec4(0.120f, 0.112f, 0.108f, 0.56f)), 5.0f);
+                dl->AddRectFilled(block_min, ImVec2(block_min.x + 2.0f, block_max.y),
+                    ImGui::GetColorU32(ImVec4(0.78f, 0.42f, 0.32f, 0.40f)), 2.0f);
             }
         }
     }
@@ -6894,6 +7185,69 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         break;
     }
 
+    case RES_NANOVDB: {
+        static ResHandle nvdb_edit = INVALID_HANDLE;
+        static char nvdb_path[MAX_PATH_LEN] = {};
+        if (nvdb_edit != h) {
+            nvdb_edit = h;
+            strncpy(nvdb_path, r->path, MAX_PATH_LEN - 1);
+            nvdb_path[MAX_PATH_LEN - 1] = '\0';
+        }
+
+        ResourceLoadProgress load_progress = {};
+        bool loading_this = res_get_load_progress(&load_progress) && load_progress.active &&
+                            strcmp(load_progress.path, r->path) == 0 &&
+                            strcmp(load_progress.label, r->name) == 0;
+        if (r->srv && r->compiled_ok) {
+            ImGui::TextColored({0.35f, 1, 0.45f, 1}, "Status: OK");
+        } else if (loading_this) {
+            ImGui::TextColored({1.0f, 0.55f, 0.22f, 1.0f}, "Status: LOADING %.0f%%", load_progress.fraction * 100.0f);
+        } else if (r->path[0]) {
+            ImGui::TextColored({1, 0.35f, 0.3f, 1}, "Status: ERROR");
+        } else {
+            ui_inspector_text_disabled_wrapped("Status: no file loaded");
+        }
+        if (r->compile_err[0])
+            ImGui::TextWrapped("%s", r->compile_err);
+
+        ImGui::TextWrapped("Path: %s", r->path[0] ? r->path : "(none)");
+        PathInputResult nvdb_path_result = ui_path_input_ex("Path##nvdb", nvdb_path, MAX_PATH_LEN, ".nvdb");
+        if (nvdb_path_result.file_selected) {
+            if (res_reload_nanovdb(r, nvdb_path)) {
+                strncpy(nvdb_path, r->path, MAX_PATH_LEN - 1);
+                nvdb_path[MAX_PATH_LEN - 1] = '\0';
+            }
+        }
+        if (loading_this)
+            ImGui::BeginDisabled();
+        if (ImGui::Button(loading_this ? "Loading NVDB" : (r->srv ? "Reload NVDB" : "Load NVDB"))) {
+            if (res_reload_nanovdb(r, nvdb_path)) {
+                strncpy(nvdb_path, r->path, MAX_PATH_LEN - 1);
+                nvdb_path[MAX_PATH_LEN - 1] = '\0';
+            }
+        }
+        if (loading_this)
+            ImGui::EndDisabled();
+
+        ImGui::Separator();
+        ImGui::Text("File bytes: %.3f MB", (double)r->nanovdb_byte_count / (1024.0 * 1024.0));
+        ImGui::Text("GPU uints: %d", r->elem_count);
+        ImGui::Text("Grid byte offset: %u", r->nanovdb_grid_byte_offset);
+        ImGui::Text("GPU: %.3f MB", (double)res_estimate_gpu_bytes(*r) / (1024.0 * 1024.0));
+        ImGui::Text("SRV:%s UAV:%s", r->has_srv ? "Y" : "N", r->has_uav ? "Y" : "N");
+        ui_inspector_text_disabled_wrapped("Read-only StructuredBuffer<uint> SRV; bind it in SRV slots for NanoVDB raymarch shaders.");
+        ui_inspector_text_disabled_wrapped("The provided shaders expect an uncompressed/raw NanoVDB grid or a correct grid byte offset parameter.");
+
+        if (r->size_handle != INVALID_HANDLE) {
+            if (Resource* sr = res_get(r->size_handle)) {
+                ImGui::Separator();
+                ImGui::Text("Size variable: %s = %d", sr->name, sr->ival[0]);
+                ui_inspector_text_disabled_wrapped("This is the uint count in the uploaded NanoVDB buffer.");
+            }
+        }
+        break;
+    }
+
     case RES_MESH: {
         ImGui::Text("Vertices: %d", r->vert_count);
         ImGui::Text("Indices:  %d", r->idx_count);
@@ -7043,8 +7397,8 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         }
         ui_shader_template_buttons(h, r, shader_path);
 
-        ui_inspector_section("SOURCE");
-        ui_shader_source_viewer(h, r);
+        if (ui_inspector_section("SOURCE"))
+            ui_shader_source_viewer(h, r);
 
         ImGui::Separator();
         if (r->shader_cb.active) {
@@ -7312,21 +7666,22 @@ static void ui_command_transform_editor(Command* c) {
     if (!c)
         return;
 
-    ui_inspector_section("TRANSFORM");
     bool transform_changed = false;
-    transform_changed |= ui_tinted_transform_row(
-        "Position", c->pos, 0.001f,
-        ImVec4(0.150f, 0.055f, 0.050f, 0.3f),
-        ImVec4(0.230f, 0.080f, 0.070f, 0.5f)
-    );
+    if (ui_inspector_section("TRANSFORM")) {
+        transform_changed |= ui_tinted_transform_row(
+            "Position", c->pos, 0.001f,
+            ImVec4(0.150f, 0.055f, 0.050f, 0.3f),
+            ImVec4(0.230f, 0.080f, 0.070f, 0.5f)
+        );
 
-    transform_changed |= ui_command_rotation_editor(c);
+        transform_changed |= ui_command_rotation_editor(c);
 
-    transform_changed |= ui_tinted_transform_row(
-        "Scale", c->scale, 0.001f,
-        ImVec4(0.050f, 0.075f, 0.150f, 0.3f),
-        ImVec4(0.070f, 0.105f, 0.230f, 0.5f)
-    );
+        transform_changed |= ui_tinted_transform_row(
+            "Scale", c->scale, 0.001f,
+            ImVec4(0.050f, 0.075f, 0.150f, 0.3f),
+            ImVec4(0.070f, 0.105f, 0.230f, 0.5f)
+        );
+    }
     if (transform_changed)
         timeline_capture_if_tracked(TIMELINE_TRACK_COMMAND_TRANSFORM, c->name, RES_NONE);
 }
@@ -7398,7 +7753,8 @@ static void ui_command_compute_resource_bindings(Command* c, const char* id_suff
     if (!c)
         return;
 
-    ui_inspector_section("BINDINGS");
+    if (!ui_inspector_section("BINDINGS"))
+        return;
     ui_inspector_text_disabled_wrapped("SRVs are bound to t# in CS. UAVs are bound to u# in CS.");
     ImGui::Text("SRV Slots t# (%d / %d):", c->srv_count, MAX_SRV_SLOTS);
     for (int s = 0; s < c->srv_count; s++) {
@@ -7451,34 +7807,35 @@ static void ui_inspector_command(Command* c) {
 
     switch (c->type) {
     case CMD_GROUP: {
-        ui_inspector_section("GROUP");
-        if (ImGui::Checkbox("Expanded", &c->repeat_expanded))
-            cmd_mark_dirty(inspected_h);
-        ImGui::Spacing();
-        for (int i = 0; i < MAX_COMMANDS; i++) {
-            Command& child = g_commands[i];
-            if (!child.active || child.parent != g_sel_cmd) continue;
-            ImGui::PushID(i);
-            if (ImGui::Selectable(child.name, false)) {
-                g_sel_cmd = (CmdHandle)(i + 1);
-                g_sel_res = INVALID_HANDLE;
-                s_cmd_nav = g_sel_cmd;
+        if (ui_inspector_section("GROUP")) {
+            if (ImGui::Checkbox("Expanded", &c->repeat_expanded))
+                cmd_mark_dirty(inspected_h);
+            ImGui::Spacing();
+            for (int i = 0; i < MAX_COMMANDS; i++) {
+                Command& child = g_commands[i];
+                if (!child.active || child.parent != g_sel_cmd) continue;
+                ImGui::PushID(i);
+                if (ImGui::Selectable(child.name, false)) {
+                    g_sel_cmd = (CmdHandle)(i + 1);
+                    g_sel_res = INVALID_HANDLE;
+                    s_cmd_nav = g_sel_cmd;
+                }
+                ImGui::SameLine();
+                ui_inspector_text_disabled_wrapped("%s", cmd_type_str(child.type));
+                ImGui::PopID();
             }
-            ImGui::SameLine();
-            ui_inspector_text_disabled_wrapped("%s", cmd_type_str(child.type));
-            ImGui::PopID();
         }
         break;
     }
 
     case CMD_REPEAT: {
-        ui_inspector_section("REPEAT");
-        ImGui::InputInt("Iterations", &c->repeat_count);
-        if (c->repeat_count < 1) c->repeat_count = 1;
-        if (ImGui::Checkbox("Expanded", &c->repeat_expanded))
-            cmd_mark_dirty(inspected_h);
+        if (ui_inspector_section("REPEAT")) {
+            ImGui::InputInt("Iterations", &c->repeat_count);
+            if (c->repeat_count < 1) c->repeat_count = 1;
+            if (ImGui::Checkbox("Expanded", &c->repeat_expanded))
+                cmd_mark_dirty(inspected_h);
+        }
 
-        ui_inspector_section("COMPUTE SHADERS");
         static CmdHandle s_repeat_parent = INVALID_HANDLE;
         static ResHandle s_repeat_shader = INVALID_HANDLE;
         if (s_repeat_parent != g_sel_cmd) {
@@ -7486,291 +7843,309 @@ static void ui_inspector_command(Command* c) {
             s_repeat_shader = INVALID_HANDLE;
         }
         CmdHandle repeat_h = g_sel_cmd;
-        ui_compute_shader_combo("Add Shader", &s_repeat_shader);
-        bool can_add = s_repeat_shader != INVALID_HANDLE;
-        if (!can_add) ImGui::BeginDisabled();
-        if (ImGui::Button("Add Dispatch")) {
-            CmdHandle child_h = ui_create_repeat_dispatch_child(repeat_h, s_repeat_shader);
-            g_sel_cmd = child_h;
-            g_sel_res = INVALID_HANDLE;
-            s_cmd_nav = child_h;
-        }
-        if (!can_add) ImGui::EndDisabled();
-
-        ImGui::Spacing();
-        for (int i = 0; i < MAX_COMMANDS; i++) {
-            Command& child = g_commands[i];
-            if (!child.active || child.parent != repeat_h) continue;
-            ImGui::PushID(i);
-            if (ImGui::Selectable(child.name, false)) {
-                g_sel_cmd = (CmdHandle)(i + 1);
+        if (ui_inspector_section("COMPUTE SHADERS")) {
+            ui_compute_shader_combo("Add Shader", &s_repeat_shader);
+            bool can_add = s_repeat_shader != INVALID_HANDLE;
+            if (!can_add) ImGui::BeginDisabled();
+            if (ImGui::Button("Add Dispatch")) {
+                CmdHandle child_h = ui_create_repeat_dispatch_child(repeat_h, s_repeat_shader);
+                g_sel_cmd = child_h;
                 g_sel_res = INVALID_HANDLE;
-                s_cmd_nav = g_sel_cmd;
+                s_cmd_nav = child_h;
             }
-            ImGui::SameLine();
-            ui_inspector_text_disabled_wrapped("%s", cmd_type_str(child.type));
-            ImGui::PopID();
+            if (!can_add) ImGui::EndDisabled();
+
+            ImGui::Spacing();
+            for (int i = 0; i < MAX_COMMANDS; i++) {
+                Command& child = g_commands[i];
+                if (!child.active || child.parent != repeat_h) continue;
+                ImGui::PushID(i);
+                if (ImGui::Selectable(child.name, false)) {
+                    g_sel_cmd = (CmdHandle)(i + 1);
+                    g_sel_res = INVALID_HANDLE;
+                    s_cmd_nav = g_sel_cmd;
+                }
+                ImGui::SameLine();
+                ui_inspector_text_disabled_wrapped("%s", cmd_type_str(child.type));
+                ImGui::PopID();
+            }
         }
         break;
     }
 
     case CMD_CLEAR: {
-        ui_inspector_section("CLEAR");
         bool clear_changed = false;
-        clear_changed |= ImGui::Checkbox("Clear Color", &c->clear_color_enabled);
-        if (c->clear_color_enabled) {
-            clear_changed |= ui_clear_resource_source_combo("Color Source", c->clear_color_source, RES_FLOAT4);
-            Resource* color_res = ui_clear_source_resource(c->clear_color_source, RES_FLOAT4);
-            if (color_res) {
-                ImGui::TextWrapped("Clear color is driven by resource '%s'.", color_res->name);
-            } else if (ui_clear_source_valid(c->clear_color_source, RES_FLOAT4)) {
-                ImGui::TextWrapped("Clear color is driven by resource '%s'.", c->clear_color_source);
-            } else {
-                if (c->clear_color_source[0])
-                    ImGui::TextWrapped("Selected color source is missing or not float4; using the hardcoded fallback value.");
-                ui_inspector_text_disabled_wrapped("Clear Color Value");
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                clear_changed |= ImGui::ColorEdit4("##clear_color_value", c->clear_color);
+        if (ui_inspector_section("CLEAR")) {
+            clear_changed |= ImGui::Checkbox("Clear Color", &c->clear_color_enabled);
+            if (c->clear_color_enabled) {
+                clear_changed |= ui_clear_resource_source_combo("Color Source", c->clear_color_source, RES_FLOAT4);
+                Resource* color_res = ui_clear_source_resource(c->clear_color_source, RES_FLOAT4);
+                if (color_res) {
+                    ImGui::TextWrapped("Clear color is driven by resource '%s'.", color_res->name);
+                } else if (ui_clear_source_valid(c->clear_color_source, RES_FLOAT4)) {
+                    ImGui::TextWrapped("Clear color is driven by resource '%s'.", c->clear_color_source);
+                } else {
+                    if (c->clear_color_source[0])
+                        ImGui::TextWrapped("Selected color source is missing or not float4; using the hardcoded fallback value.");
+                    ui_inspector_text_disabled_wrapped("Clear Color Value");
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    clear_changed |= ImGui::ColorEdit4("##clear_color_value", c->clear_color);
+                }
             }
-        }
-        clear_changed |= ImGui::Checkbox("Clear Depth", &c->clear_depth);
-        if (c->clear_depth) {
-            clear_changed |= ui_clear_resource_source_combo("Depth Source", c->clear_depth_source, RES_FLOAT);
-            Resource* depth_res = ui_clear_source_resource(c->clear_depth_source, RES_FLOAT);
-            if (depth_res) {
-                ImGui::TextWrapped("Depth clear is driven by resource '%s'.", depth_res->name);
-            } else if (ui_clear_source_valid(c->clear_depth_source, RES_FLOAT)) {
-                ImGui::TextWrapped("Depth clear is driven by resource '%s'.", c->clear_depth_source);
-            } else {
-                if (c->clear_depth_source[0])
-                    ImGui::TextWrapped("Selected depth source is missing or not float; using the hardcoded fallback value.");
-                ui_inspector_text_disabled_wrapped("Depth Value");
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                clear_changed |= ImGui::DragFloat("##depth_value", &c->depth_clear_val, 0.01f, 0.f, 1.f);
+            clear_changed |= ImGui::Checkbox("Clear Depth", &c->clear_depth);
+            if (c->clear_depth) {
+                clear_changed |= ui_clear_resource_source_combo("Depth Source", c->clear_depth_source, RES_FLOAT);
+                Resource* depth_res = ui_clear_source_resource(c->clear_depth_source, RES_FLOAT);
+                if (depth_res) {
+                    ImGui::TextWrapped("Depth clear is driven by resource '%s'.", depth_res->name);
+                } else if (ui_clear_source_valid(c->clear_depth_source, RES_FLOAT)) {
+                    ImGui::TextWrapped("Depth clear is driven by resource '%s'.", c->clear_depth_source);
+                } else {
+                    if (c->clear_depth_source[0])
+                        ImGui::TextWrapped("Selected depth source is missing or not float; using the hardcoded fallback value.");
+                    ui_inspector_text_disabled_wrapped("Depth Value");
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    clear_changed |= ImGui::DragFloat("##depth_value", &c->depth_clear_val, 0.01f, 0.f, 1.f);
+                }
             }
         }
         if (clear_changed)
             app_request_scene_render();
 
-        ui_inspector_section("TARGETS");
-        res_combo_render_target("Render Target##clrt", &c->rt);
-        res_combo_depth_target("Depth Buffer##cldp", &c->depth);
+        if (ui_inspector_section("TARGETS")) {
+            res_combo_render_target("Render Target##clrt", &c->rt);
+            res_combo_depth_target("Depth Buffer##cldp", &c->depth);
+        }
         break;
     }
 
     case CMD_DRAW_MESH:
     case CMD_DRAW_INSTANCED: {
-        ui_inspector_section("DRAW SOURCE & SHADER");
-        bool source_changed = ui_draw_source_combo("Source##dm", &c->draw_source);
-        if (source_changed && c->draw_source == DRAW_SOURCE_PROCEDURAL && c->vertex_count < 1)
-            c->vertex_count = 3;
-        if (ui_command_uses_procedural_draw(*c)) {
-            ui_draw_topology_combo("Topology##dm", &c->draw_topology);
-            ImGui::InputInt("Vertex Count", &c->vertex_count);
-            if (c->vertex_count < 0) c->vertex_count = 0;
-            ui_inspector_text_disabled_wrapped("No mesh is bound. The VS should use SV_VertexID / VS SRVs.");
-        } else {
-            res_combo("Mesh##dm", &c->mesh, RES_MESH, false);
+        if (ui_inspector_section("DRAW SOURCE & SHADER")) {
+            bool source_changed = ui_draw_source_combo("Source##dm", &c->draw_source);
+            if (source_changed && c->draw_source == DRAW_SOURCE_PROCEDURAL && c->vertex_count < 1)
+                c->vertex_count = 3;
+            if (ui_command_uses_procedural_draw(*c)) {
+                ui_draw_topology_combo("Topology##dm", &c->draw_topology);
+                ImGui::InputInt("Vertex Count", &c->vertex_count);
+                if (c->vertex_count < 0) c->vertex_count = 0;
+                ui_inspector_text_disabled_wrapped("No mesh is bound. The VS should use SV_VertexID / VS SRVs.");
+            } else {
+                res_combo("Mesh##dm", &c->mesh, RES_MESH, false);
+            }
+            res_combo("Shader##dm", &c->shader, RES_SHADER, false);
         }
-        res_combo("Shader##dm", &c->shader, RES_SHADER, false);
         ui_draw_command_bounds_inspector(c, g_sel_cmd);
 
-        ui_inspector_section("SHADER PARAMETERS");
-        ui_command_shader_params(c, res_get(c->shader));
+        if (ui_inspector_section("SHADER PARAMETERS"))
+            ui_command_shader_params(c, res_get(c->shader));
 
-        ui_inspector_section("TARGETS");
-        res_combo_render_target("Render Target##dm", &c->rt);
-        res_combo_depth_target("Depth Buffer##dm", &c->depth);
-        ImGui::Text("Additional MRTs (%d / %d):", c->mrt_count, MAX_DRAW_RENDER_TARGETS - 1);
-        for (int rt_i = 0; rt_i < c->mrt_count; rt_i++) {
-            ImGui::PushID(600 + rt_i);
-            char lbl[32]; snprintf(lbl, sizeof(lbl), "RT%d##dm_mrt", rt_i + 1);
-            res_combo_render_target(lbl, &c->mrt_handles[rt_i]);
-            ImGui::PopID();
+        if (ui_inspector_section("TARGETS")) {
+            res_combo_render_target("Render Target##dm", &c->rt);
+            res_combo_depth_target("Depth Buffer##dm", &c->depth);
+            ImGui::Text("Additional MRTs (%d / %d):", c->mrt_count, MAX_DRAW_RENDER_TARGETS - 1);
+            for (int rt_i = 0; rt_i < c->mrt_count; rt_i++) {
+                ImGui::PushID(600 + rt_i);
+                char lbl[32]; snprintf(lbl, sizeof(lbl), "RT%d##dm_mrt", rt_i + 1);
+                res_combo_render_target(lbl, &c->mrt_handles[rt_i]);
+                ImGui::PopID();
+            }
+            if (c->mrt_count < MAX_DRAW_RENDER_TARGETS - 1 && ImGui::SmallButton("+##dm_mrt")) c->mrt_count++;
+            if (c->mrt_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##dm_mrt")) c->mrt_count--; }
         }
-        if (c->mrt_count < MAX_DRAW_RENDER_TARGETS - 1 && ImGui::SmallButton("+##dm_mrt")) c->mrt_count++;
-        if (c->mrt_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##dm_mrt")) c->mrt_count--; }
 
-        ui_inspector_section("RENDER STATE");
-        ImGui::Checkbox("Color Write", &c->color_write);
-        ImGui::SameLine(170.0f);
-        ImGui::Checkbox("Alpha Blend", &c->alpha_blend);
-        ImGui::Checkbox("Depth Test", &c->depth_test);
-        ImGui::SameLine(170.0f);
-        ImGui::Checkbox("Backface Cull", &c->cull_back);
-        if (!c->depth_test) ImGui::BeginDisabled();
-        ImGui::Checkbox("Depth Write", &c->depth_write);
-        if (!c->depth_test) ImGui::EndDisabled();
-        ImGui::SameLine(170.0f);
-        ImGui::Checkbox("Shadow Caster", &c->shadow_cast);
-        ImGui::Checkbox("Shadow Receiver", &c->shadow_receive);
-        if (c->shadow_cast)
-            res_combo("Shadow Shader##dm", &c->shadow_shader, RES_SHADER);
+        if (ui_inspector_section("RENDER STATE")) {
+            ImGui::Checkbox("Color Write", &c->color_write);
+            ImGui::SameLine(170.0f);
+            ImGui::Checkbox("Alpha Blend", &c->alpha_blend);
+            ImGui::Checkbox("Depth Test", &c->depth_test);
+            ImGui::SameLine(170.0f);
+            ImGui::Checkbox("Backface Cull", &c->cull_back);
+            if (!c->depth_test) ImGui::BeginDisabled();
+            ImGui::Checkbox("Depth Write", &c->depth_write);
+            if (!c->depth_test) ImGui::EndDisabled();
+            ImGui::SameLine(170.0f);
+            ImGui::Checkbox("Shadow Caster", &c->shadow_cast);
+            ImGui::Checkbox("Shadow Receiver", &c->shadow_receive);
+            if (c->shadow_cast)
+                res_combo("Shadow Shader##dm", &c->shadow_shader, RES_SHADER);
 
-        if (c->type == CMD_DRAW_INSTANCED)
-            ImGui::InputInt("Instance Count", &c->instance_count);
-
-        ui_inspector_section("SRV BINDINGS");
-        ui_inspector_text_disabled_wrapped("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
-        ui_inspector_text_disabled_wrapped("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
-        if (ImGui::TreeNodeEx("Slot Reference##draw_slots", ImGuiTreeNodeFlags_None)) {
-            ui_draw_texture_slot_reference("##draw_slot_reference");
-            ImGui::TreePop();
+            if (c->type == CMD_DRAW_INSTANCED)
+                ImGui::InputInt("Instance Count", &c->instance_count);
         }
-        ImGui::Text("SRV Slots (%d / %d):", c->srv_count, MAX_SRV_SLOTS);
-        for (int s = 0; s < c->srv_count; s++) {
-            ImGui::PushID(100 + s);
-            char lbl[32]; snprintf(lbl, sizeof(lbl), "t%d srv", (int)c->srv_slots[s]);
-            res_combo(lbl, &c->srv_handles[s], RES_NONE);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(48.f);
-            ImGui::InputScalar("##sslot", ImGuiDataType_U32, &c->srv_slots[s]);
-            ImGui::PopID();
-        }
-        if (c->srv_count < MAX_SRV_SLOTS && ImGui::SmallButton("+##s")) c->srv_count++;
-        if (c->srv_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##s")) c->srv_count--; }
 
-        ui_inspector_section("PIXEL UAV OUTPUTS");
-        UINT draw_rtv_count = ui_draw_command_rtv_count(*c);
-        ui_inspector_text_disabled_wrapped("DX11 output slots are shared by RTVs and PS UAVs.");
-        ui_inspector_text_disabled_wrapped("With %u RTV%s active, the first valid UAV slot is u%u.",
-            draw_rtv_count, draw_rtv_count == 1 ? "" : "s", draw_rtv_count);
-        ImGui::Text("UAV Slots (%d / %d):", c->uav_count, MAX_UAV_SLOTS);
-        for (int u = 0; u < c->uav_count; u++) {
-            ImGui::PushID(700 + u);
-            char lbl[32]; snprintf(lbl, sizeof(lbl), "u%d uav", (int)c->uav_slots[u]);
-            res_combo(lbl, &c->uav_handles[u], RES_NONE);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(48.f);
-            ImGui::InputScalar("##puavslot", ImGuiDataType_U32, &c->uav_slots[u]);
-            ImGui::PopID();
+        if (ui_inspector_section("SRV BINDINGS")) {
+            ui_inspector_text_disabled_wrapped("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
+            ui_inspector_text_disabled_wrapped("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
+            if (ImGui::TreeNodeEx("Slot Reference##draw_slots", ImGuiTreeNodeFlags_None)) {
+                ui_draw_texture_slot_reference("##draw_slot_reference");
+                ImGui::TreePop();
+            }
+            ImGui::Text("SRV Slots (%d / %d):", c->srv_count, MAX_SRV_SLOTS);
+            for (int s = 0; s < c->srv_count; s++) {
+                ImGui::PushID(100 + s);
+                char lbl[32]; snprintf(lbl, sizeof(lbl), "t%d srv", (int)c->srv_slots[s]);
+                res_combo(lbl, &c->srv_handles[s], RES_NONE);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(48.f);
+                ImGui::InputScalar("##sslot", ImGuiDataType_U32, &c->srv_slots[s]);
+                ImGui::PopID();
+            }
+            if (c->srv_count < MAX_SRV_SLOTS && ImGui::SmallButton("+##s")) c->srv_count++;
+            if (c->srv_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##s")) c->srv_count--; }
         }
-        if (c->uav_count < MAX_UAV_SLOTS && ImGui::SmallButton("+##pu")) c->uav_count++;
-        if (c->uav_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##pu")) c->uav_count--; }
+
+        if (ui_inspector_section("PIXEL UAV OUTPUTS")) {
+            UINT draw_rtv_count = ui_draw_command_rtv_count(*c);
+            ui_inspector_text_disabled_wrapped("DX11 output slots are shared by RTVs and PS UAVs.");
+            ui_inspector_text_disabled_wrapped("With %u RTV%s active, the first valid UAV slot is u%u.",
+                draw_rtv_count, draw_rtv_count == 1 ? "" : "s", draw_rtv_count);
+            ImGui::Text("UAV Slots (%d / %d):", c->uav_count, MAX_UAV_SLOTS);
+            for (int u = 0; u < c->uav_count; u++) {
+                ImGui::PushID(700 + u);
+                char lbl[32]; snprintf(lbl, sizeof(lbl), "u%d uav", (int)c->uav_slots[u]);
+                res_combo(lbl, &c->uav_handles[u], RES_NONE);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(48.f);
+                ImGui::InputScalar("##puavslot", ImGuiDataType_U32, &c->uav_slots[u]);
+                ImGui::PopID();
+            }
+            if (c->uav_count < MAX_UAV_SLOTS && ImGui::SmallButton("+##pu")) c->uav_count++;
+            if (c->uav_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##pu")) c->uav_count--; }
+        }
         break;
     }
 
     case CMD_DISPATCH: {
-        ui_inspector_section("COMPUTE");
-        res_combo("Compute Shader##dp", &c->shader, RES_SHADER, false);
-        ImGui::Checkbox("Only On Reset", &c->compute_on_reset);
-        res_combo_dispatch_source("Dispatch From##dp", &c->dispatch_size_source);
-        if (c->dispatch_size_source != INVALID_HANDLE) {
-            ImGui::InputInt3("Divisor XYZ", &c->thread_x);
-            ui_inspector_text_disabled_wrapped("Dispatch = ceil(source_size / divisor)");
-        } else {
-            ImGui::InputInt3("Dispatch XYZ", &c->thread_x);
+        if (ui_inspector_section("COMPUTE")) {
+            res_combo("Compute Shader##dp", &c->shader, RES_SHADER, false);
+            ImGui::Checkbox("Only On Reset", &c->compute_on_reset);
+            res_combo_dispatch_source("Dispatch From##dp", &c->dispatch_size_source);
+            if (c->dispatch_size_source != INVALID_HANDLE) {
+                ImGui::InputInt3("Divisor XYZ", &c->thread_x);
+                ui_inspector_text_disabled_wrapped("Dispatch = ceil(source_size / divisor)");
+            } else {
+                ImGui::InputInt3("Dispatch XYZ", &c->thread_x);
+            }
         }
 
-        ui_inspector_section("SHADER PARAMETERS");
-        ui_command_shader_params(c, res_get(c->shader));
+        if (ui_inspector_section("SHADER PARAMETERS"))
+            ui_command_shader_params(c, res_get(c->shader));
 
         ui_command_compute_resource_bindings(c, "dispatch", 200, 300);
         break;
     }
 
     case CMD_INDIRECT_DRAW: {
-        ui_inspector_section("INDIRECT COMMAND");
-        bool source_changed = ui_draw_source_combo("Source##id", &c->draw_source);
-        if (source_changed && c->draw_source == DRAW_SOURCE_PROCEDURAL)
-            c->draw_topology = DRAW_TOPOLOGY_TRIANGLE_LIST;
-        Resource* mesh = res_get(c->mesh);
-        if (ui_command_uses_procedural_draw(*c)) {
-            ui_draw_topology_combo("Topology##id", &c->draw_topology);
-            ui_inspector_text_disabled_wrapped("Uses DrawInstancedIndirect args.");
-        } else {
-            res_combo("Mesh##id", &c->mesh, RES_MESH, false);
-            ui_inspector_text_disabled_wrapped("%s",
-                (mesh && mesh->ib) ? "Uses DrawIndexedInstancedIndirect args."
-                                   : "Uses DrawInstancedIndirect args.");
+        if (ui_inspector_section("INDIRECT COMMAND")) {
+            bool source_changed = ui_draw_source_combo("Source##id", &c->draw_source);
+            if (source_changed && c->draw_source == DRAW_SOURCE_PROCEDURAL)
+                c->draw_topology = DRAW_TOPOLOGY_TRIANGLE_LIST;
+            Resource* mesh = res_get(c->mesh);
+            if (ui_command_uses_procedural_draw(*c)) {
+                ui_draw_topology_combo("Topology##id", &c->draw_topology);
+                ui_inspector_text_disabled_wrapped("Uses DrawInstancedIndirect args.");
+            } else {
+                res_combo("Mesh##id", &c->mesh, RES_MESH, false);
+                ui_inspector_text_disabled_wrapped("%s",
+                    (mesh && mesh->ib) ? "Uses DrawIndexedInstancedIndirect args."
+                                       : "Uses DrawInstancedIndirect args.");
+            }
+            res_combo("Shader##id", &c->shader, RES_SHADER, false);
         }
-        res_combo("Shader##id", &c->shader, RES_SHADER, false);
         ui_draw_command_bounds_inspector(c, g_sel_cmd);
-        ui_inspector_section("SHADER PARAMETERS");
-        ui_command_shader_params(c, res_get(c->shader));
-        ui_inspector_section("TARGETS");
-        res_combo_render_target("Render Target##id", &c->rt);
-        res_combo_depth_target("Depth Buffer##id", &c->depth);
-        ImGui::Text("Additional MRTs (%d / %d):", c->mrt_count, MAX_DRAW_RENDER_TARGETS - 1);
-        for (int rt_i = 0; rt_i < c->mrt_count; rt_i++) {
-            ImGui::PushID(800 + rt_i);
-            char lbl[32]; snprintf(lbl, sizeof(lbl), "RT%d##id_mrt", rt_i + 1);
-            res_combo_render_target(lbl, &c->mrt_handles[rt_i]);
-            ImGui::PopID();
+        if (ui_inspector_section("SHADER PARAMETERS"))
+            ui_command_shader_params(c, res_get(c->shader));
+        if (ui_inspector_section("TARGETS")) {
+            res_combo_render_target("Render Target##id", &c->rt);
+            res_combo_depth_target("Depth Buffer##id", &c->depth);
+            ImGui::Text("Additional MRTs (%d / %d):", c->mrt_count, MAX_DRAW_RENDER_TARGETS - 1);
+            for (int rt_i = 0; rt_i < c->mrt_count; rt_i++) {
+                ImGui::PushID(800 + rt_i);
+                char lbl[32]; snprintf(lbl, sizeof(lbl), "RT%d##id_mrt", rt_i + 1);
+                res_combo_render_target(lbl, &c->mrt_handles[rt_i]);
+                ImGui::PopID();
+            }
+            if (c->mrt_count < MAX_DRAW_RENDER_TARGETS - 1 && ImGui::SmallButton("+##id_mrt")) c->mrt_count++;
+            if (c->mrt_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##id_mrt")) c->mrt_count--; }
         }
-        if (c->mrt_count < MAX_DRAW_RENDER_TARGETS - 1 && ImGui::SmallButton("+##id_mrt")) c->mrt_count++;
-        if (c->mrt_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##id_mrt")) c->mrt_count--; }
 
-        ui_inspector_section("RENDER STATE");
-        ImGui::Checkbox("Color Write", &c->color_write);
-        ImGui::SameLine(170.0f);
-        ImGui::Checkbox("Alpha Blend", &c->alpha_blend);
-        ImGui::Checkbox("Depth Test", &c->depth_test);
-        ImGui::SameLine(170.0f);
-        ImGui::Checkbox("Backface Cull", &c->cull_back);
-        if (!c->depth_test) ImGui::BeginDisabled();
-        ImGui::Checkbox("Depth Write", &c->depth_write);
-        if (!c->depth_test) ImGui::EndDisabled();
-        ImGui::SameLine(170.0f);
-        ImGui::Checkbox("Shadow Caster", &c->shadow_cast);
-        ImGui::Checkbox("Shadow Receiver", &c->shadow_receive);
-        if (c->shadow_cast)
-            res_combo("Shadow Shader##id", &c->shadow_shader, RES_SHADER);
-
-        ui_inspector_section("SRV BINDINGS");
-        ui_inspector_text_disabled_wrapped("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
-        ui_inspector_text_disabled_wrapped("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
-        if (ImGui::TreeNodeEx("Slot Reference##indirect_draw_slots", ImGuiTreeNodeFlags_None)) {
-            ui_draw_texture_slot_reference("##indirect_draw_slot_reference");
-            ImGui::TreePop();
+        if (ui_inspector_section("RENDER STATE")) {
+            ImGui::Checkbox("Color Write", &c->color_write);
+            ImGui::SameLine(170.0f);
+            ImGui::Checkbox("Alpha Blend", &c->alpha_blend);
+            ImGui::Checkbox("Depth Test", &c->depth_test);
+            ImGui::SameLine(170.0f);
+            ImGui::Checkbox("Backface Cull", &c->cull_back);
+            if (!c->depth_test) ImGui::BeginDisabled();
+            ImGui::Checkbox("Depth Write", &c->depth_write);
+            if (!c->depth_test) ImGui::EndDisabled();
+            ImGui::SameLine(170.0f);
+            ImGui::Checkbox("Shadow Caster", &c->shadow_cast);
+            ImGui::Checkbox("Shadow Receiver", &c->shadow_receive);
+            if (c->shadow_cast)
+                res_combo("Shadow Shader##id", &c->shadow_shader, RES_SHADER);
         }
-        ImGui::Text("SRV Slots (%d / %d):", c->srv_count, MAX_SRV_SLOTS);
-        for (int s = 0; s < c->srv_count; s++) {
-            ImGui::PushID(1000 + s);
-            char lbl[32]; snprintf(lbl, sizeof(lbl), "t%d srv", (int)c->srv_slots[s]);
-            res_combo(lbl, &c->srv_handles[s], RES_NONE);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(48.f);
-            ImGui::InputScalar("##idsslot", ImGuiDataType_U32, &c->srv_slots[s]);
-            ImGui::PopID();
-        }
-        if (c->srv_count < MAX_SRV_SLOTS && ImGui::SmallButton("+##id_s")) c->srv_count++;
-        if (c->srv_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##id_s")) c->srv_count--; }
 
-        ui_inspector_section("PIXEL UAV OUTPUTS");
-        UINT draw_rtv_count = ui_draw_command_rtv_count(*c);
-        ui_inspector_text_disabled_wrapped("DX11 output slots are shared by RTVs and PS UAVs.");
-        ui_inspector_text_disabled_wrapped("With %u RTV%s active, the first valid UAV slot is u%u.",
-            draw_rtv_count, draw_rtv_count == 1 ? "" : "s", draw_rtv_count);
-        ImGui::Text("UAV Slots (%d / %d):", c->uav_count, MAX_UAV_SLOTS);
-        for (int u = 0; u < c->uav_count; u++) {
-            ImGui::PushID(1100 + u);
-            char lbl[32]; snprintf(lbl, sizeof(lbl), "u%d uav", (int)c->uav_slots[u]);
-            res_combo(lbl, &c->uav_handles[u], RES_NONE);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(48.f);
-            ImGui::InputScalar("##idpuavslot", ImGuiDataType_U32, &c->uav_slots[u]);
-            ImGui::PopID();
+        if (ui_inspector_section("SRV BINDINGS")) {
+            ui_inspector_text_disabled_wrapped("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
+            ui_inspector_text_disabled_wrapped("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
+            if (ImGui::TreeNodeEx("Slot Reference##indirect_draw_slots", ImGuiTreeNodeFlags_None)) {
+                ui_draw_texture_slot_reference("##indirect_draw_slot_reference");
+                ImGui::TreePop();
+            }
+            ImGui::Text("SRV Slots (%d / %d):", c->srv_count, MAX_SRV_SLOTS);
+            for (int s = 0; s < c->srv_count; s++) {
+                ImGui::PushID(1000 + s);
+                char lbl[32]; snprintf(lbl, sizeof(lbl), "t%d srv", (int)c->srv_slots[s]);
+                res_combo(lbl, &c->srv_handles[s], RES_NONE);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(48.f);
+                ImGui::InputScalar("##idsslot", ImGuiDataType_U32, &c->srv_slots[s]);
+                ImGui::PopID();
+            }
+            if (c->srv_count < MAX_SRV_SLOTS && ImGui::SmallButton("+##id_s")) c->srv_count++;
+            if (c->srv_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##id_s")) c->srv_count--; }
         }
-        if (c->uav_count < MAX_UAV_SLOTS && ImGui::SmallButton("+##id_u")) c->uav_count++;
-        if (c->uav_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##id_u")) c->uav_count--; }
 
-        ui_inspector_section("INDIRECT BUFFER");
-        res_combo("Indirect Buffer##id", &c->indirect_buf, RES_STRUCTURED_BUFFER, false);
-        ImGui::InputScalar("Byte Offset", ImGuiDataType_U32, &c->indirect_offset);
+        if (ui_inspector_section("PIXEL UAV OUTPUTS")) {
+            UINT draw_rtv_count = ui_draw_command_rtv_count(*c);
+            ui_inspector_text_disabled_wrapped("DX11 output slots are shared by RTVs and PS UAVs.");
+            ui_inspector_text_disabled_wrapped("With %u RTV%s active, the first valid UAV slot is u%u.",
+                draw_rtv_count, draw_rtv_count == 1 ? "" : "s", draw_rtv_count);
+            ImGui::Text("UAV Slots (%d / %d):", c->uav_count, MAX_UAV_SLOTS);
+            for (int u = 0; u < c->uav_count; u++) {
+                ImGui::PushID(1100 + u);
+                char lbl[32]; snprintf(lbl, sizeof(lbl), "u%d uav", (int)c->uav_slots[u]);
+                res_combo(lbl, &c->uav_handles[u], RES_NONE);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(48.f);
+                ImGui::InputScalar("##idpuavslot", ImGuiDataType_U32, &c->uav_slots[u]);
+                ImGui::PopID();
+            }
+            if (c->uav_count < MAX_UAV_SLOTS && ImGui::SmallButton("+##id_u")) c->uav_count++;
+            if (c->uav_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##id_u")) c->uav_count--; }
+        }
+
+        if (ui_inspector_section("INDIRECT BUFFER")) {
+            res_combo("Indirect Buffer##id", &c->indirect_buf, RES_STRUCTURED_BUFFER, false);
+            ImGui::InputScalar("Byte Offset", ImGuiDataType_U32, &c->indirect_offset);
+        }
         break;
     }
 
     case CMD_INDIRECT_DISPATCH: {
-        ui_inspector_section("INDIRECT COMMAND");
-        res_combo("Shader##id", &c->shader, RES_SHADER, false);
-        ImGui::Checkbox("Only On Reset", &c->compute_on_reset);
-        ui_inspector_section("SHADER PARAMETERS");
-        ui_command_shader_params(c, res_get(c->shader));
+        if (ui_inspector_section("INDIRECT COMMAND")) {
+            res_combo("Shader##id", &c->shader, RES_SHADER, false);
+            ImGui::Checkbox("Only On Reset", &c->compute_on_reset);
+        }
+        if (ui_inspector_section("SHADER PARAMETERS"))
+            ui_command_shader_params(c, res_get(c->shader));
         ui_command_compute_resource_bindings(c, "indirect_dispatch", 1200, 1300);
-        ui_inspector_section("INDIRECT BUFFER");
-        res_combo("Indirect Buffer##id", &c->indirect_buf, RES_STRUCTURED_BUFFER, false);
-        ImGui::InputScalar("Byte Offset", ImGuiDataType_U32, &c->indirect_offset);
+        if (ui_inspector_section("INDIRECT BUFFER")) {
+            res_combo("Indirect Buffer##id", &c->indirect_buf, RES_STRUCTURED_BUFFER, false);
+            ImGui::InputScalar("Byte Offset", ImGuiDataType_U32, &c->indirect_offset);
+        }
         break;
     }
 
@@ -7793,8 +8168,286 @@ static void ui_inspector_command(Command* c) {
     }
 }
 
-static void ui_panel_inspector(bool embedded = false) {
-    if (!embedded) ImGui::Begin("Inspector");
+static bool ui_inspector_variable_value_editor(Resource* r, ResHandle h) {
+    if (!r)
+        return false;
+
+    bool changed = false;
+    float value_w = ImGui::GetContentRegionAvail().x;
+    if (value_w < ui_px(80.0f))
+        value_w = ui_px(80.0f);
+    switch (r->type) {
+    case RES_INT:
+        ImGui::SetNextItemWidth(value_w);
+        changed = ImGui::InputInt("##var_value", &r->ival[0]);
+        break;
+    case RES_INT2:
+        ImGui::SetNextItemWidth(value_w);
+        changed = ImGui::InputInt2("##var_value", r->ival);
+        break;
+    case RES_INT3:
+        ImGui::SetNextItemWidth(value_w);
+        changed = ImGui::InputInt3("##var_value", r->ival);
+        break;
+    case RES_FLOAT:
+    case RES_FLOAT2:
+    case RES_FLOAT3:
+    case RES_FLOAT4:
+        changed = ui_float_value_editor("##var_value", r->type, r->fval, value_w);
+        break;
+    case RES_BUILTIN_TIME: {
+        float t = app_scene_time();
+        ImGui::SetNextItemWidth(value_w);
+        if (ImGui::InputFloat("##scene_time_value", &t, 0.0f, 0.0f, "%.3f")) {
+            app_set_scene_time(t);
+            changed = true;
+        }
+        break;
+    }
+    default:
+        ui_inspector_text_disabled_wrapped("%s", ui_resource_display_type(*r));
+        break;
+    }
+
+    if (changed) {
+        if (!r->is_builtin)
+            ui_timeline_capture_user_vars_for_resource(h);
+        app_request_scene_render();
+    }
+    return changed;
+}
+
+static void ui_inspector_variable_resource_row(ResHandle h) {
+    Resource* r = res_get(h);
+    if (!r)
+        return;
+
+    ImGui::PushID((int)h);
+    float row_h = ImGui::GetFrameHeight();
+    float row_w = ImGui::GetContentRegionAvail().x - ui_current_vertical_scroll_margin(6.0f);
+    if (row_w < ui_px(96.0f)) row_w = ui_px(96.0f);
+    float spacing = ImGui::GetStyle().ItemSpacing.x;
+    bool show_type_badge = r->type == RES_BUILTIN_TIME || r->type == RES_BUILTIN_DIRLIGHT;
+    float name_w = ImMin(ui_px(show_type_badge ? 118.0f : 185.0f), row_w * (show_type_badge ? 0.34f : 0.42f));
+    float type_w = show_type_badge ? ImMin(ui_px(74.0f), row_w * 0.22f) : 0.0f;
+    if (name_w < ui_px(54.0f)) name_w = ui_px(54.0f);
+    if (show_type_badge && type_w < ui_px(42.0f)) type_w = ui_px(42.0f);
+    float min_value_w = ui_px(72.0f);
+    float used_w = name_w + type_w + spacing * (show_type_badge ? 2.0f : 1.0f);
+    if (row_w - used_w < min_value_w) {
+        float deficit = min_value_w - (row_w - used_w);
+        float name_room = ImMax(0.0f, name_w - ui_px(54.0f));
+        float take = ImMin(name_room, deficit);
+        name_w -= take;
+        deficit -= take;
+        if (show_type_badge) {
+            float type_room = ImMax(0.0f, type_w - ui_px(42.0f));
+            take = ImMin(type_room, deficit);
+            type_w -= take;
+        }
+    }
+    char name_fit[MAX_NAME] = {};
+    ui_fit_text_ellipsis(ui_resource_display_name(*r), name_w, name_fit, sizeof(name_fit));
+    ImVec2 name_pos = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##var_name", ImVec2(name_w, row_h));
+    ImGui::GetWindowDrawList()->AddText(
+        ImVec2(name_pos.x, name_pos.y + floorf((row_h - ImGui::GetTextLineHeight()) * 0.5f)),
+        ImGui::GetColorU32(ImGuiCol_Text), name_fit);
+    if (ImGui::IsItemHovered() && strcmp(name_fit, ui_resource_display_name(*r)) != 0)
+        ImGui::SetTooltip("%s", ui_resource_display_name(*r));
+    ImGui::SameLine();
+    if (show_type_badge) {
+        ImVec2 badge_pos = ImGui::GetCursorScreenPos();
+        ui_draw_badge(ImGui::GetWindowDrawList(), ImVec2(badge_pos.x, badge_pos.y + ui_px(2.0f)),
+                      ui_resource_display_type(*r), ui_type_color(r->type));
+        ImGui::Dummy(ImVec2(type_w, row_h));
+        ImGui::SameLine();
+    }
+    ui_inspector_variable_value_editor(r, h);
+    ImGui::PopID();
+}
+
+static void ui_inspector_builtin_dirlight_summary(Resource* r) {
+    if (!r)
+        return;
+
+    bool changed = false;
+    changed |= ImGui::ColorEdit3("Light Color", r->light_color);
+    changed |= ImGui::DragFloat("Light Intensity", &r->light_intensity, 0.01f, 0.0f, 10.0f);
+    changed |= ImGui::DragFloat3("Light Target", r->light_target, 0.01f);
+    changed |= ImGui::DragFloat3("Light Position", r->light_pos, 0.01f);
+    if (changed) {
+        timeline_capture_if_tracked(TIMELINE_TRACK_DIRLIGHT, "dirlight", RES_NONE);
+        app_request_scene_render();
+    }
+}
+
+static ID3D11ShaderResourceView* ui_runtime_preview_srv(const Resource* r) {
+    if (!r)
+        return nullptr;
+    switch (r->type) {
+    case RES_BUILTIN_SCENE_COLOR: return g_dx.scene_srv;
+    case RES_BUILTIN_SCENE_DEPTH: return g_dx.depth_srv;
+    case RES_BUILTIN_SHADOW_MAP:  return g_dx.shadow_srv;
+    case RES_RENDER_TEXTURE2D:    return r->srv;
+    default:                      return nullptr;
+    }
+}
+
+static bool ui_runtime_preview_resource_dims(const Resource* r, int* out_w, int* out_h) {
+    if (!r)
+        return false;
+    int w = r->width;
+    int h = r->height;
+    if (r->type == RES_BUILTIN_SCENE_COLOR || r->type == RES_BUILTIN_SCENE_DEPTH) {
+        w = g_dx.scene_width;
+        h = g_dx.scene_height;
+    } else if (r->type == RES_BUILTIN_SHADOW_MAP) {
+        w = g_dx.shadow_width;
+        h = g_dx.shadow_height;
+    }
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    return true;
+}
+
+static bool ui_is_runtime_preview_render_target(const Resource& r) {
+    if (!r.active || r.is_generated)
+        return false;
+    return r.type == RES_RENDER_TEXTURE2D ||
+           r.type == RES_BUILTIN_SCENE_COLOR ||
+           r.type == RES_BUILTIN_SCENE_DEPTH ||
+           r.type == RES_BUILTIN_SHADOW_MAP;
+}
+
+static void ui_inspector_render_target_grid() {
+    if (!ui_inspector_section("RENDER TARGETS"))
+        return;
+
+    ResHandle handles[MAX_RESOURCES] = {};
+    int count = 0;
+    for (int i = 0; i < MAX_RESOURCES; i++) {
+        if (ui_is_runtime_preview_render_target(g_resources[i]))
+            handles[count++] = (ResHandle)(i + 1);
+    }
+
+    if (count == 0) {
+        ui_inspector_text_disabled_wrapped("No render targets.");
+        return;
+    }
+
+    float table_w = ImGui::GetContentRegionAvail().x - ui_current_vertical_scroll_margin(6.0f);
+    if (table_w < ui_px(48.0f)) table_w = ui_px(48.0f);
+    int cols = s_render_target_preview_columns;
+    if (cols < 1) cols = 1;
+    if (cols > 8) cols = 8;
+    int cols_that_fit = (int)floorf(table_w / ui_px(54.0f));
+    if (cols_that_fit < 1) cols_that_fit = 1;
+    if (cols > cols_that_fit) cols = cols_that_fit;
+    int row_count = (count + cols - 1) / cols;
+    float approx_cell_w = table_w / (float)cols;
+    if (approx_cell_w < ui_px(48.0f)) approx_cell_w = ui_px(48.0f);
+    float approx_thumb_h = approx_cell_w * 0.62f;
+    if (approx_thumb_h > ui_px(78.0f)) approx_thumb_h = ui_px(78.0f);
+    float row_h = approx_thumb_h + ImGui::GetTextLineHeightWithSpacing() * 2.0f + ui_margin_px(8.0f);
+
+    if (ImGui::BeginTable("##rt_preview_grid", cols, ImGuiTableFlags_SizingStretchSame)) {
+        ImGuiListClipper clipper;
+        clipper.Begin(row_count, row_h);
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
+                ImGui::TableNextRow(0, row_h);
+                for (int col = 0; col < cols; col++) {
+                    int item = row * cols + col;
+                    ImGui::TableSetColumnIndex(col);
+                    if (item >= count)
+                        continue;
+
+                    Resource* r = res_get(handles[item]);
+                    if (!r)
+                        continue;
+
+                    ImGui::PushID((int)handles[item]);
+                    float cell_w = ImGui::GetContentRegionAvail().x;
+                    if (cell_w < ui_px(48.0f)) cell_w = ui_px(48.0f);
+                    float thumb_h = cell_w * 0.62f;
+                    if (thumb_h > ui_px(78.0f)) thumb_h = ui_px(78.0f);
+
+                    ImVec2 thumb_size(cell_w, thumb_h);
+                    ImGui::InvisibleButton("##rt_thumb", thumb_size);
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    ImVec2 min = ImGui::GetItemRectMin();
+                    ImVec2 max = ImGui::GetItemRectMax();
+                    dl->AddRectFilled(min, max, ImGui::GetColorU32(ImVec4(0.055f, 0.052f, 0.055f, 1.0f)), ui_px(3.0f));
+                    dl->AddRect(min, max, ImGui::GetColorU32(ImVec4(0.24f, 0.22f, 0.21f, 0.85f)), ui_px(3.0f));
+
+                    int w = 1, h = 1;
+                    ui_runtime_preview_resource_dims(r, &w, &h);
+                    ID3D11ShaderResourceView* srv = ui_runtime_preview_srv(r);
+                    if (srv) {
+                        float src_w = (float)w;
+                        float src_h = (float)h;
+                        float scale = (thumb_size.x - ui_px(6.0f)) / src_w;
+                        float sy = (thumb_size.y - ui_px(6.0f)) / src_h;
+                        if (sy < scale) scale = sy;
+                        if (scale <= 0.0f) scale = 1.0f;
+                        ImVec2 img_size(src_w * scale, src_h * scale);
+                        ImVec2 img_min(min.x + (thumb_size.x - img_size.x) * 0.5f,
+                                       min.y + (thumb_size.y - img_size.y) * 0.5f);
+                        dl->AddImage((ImTextureID)srv, img_min, ImVec2(img_min.x + img_size.x, img_min.y + img_size.y));
+                    }
+                    char name_fit[MAX_NAME] = {};
+                    ui_fit_text_ellipsis(ui_resource_display_name(*r), cell_w, name_fit, sizeof(name_fit));
+                    ImGui::TextUnformatted(name_fit);
+                    ImGui::TextDisabled("%dx%d", w, h);
+                    ImGui::PopID();
+                }
+            }
+        }
+        ImGui::EndTable();
+    }
+}
+
+static void ui_inspector_variables_tab() {
+    ResHandle vars[MAX_RESOURCES] = {};
+    int var_count = ui_collect_variable_inspector_resources(vars, MAX_RESOURCES);
+    int user_count = 0;
+    for (int i = 0; i < var_count; i++) {
+        Resource* r = res_get(vars[i]);
+        if (r && !r->is_builtin)
+            user_count++;
+    }
+
+    if (ui_inspector_section("USER VARIABLES")) {
+        if (user_count > 0) {
+            for (int i = 0; i < var_count; i++) {
+                Resource* r = res_get(vars[i]);
+                if (!r || r->is_builtin)
+                    continue;
+                ui_inspector_variable_resource_row(vars[i]);
+            }
+        } else {
+            ui_inspector_text_disabled_wrapped("No user scalar/vector variables.");
+        }
+    }
+
+    if (ui_inspector_section("BUILT-IN VARIABLES")) {
+        if (Resource* t = res_get(g_builtin_time))
+            ui_inspector_variable_resource_row(g_builtin_time);
+        if (Resource* dl = res_get(g_builtin_dirlight)) {
+            ImGui::PushID((int)g_builtin_dirlight);
+            ImGui::TextUnformatted(ui_resource_display_name(*dl));
+            ui_inspector_builtin_dirlight_summary(dl);
+            ImGui::PopID();
+        }
+    }
+
+    ui_inspector_render_target_grid();
+}
+
+static void ui_inspector_selection_tab() {
     if (g_sel_res != INVALID_HANDLE) {
         Resource* r = res_get(g_sel_res);
         if (r) {
@@ -7812,6 +8465,17 @@ static void ui_panel_inspector(bool embedded = false) {
         ui_inspector_text_disabled_wrapped("Nothing selected.");
         ui_inspector_text_disabled_wrapped("Right-click Resources or Commands panels to create items.");
     }
+}
+
+static void ui_panel_inspector(bool embedded = false) {
+    if (!embedded) ImGui::Begin("Inspector");
+    ui_inspector_selection_tab();
+    if (!embedded) ImGui::End();
+}
+
+static void ui_panel_resources_viewer(bool embedded = false) {
+    if (!embedded) ImGui::Begin("Resources Viewer");
+    ui_inspector_variables_tab();
     if (!embedded) ImGui::End();
 }
 
@@ -7864,86 +8528,91 @@ static void ui_panel_bindings(bool embedded = false) {
         } else {
             switch (c->type) {
             case CMD_CLEAR:
-                ui_inspector_section("OUTPUTS");
-                ui_binding_row("Render Target", "OM", -1, c->rt);
-                ui_binding_row("Depth Buffer", "OM", -1, c->depth);
+                if (ui_inspector_section("OUTPUTS")) {
+                    ui_binding_row("Render Target", "OM", -1, c->rt);
+                    ui_binding_row("Depth Buffer", "OM", -1, c->depth);
+                }
                 break;
             case CMD_DRAW_MESH:
             case CMD_DRAW_INSTANCED:
-                ui_inspector_section("PIPELINE");
-                if (ui_command_uses_procedural_draw(*c))
-                    ui_inspector_text_disabled_wrapped("Source: Procedural (%s)", ui_draw_topology_name(c->draw_topology));
-                else
-                    ui_binding_row("Mesh", "IA", -1, c->mesh);
-                ui_binding_row("Shader", "VS/PS", -1, c->shader);
-                if (c->shadow_cast)
-                    ui_binding_row("Shadow Shader", "VS", -1, c->shadow_shader);
-                ui_inspector_section("OUTPUTS");
-                ui_binding_row("Render Target 0", "OM", 0, c->rt);
-                for (int i = 0; i < c->mrt_count; i++) {
-                    char role[32];
-                    snprintf(role, sizeof(role), "Render Target %d", i + 1);
-                    ui_binding_row(role, "OM", i + 1, c->mrt_handles[i]);
+                if (ui_inspector_section("PIPELINE")) {
+                    if (ui_command_uses_procedural_draw(*c))
+                        ui_inspector_text_disabled_wrapped("Source: Procedural (%s)", ui_draw_topology_name(c->draw_topology));
+                    else
+                        ui_binding_row("Mesh", "IA", -1, c->mesh);
+                    ui_binding_row("Shader", "VS/PS", -1, c->shader);
+                    if (c->shadow_cast)
+                        ui_binding_row("Shadow Shader", "VS", -1, c->shadow_shader);
                 }
-                ui_binding_row("Depth Buffer", "OM", -1, c->depth);
-                for (int i = 0; i < c->uav_count; i++)
-                    ui_binding_row("UAV", "OM/PS", (int)c->uav_slots[i], c->uav_handles[i]);
-                if (c->srv_count > 0)
-                    ui_inspector_section("SHADER RESOURCES");
-                for (int i = 0; i < c->srv_count; i++)
-                    ui_binding_row("SRV", "VS/PS", (int)c->srv_slots[i], c->srv_handles[i]);
+                if (ui_inspector_section("OUTPUTS")) {
+                    ui_binding_row("Render Target 0", "OM", 0, c->rt);
+                    for (int i = 0; i < c->mrt_count; i++) {
+                        char role[32];
+                        snprintf(role, sizeof(role), "Render Target %d", i + 1);
+                        ui_binding_row(role, "OM", i + 1, c->mrt_handles[i]);
+                    }
+                    ui_binding_row("Depth Buffer", "OM", -1, c->depth);
+                    for (int i = 0; i < c->uav_count; i++)
+                        ui_binding_row("UAV", "OM/PS", (int)c->uav_slots[i], c->uav_handles[i]);
+                }
+                if (c->srv_count > 0 && ui_inspector_section("SHADER RESOURCES")) {
+                    for (int i = 0; i < c->srv_count; i++)
+                        ui_binding_row("SRV", "VS/PS", (int)c->srv_slots[i], c->srv_handles[i]);
+                }
                 break;
             case CMD_DISPATCH:
-                ui_inspector_section("COMPUTE");
-                ui_binding_row("Compute Shader", "CS", -1, c->shader);
-                if (c->srv_count > 0)
-                    ui_inspector_section("INPUTS");
-                for (int i = 0; i < c->srv_count; i++)
-                    ui_binding_row("SRV", "CS", (int)c->srv_slots[i], c->srv_handles[i]);
-                if (c->uav_count > 0)
-                    ui_inspector_section("OUTPUTS");
-                for (int i = 0; i < c->uav_count; i++)
-                    ui_binding_row("UAV", "CS", (int)c->uav_slots[i], c->uav_handles[i]);
+                if (ui_inspector_section("COMPUTE"))
+                    ui_binding_row("Compute Shader", "CS", -1, c->shader);
+                if (c->srv_count > 0 && ui_inspector_section("INPUTS")) {
+                    for (int i = 0; i < c->srv_count; i++)
+                        ui_binding_row("SRV", "CS", (int)c->srv_slots[i], c->srv_handles[i]);
+                }
+                if (c->uav_count > 0 && ui_inspector_section("OUTPUTS")) {
+                    for (int i = 0; i < c->uav_count; i++)
+                        ui_binding_row("UAV", "CS", (int)c->uav_slots[i], c->uav_handles[i]);
+                }
                 break;
             case CMD_INDIRECT_DRAW:
-                ui_inspector_section("PIPELINE");
-                if (ui_command_uses_procedural_draw(*c))
-                    ui_inspector_text_disabled_wrapped("Source: Procedural (%s)", ui_draw_topology_name(c->draw_topology));
-                else
-                    ui_binding_row("Mesh", "IA", -1, c->mesh);
-                ui_binding_row("Shader", "VS/PS", -1, c->shader);
-                if (c->shadow_cast)
-                    ui_binding_row("Shadow Shader", "VS", -1, c->shadow_shader);
-                ui_inspector_section("OUTPUTS");
-                ui_binding_row("Render Target 0", "OM", 0, c->rt);
-                for (int i = 0; i < c->mrt_count; i++) {
-                    char role[32];
-                    snprintf(role, sizeof(role), "Render Target %d", i + 1);
-                    ui_binding_row(role, "OM", i + 1, c->mrt_handles[i]);
+                if (ui_inspector_section("PIPELINE")) {
+                    if (ui_command_uses_procedural_draw(*c))
+                        ui_inspector_text_disabled_wrapped("Source: Procedural (%s)", ui_draw_topology_name(c->draw_topology));
+                    else
+                        ui_binding_row("Mesh", "IA", -1, c->mesh);
+                    ui_binding_row("Shader", "VS/PS", -1, c->shader);
+                    if (c->shadow_cast)
+                        ui_binding_row("Shadow Shader", "VS", -1, c->shadow_shader);
                 }
-                ui_binding_row("Depth Buffer", "OM", -1, c->depth);
-                for (int i = 0; i < c->uav_count; i++)
-                    ui_binding_row("UAV", "OM/PS", (int)c->uav_slots[i], c->uav_handles[i]);
-                if (c->srv_count > 0)
-                    ui_inspector_section("SHADER RESOURCES");
-                for (int i = 0; i < c->srv_count; i++)
-                    ui_binding_row("SRV", "VS/PS", (int)c->srv_slots[i], c->srv_handles[i]);
-                ui_inspector_section("ARGUMENTS");
-                ui_binding_row("Indirect Buffer", "ARG", -1, c->indirect_buf);
+                if (ui_inspector_section("OUTPUTS")) {
+                    ui_binding_row("Render Target 0", "OM", 0, c->rt);
+                    for (int i = 0; i < c->mrt_count; i++) {
+                        char role[32];
+                        snprintf(role, sizeof(role), "Render Target %d", i + 1);
+                        ui_binding_row(role, "OM", i + 1, c->mrt_handles[i]);
+                    }
+                    ui_binding_row("Depth Buffer", "OM", -1, c->depth);
+                    for (int i = 0; i < c->uav_count; i++)
+                        ui_binding_row("UAV", "OM/PS", (int)c->uav_slots[i], c->uav_handles[i]);
+                }
+                if (c->srv_count > 0 && ui_inspector_section("SHADER RESOURCES")) {
+                    for (int i = 0; i < c->srv_count; i++)
+                        ui_binding_row("SRV", "VS/PS", (int)c->srv_slots[i], c->srv_handles[i]);
+                }
+                if (ui_inspector_section("ARGUMENTS"))
+                    ui_binding_row("Indirect Buffer", "ARG", -1, c->indirect_buf);
                 break;
             case CMD_INDIRECT_DISPATCH:
-                ui_inspector_section("COMPUTE");
-                ui_binding_row("Compute Shader", "CS", -1, c->shader);
-                if (c->srv_count > 0)
-                    ui_inspector_section("INPUTS");
-                for (int i = 0; i < c->srv_count; i++)
-                    ui_binding_row("SRV", "CS", (int)c->srv_slots[i], c->srv_handles[i]);
-                if (c->uav_count > 0)
-                    ui_inspector_section("OUTPUTS");
-                for (int i = 0; i < c->uav_count; i++)
-                    ui_binding_row("UAV", "CS", (int)c->uav_slots[i], c->uav_handles[i]);
-                ui_inspector_section("ARGUMENTS");
-                ui_binding_row("Indirect Buffer", "ARG", -1, c->indirect_buf);
+                if (ui_inspector_section("COMPUTE"))
+                    ui_binding_row("Compute Shader", "CS", -1, c->shader);
+                if (c->srv_count > 0 && ui_inspector_section("INPUTS")) {
+                    for (int i = 0; i < c->srv_count; i++)
+                        ui_binding_row("SRV", "CS", (int)c->srv_slots[i], c->srv_handles[i]);
+                }
+                if (c->uav_count > 0 && ui_inspector_section("OUTPUTS")) {
+                    for (int i = 0; i < c->uav_count; i++)
+                        ui_binding_row("UAV", "CS", (int)c->uav_slots[i], c->uav_handles[i]);
+                }
+                if (ui_inspector_section("ARGUMENTS"))
+                    ui_binding_row("Indirect Buffer", "ARG", -1, c->indirect_buf);
                 break;
             default:
                 break;
@@ -7953,8 +8622,7 @@ static void ui_panel_bindings(bool embedded = false) {
         Resource* r = res_get(g_sel_res);
         if (!r) {
             ui_inspector_text_disabled_wrapped("(stale resource)");
-        } else if (r->type == RES_SHADER && r->shader_cb.active) {
-            ui_inspector_section("REFLECTED CBUFFER");
+        } else if (r->type == RES_SHADER && r->shader_cb.active && ui_inspector_section("REFLECTED CBUFFER")) {
             ui_inspector_text_disabled_wrapped("%s: register(b%u), %u bytes",
                 r->shader_cb.name, r->shader_cb.bind_slot, r->shader_cb.size);
             for (int i = 0; i < r->shader_cb.var_count; i++) {
@@ -7974,29 +8642,32 @@ static void ui_panel_bindings(bool embedded = false) {
             }
         } else if (r->type == RES_MESH && (r->mesh_part_count > 0 || r->mesh_material_count > 0)) {
             if (r->mesh_part_count > 0) {
-                ui_inspector_section("MESH PARTS");
-                for (int i = 0; i < r->mesh_part_count; i++) {
-                    MeshPart& part = r->mesh_parts[i];
-                    ImGui::Text("%s [%s]", part.name[0] ? part.name : "(part)", part.enabled ? "on" : "off");
+                if (ui_inspector_section("MESH PARTS")) {
+                    for (int i = 0; i < r->mesh_part_count; i++) {
+                        MeshPart& part = r->mesh_parts[i];
+                        ImGui::Text("%s [%s]", part.name[0] ? part.name : "(part)", part.enabled ? "on" : "off");
+                    }
                 }
             }
             if (r->mesh_material_count > 0) {
-                ui_inspector_section("MESH MATERIALS");
-                for (int mi = 0; mi < r->mesh_material_count; mi++) {
-                    MeshMaterial& mat = r->mesh_materials[mi];
-                    ui_inspector_text_disabled_wrapped("%s", mat.name[0] ? mat.name : "(material)");
-                    for (int slot = 0; slot < MAX_MESH_MATERIAL_TEXTURES; slot++) {
-                        if (mat.textures[slot] != INVALID_HANDLE)
-                            ui_key_value_handle(ui_mesh_material_slot_name(slot), mat.textures[slot]);
+                if (ui_inspector_section("MESH MATERIALS")) {
+                    for (int mi = 0; mi < r->mesh_material_count; mi++) {
+                        MeshMaterial& mat = r->mesh_materials[mi];
+                        ui_inspector_text_disabled_wrapped("%s", mat.name[0] ? mat.name : "(material)");
+                        for (int slot = 0; slot < MAX_MESH_MATERIAL_TEXTURES; slot++) {
+                            if (mat.textures[slot] != INVALID_HANDLE)
+                                ui_key_value_handle(ui_mesh_material_slot_name(slot), mat.textures[slot]);
+                        }
                     }
                 }
             }
         } else {
-            ui_inspector_section("GPU BIND FLAGS");
-            ImGui::Text("RTV: %s", r->has_rtv ? "yes" : "no");
-            ImGui::Text("SRV: %s", r->has_srv ? "yes" : "no");
-            ImGui::Text("UAV: %s", r->has_uav ? "yes" : "no");
-            ImGui::Text("DSV: %s", r->has_dsv ? "yes" : "no");
+            if (ui_inspector_section("GPU BIND FLAGS")) {
+                ImGui::Text("RTV: %s", r->has_rtv ? "yes" : "no");
+                ImGui::Text("SRV: %s", r->has_srv ? "yes" : "no");
+                ImGui::Text("UAV: %s", r->has_uav ? "yes" : "no");
+                ImGui::Text("DSV: %s", r->has_dsv ? "yes" : "no");
+            }
         }
     } else {
         ui_inspector_text_disabled_wrapped("Nothing selected.");
@@ -8013,31 +8684,33 @@ static void ui_panel_selection_state(bool embedded = false) {
         if (!c) {
             ui_inspector_text_disabled_wrapped("(stale command)");
         } else {
-            ui_inspector_section("COMMAND STATE");
-            ImGui::Text("Enabled: %s", c->enabled ? "yes" : "no");
-            ImGui::Text("Warning: %s", ui_command_has_warning(*c) ? "yes" : "no");
-            ImGui::Text("Type: %s", cmd_type_str(c->type));
+            if (ui_inspector_section("COMMAND STATE")) {
+                ImGui::Text("Enabled: %s", c->enabled ? "yes" : "no");
+                ImGui::Text("Warning: %s", ui_command_has_warning(*c) ? "yes" : "no");
+                ImGui::Text("Type: %s", cmd_type_str(c->type));
+            }
             if (c->type == CMD_DRAW_MESH || c->type == CMD_DRAW_INSTANCED || c->type == CMD_INDIRECT_DRAW) {
-                ui_inspector_section("DRAW STATE");
-                ImGui::Text("Source: %s", ui_draw_source_name(c->draw_source));
-                if (ui_command_uses_procedural_draw(*c)) {
-                    ImGui::Text("Topology: %s", ui_draw_topology_name(c->draw_topology));
-                    if (c->type != CMD_INDIRECT_DRAW)
-                        ImGui::Text("Vertex Count: %d", c->vertex_count);
+                if (ui_inspector_section("DRAW STATE")) {
+                    ImGui::Text("Source: %s", ui_draw_source_name(c->draw_source));
+                    if (ui_command_uses_procedural_draw(*c)) {
+                        ImGui::Text("Topology: %s", ui_draw_topology_name(c->draw_topology));
+                        if (c->type != CMD_INDIRECT_DRAW)
+                            ImGui::Text("Vertex Count: %d", c->vertex_count);
+                    }
+                    ImGui::Text("Color Write: %s", c->color_write ? "yes" : "no");
+                    ImGui::Text("Depth Test: %s", c->depth_test ? "yes" : "no");
+                    ImGui::Text("Depth Write: %s", c->depth_write ? "yes" : "no");
+                    ImGui::Text("Alpha Blend: %s", c->alpha_blend ? "yes" : "no");
+                    ImGui::Text("RTV Count: %u", ui_draw_command_rtv_count(*c));
+                    ImGui::Text("Pixel UAV Count: %d", c->uav_count);
+                    ImGui::Text("Cull Back: %s", c->cull_back ? "yes" : "no");
+                    ImGui::Text("Shadow Cast: %s", c->shadow_cast ? "yes" : "no");
+                    ImGui::Text("Shadow Receive: %s", c->shadow_receive ? "yes" : "no");
                 }
-                ImGui::Text("Color Write: %s", c->color_write ? "yes" : "no");
-                ImGui::Text("Depth Test: %s", c->depth_test ? "yes" : "no");
-                ImGui::Text("Depth Write: %s", c->depth_write ? "yes" : "no");
-                ImGui::Text("Alpha Blend: %s", c->alpha_blend ? "yes" : "no");
-                ImGui::Text("RTV Count: %u", ui_draw_command_rtv_count(*c));
-                ImGui::Text("Pixel UAV Count: %d", c->uav_count);
-                ImGui::Text("Cull Back: %s", c->cull_back ? "yes" : "no");
-                ImGui::Text("Shadow Cast: %s", c->shadow_cast ? "yes" : "no");
-                ImGui::Text("Shadow Receive: %s", c->shadow_receive ? "yes" : "no");
             }
             if (c->type == CMD_DISPATCH) {
-                ui_inspector_section("DISPATCH");
-                ImGui::Text("Threads: %d, %d, %d", c->thread_x, c->thread_y, c->thread_z);
+                if (ui_inspector_section("DISPATCH"))
+                    ImGui::Text("Threads: %d, %d, %d", c->thread_x, c->thread_y, c->thread_z);
             }
         }
     } else if (g_sel_res != INVALID_HANDLE) {
@@ -8045,26 +8718,27 @@ static void ui_panel_selection_state(bool embedded = false) {
         if (!r) {
             ui_inspector_text_disabled_wrapped("(stale resource)");
         } else {
-            ui_inspector_section("RESOURCE STATE");
-            ImGui::Text("Type: %s", ui_resource_display_type(*r));
-            ImGui::Text("Built-in: %s", r->is_builtin ? "yes" : "no");
-            ImGui::Text("Warning: %s", ui_resource_has_warning(*r) ? "yes" : "no");
-            if (r->path[0])
-                ImGui::TextWrapped("Path: %s", r->path);
-            if (r->type == RES_SHADER || r->type == RES_MESH) {
-                ImGui::Text("Compiled OK: %s", r->compiled_ok ? "yes" : "no");
-                ImGui::Text("Fallback: %s", r->using_fallback ? "yes" : "no");
+            if (ui_inspector_section("RESOURCE STATE")) {
+                ImGui::Text("Type: %s", ui_resource_display_type(*r));
+                ImGui::Text("Built-in: %s", r->is_builtin ? "yes" : "no");
+                ImGui::Text("Warning: %s", ui_resource_has_warning(*r) ? "yes" : "no");
+                if (r->path[0])
+                    ImGui::TextWrapped("Path: %s", r->path);
+                if (r->type == RES_SHADER || r->type == RES_MESH) {
+                    ImGui::Text("Compiled OK: %s", r->compiled_ok ? "yes" : "no");
+                    ImGui::Text("Fallback: %s", r->using_fallback ? "yes" : "no");
+                }
+                if (r->width > 0 || r->height > 0) {
+                    if (r->depth > 1)
+                        ImGui::Text("Size: %dx%dx%d", r->width, r->height, r->depth);
+                    else
+                        ImGui::Text("Size: %dx%d", r->width, r->height);
+                }
+                if (r->elem_count > 0)
+                    ImGui::Text("Elements: %d x %d bytes", r->elem_count, r->elem_size);
+                if (r->vert_count > 0)
+                    ImGui::Text("Geometry: %d verts, %d indices", r->vert_count, r->idx_count);
             }
-            if (r->width > 0 || r->height > 0) {
-                if (r->depth > 1)
-                    ImGui::Text("Size: %dx%dx%d", r->width, r->height, r->depth);
-                else
-                    ImGui::Text("Size: %dx%d", r->width, r->height);
-            }
-            if (r->elem_count > 0)
-                ImGui::Text("Elements: %d x %d bytes", r->elem_count, r->elem_size);
-            if (r->vert_count > 0)
-                ImGui::Text("Geometry: %d verts, %d indices", r->vert_count, r->idx_count);
         }
     } else {
         ui_inspector_text_disabled_wrapped("Nothing selected.");
@@ -8343,7 +9017,7 @@ static void ui_panel_general(bool embedded = false) {
     if (!embedded) ImGui::Begin("General");
     bool settings_dirty = false;
 
-    if (ImGui::CollapsingHeader("Interface", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ui_inspector_section("INTERFACE")) {
         float ui_scale = ui_global_scale();
         if (ImGui::SliderFloat("Global Scale", &ui_scale, k_ui_scale_min, k_ui_scale_max, "%.2fx")) {
             ui_set_global_scale(ui_scale);
@@ -8362,9 +9036,15 @@ static void ui_panel_general(bool embedded = false) {
             settings_dirty = true;
         }
         ImGui::TextDisabled("Controls whether per-resource and per-command notes appear in the Inspector.");
+
+        int rt_preview_columns = ui_render_target_preview_columns();
+        if (ImGui::SliderInt("RT Preview Columns", &rt_preview_columns, 1, 8)) {
+            ui_set_render_target_preview_columns(rt_preview_columns);
+            settings_dirty = true;
+        }
     }
 
-    if (ImGui::CollapsingHeader("Shader Editor", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ui_inspector_section("SHADER EDITOR")) {
         float font_size = ui_code_font_size();
         if (ImGui::SliderFloat("Code Font Size", &font_size, 10.0f, 28.0f, "%.0f px")) {
             ui_set_code_font_size(font_size);
@@ -8373,14 +9053,14 @@ static void ui_panel_general(bool embedded = false) {
         ImGui::TextDisabled("Shader source editor defaults. Saved outside project files.");
     }
 
-    if (ImGui::CollapsingHeader("Application", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ui_inspector_section("APPLICATION")) {
         settings_dirty |= ImGui::Checkbox("VSync", &g_dx.vsync);
         ImGui::SameLine();
         ImGui::TextDisabled("%s", g_dx.vsync ? "Present interval 1" :
             (g_dx.present_allow_tearing ? "Present immediate + tearing" : "Present immediate"));
 
         float frame_cap = app_editor_frame_cap_fps();
-        if (ImGui::SliderFloat("Editor Frame Cap", &frame_cap, 0.0f, 240.0f, frame_cap <= 0.0f ? "uncapped" : "%.0f fps")) {
+        if (ImGui::SliderFloat("Editor Frame Cap", &frame_cap, 0.0f, 1000.0f, frame_cap <= 0.0f ? "uncapped" : "%.0f fps")) {
             app_set_editor_frame_cap_fps(frame_cap);
             settings_dirty = true;
         }
@@ -8392,7 +9072,7 @@ static void ui_panel_general(bool embedded = false) {
         ImGui::TextDisabled("Editor-only throttle. It is ignored when VSync is enabled and does not affect exported players.");
     }
 
-    if (ImGui::CollapsingHeader("Exporter / Standalone", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ui_inspector_section("EXPORTER / STANDALONE")) {
         ImGui::TextDisabled("Project settings used by Export EXE and build64k.");
         // Keep every item in this section explicitly namespaced. The General panel
         // also has editor/runtime diagnostics with similarly named controls, and
@@ -8436,7 +9116,7 @@ static void ui_panel_general(bool embedded = false) {
         ImGui::TextDisabled("Exported players ignore editor wireframe, grid, profiler and shader diagnostics.");
     }
 
-    if (ImGui::CollapsingHeader("Viewport", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ui_inspector_section("VIEWPORT")) {
         if (ImGui::Checkbox("Show Grid", &g_dx.scene_grid_enabled)) {
             settings_dirty = true;
             app_request_scene_render();
@@ -8476,6 +9156,7 @@ static void ui_panel_general(bool embedded = false) {
                 g_dx.scene_grid_fade_end = g_dx.scene_grid_fade_start + 1.0f;
         }
         settings_dirty |= ImGui::Checkbox("Show Camera Orientation Gizmo", &g_dx.scene_orientation_gizmo_enabled);
+        settings_dirty |= ImGui::Checkbox("Show Manual Control Overlay", &g_dx.scene_manual_control_overlay_enabled);
         if (ImGui::Checkbox("Debug Draw Bounds", &g_dx.scene_bounds_debug_enabled)) {
             settings_dirty = true;
             app_request_scene_render();
@@ -8483,7 +9164,7 @@ static void ui_panel_general(bool embedded = false) {
         ImGui::TextDisabled("Infinite grid overlay on y=0. Color alpha controls overall intensity; level opacity balances fine/medium/coarse lines.");
     }
 
-    if (ImGui::CollapsingHeader("Diagnostics", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ui_inspector_section("DIAGNOSTICS")) {
         ImGui::Text("DX11 Adapter: %s", g_dx.adapter_name[0] ? g_dx.adapter_name : "unknown");
         ImGui::TextDisabled("vendor=0x%04X device=0x%04X dedicated=%llu MB",
             g_dx.adapter_vendor_id,
@@ -8516,7 +9197,7 @@ static void ui_panel_general(bool embedded = false) {
             ImGui::EndDisabled();
     }
 
-    if (ImGui::CollapsingHeader("Profiler", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ui_inspector_section("PROFILER")) {
         settings_dirty |= ImGui::Checkbox("Enable profiling", &g_profiler_enabled);
         if (g_profiler_enabled) {
             ui_refresh_profiler_readout_cache();
@@ -8534,11 +9215,13 @@ static void ui_panel_general(bool embedded = false) {
             ImGui::Text("Other CPU: %.3f ms", app_cpu_other_ms());
             ui_help_marker("Everything in the measured frame not attributed to scene, ImGui build, ImGui render, or Present. Ideally small; includes message handling and loop overhead.");
             ImGuiIO& profiler_io = ImGui::GetIO();
-            ImGui::Text("ImGui output: %d verts, %d indices, %d windows",
+            ImGui::Text("ImGui output: %d verts, %d indices, %d draw cmds, %d lists, %d windows",
                 profiler_io.MetricsRenderVertices,
                 profiler_io.MetricsRenderIndices,
+                app_imgui_draw_command_count(),
+                app_imgui_draw_list_count(),
                 profiler_io.MetricsRenderWindows);
-            ui_help_marker("Final draw-list size generated by Dear ImGui. Vertices/indices affect UI GPU cost; windows approximates how many ImGui windows/child windows are active.");
+            ui_help_marker("Final draw-list size generated by Dear ImGui. Draw cmds map closely to D3D11 UI draw submissions, while vertices/indices affect UI GPU cost.");
             if (ImGui::TreeNodeEx("ImGui build breakdown", ImGuiTreeNodeFlags_DefaultOpen)) {
                 ui_help_marker("Breakdown of the ImGui build CPU time by lazyTool UI section. Percentages are relative to ImGui build CPU, not total frame time.");
                 float total = app_cpu_ui_build_ms();
@@ -8581,7 +9264,7 @@ static void ui_panel_general(bool embedded = false) {
         }
     }
 
-    if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ui_inspector_section("CAMERA")) {
         settings_dirty |= ImGui::Checkbox("Enabled", &g_camera_controls.enabled);
         const char* camera_modes[] = { "Horizon Locked", "Free Camera" };
         int camera_mode = g_camera_controls.mode == CAMERA_MODE_FREE ? 1 : 0;
@@ -9280,17 +9963,14 @@ static void ui_draw_bounds_values(const char* label, const float bmin[3], const 
         }
         ImGui::EndTable();
     }
-
-    float diagonal = sqrtf(size.x * size.x + size.y * size.y + size.z * size.z);
-    float volume = fabsf(size.x * size.y * size.z);
-    ImGui::TextDisabled("Diagonal %.4g    Volume %.4g", diagonal, volume);
 }
 
 static void ui_draw_command_bounds_inspector(Command* c, CmdHandle h) {
     if (!c)
         return;
+    if (!ui_inspector_section("BOUNDING BOX"))
+        return;
     cmd_refresh_draw_bounds(h);
-    ui_inspector_section("BOUNDING BOX");
     if (c->bbox_identity)
         ui_inspector_text_disabled_wrapped("Identity/unit bounds are being used because this draw has no mesh geometry available.");
     else
@@ -9534,11 +10214,10 @@ static void ui_draw_viewport_camera_overlay(ImVec2 rect_min, ImVec2 rect_max) {
     s_scene_view_overlay_screen_rect_valid = true;
 
     ImVec2 pos = toolbar_min;
-    const bool free_camera = g_camera_controls.mode == CAMERA_MODE_FREE;
-    const char* mode_label = ui_camera_mode_name(g_camera_controls.mode);
-    if (ui_viewport_overlay_text_button(dl, pos, mode_label,
-            "Camera mode. Horizon Locked preserves the current roll; Free Camera allows loopings.", free_camera, &pos)) {
-        g_camera_controls.mode = free_camera ? CAMERA_MODE_HORIZON_LOCKED : CAMERA_MODE_FREE;
+    if (ui_viewport_overlay_text_button(dl, pos, ui_camera_mode_name(g_camera_controls.mode),
+            g_camera_controls.mode == CAMERA_MODE_FREE ? "Switch to horizon locked camera" : "Switch to free camera",
+            true, &pos)) {
+        g_camera_controls.mode = g_camera_controls.mode == CAMERA_MODE_FREE ? CAMERA_MODE_HORIZON_LOCKED : CAMERA_MODE_FREE;
         if (g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED) {
             camera_sync_euler_from_quat(&g_camera);
             camera_set_euler(&g_camera, g_camera.yaw, clampf(g_camera.pitch, -1.55334f, 1.55334f), g_camera.roll);
@@ -9546,9 +10225,7 @@ static void ui_draw_viewport_camera_overlay(ImVec2 rect_min, ImVec2 rect_max) {
         app_settings_save();
         app_request_scene_render();
     }
-
     pos.x += ui_px(5.0f);
-
     if (ui_viewport_overlay_icon_button(dl, pos, UI_ICON_GIZMO_MOVE, "Move gizmo (1)",
             s_viewport_gizmo_mode == UI_GIZMO_TRANSLATE, &pos)) {
         ui_set_viewport_gizmo_mode(UI_GIZMO_TRANSLATE);
@@ -9580,6 +10257,83 @@ static void ui_draw_viewport_camera_overlay(ImVec2 rect_min, ImVec2 rect_max) {
     }
 }
 
+static void ui_draw_rotation_feedback_quad(ImDrawList* dl, ImVec2 min, const char* label,
+                                           float yaw, float pitch, ImVec4 tint, float alpha) {
+    float size = ui_px(70.0f);
+    float label_h = ui_px(15.0f);
+    ImVec2 max(min.x + size, min.y + size + label_h);
+    ImU32 bg = ImGui::GetColorU32(ImVec4(0.045f, 0.043f, 0.047f, 0.78f * alpha));
+    ImU32 border = ImGui::GetColorU32(ImVec4(tint.x, tint.y, tint.z, 0.82f * alpha));
+    ImU32 line = ImGui::GetColorU32(ImVec4(0.78f, 0.76f, 0.72f, 0.20f * alpha));
+    ImU32 text = ImGui::GetColorU32(ImVec4(0.92f, 0.90f, 0.86f, 0.86f * alpha));
+    ImU32 dot = ImGui::GetColorU32(ImVec4(tint.x, tint.y, tint.z, alpha));
+
+    dl->AddRectFilled(min, max, bg, ui_px(4.0f));
+    dl->AddRect(min, max, border, ui_px(4.0f), 0, ui_px(1.0f));
+    ImVec2 q0(min.x + ui_px(8.0f), min.y + ui_px(8.0f));
+    ImVec2 q1(min.x + size - ui_px(8.0f), min.y + size - ui_px(8.0f));
+    dl->AddRect(q0, q1, line, ui_px(2.0f));
+    dl->AddLine(ImVec2((q0.x + q1.x) * 0.5f, q0.y), ImVec2((q0.x + q1.x) * 0.5f, q1.y), line);
+    dl->AddLine(ImVec2(q0.x, (q0.y + q1.y) * 0.5f), ImVec2(q1.x, (q0.y + q1.y) * 0.5f), line);
+
+    const float pi = 3.14159265358979323846f;
+    float x = fmodf(yaw + pi, pi * 2.0f);
+    if (x < 0.0f) x += pi * 2.0f;
+    x /= pi * 2.0f;
+    float y = 0.5f - clampf(pitch / (pi * 0.5f), -1.0f, 1.0f) * 0.5f;
+    ImVec2 p(q0.x + x * (q1.x - q0.x), q0.y + y * (q1.y - q0.y));
+    dl->AddCircleFilled(p, ui_px(4.4f), dot, 18);
+    dl->AddCircle(p, ui_px(6.2f), ImGui::GetColorU32(ImVec4(0.02f, 0.018f, 0.016f, 0.70f * alpha)), 18, ui_px(1.0f));
+
+    ImVec2 ts = ImGui::CalcTextSize(label);
+    dl->AddText(ImVec2(min.x + (size - ts.x) * 0.5f, min.y + size - ui_px(2.0f)), text, label);
+}
+
+static void ui_draw_manual_control_feedback(ImVec2 rect_min, ImVec2 rect_max) {
+    if (!g_dx.scene_manual_control_overlay_enabled)
+        return;
+
+    static float s_camera_feedback = 0.0f;
+    static float s_light_feedback = 0.0f;
+    float dt = ImGui::GetIO().DeltaTime;
+    float fade_speed = dt > 0.0f ? dt * 4.5f : 0.08f;
+    if (g_viewport_manual_camera_active) s_camera_feedback = 1.0f;
+    else s_camera_feedback = s_camera_feedback > fade_speed ? s_camera_feedback - fade_speed : 0.0f;
+    if (g_viewport_manual_light_active) s_light_feedback = 1.0f;
+    else s_light_feedback = s_light_feedback > fade_speed ? s_light_feedback - fade_speed : 0.0f;
+    if (s_camera_feedback <= 0.001f && s_light_feedback <= 0.001f)
+        return;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float size = ui_px(70.0f);
+    float gap = ui_px(8.0f);
+    float total_w = 0.0f;
+    if (s_camera_feedback > 0.001f) total_w += size;
+    if (s_light_feedback > 0.001f) total_w += (total_w > 0.0f ? gap : 0.0f) + size;
+    ImVec2 pos(rect_max.x - total_w - ui_px(12.0f), rect_max.y - size - ui_px(30.0f));
+    if (pos.x < rect_min.x + ui_px(8.0f)) pos.x = rect_min.x + ui_px(8.0f);
+    if (pos.y < rect_min.y + ui_px(48.0f)) pos.y = rect_min.y + ui_px(48.0f);
+
+    if (s_camera_feedback > 0.001f) {
+        ui_draw_rotation_feedback_quad(dl, pos, "Camera", g_camera.yaw, g_camera.pitch,
+                                       ImVec4(0.58f, 0.74f, 0.96f, 1.0f), s_camera_feedback);
+        pos.x += size + gap;
+    }
+    if (s_light_feedback > 0.001f) {
+        Resource* dl_res = res_get(g_builtin_dirlight);
+        float yaw = 0.0f;
+        float pitch = 0.0f;
+        if (dl_res) {
+            Vec3 light_dir = v3_norm(v3_sub(v3(dl_res->light_target[0], dl_res->light_target[1], dl_res->light_target[2]),
+                                           v3(dl_res->light_pos[0], dl_res->light_pos[1], dl_res->light_pos[2])));
+            yaw = atan2f(light_dir.x, light_dir.z);
+            pitch = asinf(clampf(light_dir.y, -1.0f, 1.0f));
+        }
+        ui_draw_rotation_feedback_quad(dl, pos, "Light", yaw, pitch,
+                                       ImVec4(1.00f, 0.70f, 0.36f, 1.0f), s_light_feedback);
+    }
+}
+
 static void ui_panel_scene(bool embedded = false) {
     if (!embedded) ImGui::Begin("Scene");
     bool hovered = false;
@@ -9605,23 +10359,24 @@ static void ui_panel_scene(bool embedded = false) {
             s_scene_view_screen_rect.right = (LONG)ceilf(image_max.x);
             s_scene_view_screen_rect.bottom = (LONG)ceilf(image_max.y);
             s_scene_view_screen_rect_valid = true;
-            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-                ImGui::SetWindowFocus();
-                ImGui::ClearActiveID();
-            }
         }
     }
     bool overlay_hovered = false;
     if (g_dx.scene_srv && image_max.x > image_min.x && image_max.y > image_min.y)
         overlay_hovered = ui_viewport_toolbar_hit_test(image_min, image_max);
-    bool viewport_hovered = hovered && !overlay_hovered;
+    bool panel_focused = ui_current_panel_focused();
+    bool pointer_over_viewport = hovered && !overlay_hovered;
+    bool viewport_hovered = panel_focused && pointer_over_viewport;
     ui_handle_viewport_gizmo_hotkeys(viewport_hovered);
     g_scene_view_hovered = viewport_hovered;
+    g_scene_view_focused = panel_focused;
+    g_scene_view_pointer_over = pointer_over_viewport;
     if (g_dx.scene_srv && image_max.x > image_min.x && image_max.y > image_min.y) {
         ui_draw_viewport_bounds_debug(image_min, image_max);
         ui_draw_viewport_gizmo(image_min, image_max, viewport_hovered);
         if (g_dx.scene_orientation_gizmo_enabled)
             ui_draw_camera_orientation_gizmo(image_min, image_max);
+        ui_draw_manual_control_feedback(image_min, image_max);
         ui_draw_viewport_camera_overlay(image_min, image_max);
     }
     if (!embedded) ImGui::End();
@@ -9706,7 +10461,8 @@ static void ui_focus_current_panel_window() {
         s_panel_focus_stack[s_panel_focus_count - 1] = true;
 }
 
-static bool ui_update_panel_focus_from_current_window(bool accept_imgui_focus = true) {
+static bool ui_update_panel_focus_from_current_window(bool accept_imgui_focus = true,
+                                                      bool accept_mouse_focus = true) {
     ImGuiWindow* window = ImGui::GetCurrentWindow();
     if (!window)
         return false;
@@ -9714,7 +10470,11 @@ static bool ui_update_panel_focus_from_current_window(bool accept_imgui_focus = 
     ImGuiID panel_id = window->ID;
     bool hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
     bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
-    if ((accept_imgui_focus && focused) || (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)))
+    bool mouse_focus_click = ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+                             ImGui::IsMouseClicked(ImGuiMouseButton_Right) ||
+                             ImGui::IsMouseClicked(ImGuiMouseButton_Middle);
+    if ((accept_imgui_focus && focused) ||
+        (accept_mouse_focus && hovered && mouse_focus_click))
         s_focused_panel_id = panel_id;
     return s_focused_panel_id == panel_id;
 }
@@ -9739,11 +10499,11 @@ static void ui_lock_current_window_scroll_x() {
 
 static void ui_apply_gray_tool_style() {
     ImGuiStyle& s = ImGui::GetStyle();
-    s.WindowPadding = ImVec2(8.0f, 8.0f);
-    s.FramePadding = ImVec2(7.0f, 4.0f);
-    s.CellPadding = ImVec2(6.0f, 4.0f);
-    s.ItemSpacing = ImVec2(7.0f, 6.0f);
-    s.ItemInnerSpacing = ImVec2(6.0f, 4.0f);
+    s.WindowPadding = ImVec2(7.0f, 7.0f);
+    s.FramePadding = ImVec2(6.0f, 3.0f);
+    s.CellPadding = ImVec2(6.0f, 3.0f);
+    s.ItemSpacing = ImVec2(6.0f, 5.0f);
+    s.ItemInnerSpacing = ImVec2(5.0f, 3.0f);
     s.ScrollbarSize = 12.0f;
     s.GrabMinSize = 8.0f;
     s.WindowRounding = 4.0f;
@@ -10181,7 +10941,9 @@ static void ui_panel_header(const char* title, const char* detail = nullptr,
     ImVec2 header_min(header_pos.x - ui_margin_px(3.0f), header_pos.y - ui_margin_px(2.0f));
     ImVec2 header_max(header_right, header_pos.y + header_h + ui_margin_px(2.0f));
     ImVec2 mouse = ImGui::GetMousePos();
-    bool header_clicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+    bool header_window_hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+    bool was_focused = focused;
+    bool header_clicked = header_window_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
         mouse.x >= header_min.x && mouse.x <= header_max.x &&
         mouse.y >= header_min.y && mouse.y <= header_max.y;
     if (header_clicked) {
@@ -10253,7 +11015,7 @@ static void ui_panel_header(const char* title, const char* detail = nullptr,
                 ImGui::GetColorU32(ImVec4(0.28f, 0.25f, 0.24f, 0.85f)), 1.0f);
         } else {
             ImGui::SetCursorScreenPos(ImVec2(buttons_x, buttons_y));
-            if (ui_header_action_button(actions[i]) && clicks[i])
+            if (ui_header_action_button(actions[i]) && clicks[i] && was_focused)
                 *clicks[i] = true;
         }
         buttons_x += action_w + button_spacing;
@@ -10265,8 +11027,11 @@ static void ui_panel_header(const char* title, const char* detail = nullptr,
 }
 
 static void ui_draw_shader_editor_window() {
-    if (!s_shader_editor_floating)
+    static bool s_shader_editor_was_open = false;
+    if (!s_shader_editor_floating) {
+        s_shader_editor_was_open = false;
         return;
+    }
 
     if (!ui_shader_editor_is_shader_handle(s_shader_editor_floating_h))
         s_shader_editor_floating_h = ui_shader_editor_first_shader_handle();
@@ -10274,6 +11039,9 @@ static void ui_draw_shader_editor_window() {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowViewport(vp->ID);
     ImGui::SetNextWindowSize(ImVec2(ui_px(900.0f), ui_px(640.0f)), ImGuiCond_FirstUseEver);
+    bool focus_on_open = !s_shader_editor_was_open;
+    if (focus_on_open)
+        ImGui::SetNextWindowFocus();
     ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoCollapse |
                                     ImGuiWindowFlags_NoTitleBar;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
@@ -10284,6 +11052,7 @@ static void ui_draw_shader_editor_window() {
     ImGui::PushStyleColor(ImGuiCol_ResizeGripActive, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
     bool open = true;
     bool began = ImGui::Begin("Shader Editor###ShaderSourceFloating", &open, window_flags);
+    s_shader_editor_was_open = true;
     ImGui::PopStyleColor(4);
     ImGui::PopStyleVar(2);
     if (!began) {
@@ -10325,7 +11094,16 @@ static void ui_draw_shader_editor_window() {
     }
 
     bool close_clicked = false;
+    bool focused = ui_update_panel_focus_from_current_window(false, true);
+    ui_push_panel_focus(focused);
+    if (focus_on_open) {
+        ui_focus_current_panel_window();
+        focused = true;
+    }
+    if (focused)
+        ui_draw_panel_focus_bg(UI_PANEL_DEFAULT);
     ui_panel_header("SHADER EDITOR", detail, "Close##shader_editor_close", &close_clicked);
+    ui_pop_panel_focus();
     if (close_clicked)
         open = false;
     ImGui::Spacing();
@@ -10422,8 +11200,20 @@ static bool ui_begin_tool_panel(const char* id, const char* title, const char* d
     bool open = ImGui::BeginChild(id, size, true,
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ui_lock_current_window_scroll_x();
+    bool force_focus = (strcmp(id, "##inspector_panel") == 0 && s_focus_inspector_panel_next) ||
+                       (strcmp(id, "##general_panel") == 0 && s_focus_general_panel_next);
+    if (force_focus) {
+        if (strcmp(id, "##inspector_panel") == 0)
+            s_focus_inspector_panel_next = false;
+        if (strcmp(id, "##general_panel") == 0)
+            s_focus_general_panel_next = false;
+    }
     bool focused = ui_update_panel_focus_from_current_window(false);
     ui_push_panel_focus(focused);
+    if (force_focus) {
+        ui_focus_current_panel_window();
+        focused = true;
+    }
     if (focused)
         ui_draw_panel_focus_bg(tone);
     ui_panel_header(title, detail,
@@ -10642,12 +11432,6 @@ static void ui_refresh_profiler_readout_cache(bool force) {
     s_profiler_readout_cache.next_update_time = now + 0.25;
 }
 
-static void ui_viewport_detail(char* out, int out_sz) {
-    snprintf(out, out_sz, "frame %llu  %.2fs  %dx%d  %s",
-        (unsigned long long)app_scene_frame(), app_scene_time(),
-        g_dx.scene_width, g_dx.scene_height, ui_camera_mode_name(g_camera_controls.mode));
-}
-
 static void ui_reset_camera_view() {
     project_reset_camera_defaults();
 }
@@ -10794,6 +11578,7 @@ static void ui_draw_help_shortcuts_tab() {
     if (ui_begin_shortcut_section("##help_shortcuts_execution", "EXECUTION", table_flags)) {
         ui_draw_shortcut_row("Space", "Pause / resume scene execution");
         ui_draw_shortcut_row("F6", "Restart scene from frame 0");
+        ui_draw_shortcut_row("F10", "Toggle player preview with no editor UI");
         ui_draw_shortcut_row("F11", "Toggle viewport fullscreen");
         ImGui::EndTable();
     }
@@ -10833,6 +11618,7 @@ static void ui_draw_help_shortcuts_tab() {
 
     if (ui_begin_shortcut_section("##help_shortcuts_camera", "CAMERA", table_flags)) {
         ui_draw_shortcut_row("RMB", "Mouse look");
+        ui_draw_shortcut_row("MMB / Wheel", "Zoom around selected/scene bounding box");
         ui_draw_shortcut_row("WASD", "Move on camera forward/right axes");
         ui_draw_shortcut_row("R / T", "Move up / down on camera up axis");
         ui_draw_shortcut_row("Q / E", "Roll left / right");
@@ -10844,10 +11630,11 @@ static void ui_draw_help_shortcuts_tab() {
         ImGui::EndTable();
     }
 
-    ui_inspector_section("DRAW SRV SLOTS");
-    ui_inspector_text_disabled_wrapped("Common shader t# convention used by mesh materials and PBR shaders.");
-    ui_draw_texture_slot_reference("##help_draw_slots");
-    ui_inspector_text_disabled_wrapped("Manual SRV bindings in a draw command override mesh material textures on the same slot.");
+    if (ui_inspector_section("DRAW SRV SLOTS")) {
+        ui_inspector_text_disabled_wrapped("Common shader t# convention used by mesh materials and PBR shaders.");
+        ui_draw_texture_slot_reference("##help_draw_slots");
+        ui_inspector_text_disabled_wrapped("Manual SRV bindings in a draw command override mesh material textures on the same slot.");
+    }
 
     ImGui::PopStyleVar();
 }
@@ -10862,8 +11649,8 @@ static void ui_draw_common_function_row(const char* signature, const char* args,
     ImGui::TextWrapped("%s", desc);
 }
 
-static void ui_draw_help_common_section(const char* title) {
-    ui_inspector_section(title);
+static bool ui_draw_help_common_section(const char* title) {
+    return ui_inspector_section(title);
 }
 
 static void ui_draw_help_common_tab() {
@@ -10878,8 +11665,8 @@ static void ui_draw_help_common_tab() {
         ImGuiTableFlags_PadOuterX;
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(7.0f, 5.0f));
 
-    ui_draw_help_common_section("CAMERA / TRANSFORM");
-    if (ImGui::BeginTable("##help_common_camera", 3, flags)) {
+    if (ui_draw_help_common_section("CAMERA / TRANSFORM") &&
+        ImGui::BeginTable("##help_common_camera", 3, flags)) {
         ImGui::TableSetupColumn("Signature", ImGuiTableColumnFlags_WidthStretch, 1.35f);
         ImGui::TableSetupColumn("Arguments", ImGuiTableColumnFlags_WidthStretch, 1.00f);
         ImGui::TableSetupColumn("Use", ImGuiTableColumnFlags_WidthStretch, 1.35f);
@@ -10897,8 +11684,8 @@ static void ui_draw_help_common_tab() {
         ImGui::EndTable();
     }
 
-    ui_draw_help_common_section("DEPTH / SCREEN");
-    if (ImGui::BeginTable("##help_common_depth", 3, flags)) {
+    if (ui_draw_help_common_section("DEPTH / SCREEN") &&
+        ImGui::BeginTable("##help_common_depth", 3, flags)) {
         ImGui::TableSetupColumn("Signature", ImGuiTableColumnFlags_WidthStretch, 1.35f);
         ImGui::TableSetupColumn("Arguments", ImGuiTableColumnFlags_WidthStretch, 1.00f);
         ImGui::TableSetupColumn("Use", ImGuiTableColumnFlags_WidthStretch, 1.35f);
@@ -10917,8 +11704,8 @@ static void ui_draw_help_common_tab() {
         ImGui::EndTable();
     }
 
-    ui_draw_help_common_section("SHADOW");
-    if (ImGui::BeginTable("##help_common_shadow", 3, flags)) {
+    if (ui_draw_help_common_section("SHADOW") &&
+        ImGui::BeginTable("##help_common_shadow", 3, flags)) {
         ImGui::TableSetupColumn("Signature", ImGuiTableColumnFlags_WidthStretch, 1.35f);
         ImGui::TableSetupColumn("Arguments", ImGuiTableColumnFlags_WidthStretch, 1.00f);
         ImGui::TableSetupColumn("Use", ImGuiTableColumnFlags_WidthStretch, 1.35f);
@@ -10938,8 +11725,8 @@ static void ui_draw_help_common_tab() {
         ImGui::EndTable();
     }
 
-    ui_draw_help_common_section("UTILITY");
-    if (ImGui::BeginTable("##help_common_utility", 3, flags)) {
+    if (ui_draw_help_common_section("UTILITY") &&
+        ImGui::BeginTable("##help_common_utility", 3, flags)) {
         ImGui::TableSetupColumn("Signature", ImGuiTableColumnFlags_WidthStretch, 1.35f);
         ImGui::TableSetupColumn("Arguments", ImGuiTableColumnFlags_WidthStretch, 1.00f);
         ImGui::TableSetupColumn("Use", ImGuiTableColumnFlags_WidthStretch, 1.35f);
@@ -10956,10 +11743,16 @@ static void ui_draw_help_common_tab() {
 }
 
 static void ui_draw_help_popup() {
-    if (!s_help_popup_open)
+    static bool s_help_was_open = false;
+    if (!s_help_popup_open) {
+        s_help_was_open = false;
         return;
+    }
 
     ImGui::SetNextWindowSize(ImVec2(760.0f, 560.0f), ImGuiCond_Appearing);
+    bool focus_on_open = !s_help_was_open;
+    if (focus_on_open)
+        ImGui::SetNextWindowFocus();
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ui_panel_bg(UI_PANEL_GENERAL));
     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.220f, 0.205f, 0.200f, 1.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 5.0f);
@@ -10967,16 +11760,24 @@ static void ui_draw_help_popup() {
     if (ImGui::Begin("Help", &s_help_popup_open,
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar))
     {
+        s_help_was_open = true;
         bool close_clicked = false;
-        bool focused = ui_update_panel_focus_from_current_window();
+        bool focused = ui_update_panel_focus_from_current_window(false, true);
         ui_push_panel_focus(focused);
+        if (focus_on_open) {
+            ui_focus_current_panel_window();
+            focused = true;
+        }
         if (focused)
             ui_draw_panel_focus_bg(UI_PANEL_GENERAL);
         ui_panel_header("HELP", "F1", "Close##help_close", &close_clicked);
+        bool panel_interactive = ui_current_panel_focused();
         ui_pop_panel_focus();
         if (close_clicked)
             s_help_popup_open = false;
 
+        if (!panel_interactive)
+            ImGui::BeginDisabled();
         if (ImGui::BeginTabBar("##help_tabs")) {
             if (ImGui::BeginTabItem("Shortcuts")) {
                 ImGui::BeginChild("##help_shortcuts_scroll", ImVec2(0.0f, 0.0f), false,
@@ -10994,6 +11795,8 @@ static void ui_draw_help_popup() {
             }
             ImGui::EndTabBar();
         }
+        if (!panel_interactive)
+            ImGui::EndDisabled();
     }
     ImGui::End();
     ImGui::PopStyleVar(2);
@@ -11001,7 +11804,8 @@ static void ui_draw_help_popup() {
 }
 
 static bool ui_begin_shortcut_section(const char* id, const char* title, ImGuiTableFlags table_flags) {
-    ui_inspector_section(title);
+    if (!ui_inspector_section(title))
+        return false;
     if (!ImGui::BeginTable(id, 2, table_flags))
         return false;
     ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 108.0f);
@@ -11215,7 +12019,8 @@ static void ui_timeline_add_parameter_track(ResHandle h) {
 }
 
 static void ui_timeline_add_tracks() {
-    ui_inspector_section("ADD TRACK");
+    if (!ui_inspector_section("ADD TRACK"))
+        return;
 
     ui_timeline_add_track_button("Camera", TIMELINE_TRACK_CAMERA, "camera", RES_NONE);
     ImGui::SameLine();
@@ -11467,7 +12272,9 @@ static bool ui_timeline_scrollbar(const char* id, int* first_frame, int max_firs
 }
 
 static void ui_draw_timeline_window() {
+    static bool s_timeline_was_open = false;
     if (!s_timeline_window_open) {
+        s_timeline_was_open = false;
         s_timeline_keyboard_focus = false;
         return;
     }
@@ -11476,6 +12283,9 @@ static void ui_draw_timeline_window() {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowViewport(vp->ID);
     ImGui::SetNextWindowSize(ImVec2(ui_px(920.0f), ui_px(420.0f)), ImGuiCond_FirstUseEver);
+    bool focus_on_open = !s_timeline_was_open;
+    if (focus_on_open)
+        ImGui::SetNextWindowFocus();
     ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoCollapse |
                                     ImGuiWindowFlags_NoTitleBar;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
@@ -11485,6 +12295,7 @@ static void ui_draw_timeline_window() {
     ImGui::PushStyleColor(ImGuiCol_ResizeGripHovered, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
     ImGui::PushStyleColor(ImGuiCol_ResizeGripActive, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
     bool timeline_window_open = ImGui::Begin("Timeline", nullptr, window_flags);
+    s_timeline_was_open = true;
     ImGui::PopStyleColor(4);
     ImGui::PopStyleVar(2);
     if (!timeline_window_open) {
@@ -11517,12 +12328,17 @@ static void ui_draw_timeline_window() {
         return;
     }
     ui_lock_current_window_scroll_x();
-    bool focused = ui_update_panel_focus_from_current_window(false);
+    bool focused = ui_update_panel_focus_from_current_window(false, true);
     ui_push_panel_focus(focused);
+    if (focus_on_open) {
+        ui_focus_current_panel_window();
+        focused = true;
+    }
     if (focused)
         ui_draw_panel_focus_bg(UI_PANEL_DEFAULT);
     bool close_clicked = false;
     ui_panel_header("TIMELINE", detail, "Close##timeline_close", &close_clicked);
+    bool panel_interactive = ui_current_panel_focused();
     ui_pop_panel_focus();
     if (close_clicked) {
         s_timeline_window_open = false;
@@ -11538,8 +12354,8 @@ static void ui_draw_timeline_window() {
 
     ImGuiIO& io = ImGui::GetIO();
     bool track_enabled = timeline_enabled();
-    bool timeline_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
-    bool timeline_hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows);
+    bool timeline_focused = panel_interactive && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    bool timeline_hovered = panel_interactive && ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows);
     s_timeline_keyboard_focus = timeline_focused;
     bool timeline_nav_active = track_enabled && timeline_focused &&
                                !io.WantTextInput && !ImGui::IsAnyItemActive() &&
@@ -12438,7 +13254,9 @@ static void ui_render_graph_draw_canvas_grid(ImDrawList* dl, ImVec2 min, ImVec2 
 }
 
 static void ui_draw_render_graph_window() {
+    static bool s_render_graph_was_open = false;
     if (!s_render_graph_window_open) {
+        s_render_graph_was_open = false;
         s_render_graph_center_next = true;
         return;
     }
@@ -12450,6 +13268,9 @@ static void ui_draw_render_graph_window() {
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f - default_size.x * 0.5f,
                                    vp->WorkPos.y + vp->WorkSize.y - default_size.y - ui_margin_px(24.0f)),
                             ImGuiCond_FirstUseEver);
+    bool focus_on_open = !s_render_graph_was_open;
+    if (focus_on_open)
+        ImGui::SetNextWindowFocus();
 
     ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoCollapse |
                                     ImGuiWindowFlags_NoTitleBar;
@@ -12460,6 +13281,7 @@ static void ui_draw_render_graph_window() {
     ImGui::PushStyleColor(ImGuiCol_ResizeGripHovered, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
     ImGui::PushStyleColor(ImGuiCol_ResizeGripActive, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
     bool render_graph_window_open = ImGui::Begin("Render Graph", nullptr, window_flags);
+    s_render_graph_was_open = true;
     ImGui::PopStyleColor(4);
     ImGui::PopStyleVar(2);
     if (!render_graph_window_open) {
@@ -12492,12 +13314,17 @@ static void ui_draw_render_graph_window() {
         return;
     }
 
-    bool focused = ui_update_panel_focus_from_current_window(false);
+    bool focused = ui_update_panel_focus_from_current_window(false, true);
     ui_push_panel_focus(focused);
+    if (focus_on_open) {
+        ui_focus_current_panel_window();
+        focused = true;
+    }
     if (focused)
         ui_draw_panel_focus_bg(UI_PANEL_DEFAULT);
     bool close_clicked = false;
     ui_panel_header("RENDER GRAPH", detail, "Close##render_graph_close", &close_clicked);
+    bool graph_interactive = ui_current_panel_focused();
     ui_pop_panel_focus();
     if (close_clicked) {
         s_render_graph_window_open = false;
@@ -12533,12 +13360,12 @@ static void ui_draw_render_graph_window() {
     ImGui::PopStyleColor();
 
     ImGuiIO& io = ImGui::GetIO();
-    bool canvas_hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows);
-    if (!ImGui::IsMouseDown(ImGuiMouseButton_Right))
+    bool canvas_hovered = graph_interactive && ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows);
+    if (!graph_interactive || !ImGui::IsMouseDown(ImGuiMouseButton_Right))
         s_render_graph_mouse_dragging = false;
     if (canvas_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
         s_render_graph_mouse_dragging = true;
-    if (canvas_hovered || s_render_graph_mouse_dragging) {
+    if (graph_interactive && (canvas_hovered || s_render_graph_mouse_dragging)) {
         g_editor_mouse_capture = true;
     }
     ImVec2 canvas_pos = ImGui::GetWindowPos();
@@ -12558,7 +13385,7 @@ static void ui_draw_render_graph_window() {
             s_render_graph_pan.y = mouse_local.y - graph_under_mouse.y * s_render_graph_zoom;
         }
     }
-    if (s_render_graph_mouse_dragging && ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.0f)) {
+    if (graph_interactive && s_render_graph_mouse_dragging && ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.0f)) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
         s_render_graph_pan.x += io.MouseDelta.x;
         s_render_graph_pan.y += io.MouseDelta.y;
@@ -12893,12 +13720,12 @@ static void ui_draw_render_graph_window() {
         ImGui::PushID(10000 + ci);
         ImGui::SetCursorScreenPos(n0);
         ImGui::InvisibleButton("cmd_node", ImVec2(n1.x - n0.x, n1.y - n0.y));
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+        if (graph_interactive && ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
             g_sel_cmd = graph.cmd_handles[ci];
             g_sel_res = INVALID_HANDLE;
             s_cmd_nav = g_sel_cmd;
         }
-        if (ImGui::IsItemHovered()) {
+        if (graph_interactive && ImGui::IsItemHovered()) {
             if (g_profiler_enabled && cmd_profile_ready())
                 ImGui::SetTooltip("%02d %s\n%s\nGPU %.3f ms", ci + 1, c->name, cmd_type_str(c->type), cmd_profile_ms(graph.cmd_handles[ci]));
             else
@@ -12922,12 +13749,12 @@ static void ui_draw_render_graph_window() {
             ImGui::PushID(30000 + lane * MAX_COMMANDS + ci);
             ImGui::SetCursorScreenPos(node0);
             ImGui::InvisibleButton("resource_node", ImVec2(res_node_w, res_node_h));
-            if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            if (graph_interactive && ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
                 g_sel_res = graph.resource_handles[lane];
                 g_sel_cmd = INVALID_HANDLE;
                 s_res_nav = g_sel_res;
             }
-            if (ImGui::IsItemHovered())
+            if (graph_interactive && ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s %s\nCommand: %s\n%s", ui_render_graph_usage_label(flags), ui_resource_display_name(*r), c->name, ui_resource_display_type(*r));
             ImGui::PopID();
         }
@@ -12966,6 +13793,23 @@ static void ui_top_bar_load_progress(float row_y, float row_h) {
         int pct = (int)(progress.fraction * 100.0f + 0.5f);
         ImGui::SetTooltip("Loading %s  %d%%\n%s", progress.label, pct, progress.path);
     }
+}
+
+static float ui_top_bar_chip_width(const char* text) {
+    return ImGui::CalcTextSize(text ? text : "").x + ui_margin_px(14.0f);
+}
+
+static void ui_top_bar_chip(ImDrawList* dl, ImVec2 pos, const char* text, float row_h, ImVec4 tint) {
+    const char* safe_text = text ? text : "";
+    ImVec2 text_sz = ImGui::CalcTextSize(safe_text);
+    ImVec2 size(ui_top_bar_chip_width(safe_text), row_h);
+    ImVec2 max(pos.x + size.x, pos.y + size.y);
+    ImVec4 bg = ImVec4(tint.x * 0.16f + 0.070f, tint.y * 0.16f + 0.066f, tint.z * 0.16f + 0.068f, 1.0f);
+    ImVec4 border = ImVec4(tint.x * 0.42f, tint.y * 0.42f, tint.z * 0.42f, 0.86f);
+    dl->AddRectFilled(pos, max, ImGui::GetColorU32(bg), ui_margin_px(3.0f));
+    dl->AddRect(pos, max, ImGui::GetColorU32(border), ui_margin_px(3.0f));
+    dl->AddText(ImVec2(pos.x + ui_margin_px(8.0f), pos.y + floorf((row_h - text_sz.y) * 0.5f)),
+                ImGui::GetColorU32(ImVec4(0.90f, 0.88f, 0.86f, 1.0f)), safe_text);
 }
 
 static void ui_top_bar() {
@@ -13096,7 +13940,6 @@ static void ui_top_bar() {
                     ImVec4(0.74f, 0.53f, 0.42f, 1.0f), row_h);
     ui_top_bar_load_progress(row_y, row_h);
 
-    char summary[256] = {};
     static bool s_frame_ms_display_valid = false;
     static float s_frame_ms_display = 0.0f;
     float frame_ms_raw = ImGui::GetIO().DeltaTime * 1000.0f;
@@ -13107,46 +13950,22 @@ static void ui_top_bar() {
         s_frame_ms_display_valid = true;
     }
     float frame_ms = s_frame_ms_display;
-    const char* present_mode_label = g_dx.vsync ? "vsync" :
-        (g_dx.present_allow_tearing ? "tearing" : "no-vsync");
-    if (g_profiler_enabled) {
-        ui_refresh_profiler_readout_cache();
-        if (cmd_profile_total_ready() && cmd_profile_ready()) {
-            snprintf(summary, sizeof(summary),
-                "dt %.2f ms  cpu %.2f ms  ui %.2f+%.2f ms  present %.2f ms  other %.2f ms  gpu %.3f ms  cmds %.3f ms  app %s  vram %s  %s  cfg %s",
-                frame_ms, app_cpu_frame_ms(), app_cpu_ui_build_ms(), app_cpu_ui_render_ms(),
-                app_cpu_present_ms(), app_cpu_other_ms(),
-                cmd_profile_total_frame_ms(), cmd_profile_frame_ms(),
-                s_profiler_readout_cache.app_memory, s_profiler_readout_cache.gpu_memory,
-                present_mode_label, LAZYTOOL_BUILD_CONFIG);
-        } else if (cmd_profile_total_ready()) {
-            snprintf(summary, sizeof(summary),
-                "dt %.2f ms  cpu %.2f ms  ui %.2f+%.2f ms  present %.2f ms  other %.2f ms  gpu %.3f ms  cmds ...  app %s  vram %s  %s  cfg %s",
-                frame_ms, app_cpu_frame_ms(), app_cpu_ui_build_ms(), app_cpu_ui_render_ms(),
-                app_cpu_present_ms(), app_cpu_other_ms(),
-                cmd_profile_total_frame_ms(),
-                s_profiler_readout_cache.app_memory, s_profiler_readout_cache.gpu_memory,
-                present_mode_label, LAZYTOOL_BUILD_CONFIG);
-        } else if (cmd_profile_ready()) {
-            snprintf(summary, sizeof(summary),
-                "dt %.2f ms  cpu %.2f ms  ui %.2f+%.2f ms  present %.2f ms  other %.2f ms  gpu ...  cmds %.3f ms  app %s  vram %s  %s  cfg %s",
-                frame_ms, app_cpu_frame_ms(), app_cpu_ui_build_ms(), app_cpu_ui_render_ms(),
-                app_cpu_present_ms(), app_cpu_other_ms(),
-                cmd_profile_frame_ms(),
-                s_profiler_readout_cache.app_memory, s_profiler_readout_cache.gpu_memory,
-                present_mode_label, LAZYTOOL_BUILD_CONFIG);
-        } else {
-            snprintf(summary, sizeof(summary),
-                "dt %.2f ms  cpu %.2f ms  ui %.2f+%.2f ms  present %.2f ms  other %.2f ms  gpu ...  cmds ...  app %s  vram %s  %s  cfg %s",
-                frame_ms, app_cpu_frame_ms(), app_cpu_ui_build_ms(), app_cpu_ui_render_ms(),
-                app_cpu_present_ms(), app_cpu_other_ms(),
-                s_profiler_readout_cache.app_memory, s_profiler_readout_cache.gpu_memory,
-                present_mode_label, LAZYTOOL_BUILD_CONFIG);
-        }
-    } else {
-        snprintf(summary, sizeof(summary), "dt %.2f ms  cmds %d  %s  cfg %s",
-            frame_ms, ui_active_command_count(), present_mode_label, LAZYTOOL_BUILD_CONFIG);
-    }
+    const char* present_chip = g_dx.vsync ? "VSync" : (g_dx.present_allow_tearing ? "Tearing" : "No VSync");
+    char cfg_chip[32] = {};
+    ui_title_case_label(LAZYTOOL_BUILD_CONFIG, cfg_chip, sizeof(cfg_chip));
+    char fps_chip[32] = {};
+    char ms_chip[32] = {};
+    char res_chip[32] = {};
+    char frame_chip[40] = {};
+    char time_chip[40] = {};
+    char mode_chip[48] = {};
+    float fps = frame_ms > 0.001f ? 1000.0f / frame_ms : 0.0f;
+    snprintf(fps_chip, sizeof(fps_chip), "%.0f FPS", fps);
+    snprintf(ms_chip, sizeof(ms_chip), "%.1f ms", frame_ms);
+    snprintf(res_chip, sizeof(res_chip), "%dx%d", g_dx.scene_width, g_dx.scene_height);
+    snprintf(frame_chip, sizeof(frame_chip), "Frame %llu", (unsigned long long)app_scene_frame());
+    snprintf(time_chip, sizeof(time_chip), "Time %.2fs", app_scene_time());
+    snprintf(mode_chip, sizeof(mode_chip), "%s / %s", present_chip, cfg_chip);
 
     float content_max_x = ImGui::GetWindowContentRegionMax().x;
     float controls_w = ui_window_controls_width();
@@ -13154,17 +13973,26 @@ static void ui_top_bar() {
     float summary_gap = ui_margin_px(12.0f);
     float drag_gap = ui_margin_px(8.0f);
     float left_end_x = ImGui::GetCursorPosX();
-    float summary_max_w = controls_x - left_end_x - summary_gap - drag_gap;
-    char summary_fit[256] = {};
-    float summary_w = 0.0f;
-    float summary_x = controls_x - summary_gap;
-    if (summary_max_w > ui_margin_px(32.0f)) {
-        ui_fit_text_ellipsis(summary, summary_max_w, summary_fit, sizeof(summary_fit));
-        summary_w = ImGui::CalcTextSize(summary_fit).x;
-        summary_x = controls_x - summary_gap - summary_w;
+    const char* chips[] = { fps_chip, ms_chip, frame_chip, time_chip, res_chip, mode_chip };
+    ImVec4 chip_tints[] = {
+        ImVec4(0.70f, 0.78f, 0.86f, 1.0f),
+        ImVec4(0.72f, 0.66f, 0.88f, 1.0f),
+        ImVec4(0.86f, 0.68f, 0.45f, 1.0f),
+        ImVec4(0.80f, 0.74f, 0.58f, 1.0f),
+        ImVec4(0.60f, 0.78f, 0.68f, 1.0f),
+        ImVec4(0.78f, 0.42f, 0.32f, 1.0f)
+    };
+    const int chip_count = (int)(sizeof(chips) / sizeof(chips[0]));
+    float chip_spacing = ui_margin_px(6.0f);
+    float chips_w = 0.0f;
+    for (int i = 0; i < chip_count; i++) {
+        if (i > 0)
+            chips_w += chip_spacing;
+        chips_w += ui_top_bar_chip_width(chips[i]);
     }
+    float chips_x = controls_x - summary_gap - chips_w;
 
-    float drag_w = summary_x - left_end_x - drag_gap;
+    float drag_w = chips_x - left_end_x - drag_gap;
     if (drag_w > ui_margin_px(24.0f)) {
         ImGui::SameLine();
         ui_align_frame_row(row_y);
@@ -13175,10 +14003,17 @@ static void ui_top_bar() {
         }
     }
 
-    if (summary_w > 0.0f) {
-        ImGui::SetCursorPosX(summary_x);
-        ui_align_text_row(row_y);
-        ImGui::TextDisabled("%s", summary_fit);
+    if (chips_x > left_end_x + ui_margin_px(12.0f)) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 chip_pos = ImGui::GetWindowPos();
+        chip_pos.x += chips_x;
+        chip_pos.y += row_y;
+        for (int i = 0; i < chip_count; i++) {
+            if (i > 0)
+                chip_pos.x += chip_spacing;
+            ui_top_bar_chip(dl, chip_pos, chips[i], row_h, chip_tints[i]);
+            chip_pos.x += ui_top_bar_chip_width(chips[i]);
+        }
     }
 
     ImGui::SetCursorPosX(controls_x);
@@ -13206,12 +14041,10 @@ static void ui_workspace_layout() {
     }
 
     if (s_viewport_fullscreen) {
-        char detail[96] = {};
-        ui_viewport_detail(detail, sizeof(detail));
         bool restart_clicked = false;
         bool pause_clicked = false;
         bool exit_clicked = false;
-        if (ui_begin_tool_panel("##viewport_panel_full", "VIEWPORT", detail, avail, UI_PANEL_VIEWPORT,
+        if (ui_begin_tool_panel("##viewport_panel_full", "VIEWPORT", nullptr, avail, UI_PANEL_VIEWPORT,
                                 "Restart##viewport_restart_full", &restart_clicked,
                                 app_scene_paused() ? "Resume##viewport_resume_full" : "Pause##viewport_pause_full", &pause_clicked,
                                 "Exit fullscreen##viewport_fullscreen_exit", &exit_clicked)) {
@@ -13266,12 +14099,10 @@ static void ui_workspace_layout() {
 
     ImGui::SameLine(0.0f, col_gap);
     ImGui::BeginGroup();
-    char viewport_detail[96] = {};
-    ui_viewport_detail(viewport_detail, sizeof(viewport_detail));
     bool restart_clicked = false;
     bool pause_clicked = false;
     bool fullscreen_clicked = false;
-    if (ui_begin_tool_panel("##viewport_panel", "VIEWPORT", viewport_detail, ImVec2(center_w, viewport_h), UI_PANEL_VIEWPORT,
+    if (ui_begin_tool_panel("##viewport_panel", "VIEWPORT", nullptr, ImVec2(center_w, viewport_h), UI_PANEL_VIEWPORT,
                             "Restart##viewport_restart", &restart_clicked,
                             app_scene_paused() ? "Resume##viewport_resume" : "Pause##viewport_pause", &pause_clicked,
                             "Fullscreen##viewport_fullscreen", &fullscreen_clicked)) {
@@ -13313,8 +14144,10 @@ static void ui_workspace_layout() {
         if (s_right_panel_general_open) {
             if (collapsed_h > 0.0f) {
                 if (ui_header_only_panel("##inspector_collapsed_panel", "INSPECTOR", ui_inspector_header_detail(),
-                                         ImVec2(0.0f, collapsed_h), UI_PANEL_INSPECTOR))
+                                         ImVec2(0.0f, collapsed_h), UI_PANEL_INSPECTOR)) {
                     s_right_panel_general_open = false;
+                    s_focus_inspector_panel_next = true;
+                }
             }
 
             if (collapsed_h > 0.0f)
@@ -13335,6 +14168,10 @@ static void ui_workspace_layout() {
                         ui_panel_inspector(true);
                         ImGui::EndTabItem();
                     }
+                    if (ImGui::BeginTabItem("Resources Viewer")) {
+                        ui_panel_resources_viewer(true);
+                        ImGui::EndTabItem();
+                    }
                     if (ImGui::BeginTabItem("Bindings")) {
                         ui_panel_bindings(true);
                         ImGui::EndTabItem();
@@ -13347,8 +14184,10 @@ static void ui_workspace_layout() {
             if (collapsed_h > 0.0f) {
                 ImGui::SetCursorPosY(ImGui::GetCursorPosY() + col_gap);
                 if (ui_header_only_panel("##general_collapsed_panel", "GENERAL", nullptr,
-                                         ImVec2(0.0f, collapsed_h), UI_PANEL_GENERAL))
+                                         ImVec2(0.0f, collapsed_h), UI_PANEL_GENERAL)) {
                     s_right_panel_general_open = true;
+                    s_focus_general_panel_next = true;
+                }
             }
         }
     }
@@ -13414,6 +14253,22 @@ bool ui_show_inspector_notes() {
     return s_show_inspector_notes;
 }
 
+void ui_set_render_target_preview_columns(int columns) {
+    if (columns < 1) columns = 1;
+    if (columns > 8) columns = 8;
+    s_render_target_preview_columns = columns;
+}
+
+int ui_render_target_preview_columns() {
+    return s_render_target_preview_columns;
+}
+
+void ui_request_scene_surface_layout_refresh() {
+    s_scene_surface_resize_armed = true;
+    s_scene_surface_host_w = 0;
+    s_scene_surface_host_h = 0;
+}
+
 void ui_init() {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -13422,7 +14277,7 @@ void ui_init() {
     ImGui::StyleColorsDark();
     ImGui::SetColorEditOptions(ImGuiColorEditFlags_Float);
 
-    ImFont* ui_font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 18.0f);
+    ImFont* ui_font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 16.0f);
     if (ui_font)
         io.FontDefault = ui_font;
     else
@@ -13435,7 +14290,6 @@ void ui_init() {
     ui_apply_gray_tool_style();
     s_ui_base_style = ImGui::GetStyle();
     s_ui_base_style_valid = true;
-    s_ui_global_scale = k_ui_scale_default;
     ui_apply_global_scale_now();
     s_ui_scale_dirty = false;
 
@@ -13448,6 +14302,9 @@ void ui_init() {
 void ui_draw() {
     ui_profile_begin_frame();
     g_editor_mouse_capture = false;
+    g_scene_view_hovered = false;
+    g_scene_view_focused = false;
+    g_scene_view_pointer_over = false;
 
     {
         UI_PROFILE_SCOPE(UI_PROFILE_FRAME_SETUP);
@@ -13460,13 +14317,15 @@ void ui_draw() {
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
     }
+    ui_update_project_load_request();
 
     ImGuiIO& io = ImGui::GetIO();
     bool shader_editor_was_focused = s_shader_source_editor_focused;
     s_shader_source_editor_focused = false;
     bool hotkeys_ok = !io.WantTextInput && !io.WantCaptureKeyboard &&
                       !ImGui::IsAnyItemActive() && !shader_editor_was_focused;
-    bool editor_selection_hotkeys_ok = hotkeys_ok && !s_timeline_keyboard_focus;
+    bool editor_selection_hotkeys_ok = !io.WantTextInput && !ImGui::IsAnyItemActive() &&
+                                       !shader_editor_was_focused && !s_timeline_keyboard_focus;
     if (ImGui::IsKeyPressed(ImGuiKey_F5, false))
         ui_recompile_all_shaders();
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false))
@@ -13530,6 +14389,7 @@ void ui_draw() {
         ui_draw_render_graph_window();
         ui_draw_timeline_window();
         ui_draw_shader_editor_window();
+        ui_draw_project_load_progress_window();
     }
 
     {
