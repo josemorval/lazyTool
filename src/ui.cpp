@@ -278,6 +278,9 @@ static bool s_rename_is_cmd = false;
 static char s_project_path[MAX_PATH_LEN] = "project.lt";
 static ResHandle s_res_nav = INVALID_HANDLE;
 static CmdHandle s_cmd_nav = INVALID_HANDLE;
+static bool s_res_scroll_to_nav = false;
+static bool s_cmd_scroll_to_nav = false;
+static void ui_scroll_resources_to_nav_if_requested(int nav_index, float row_h);
 
 enum ProjectFileMode {
     PROJECT_FILE_NONE = 0,
@@ -430,6 +433,7 @@ struct PathInputResult {
     bool changed;
     bool file_selected;
     bool dir_selected;
+    bool submitted;
 };
 
 struct PathInputCallbackState {
@@ -900,6 +904,7 @@ static PathInputResult ui_path_input_ex(const char* label, char* buf, int buf_sz
     ImGui::SetItemKeyOwner(ImGuiKey_Enter);
     ImGui::SetItemKeyOwner(ImGuiKey_KeypadEnter);
     result.changed = ImGui::IsItemEdited();
+    result.submitted = enter_requested;
     if (result.changed)
         ui_canonicalize_path_separators(buf, buf_sz);
     bool activated = ImGui::IsItemActivated();
@@ -959,6 +964,7 @@ static PathInputResult ui_path_input_ex(const char* label, char* buf, int buf_sz
                     ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
                     ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
                 if (accept) {
+                    result.submitted = true;
                     ui_apply_path_candidate(candidates[s_nav_index], buf, buf_sz, &result);
                     if (!candidates[s_nav_index].is_dir)
                         s_open_id = 0;
@@ -1348,13 +1354,19 @@ static void ui_project_file_bar() {
     }
     PathInputResult path_result = ui_path_input_ex("##project_path", s_project_path, MAX_PATH_LEN, ".lt",
         focus_path ? ImGuiInputTextFlags_AutoSelectAll : 0);
-    if (!save && path_result.file_selected) {
-        project_load_text(s_project_path);
-        if (g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED) {
-            camera_sync_euler_from_quat(&g_camera);
-            camera_set_euler(&g_camera, g_camera.yaw, clampf(g_camera.pitch, -1.55334f, 1.55334f), g_camera.roll);
+    bool path_commit = (path_result.file_selected || path_result.submitted) && !path_result.dir_selected;
+    if (path_commit) {
+        if (save) {
+            project_save_text(s_project_path);
+            s_project_file_mode = PROJECT_FILE_NONE;
+        } else if (ui_file_exists(s_project_path)) {
+            project_load_text(s_project_path);
+            if (g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED) {
+                camera_sync_euler_from_quat(&g_camera);
+                camera_set_euler(&g_camera, g_camera.yaw, clampf(g_camera.pitch, -1.55334f, 1.55334f), g_camera.roll);
+            }
+            s_project_file_mode = PROJECT_FILE_NONE;
         }
-        s_project_file_mode = PROJECT_FILE_NONE;
     }
     ImGui::SameLine();
 
@@ -6128,19 +6140,36 @@ static void ui_panel_resources(bool embedded = false) {
                     if (nav_index < 0)
                         nav_index = ui_find_visible_resource_index(visible_items, visible, g_sel_res);
                     if (nav_index < 0) nav_index = 0;
-                    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false) && nav_index > 0)
+                    bool nav_moved = false;
+                    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false) && nav_index > 0) {
                         nav_index--;
-                    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false) && nav_index + 1 < visible)
+                        nav_moved = true;
+                    }
+                    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false) && nav_index + 1 < visible) {
                         nav_index++;
+                        nav_moved = true;
+                    }
+                    if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) {
+                        nav_index = 0;
+                        nav_moved = true;
+                    }
+                    if (ImGui::IsKeyPressed(ImGuiKey_End, false)) {
+                        nav_index = visible - 1;
+                        nav_moved = true;
+                    }
                     s_res_nav = visible_items[nav_index];
+                    if (nav_moved)
+                        s_res_scroll_to_nav = true;
                     if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
                         g_sel_res = s_res_nav;
                         g_sel_cmd = INVALID_HANDLE;
                     }
                 }
             }
+            float row_h = ImGui::GetTextLineHeight() + 10.0f;
+            ui_scroll_resources_to_nav_if_requested(ui_find_visible_resource_index(visible_items, visible, s_res_nav), row_h);
             ImGuiListClipper clipper;
-            clipper.Begin(visible, ImGui::GetTextLineHeight() + 10.0f);
+            clipper.Begin(visible, row_h);
             while (clipper.Step()) {
                 for (int item = clipper.DisplayStart; item < clipper.DisplayEnd; item++) {
                     Resource* r = res_get(visible_items[item]);
@@ -6165,19 +6194,36 @@ static void ui_panel_resources(bool embedded = false) {
                     if (nav_index < 0)
                         nav_index = ui_find_visible_resource_index(visible_items, visible, g_sel_res);
                     if (nav_index < 0) nav_index = 0;
-                    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false) && nav_index > 0)
+                    bool nav_moved = false;
+                    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false) && nav_index > 0) {
                         nav_index--;
-                    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false) && nav_index + 1 < visible)
+                        nav_moved = true;
+                    }
+                    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false) && nav_index + 1 < visible) {
                         nav_index++;
+                        nav_moved = true;
+                    }
+                    if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) {
+                        nav_index = 0;
+                        nav_moved = true;
+                    }
+                    if (ImGui::IsKeyPressed(ImGuiKey_End, false)) {
+                        nav_index = visible - 1;
+                        nav_moved = true;
+                    }
                     s_res_nav = visible_items[nav_index];
+                    if (nav_moved)
+                        s_res_scroll_to_nav = true;
                     if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
                         g_sel_res = s_res_nav;
                         g_sel_cmd = INVALID_HANDLE;
                     }
                 }
             }
+            float row_h = ImGui::GetTextLineHeight() + 10.0f;
+            ui_scroll_resources_to_nav_if_requested(ui_find_visible_resource_index(visible_items, visible, s_res_nav), row_h);
             ImGuiListClipper clipper;
-            clipper.Begin(visible, ImGui::GetTextLineHeight() + 10.0f);
+            clipper.Begin(visible, row_h);
             while (clipper.Step()) {
                 for (int item = clipper.DisplayStart; item < clipper.DisplayEnd; item++) {
                     Resource* r = res_get(visible_items[item]);
@@ -6261,6 +6307,56 @@ static void ui_draw_command_tree_cached(const UiVisibleCommandCache* cache) {
         }
     }
 }
+
+static float ui_visible_command_y_offset(const UiVisibleCommandCache* cache, int target_index) {
+    if (!cache || target_index <= 0)
+        return 0.0f;
+
+    float y = 0.0f;
+    const float spacing_y = ImGui::GetStyle().ItemSpacing.y;
+    int count = target_index < cache->count ? target_index : cache->count;
+    for (int i = 0; i < count; i++) {
+        Command* c = cmd_get(cache->items[i]);
+        if (!c)
+            continue;
+        if (i > 0)
+            y += spacing_y;
+        y += ui_command_tree_row_height(*c);
+    }
+    return y;
+}
+
+static void ui_scroll_list_to_row(float list_start_y, float row_y, float row_h) {
+    float visible_h = ImGui::GetWindowHeight();
+    float target_scroll = list_start_y + row_y - (visible_h - row_h) * 0.5f;
+    if (target_scroll < 0.0f)
+        target_scroll = 0.0f;
+    ImGui::SetScrollY(target_scroll);
+}
+
+static void ui_scroll_commands_to_nav_if_requested(const UiVisibleCommandCache* cache, int nav_index) {
+    if (!s_cmd_scroll_to_nav)
+        return;
+    s_cmd_scroll_to_nav = false;
+    if (!cache || nav_index < 0 || nav_index >= cache->count)
+        return;
+
+    Command* c = cmd_get(cache->items[nav_index]);
+    if (!c)
+        return;
+    ui_scroll_list_to_row(ImGui::GetCursorPosY(), ui_visible_command_y_offset(cache, nav_index),
+                          ui_command_tree_row_height(*c));
+}
+
+static void ui_scroll_resources_to_nav_if_requested(int nav_index, float row_h) {
+    if (!s_res_scroll_to_nav)
+        return;
+    s_res_scroll_to_nav = false;
+    if (nav_index < 0)
+        return;
+    ui_scroll_list_to_row(ImGui::GetCursorPosY(), (float)nav_index * row_h, row_h);
+}
+
 
 static void ui_panel_commands(bool embedded = false) {
     if (!embedded) ImGui::Begin("Commands");
@@ -6352,11 +6448,26 @@ static void ui_panel_commands(bool embedded = false) {
             if (nav_index < 0)
                 nav_index = ui_find_visible_command_index(visible_items, visible, g_sel_cmd);
             if (nav_index < 0) nav_index = 0;
-            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false) && nav_index > 0)
+            bool nav_moved = false;
+            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false) && nav_index > 0) {
                 nav_index--;
-            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false) && nav_index + 1 < visible)
+                nav_moved = true;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false) && nav_index + 1 < visible) {
                 nav_index++;
+                nav_moved = true;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) {
+                nav_index = 0;
+                nav_moved = true;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_End, false)) {
+                nav_index = visible - 1;
+                nav_moved = true;
+            }
             s_cmd_nav = visible_items[nav_index];
+            if (nav_moved)
+                s_cmd_scroll_to_nav = true;
             Command* nav_cmd = cmd_get(s_cmd_nav);
             if (nav_cmd && (nav_cmd->type == CMD_REPEAT || nav_cmd->type == CMD_GROUP)) {
                 if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false) && nav_cmd->repeat_expanded) {
@@ -6375,6 +6486,7 @@ static void ui_panel_commands(bool embedded = false) {
         }
     }
 
+    ui_scroll_commands_to_nav_if_requested(visible_cache, ui_find_visible_command_index(visible_items, visible, s_cmd_nav));
     ui_draw_command_tree_cached(visible_cache);
 
     if (ImGui::IsWindowFocused() && ImGui::IsKeyPressed(ImGuiKey_F2)) {
@@ -9588,6 +9700,8 @@ static void ui_focus_current_panel_window() {
         return;
 
     s_focused_panel_id = window->ID;
+    ImGui::SetWindowFocus();
+    ImGui::ClearActiveID();
     if (s_panel_focus_count > 0)
         s_panel_focus_stack[s_panel_focus_count - 1] = true;
 }
@@ -10161,8 +10275,7 @@ static void ui_draw_shader_editor_window() {
     ImGui::SetNextWindowViewport(vp->ID);
     ImGui::SetNextWindowSize(ImVec2(ui_px(900.0f), ui_px(640.0f)), ImGuiCond_FirstUseEver);
     ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoCollapse |
-                                    ImGuiWindowFlags_NoTitleBar |
-                                    ImGuiWindowFlags_NoFocusOnAppearing;
+                                    ImGuiWindowFlags_NoTitleBar;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ui_panel_bg(UI_PANEL_DEFAULT));
@@ -11364,8 +11477,7 @@ static void ui_draw_timeline_window() {
     ImGui::SetNextWindowViewport(vp->ID);
     ImGui::SetNextWindowSize(ImVec2(ui_px(920.0f), ui_px(420.0f)), ImGuiCond_FirstUseEver);
     ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoCollapse |
-                                    ImGuiWindowFlags_NoTitleBar |
-                                    ImGuiWindowFlags_NoFocusOnAppearing;
+                                    ImGuiWindowFlags_NoTitleBar;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ui_panel_bg(UI_PANEL_DEFAULT));
@@ -12340,8 +12452,7 @@ static void ui_draw_render_graph_window() {
                             ImGuiCond_FirstUseEver);
 
     ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoCollapse |
-                                    ImGuiWindowFlags_NoTitleBar |
-                                    ImGuiWindowFlags_NoFocusOnAppearing;
+                                    ImGuiWindowFlags_NoTitleBar;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ui_panel_bg(UI_PANEL_DEFAULT));
