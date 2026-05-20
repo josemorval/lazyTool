@@ -1,0 +1,1070 @@
+# demo_64k_pbr_post.lt
+# Procedural 64k-style PBR/deferred demo for lazyTool DX11.
+# No external assets, external textures, GLTF, Gaussian Splats, compute shaders, GitHub snippets or third-party shader code are used. V3 adds a procedural sky/IBL and higher-quality postprocesses.
+# Visible geometry is only cube and sphere primitives; fullscreen_triangle is used only by post/deferred passes.
+
+lazyTool_project 1
+
+camera_fps 0 1.65 -6.2 0 -0.13 0.82 0.05 80 0
+
+dirlight -3.8 7.2 -4.4 0 0 0 1 0.88 0.72 4.2 2048 2048 0.05 45 11 11 4 34 0.72 5.5 8 8 0.05 18 12 13 13 0.05 26 22 23 23 0.05 38 34 36 36 0.05 55
+
+export_settings 1 1 0 1 1 1
+
+resources
+resource mesh_primitive mesh_cube cube
+resource mesh_primitive mesh_sphere sphere
+resource mesh_primitive mesh_fullscreen fullscreen_triangle
+resource render_texture rt_gbuf_normal 1 1 10 1 1 0 0 1
+resource render_texture rt_gbuf_albedo 1 1 10 1 1 0 0 1
+resource render_texture rt_gbuf_emissive 1 1 10 1 1 0 0 1
+resource render_texture rt_hdr_scene 1 1 10 1 1 0 0 1
+resource render_texture rt_ssao_raw 1 1 28 1 1 0 0 2
+resource render_texture rt_ssao_tmp 1 1 28 1 1 0 0 2
+resource render_texture rt_ssao_blur 1 1 28 1 1 0 0 2
+resource render_texture rt_bloom_a 1 1 10 1 1 0 0 2
+resource render_texture rt_bloom_b 1 1 10 1 1 0 0 2
+resource render_texture rt_bloom_q_a 1 1 10 1 1 0 0 4
+resource render_texture rt_bloom_q_b 1 1 10 1 1 0 0 4
+resource render_texture rt_bloom_e_a 1 1 10 1 1 0 0 8
+resource render_texture rt_bloom_e_b 1 1 10 1 1 0 0 8
+resource render_texture rt_bloom_final 1 1 10 1 1 0 0 2
+resource render_texture rt_dof_coc 1 1 28 1 1 0 0 1
+resource render_texture rt_dof_scene 1 1 10 1 1 0 0 1
+resource render_texture rt_lens_flare 1 1 10 1 1 0 0 2
+resource value float4 PostBloomParams 0 0 0 0 1.08 0.42 0.58 0.55
+resource value float4 PostAOParams 0 0 0 0 1.45 1.08 0.045 1.03
+resource value float4 PostDOFParams 0 0 0 0 7 0.42 7.5 0
+resource value float4 PostFlareParams 0 0 0 0 1.35 0.36 0.43 2.15
+resource value float4 PostGradeParams 0 0 0 0 0.02 1.05 0.94 0.68
+resource value float4 ColorGrade 0 0 0 0 1.04 0.99 0.92 0.42
+resource value float GrainAmount 0 0 0 0 0.009 0 0 0
+resource value float4 SunColorTuning 0 0 0 0 1.04 0.96 0.86 0.70
+resource value float4 MaterialGlobalTuning 0 0 0 0 0.96 1 0.58 1
+resource value float4 SkyParams 0 0 0 0 1.25 0.58 0.75 0.08
+resource value float4 SkyTint 0 0 0 0 0.76 0.88 1.12 0.92
+resource value float4 ClearDark 0 0 0 0 0.004 0.006 0.011 1
+resource shader_vsps shader_gbuffer_pbr shaders/demo64k/gbuffer_pbr.hlsl
+resource shader_vsps shader_lighting_pbr shaders/demo64k/lighting_pbr.hlsl
+resource shader_vsps shader_ssao shaders/demo64k/ssao.hlsl
+resource shader_vsps shader_blur_bilateral shaders/demo64k/blur_bilateral.hlsl
+resource shader_vsps shader_bloom_prefilter shaders/demo64k/bloom_prefilter.hlsl
+resource shader_vsps shader_bloom_downsample shaders/demo64k/bloom_downsample.hlsl
+resource shader_vsps shader_bloom_blur shaders/demo64k/bloom_blur.hlsl
+resource shader_vsps shader_bloom_combine shaders/demo64k/bloom_combine.hlsl
+resource shader_vsps shader_dof_coc shaders/demo64k/dof_coc.hlsl
+resource shader_vsps shader_dof_blur shaders/demo64k/dof_blur.hlsl
+resource shader_vsps shader_lens_flare_hex shaders/demo64k/lens_flare_hex.hlsl
+resource shader_vsps shader_composite_tonemap shaders/demo64k/composite_tonemap.hlsl
+resource_note mesh_cube|mesh Visible geometry primitive only. The demo deliberately avoids GLTF, splats, external textures and any asset file.
+resource_note mesh_sphere|mesh Visible geometry primitive only. Spheres receive all material detail procedurally in gbuffer_pbr.hlsl.
+resource_note mesh_fullscreen|mesh Fullscreen triangle is used only for post-processing / deferred passes, never as visible scene geometry.
+resource_note PostBloomParams|float4 x BloomThreshold, y BloomKnee, z BloomIntensity, w wide-bloom blend. V3 uses multi-scale half/quarter/eighth bloom for a softer professional glow.
+resource_note PostAOParams|float4 x AORadius, y AOIntensity, z AOBias, w AOPower. V3 SSAO uses stable spiral sampling plus two-pass bilateral denoise for less crawling/noise.
+resource_note PostDOFParams|float4 x DOFFocusDistance, y DOFAperture, z DOFMaxBlur pixels, w unused. V3 stores near/far CoC and uses a 24-tap hex bokeh gather.
+resource_note PostFlareParams|float4 x LensFlareThreshold, y LensFlareIntensity, z ghost spacing, w hex sharpness. The shader is custom and procedural; no GitHub/external code used.
+resource_note PostGradeParams|float4 x Exposure, y Contrast, z Saturation, w Vignette. Final tonemap uses ACES from shaders/common.hlsl plus subtle grading.
+resource_note ColorGrade|float4 rgb ColorGrade multiplier, w subtle chromatic aberration amount. Keep w low for a 64k-style polished look.
+resource_note GrainAmount|float Very subtle procedural film grain amount in composite_tonemap.hlsl. No texture is used.
+resource_note SunColorTuning|float4 rgb warm sunlight tint multiplier, w ambient amount. Directional light and cascaded shadow data come from SceneCB/common.hlsl.
+resource_note SkyParams|float4 x sky intensity, y sun disk/glow, z horizon warmth, w procedural stars. No cubemap or external texture is used.
+resource_note SkyTint|float4 rgb sky tint, w reflection/IBL strength. Lighting uses the procedural sky for ambient diffuse and glossy sky reflections.
+resource_note MaterialGlobalTuning|float4 x roughness scale, y metalness scale, z procedural micro-detail, w emissive boost. Shared by all gbuffer material commands.
+resource_note rt_gbuf_normal|render_texture2d GBuffer target 0: encoded world normal in rgb and roughness in alpha.
+resource_note rt_gbuf_albedo|render_texture2d GBuffer target 1: procedural base color in rgb and metalness in alpha.
+resource_note rt_gbuf_emissive|render_texture2d GBuffer target 2: HDR emissive color from procedural neon material.
+resource_note rt_hdr_scene|render_texture2d Linear HDR lighting buffer before bloom, DOF and tonemap.
+resource_note rt_ssao_raw|render_texture2d Half-resolution procedural SSAO output before denoise. Raw preview will still look noisy; final lighting reads rt_ssao_blur.
+resource_note rt_ssao_tmp|render_texture2d Half-resolution temporary texture for the first separable bilateral SSAO blur pass.
+resource_note rt_ssao_blur|render_texture2d Half-resolution final bilateral SSAO. Lighting reads this to darken ambient only.
+resource_note rt_bloom_a|render_texture2d Half-resolution bloom ping-pong A / final blurred bloom.
+resource_note rt_bloom_b|render_texture2d Half-resolution bloom ping-pong B.
+resource_note rt_bloom_q_a|render_texture2d Quarter-resolution bloom pyramid A for wider glow.
+resource_note rt_bloom_q_b|render_texture2d Quarter-resolution bloom pyramid B for wider glow.
+resource_note rt_bloom_e_a|render_texture2d Eighth-resolution bloom pyramid A for large-radius soft glow.
+resource_note rt_bloom_e_b|render_texture2d Eighth-resolution bloom pyramid B for large-radius soft glow.
+resource_note rt_bloom_final|render_texture2d Combined multi-scale bloom read by flare and final composite.
+resource_note rt_dof_coc|render_texture2d Circle-of-confusion buffer from scene depth. R is absolute CoC, G near foreground CoC, B far background CoC.
+resource_note rt_dof_scene|render_texture2d HDR scene after cheap depth-of-field blur, still linear.
+resource_note rt_lens_flare|render_texture2d Procedural hex/ghost flare buffer generated from bloom highlights. No external assets or code used.
+resource_note shader_gbuffer_pbr|shader Shader Model 5 VS/PS pass. Source is shaders/demo64k/gbuffer_pbr.hlsl; authored from scratch for this project, no GitHub or external snippets.
+resource_note shader_lighting_pbr|shader Shader Model 5 VS/PS pass. Source is shaders/demo64k/lighting_pbr.hlsl; V3 adds procedural sky background and sky-driven ambient/specular IBL; authored from scratch, no GitHub/external snippets.
+resource_note shader_ssao|shader Shader Model 5 VS/PS pass. Source is shaders/demo64k/ssao.hlsl; authored from scratch for this project, no GitHub or external snippets.
+resource_note shader_blur_bilateral|shader Shader Model 5 VS/PS pass. Source is shaders/demo64k/blur_bilateral.hlsl; authored from scratch for this project, no GitHub or external snippets.
+resource_note shader_bloom_prefilter|shader Shader Model 5 VS/PS pass. Source is shaders/demo64k/bloom_prefilter.hlsl; authored from scratch for this project, no GitHub or external snippets.
+resource_note shader_bloom_downsample|shader Shader Model 5 VS/PS pass. Downsamples the bloom pyramid with a tent filter; authored from scratch, no GitHub/external snippets.
+resource_note shader_bloom_blur|shader Shader Model 5 VS/PS pass. Source is shaders/demo64k/bloom_blur.hlsl; authored from scratch for this project, no GitHub or external snippets.
+resource_note shader_bloom_combine|shader Shader Model 5 VS/PS pass. Combines half/quarter/eighth bloom into rt_bloom_final; authored from scratch, no GitHub/external snippets.
+resource_note shader_dof_coc|shader Shader Model 5 VS/PS pass. Source is shaders/demo64k/dof_coc.hlsl; authored from scratch for this project, no GitHub or external snippets.
+resource_note shader_dof_blur|shader Shader Model 5 VS/PS pass. Source is shaders/demo64k/dof_blur.hlsl; authored from scratch for this project, no GitHub or external snippets.
+resource_note shader_lens_flare_hex|shader Shader Model 5 VS/PS pass. Source is shaders/demo64k/lens_flare_hex.hlsl; authored from scratch for this project, no GitHub or external snippets.
+resource_note shader_composite_tonemap|shader Shader Model 5 VS/PS pass. Source is shaders/demo64k/composite_tonemap.hlsl; authored from scratch for this project, no GitHub or external snippets.
+
+user_cb
+user_var PostBloomParams float4 PostBloomParams|float4 0 0 0 0 1.08 0.42 0.58 0.55
+user_var PostAOParams float4 PostAOParams|float4 0 0 0 0 1.45 1.08 0.045 1.03
+user_var PostDOFParams float4 PostDOFParams|float4 0 0 0 0 7 0.42 7.5 0
+user_var PostFlareParams float4 PostFlareParams|float4 0 0 0 0 1.35 0.36 0.43 2.15
+user_var PostGradeParams float4 PostGradeParams|float4 0 0 0 0 0.02 1.05 0.94 0.68
+user_var ColorGrade float4 ColorGrade|float4 0 0 0 0 1.04 0.99 0.92 0.42
+user_var GrainAmount float GrainAmount|float 0 0 0 0 0.009 0 0 0
+user_var SunColorTuning float4 SunColorTuning|float4 0 0 0 0 1.04 0.96 0.86 0.70
+user_var MaterialGlobalTuning float4 MaterialGlobalTuning|float4 0 0 0 0 0.96 1 0.58 1
+user_var SkyParams float4 SkyParams|float4 0 0 0 0 1.25 0.58 0.75 0.08
+user_var SkyTint float4 SkyTint|float4 0 0 0 0 0.76 0.88 1.12 0.92
+user_var ClearDark float4 ClearDark|float4 0 0 0 0 0.004 0.006 0.011 1
+end_user_cb
+
+commands
+command group frame_setup 1
+  note Clears only the render targets that are not fully overwritten by all geometry. Builtin scene depth is cleared once here and reused by the GBuffer/deferred pipeline.
+  targets - -
+  mrts 0
+  mesh_shader - -
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent -
+  srvs 0
+  uavs 0
+  params 0
+end_command
+command clear clear_gbuffer_normal_and_depth 1
+  note Clear normal/roughness to a safe default and reset scene_depth|builtin_scene_depth for the geometry pass.
+  targets rt_gbuf_normal|render_texture2d scene_depth|builtin_scene_depth
+  mrts 0
+  mesh_shader - -
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 1 0.5 0.5 1 1 1 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent frame_setup
+  srvs 0
+  uavs 0
+  params 0
+end_command
+command clear clear_gbuffer_albedo 1
+  note Clear albedo/metalness; geometry will overwrite foreground pixels.
+  targets rt_gbuf_albedo|render_texture2d -
+  mrts 0
+  mesh_shader - -
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 1 0 0 0 0 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent frame_setup
+  srvs 0
+  uavs 0
+  params 0
+end_command
+command clear clear_gbuffer_emissive 1
+  note Clear emissive buffer so only neon primitives inject bloom energy.
+  targets rt_gbuf_emissive|render_texture2d -
+  mrts 0
+  mesh_shader - -
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 1 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent frame_setup
+  srvs 0
+  uavs 0
+  params 0
+end_command
+command clear clear_hdr_scene 1
+  note Clear the linear HDR lighting buffer to the cinematic background color.
+  targets rt_hdr_scene|render_texture2d -
+  mrts 0
+  mesh_shader - -
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 1 0.004 0.006 0.011 1 0 1
+  clear_sources ClearDark|float4 -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent frame_setup
+  srvs 0
+  uavs 0
+  params 0
+end_command
+command group scene_geometry 1
+  note Visible scene: only cube and sphere mesh primitives. Each command sets MaterialId in UserCB, writes the same GBuffer MRTs, casts cascaded shadows, and uses no texture/model assets.
+  targets - -
+  mrts 0
+  mesh_shader - -
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent -
+  srvs 0
+  uavs 0
+  params 0
+end_command
+command draw_mesh floor_concrete_slab 1
+  note Large scaled cube floor using procedural triplanar concrete; casts and receives lighting/shadow in deferred pass.
+  targets rt_gbuf_normal|render_texture2d scene_depth|builtin_scene_depth
+  mrts 2 rt_gbuf_albedo|render_texture2d rt_gbuf_emissive|render_texture2d
+  mesh_shader mesh_cube|mesh shader_gbuffer_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 0
+  transformq 0 -0.11 1 0 0 0 1 10 0.18 12
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent scene_geometry
+  srvs 0
+  uavs 0
+  params 2
+  param MaterialGlobalTuning float4 1 MaterialGlobalTuning|float4 0 0 0 0 1 1 0.72 1
+  param MaterialId int 1 - 5 0 0 0 0 0 0 0
+end_command
+command draw_mesh rear_obsidian_plinth 1
+  note Dark glossy architectural block framing the back of the composition.
+  targets rt_gbuf_normal|render_texture2d scene_depth|builtin_scene_depth
+  mrts 2 rt_gbuf_albedo|render_texture2d rt_gbuf_emissive|render_texture2d
+  mesh_shader mesh_cube|mesh shader_gbuffer_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 0
+  transformq 0 0.55 4.45 0 0 0 1 8 1.1 0.42
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent scene_geometry
+  srvs 0
+  uavs 0
+  params 2
+  param MaterialGlobalTuning float4 1 MaterialGlobalTuning|float4 0 0 0 0 1 1 0.72 1
+  param MaterialId int 1 - 2 0 0 0 0 0 0 0
+end_command
+command draw_mesh left_concrete_column 1
+  note Tall rough concrete column with procedural micro-detail.
+  targets rt_gbuf_normal|render_texture2d scene_depth|builtin_scene_depth
+  mrts 2 rt_gbuf_albedo|render_texture2d rt_gbuf_emissive|render_texture2d
+  mesh_shader mesh_cube|mesh shader_gbuffer_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 0
+  transformq -3.2 1.15 2.4 0 0.159318207 0 0.987227283 0.75 2.3 0.75
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent scene_geometry
+  srvs 0
+  uavs 0
+  params 2
+  param MaterialGlobalTuning float4 1 MaterialGlobalTuning|float4 0 0 0 0 1 1 0.72 1
+  param MaterialId int 1 - 5 0 0 0 0 0 0 0
+end_command
+command draw_mesh right_ceramic_column 1
+  note White ceramic column for contrast against the dark background.
+  targets rt_gbuf_normal|render_texture2d scene_depth|builtin_scene_depth
+  mrts 2 rt_gbuf_albedo|render_texture2d rt_gbuf_emissive|render_texture2d
+  mesh_shader mesh_cube|mesh shader_gbuffer_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 0
+  transformq 3 1 2.05 0 -0.119712207 0 0.992808636 0.72 2 0.72
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent scene_geometry
+  srvs 0
+  uavs 0
+  params 2
+  param MaterialGlobalTuning float4 1 MaterialGlobalTuning|float4 0 0 0 0 1 1 0.72 1
+  param MaterialId int 1 - 3 0 0 0 0 0 0 0
+end_command
+command draw_mesh low_gold_bar 1
+  note Brushed gold cuboid; intentionally simple geometry with shader-only material richness.
+  targets rt_gbuf_normal|render_texture2d scene_depth|builtin_scene_depth
+  mrts 2 rt_gbuf_albedo|render_texture2d rt_gbuf_emissive|render_texture2d
+  mesh_shader mesh_cube|mesh shader_gbuffer_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 0
+  transformq -1.9 0.28 0.85 0 0.271546937 0 0.962425198 1.65 0.55 0.55
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent scene_geometry
+  srvs 0
+  uavs 0
+  params 2
+  param MaterialGlobalTuning float4 1 MaterialGlobalTuning|float4 0 0 0 0 1 1 0.72 1
+  param MaterialId int 1 - 1 0 0 0 0 0 0 0
+end_command
+command draw_mesh copper_step_box 1
+  note Oxidized copper box with procedural patina noise.
+  targets rt_gbuf_normal|render_texture2d scene_depth|builtin_scene_depth
+  mrts 2 rt_gbuf_albedo|render_texture2d rt_gbuf_emissive|render_texture2d
+  mesh_shader mesh_cube|mesh shader_gbuffer_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 0
+  transformq 1.95 0.34 0.55 0 -0.2084599 0 0.978030915 1.35 0.68 0.8
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent scene_geometry
+  srvs 0
+  uavs 0
+  params 2
+  param MaterialGlobalTuning float4 1 MaterialGlobalTuning|float4 0 0 0 0 1 1 0.72 1
+  param MaterialId int 1 - 4 0 0 0 0 0 0 0
+end_command
+command draw_mesh thin_obsidian_rail 1
+  note Low glossy foreground rail that catches highlights and grounds the scene.
+  targets rt_gbuf_normal|render_texture2d scene_depth|builtin_scene_depth
+  mrts 2 rt_gbuf_albedo|render_texture2d rt_gbuf_emissive|render_texture2d
+  mesh_shader mesh_cube|mesh shader_gbuffer_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 0
+  transformq 0 0.22 -0.95 0 0 0 1 4.2 0.28 0.24
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent scene_geometry
+  srvs 0
+  uavs 0
+  params 2
+  param MaterialGlobalTuning float4 1 MaterialGlobalTuning|float4 0 0 0 0 1 1 0.72 1
+  param MaterialId int 1 - 2 0 0 0 0 0 0 0
+end_command
+command draw_mesh main_gold_sphere 1
+  note Primary polished gold sphere near focus distance; strong specular and shadow contact.
+  targets rt_gbuf_normal|render_texture2d scene_depth|builtin_scene_depth
+  mrts 2 rt_gbuf_albedo|render_texture2d rt_gbuf_emissive|render_texture2d
+  mesh_shader mesh_sphere|mesh shader_gbuffer_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 0
+  transformq -0.65 0.72 1.02 0 0 0 1 1.25 1.25 1.25
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent scene_geometry
+  srvs 0
+  uavs 0
+  params 2
+  param MaterialGlobalTuning float4 1 MaterialGlobalTuning|float4 0 0 0 0 1 1 0.72 1
+  param MaterialId int 1 - 1 0 0 0 0 0 0 0
+end_command
+command draw_mesh obsidian_sphere 1
+  note Glossy dark stone sphere for deep reflections and AO contrast.
+  targets rt_gbuf_normal|render_texture2d scene_depth|builtin_scene_depth
+  mrts 2 rt_gbuf_albedo|render_texture2d rt_gbuf_emissive|render_texture2d
+  mesh_shader mesh_sphere|mesh shader_gbuffer_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 0
+  transformq 1.15 0.52 -0.15 0 0 0 1 0.86 0.86 0.86
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent scene_geometry
+  srvs 0
+  uavs 0
+  params 2
+  param MaterialGlobalTuning float4 1 MaterialGlobalTuning|float4 0 0 0 0 1 1 0.72 1
+  param MaterialId int 1 - 2 0 0 0 0 0 0 0
+end_command
+command draw_mesh copper_sphere 1
+  note Oxidized copper sphere with green patina variation.
+  targets rt_gbuf_normal|render_texture2d scene_depth|builtin_scene_depth
+  mrts 2 rt_gbuf_albedo|render_texture2d rt_gbuf_emissive|render_texture2d
+  mesh_shader mesh_sphere|mesh shader_gbuffer_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 0
+  transformq 1.75 0.78 1.62 0 0 0 1 0.98 0.98 0.98
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent scene_geometry
+  srvs 0
+  uavs 0
+  params 2
+  param MaterialGlobalTuning float4 1 MaterialGlobalTuning|float4 0 0 0 0 1 1 0.72 1
+  param MaterialId int 1 - 4 0 0 0 0 0 0 0
+end_command
+command draw_mesh ceramic_sphere 1
+  note Small warm-white ceramic sphere balancing the left side.
+  targets rt_gbuf_normal|render_texture2d scene_depth|builtin_scene_depth
+  mrts 2 rt_gbuf_albedo|render_texture2d rt_gbuf_emissive|render_texture2d
+  mesh_shader mesh_sphere|mesh shader_gbuffer_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 0
+  transformq -2.15 0.48 1.85 0 0 0 1 0.72 0.72 0.72
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent scene_geometry
+  srvs 0
+  uavs 0
+  params 2
+  param MaterialGlobalTuning float4 1 MaterialGlobalTuning|float4 0 0 0 0 1 1 0.72 1
+  param MaterialId int 1 - 3 0 0 0 0 0 0 0
+end_command
+command draw_mesh neon_cyan_orb 1
+  note Tiny emissive sphere. It is the main procedural source for bloom and hex lens flare.
+  targets rt_gbuf_normal|render_texture2d scene_depth|builtin_scene_depth
+  mrts 2 rt_gbuf_albedo|render_texture2d rt_gbuf_emissive|render_texture2d
+  mesh_shader mesh_sphere|mesh shader_gbuffer_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 0
+  transformq -1.28 1.24 0.05 0 0 0 1 0.23 0.23 0.23
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent scene_geometry
+  srvs 0
+  uavs 0
+  params 2
+  param MaterialGlobalTuning float4 1 MaterialGlobalTuning|float4 0 0 0 0 1 1 0.72 1
+  param MaterialId int 1 - 6 0 0 0 0 0 0 0
+end_command
+command draw_mesh neon_magenta_orb 1
+  note Secondary emissive sphere high in the composition, kept small to avoid overexposure.
+  targets rt_gbuf_normal|render_texture2d scene_depth|builtin_scene_depth
+  mrts 2 rt_gbuf_albedo|render_texture2d rt_gbuf_emissive|render_texture2d
+  mesh_shader mesh_sphere|mesh shader_gbuffer_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 1 1 0 1 1 0
+  transformq 2.55 1.52 2.72 0 0 0 1 0.18 0.18 0.18
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent scene_geometry
+  srvs 0
+  uavs 0
+  params 2
+  param MaterialGlobalTuning float4 1 MaterialGlobalTuning|float4 0 0 0 0 1 1 0.72 1
+  param MaterialId int 1 - 6 0 0 0 0 0 0 0
+end_command
+command group deferred_post_pipeline 1
+  note Fullscreen triangle pipeline V3: stable SSAO with two-pass denoise, procedural-sky PBR/IBL, multi-scale bloom pyramid, improved near/far hex DOF, procedural flare, ACES tonemap and final grading. No pass reads and writes the same texture.
+  targets - -
+  mrts 0
+  mesh_shader - -
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent -
+  srvs 0
+  uavs 0
+  params 0
+end_command
+command draw_mesh ssao_half_res 1
+  note V3 stable half-resolution SSAO: 20 spiral samples, no time-varying noise, reconstructs positions from scene_depth|builtin_scene_depth.
+  targets rt_ssao_raw|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_ssao|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 2 scene_depth|builtin_scene_depth 0 rt_gbuf_normal|render_texture2d 1
+  uavs 0
+  params 0
+end_command
+command draw_mesh ssao_bilateral_blur_horizontal 1
+  note First separable bilateral AO denoise pass. It reads raw AO and full-res depth/normal; output goes to rt_ssao_tmp to avoid read/write hazards.
+  targets rt_ssao_tmp|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_blur_bilateral|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 3 rt_ssao_raw|render_texture2d 0 scene_depth|builtin_scene_depth 1 rt_gbuf_normal|render_texture2d 2
+  uavs 0
+  params 1
+  param BlurDirection float2 1 - 0 0 0 0 1 0 0 0
+end_command
+command draw_mesh ssao_bilateral_blur_vertical 1
+  note Second separable bilateral AO denoise pass. Lighting reads this final AO to affect ambient/IBL only, not direct sunlight.
+  targets rt_ssao_blur|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_blur_bilateral|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 3 rt_ssao_tmp|render_texture2d 0 scene_depth|builtin_scene_depth 1 rt_gbuf_normal|render_texture2d 2
+  uavs 0
+  params 1
+  param BlurDirection float2 1 - 0 0 0 0 0 1 0 0
+end_command
+command draw_mesh lighting_pbr_with_cascaded_shadows 1
+  note V3 deferred GGX/Smith/Schlick PBR. shadow_receive=1 binds cascaded shadows; empty depth pixels become a procedural sky, and surfaces sample that same sky as diffuse/specular IBL.
+  targets rt_hdr_scene|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_lighting_pbr|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 1
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 5 scene_depth|builtin_scene_depth 0 rt_gbuf_normal|render_texture2d 1 rt_gbuf_albedo|render_texture2d 2 rt_gbuf_emissive|render_texture2d 3 rt_ssao_blur|render_texture2d 4
+  uavs 0
+  params 0
+end_command
+command draw_mesh bloom_prefilter 1
+  note V3 bloom prefilter: soft-knee threshold plus small tent sample/firefly guard before entering the bloom pyramid.
+  targets rt_bloom_a|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_bloom_prefilter|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 1 rt_hdr_scene|render_texture2d 0
+  uavs 0
+  params 0
+end_command
+command draw_mesh bloom_blur_half_horizontal 1
+  note Half-res horizontal bloom blur, radius encoded in BlurDirection magnitude.
+  targets rt_bloom_b|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_bloom_blur|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 1 rt_bloom_a|render_texture2d 0
+  uavs 0
+  params 1
+  param BlurDirection float2 1 - 0 0 0 0 1.15 0 0 0
+end_command
+command draw_mesh bloom_blur_half_vertical 1
+  note Half-res vertical bloom blur; writes back to rt_bloom_a.
+  targets rt_bloom_a|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_bloom_blur|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 1 rt_bloom_b|render_texture2d 0
+  uavs 0
+  params 1
+  param BlurDirection float2 1 - 0 0 0 0 0 1.15 0 0
+end_command
+command draw_mesh bloom_downsample_quarter 1
+  note Downsample blurred half-res bloom into quarter-res using a tent filter for a wider cinematic halo.
+  targets rt_bloom_q_a|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_bloom_downsample|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 1 rt_bloom_a|render_texture2d 0
+  uavs 0
+  params 0
+end_command
+command draw_mesh bloom_blur_quarter_horizontal 1
+  note Quarter-res horizontal bloom blur for broader, softer highlights.
+  targets rt_bloom_q_b|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_bloom_blur|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 1 rt_bloom_q_a|render_texture2d 0
+  uavs 0
+  params 1
+  param BlurDirection float2 1 - 0 0 0 0 1.75 0 0 0
+end_command
+command draw_mesh bloom_blur_quarter_vertical 1
+  note Quarter-res vertical bloom blur, writing back to quarter A.
+  targets rt_bloom_q_a|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_bloom_blur|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 1 rt_bloom_q_b|render_texture2d 0
+  uavs 0
+  params 1
+  param BlurDirection float2 1 - 0 0 0 0 0 1.75 0 0
+end_command
+command draw_mesh bloom_downsample_eighth 1
+  note Downsample quarter bloom into eighth-res. This creates the large-radius glow layer without many full-res taps.
+  targets rt_bloom_e_a|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_bloom_downsample|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 1 rt_bloom_q_a|render_texture2d 0
+  uavs 0
+  params 0
+end_command
+command draw_mesh bloom_blur_eighth_horizontal 1
+  note Eighth-res horizontal blur for a large, elegant glow tail.
+  targets rt_bloom_e_b|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_bloom_blur|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 1 rt_bloom_e_a|render_texture2d 0
+  uavs 0
+  params 1
+  param BlurDirection float2 1 - 0 0 0 0 2.35 0 0 0
+end_command
+command draw_mesh bloom_blur_eighth_vertical 1
+  note Eighth-res vertical blur, writing back to eighth A.
+  targets rt_bloom_e_a|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_bloom_blur|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 1 rt_bloom_e_b|render_texture2d 0
+  uavs 0
+  params 1
+  param BlurDirection float2 1 - 0 0 0 0 0 2.35 0 0
+end_command
+command draw_mesh bloom_combine_multiscale 1
+  note Combines half/quarter/eighth bloom into rt_bloom_final. PostBloomParams.w controls the extra wide-bloom contribution.
+  targets rt_bloom_final|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_bloom_combine|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 3 rt_bloom_a|render_texture2d 0 rt_bloom_q_a|render_texture2d 1 rt_bloom_e_a|render_texture2d 2
+  uavs 0
+  params 0
+end_command
+command draw_mesh dof_coc_from_depth 1
+  note V3 CoC from scene depth: R absolute CoC, G near foreground CoC, B far background CoC for better foreground/background behavior.
+  targets rt_dof_coc|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_dof_coc|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 1 scene_depth|builtin_scene_depth 0
+  uavs 0
+  params 0
+end_command
+command draw_mesh dof_blur_hdr_scene 1
+  note V3 24-tap hex bokeh gather. It reads rt_hdr_scene and rt_dof_coc, writing a separate HDR buffer to avoid hazards.
+  targets rt_dof_scene|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_dof_blur|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 2 rt_hdr_scene|render_texture2d 0 rt_dof_coc|render_texture2d 1
+  uavs 0
+  params 0
+end_command
+command draw_mesh lens_flare_hex_ghosts 1
+  note Procedural ghosted/hexagonal flare now uses the combined multi-scale bloom, so ghosts are smoother and less pixel-noisy. No textures or external code.
+  targets rt_lens_flare|render_texture2d -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_lens_flare_hex|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 2 rt_bloom_final|render_texture2d 0 rt_hdr_scene|render_texture2d 1
+  uavs 0
+  params 0
+end_command
+command draw_mesh composite_tonemap_to_scene 1
+  note Final composite to scene_color|builtin_scene_color: DOF scene + multi-scale bloom + procedural flare, ACES tonemap, gamma, grade, vignette, film grain and tiny chromatic aberration.
+  targets scene_color|builtin_scene_color -
+  mrts 0
+  mesh_shader mesh_fullscreen|mesh shader_composite_tonemap|shader
+  draw_source mesh
+  topology triangle_list
+  shadow_shader -
+  render_state 1 0 0 0 0 0 0
+  transformq 0 0 0 0 0 0 1 1 1 1
+  clear 0 0 0 0 1 0 1
+  clear_sources - -
+  vertex_count 3
+  instance 1
+  threads 1 1 1
+  compute_on_reset 0
+  dispatch_from -
+  indirect_args - 0
+  repeat 1 1
+  parent deferred_post_pipeline
+  srvs 3 rt_dof_scene|render_texture2d 0 rt_bloom_final|render_texture2d 1 rt_lens_flare|render_texture2d 2
+  uavs 0
+  params 0
+end_command
+
+timeline
+timeline_global 0 0 0
+timeline_clip Timeline_1 24 240 0 1 0
+end_timeline_clip
+end_timeline
