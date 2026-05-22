@@ -2258,11 +2258,24 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             LocalFree(argv);
             return 0;
         }
+
+        if (_stricmp(arg1, "--open") == 0 && argc > 2) {
+            startup_player_mode = false;
+            wide_to_utf8(argv[2], startup_project, MAX_PATH_LEN);
+            cli_resolve_path_from_launch_dir(launch_dir, startup_project, MAX_PATH_LEN);
+        } else if (arg1[0] && arg1[0] != '-') {
+            startup_player_mode = false;
+            wide_to_utf8(argv[1], startup_project, MAX_PATH_LEN);
+            cli_resolve_path_from_launch_dir(launch_dir, startup_project, MAX_PATH_LEN);
+        }
 #endif
 
         if (_stricmp(arg1, "--play") == 0 && argc > 2) {
             startup_player_mode = true;
             wide_to_utf8(argv[2], startup_project, MAX_PATH_LEN);
+#ifndef LAZYTOOL_PLAYER_ONLY
+            cli_resolve_path_from_launch_dir(launch_dir, startup_project, MAX_PATH_LEN);
+#endif
         }
 
         LocalFree(argv);

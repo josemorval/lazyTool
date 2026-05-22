@@ -279,7 +279,7 @@ static bool s_scene_view_overlay_screen_rect_valid = false;
 static bool s_rename_active = false;
 static char s_rename_buf[MAX_NAME] = {};
 static bool s_rename_is_cmd = false;
-static char s_project_path[MAX_PATH_LEN] = "project.lt";
+static char s_project_path[MAX_PATH_LEN] = "projects/";
 static ResHandle s_res_nav = INVALID_HANDLE;
 static CmdHandle s_cmd_nav = INVALID_HANDLE;
 static bool s_res_scroll_to_nav = false;
@@ -294,13 +294,9 @@ enum ProjectFileMode {
 
 static ProjectFileMode s_project_file_mode = PROJECT_FILE_NONE;
 static bool s_project_path_focus = false;
-static bool s_project_load_queued = false;
-static bool s_project_load_modal_visible = false;
-static bool s_project_load_result_ok = false;
-static int s_project_load_defer_frames = 0;
-static int s_project_load_done_frames = 0;
+static bool s_project_path_open_popup = false;
+static HWND s_project_load_window = nullptr;
 static char s_project_load_path[MAX_PATH_LEN] = {};
-static char s_project_load_status[160] = {};
 static bool s_viewport_fullscreen = false;
 static bool s_right_panel_general_open = false;
 static bool s_focus_inspector_panel_next = false;
@@ -673,6 +669,20 @@ static bool ui_path_has_extension_ci(const char* path, const char* ext) {
     return dot && _stricmp(dot, ext) == 0;
 }
 
+static void ui_path_seed_if_empty(char* path, int path_sz, const char* default_dir) {
+    if (!path || path_sz <= 0 || !default_dir || !default_dir[0] || path[0])
+        return;
+
+    strncpy(path, default_dir, path_sz - 1);
+    path[path_sz - 1] = '\0';
+    ui_normalize_path_text_inplace(path, path_sz);
+    int len = (int)strlen(path);
+    if (len > 0 && !ui_path_is_sep(path[len - 1]) && len < path_sz - 1) {
+        path[len++] = k_ui_path_sep;
+        path[len] = '\0';
+    }
+}
+
 static bool ui_file_exists(const char* path) {
     if (!path || !path[0])
         return false;
@@ -700,102 +710,85 @@ static void ui_finish_project_load_camera_sync() {
     camera_set_euler(&g_camera, g_camera.yaw, clampf(g_camera.pitch, -1.55334f, 1.55334f), g_camera.roll);
 }
 
+static void ui_show_project_load_window() {
+    if (s_project_load_window)
+        return;
+
+    HWND parent = g_dx.hwnd;
+    RECT rc = {};
+    if (parent)
+        GetWindowRect(parent, &rc);
+    else
+        SystemParametersInfoA(SPI_GETWORKAREA, 0, &rc, 0);
+
+    int w = 260;
+    int h = 76;
+    int x = rc.left + ((rc.right - rc.left) - w) / 2;
+    int y = rc.top + ((rc.bottom - rc.top) - h) / 2;
+    s_project_load_window = CreateWindowExA(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        "STATIC",
+        "Opening project",
+        WS_POPUP | WS_BORDER | SS_CENTER | SS_CENTERIMAGE,
+        x, y, w, h,
+        parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!s_project_load_window)
+        return;
+
+    SendMessageA(s_project_load_window, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    ShowWindow(s_project_load_window, SW_SHOWNORMAL);
+    UpdateWindow(s_project_load_window);
+}
+
+static void ui_hide_project_load_window() {
+    if (!s_project_load_window)
+        return;
+    DestroyWindow(s_project_load_window);
+    s_project_load_window = nullptr;
+}
+
 static void ui_queue_project_load(const char* path) {
     if (!path || !path[0])
         return;
 
     strncpy(s_project_load_path, path, MAX_PATH_LEN - 1);
     s_project_load_path[MAX_PATH_LEN - 1] = '\0';
-    snprintf(s_project_load_status, sizeof(s_project_load_status), "Preparing %s", s_project_load_path);
-    s_project_load_queued = true;
-    s_project_load_modal_visible = true;
-    s_project_load_result_ok = false;
-    s_project_load_defer_frames = 1;
-    s_project_load_done_frames = 0;
     s_project_file_mode = PROJECT_FILE_NONE;
-}
 
-static void ui_update_project_load_request() {
-    if (!s_project_load_queued)
-        return;
-    if (s_project_load_defer_frames > 0) {
-        s_project_load_defer_frames--;
-        return;
-    }
+    char load_path[MAX_PATH_LEN] = {};
+    strncpy(load_path, s_project_load_path, MAX_PATH_LEN - 1);
+    load_path[MAX_PATH_LEN - 1] = '\0';
 
-    char path[MAX_PATH_LEN] = {};
-    strncpy(path, s_project_load_path, MAX_PATH_LEN - 1);
-    path[MAX_PATH_LEN - 1] = '\0';
-    snprintf(s_project_load_status, sizeof(s_project_load_status), "Opening %s", path);
-
-    bool ok = project_load_text(path);
-    if (ok)
+    ui_show_project_load_window();
+    bool ok = project_load_text(load_path);
+    ui_hide_project_load_window();
+    if (ok) {
         ui_finish_project_load_camera_sync();
-
-    s_project_load_result_ok = ok;
-    s_project_load_queued = false;
-    snprintf(s_project_load_status, sizeof(s_project_load_status),
-             ok ? "Project opened" : "Project load failed");
-
-    ResourceLoadProgress progress = {};
-    if (ok && res_get_load_progress(&progress) && progress.active)
-        s_project_load_done_frames = 0;
-    else
-        s_project_load_done_frames = 45;
+        // Loading a project replaces commands/resources but should behave like
+        // opening it fresh: transient render targets are cleared and
+        // compute_on_reset passes run on the next scene frame. Without this,
+        // generated resources such as cloud noise textures could stay black
+        // until the user pressed Reset manually.
+        app_request_scene_restart();
+    }
 }
 
-static void ui_draw_project_load_progress_window() {
-    ResourceLoadProgress progress = {};
-    bool resource_loading = res_get_load_progress(&progress) && progress.active;
-    bool visible = s_project_load_modal_visible;
-    if (!visible)
-        return;
+static void ui_open_project_file_bar(ProjectFileMode mode) {
+    s_project_file_mode = mode;
+    s_project_path_focus = true;
+    s_project_path_open_popup = true;
 
-    if (!s_project_load_queued && !resource_loading && s_project_load_done_frames <= 0)
-        s_project_load_done_frames = 45;
-    if (!s_project_load_queued && !resource_loading && s_project_load_done_frames > 0) {
-        s_project_load_done_frames--;
-        if (s_project_load_done_frames <= 0) {
-            s_project_load_modal_visible = false;
-            return;
-        }
+    const char* current_path = project_current_path();
+    if (mode == PROJECT_FILE_SAVE && current_path && current_path[0]) {
+        strncpy(s_project_path, current_path, MAX_PATH_LEN - 1);
+        s_project_path[MAX_PATH_LEN - 1] = '\0';
+        ui_normalize_path_text_inplace(s_project_path, MAX_PATH_LEN);
+    } else if (!s_project_path[0] || strcmp(s_project_path, "project.lt") == 0 ||
+               (mode == PROJECT_FILE_SAVE && ui_path_is_sep(s_project_path[strlen(s_project_path) - 1]))) {
+        strncpy(s_project_path, mode == PROJECT_FILE_SAVE ? "projects/project.lt" : "projects/",
+                MAX_PATH_LEN - 1);
+        s_project_path[MAX_PATH_LEN - 1] = '\0';
     }
-
-    ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f,
-                                   vp->WorkPos.y + vp->WorkSize.y * 0.5f),
-                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(ui_px(420.0f), 0.0f), ImGuiCond_Always);
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
-                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
-                             ImGuiWindowFlags_AlwaysAutoResize;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_margin_px(16.0f), ui_margin_px(14.0f)));
-    ImGui::Begin("Opening Project", nullptr, flags);
-
-    const char* title = (resource_loading && !s_project_load_queued) ? "Loading resource data" :
-        (s_project_load_queued ? "Opening project" : (s_project_load_result_ok ? "Project opened" : "Project load failed"));
-    ImGui::TextUnformatted(title);
-    ImGui::Spacing();
-
-    float fraction = 0.08f;
-    const char* detail = s_project_load_status;
-    if (resource_loading && !s_project_load_queued) {
-        fraction = progress.fraction;
-        detail = progress.label[0] ? progress.label : progress.path;
-    } else if (!s_project_load_queued) {
-        fraction = s_project_load_result_ok ? 1.0f : 0.0f;
-    }
-
-    ImGui::ProgressBar(clampf(fraction, 0.0f, 1.0f), ImVec2(ui_px(388.0f), ui_px(7.0f)), "");
-    ImGui::Spacing();
-    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ui_px(388.0f));
-    ImGui::TextDisabled("%s", detail && detail[0] ? detail : "Preparing");
-    if (resource_loading && !s_project_load_queued && progress.path[0])
-        ImGui::TextDisabled("%s", progress.path);
-    ImGui::PopTextWrapPos();
-
-    ImGui::End();
-    ImGui::PopStyleVar();
 }
 
 static void ui_path_parent_dir(const char* path, char* out, int out_sz) {
@@ -1001,7 +994,10 @@ static void ui_apply_path_candidate(const PathCandidate& c, char* buf, int buf_s
 }
 
 static PathInputResult ui_path_input_ex(const char* label, char* buf, int buf_sz, const char* ext_filter,
-                                        ImGuiInputTextFlags extra_flags = 0) {
+                                        ImGuiInputTextFlags extra_flags = 0,
+                                        const char* default_dir = nullptr,
+                                        bool force_open_popup = false) {
+    ui_path_seed_if_empty(buf, buf_sz, default_dir);
     ui_canonicalize_path_separators(buf, buf_sz);
 
     static ImGuiID s_refocus_id = 0;
@@ -1040,7 +1036,7 @@ static PathInputResult ui_path_input_ex(const char* label, char* buf, int buf_sz
             s_nav_index = 0;
     }
     if (cb_state.completion_requested || cb_state.nav_delta != 0 || enter_requested ||
-        activated || (active && result.changed)) {
+        force_open_popup || activated || (active && result.changed)) {
         if (s_open_id != path_id)
             s_nav_index = 0;
         s_open_id = path_id;
@@ -1455,6 +1451,7 @@ static void ui_project_file_bar() {
         return;
 
     const bool save = s_project_file_mode == PROJECT_FILE_SAVE;
+    ui_path_seed_if_empty(s_project_path, MAX_PATH_LEN, "projects");
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {5.0f, 4.0f});
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 0.0f));
     float bar_h = ImGui::GetFrameHeight() + 10.0f;
@@ -1475,7 +1472,9 @@ static void ui_project_file_bar() {
         s_project_path_focus = false;
     }
     PathInputResult path_result = ui_path_input_ex("##project_path", s_project_path, MAX_PATH_LEN, ".lt",
-        focus_path ? ImGuiInputTextFlags_AutoSelectAll : 0);
+        focus_path ? ImGuiInputTextFlags_AutoSelectAll : 0,
+        "projects", s_project_path_open_popup || focus_path);
+    s_project_path_open_popup = false;
     bool path_commit = (path_result.file_selected || path_result.submitted) && !path_result.dir_selected;
     if (path_commit) {
         if (save) {
@@ -7052,7 +7051,8 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             tex_path[MAX_PATH_LEN - 1] = '\0';
         }
         PathInputResult tex_path_result =
-            ui_path_input_ex("Path##tex", tex_path, MAX_PATH_LEN, ".png;.jpg;.jpeg;.tga;.bmp;.hdr");
+            ui_path_input_ex("Path##tex", tex_path, MAX_PATH_LEN,
+                             ".png;.jpg;.jpeg;.tga;.bmp;.hdr", 0, "assets/textures");
         if (tex_path_result.file_selected) {
             if (res_reload_texture(r, tex_path)) {
                 strncpy(tex_path, r->path, MAX_PATH_LEN - 1);
@@ -7132,7 +7132,8 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             ImGui::TextWrapped("%s", r->compile_err);
 
         ImGui::TextWrapped("Path: %s", r->path[0] ? r->path : "(none)");
-        PathInputResult gs_path_result = ui_path_input_ex("Path##gs", gs_path, MAX_PATH_LEN, ".ply");
+        PathInputResult gs_path_result =
+            ui_path_input_ex("Path##gs", gs_path, MAX_PATH_LEN, ".ply", 0, "assets/models");
         if (gs_path_result.file_selected) {
             if (res_reload_gaussian_splat(r, gs_path)) {
                 strncpy(gs_path, r->path, MAX_PATH_LEN - 1);
@@ -7211,7 +7212,8 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             ImGui::TextWrapped("%s", r->compile_err);
 
         ImGui::TextWrapped("Path: %s", r->path[0] ? r->path : "(none)");
-        PathInputResult nvdb_path_result = ui_path_input_ex("Path##nvdb", nvdb_path, MAX_PATH_LEN, ".nvdb");
+        PathInputResult nvdb_path_result =
+            ui_path_input_ex("Path##nvdb", nvdb_path, MAX_PATH_LEN, ".nvdb", 0, "assets/models");
         if (nvdb_path_result.file_selected) {
             if (res_reload_nanovdb(r, nvdb_path)) {
                 strncpy(nvdb_path, r->path, MAX_PATH_LEN - 1);
@@ -7356,7 +7358,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         }
         if (r->using_fallback) ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.35f, 0.06f, 0.05f, 1));
         PathInputResult mesh_path_result =
-            ui_path_input_ex("Path##mesh", mesh_path, MAX_PATH_LEN, ".gltf;.glb");
+            ui_path_input_ex("Path##mesh", mesh_path, MAX_PATH_LEN, ".gltf;.glb", 0, "assets/models");
         if (r->using_fallback) ImGui::PopStyleColor();
         if (mesh_path_result.file_selected)
             ui_reload_mesh_resource(r, mesh_path);
@@ -7385,7 +7387,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         }
         if (!r->compiled_ok) ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.35f, 0.06f, 0.05f, 1));
         PathInputResult shader_path_result =
-            ui_path_input_ex("Path##sh", shader_path, MAX_PATH_LEN, ".hlsl;.hlsli;.fx");
+            ui_path_input_ex("Path##sh", shader_path, MAX_PATH_LEN, ".hlsl;.hlsli;.fx", 0, "shaders");
         if (!r->compiled_ok) ImGui::PopStyleColor();
         if (shader_path_result.file_selected) {
             strncpy(r->path, shader_path, MAX_PATH_LEN - 1);
@@ -9805,82 +9807,199 @@ static Vec3 ui_camera_up_basis() {
     return camera_up(g_camera);
 }
 
-struct UiOrientationAxisDraw {
-    const char* label;
-    Vec3 axis;
-    ImU32 col;
+struct UiViewCubeLine {
+    ImVec2 a;
+    ImVec2 b;
     float depth;
-    ImVec2 end;
+    bool outer;
 };
+
+static ImVec2 ui_view_cube_project(Vec3 p, Vec3 cam_right, Vec3 cam_up,
+                                   ImVec2 center, float scale) {
+    float sx = v3_dot(p, cam_right);
+    float sy = -v3_dot(p, cam_up);
+    return ImVec2(center.x + sx * scale, center.y + sy * scale);
+}
+
+static void ui_draw_dashed_line(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col,
+                                float thickness, float dash, float gap) {
+    ImVec2 ab = ui_imvec2_sub(b, a);
+    float len = ui_imvec2_len(ab);
+    if (len <= 0.01f)
+        return;
+    ImVec2 dir = ui_imvec2_scale(ab, 1.0f / len);
+    for (float t = 0.0f; t < len; t += dash + gap) {
+        float t1 = t;
+        float t2 = t + dash;
+        if (t2 > len) t2 = len;
+        dl->AddLine(ui_imvec2_add(a, ui_imvec2_scale(dir, t1)),
+                    ui_imvec2_add(a, ui_imvec2_scale(dir, t2)),
+                    col, thickness);
+    }
+}
 
 static void ui_draw_camera_orientation_gizmo(ImVec2 rect_min, ImVec2 rect_max) {
     float w = rect_max.x - rect_min.x;
     float h = rect_max.y - rect_min.y;
-    if (w < 80.0f || h < 80.0f)
+    if (w < 104.0f || h < 104.0f)
         return;
 
-    float radius = ui_px(33.0f);
+    float size = ui_px(94.0f);
     float pad = ui_margin_px(18.0f);
-    ImVec2 center(rect_max.x - pad - radius, rect_min.y + pad + radius);
-    if (center.x - radius < rect_min.x + ui_margin_px(8.0f))
-        center.x = rect_max.x - ui_margin_px(8.0f) - radius;
-    if (center.y + radius > rect_max.y - ui_margin_px(8.0f))
-        center.y = rect_min.y + ui_margin_px(8.0f) + radius;
+    ImVec2 box_min(rect_max.x - pad - size, rect_min.y + pad);
+    ImVec2 box_max(box_min.x + size, box_min.y + size);
+    if (box_min.x < rect_min.x + ui_margin_px(8.0f)) {
+        box_min.x = rect_max.x - ui_margin_px(8.0f) - size;
+        box_max.x = box_min.x + size;
+    }
+    if (box_max.y > rect_max.y - ui_margin_px(8.0f)) {
+        box_min.y = rect_min.y + ui_margin_px(8.0f);
+        box_max.y = box_min.y + size;
+    }
 
+    ImVec2 center((box_min.x + box_max.x) * 0.5f, (box_min.y + box_max.y) * 0.5f);
+    float scale = size * 0.235f;
     Vec3 cam_right = ui_camera_right_basis();
     Vec3 cam_up = ui_camera_up_basis();
     Vec3 cam_forward = ui_camera_forward_basis();
 
-    UiOrientationAxisDraw axes[3] = {
-        { "X", v3(1.0f, 0.0f, 0.0f), ImGui::GetColorU32(ImVec4(0.92f, 0.22f, 0.16f, 1.0f)), 0.0f, {} },
-        { "Y", v3(0.0f, 1.0f, 0.0f), ImGui::GetColorU32(ImVec4(0.35f, 0.86f, 0.24f, 1.0f)), 0.0f, {} },
-        { "Z", v3(0.0f, 0.0f, 1.0f), ImGui::GetColorU32(ImVec4(0.25f, 0.48f, 0.95f, 1.0f)), 0.0f, {} },
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 orange = ImGui::GetColorU32(ImVec4(1.0f, 0.58f, 0.02f, 1.0f));
+    ImU32 orange_sub = ImGui::GetColorU32(ImVec4(1.0f, 0.58f, 0.02f, 0.037f));
+
+    UiViewCubeLine lines[144] = {};
+    int line_count = 0;
+    const float s[4] = { -1.0f, -0.333333f, 0.333333f, 1.0f };
+    auto add_line = [&](Vec3 a, Vec3 b, bool outer) {
+        if (line_count >= (int)(sizeof(lines) / sizeof(lines[0])))
+            return;
+        UiViewCubeLine& line = lines[line_count++];
+        line.a = ui_view_cube_project(a, cam_right, cam_up, center, scale);
+        line.b = ui_view_cube_project(b, cam_right, cam_up, center, scale);
+        Vec3 mid = v3_scale(v3_add(a, b), 0.5f);
+        line.depth = v3_dot(mid, cam_forward);
+        line.outer = outer;
     };
 
-    for (int i = 0; i < 3; i++) {
-        float sx = v3_dot(axes[i].axis, cam_right);
-        float sy = -v3_dot(axes[i].axis, cam_up);
-        axes[i].depth = v3_dot(axes[i].axis, cam_forward);
-        float len2 = sx * sx + sy * sy;
-        if (len2 > 0.0001f) {
-            float inv = 1.0f / sqrtf(len2);
-            sx *= inv;
-            sy *= inv;
-        }
-        float len = radius * (0.64f + 0.18f * (axes[i].depth + 1.0f) * 0.5f);
-        axes[i].end = ImVec2(center.x + sx * len, center.y + sy * len);
-    }
-
-    // Draw back-facing axes first, then front-facing ones on top.
-    for (int a = 0; a < 2; a++) {
-        for (int b = a + 1; b < 3; b++) {
-            if (axes[a].depth > axes[b].depth) {
-                UiOrientationAxisDraw tmp = axes[a];
-                axes[a] = axes[b];
-                axes[b] = tmp;
+    for (int axis = 0; axis < 3; axis++) {
+        for (int ia = 0; ia < 4; ia++) {
+            for (int ib = 0; ib < 4; ib++) {
+                float a = s[ia];
+                float b = s[ib];
+                bool outer = (fabsf(a) > 0.99f && fabsf(b) > 0.99f);
+                bool surface_line = outer || fabsf(a) > 0.99f || fabsf(b) > 0.99f;
+                if (!surface_line)
+                    continue;
+                if (axis == 0) add_line(v3(-1.0f, a, b), v3(1.0f, a, b), outer);
+                if (axis == 1) add_line(v3(a, -1.0f, b), v3(a, 1.0f, b), outer);
+                if (axis == 2) add_line(v3(a, b, -1.0f), v3(a, b, 1.0f), outer);
             }
         }
     }
 
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImU32 bg = ImGui::GetColorU32(ImVec4(0.055f, 0.052f, 0.056f, 0.55f));
-    ImU32 border = ImGui::GetColorU32(ImVec4(0.32f, 0.28f, 0.25f, 0.72f));
-    ImU32 muted = ImGui::GetColorU32(ImVec4(0.72f, 0.67f, 0.64f, 0.18f));
-    dl->AddCircleFilled(center, radius + ui_px(8.0f), bg, 32);
-    dl->AddCircle(center, radius + ui_px(8.0f), border, 32, 1.0f);
-    dl->AddCircle(center, ui_px(3.2f), ImGui::GetColorU32(ImVec4(0.93f, 0.90f, 0.86f, 0.85f)), 16);
-    dl->AddCircle(center, radius * 0.82f, muted, 32, 1.0f);
+    for (int a = 0; a < line_count - 1; a++) {
+        for (int b = a + 1; b < line_count; b++) {
+            if (lines[a].depth > lines[b].depth) {
+                UiViewCubeLine tmp = lines[a];
+                lines[a] = lines[b];
+                lines[b] = tmp;
+            }
+        }
+    }
 
-    for (int i = 0; i < 3; i++) {
-        float alpha = 0.55f + 0.45f * ((axes[i].depth + 1.0f) * 0.5f);
-        ImU32 col = axes[i].col;
-        float thickness = ui_px(1.8f + 1.0f * alpha);
-        ui_draw_translate_axis(dl, center, axes[i].end, col, thickness);
-        float dot_r = ui_px(7.0f + 2.0f * alpha);
-        dl->AddCircleFilled(axes[i].end, dot_r, col, 18);
-        ImVec2 ts = ImGui::CalcTextSize(axes[i].label);
-        dl->AddText(ImVec2(axes[i].end.x - ts.x * 0.5f, axes[i].end.y - ts.y * 0.5f),
-                    ImGui::GetColorU32(ImVec4(0.05f, 0.045f, 0.045f, 1.0f)), axes[i].label);
+    for (int i = 0; i < line_count; i++) {
+        float thickness = lines[i].outer ? ui_px(2.1f) : ui_px(1.45f);
+        dl->AddLine(lines[i].a, lines[i].b, lines[i].outer ? orange : orange_sub, thickness);
+    }
+
+    struct FaceLabel {
+        const char* text;
+        Vec3 normal;
+        Vec3 right;
+        Vec3 down;
+        float depth;
+    };
+    FaceLabel labels[4] = {
+        { "+X", v3( 1.0f, 0.0f, 0.0f), v3( 0.0f, 0.0f, -1.0f), v3(0.0f, -1.0f, 0.0f), 0.0f },
+        { "-X", v3(-1.0f, 0.0f, 0.0f), v3( 0.0f, 0.0f,  1.0f), v3(0.0f, -1.0f, 0.0f), 0.0f },
+        { "+Z", v3( 0.0f, 0.0f, 1.0f), v3( 1.0f, 0.0f,  0.0f), v3(0.0f, -1.0f, 0.0f), 0.0f },
+        { "-Z", v3( 0.0f, 0.0f,-1.0f), v3(-1.0f, 0.0f,  0.0f), v3(0.0f, -1.0f, 0.0f), 0.0f },
+    };
+    for (int i = 0; i < 4; i++)
+        labels[i].depth = v3_dot(labels[i].normal, cam_forward);
+    for (int a = 0; a < 3; a++) {
+        for (int b = a + 1; b < 4; b++) {
+            if (labels[a].depth > labels[b].depth) {
+                FaceLabel tmp = labels[a];
+                labels[a] = labels[b];
+                labels[b] = tmp;
+            }
+        }
+    }
+
+    auto label_point = [](const FaceLabel& label, Vec3 top_left, float x, float y) -> Vec3 {
+        return v3_add(top_left, v3_add(v3_scale(label.right, x), v3_scale(label.down, y)));
+    };
+    auto draw_face_line = [&](const FaceLabel& label, Vec3 top_left, float x0, float y0, float x1, float y1,
+                              ImU32 col, float thickness) {
+        ImVec2 p0 = ui_view_cube_project(label_point(label, top_left, x0, y0), cam_right, cam_up, center, scale);
+        ImVec2 p1 = ui_view_cube_project(label_point(label, top_left, x1, y1), cam_right, cam_up, center, scale);
+        dl->AddLine(p0, p1, col, thickness);
+    };
+    auto draw_face_char = [&](char ch, const FaceLabel& label, Vec3 top_left,
+                              float ox, float oy, float cw, float chh,
+                              ImU32 col, float thickness) {
+        auto seg = [&](float x0, float y0, float x1, float y1) {
+            draw_face_line(label, top_left, ox + x0 * cw, oy + y0 * chh,
+                           ox + x1 * cw, oy + y1 * chh, col, thickness);
+        };
+        if (ch == '+') {
+            seg(0.15f, 0.50f, 0.85f, 0.50f);
+            seg(0.50f, 0.15f, 0.50f, 0.85f);
+        } else if (ch == '-') {
+            seg(0.15f, 0.50f, 0.85f, 0.50f);
+        } else if (ch == 'X') {
+            seg(0.10f, 0.10f, 0.90f, 0.90f);
+            seg(0.90f, 0.10f, 0.10f, 0.90f);
+        } else if (ch == 'Y') {
+            seg(0.10f, 0.08f, 0.50f, 0.48f);
+            seg(0.90f, 0.08f, 0.50f, 0.48f);
+            seg(0.50f, 0.48f, 0.50f, 0.92f);
+        } else if (ch == 'Z') {
+            seg(0.12f, 0.12f, 0.88f, 0.12f);
+            seg(0.88f, 0.12f, 0.12f, 0.88f);
+            seg(0.12f, 0.88f, 0.88f, 0.88f);
+        }
+    };
+
+    ImU32 label_shadow = ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.62f));
+    ImU32 label_col = ImGui::GetColorU32(ImVec4(1.0f, 0.58f, 0.02f, 1.0f));
+    for (int li = 0; li < 4; li++) {
+        FaceLabel& label = labels[li];
+        if (label.depth >= -0.05f)
+            continue;
+
+        float glyph_w = 0.40f;
+        float glyph_h = 0.76f;
+        float gap = 0.08f;
+        float text_w = glyph_w * 2.0f + gap;
+        float text_h = glyph_h;
+        float stroke = ui_px(2.0f);
+        Vec3 lower_right = v3_add(label.normal,
+                                  v3_add(v3_scale(label.right, 0.88f),
+                                         v3_scale(label.down, 0.88f)));
+        Vec3 top_left = v3_sub(lower_right,
+                               v3_add(v3_scale(label.right, text_w),
+                                      v3_scale(label.down, text_h)));
+
+        draw_face_char(label.text[0], label, top_left,
+                       0.0f, 0.0f, glyph_w, glyph_h, label_shadow, stroke + ui_px(0.9f));
+        draw_face_char(label.text[1], label, top_left,
+                       glyph_w + gap, 0.0f, glyph_w, glyph_h, label_shadow, stroke + ui_px(0.9f));
+        draw_face_char(label.text[0], label, top_left,
+                       0.0f, 0.0f, glyph_w, glyph_h, label_col, stroke);
+        draw_face_char(label.text[1], label, top_left,
+                       glyph_w + gap, 0.0f, glyph_w, glyph_h, label_col, stroke);
     }
 }
 
@@ -11587,6 +11706,7 @@ static void ui_draw_help_shortcuts_tab() {
         ui_draw_shortcut_row("F5", "Compile all shaders");
         ui_draw_shortcut_row("Ctrl+D", "Compile edited/selected shader");
         ui_draw_shortcut_row("Ctrl+S", "Save shader source or project");
+        ui_draw_shortcut_row("Ctrl+L", "Load project");
         ui_draw_shortcut_row("F1", "Toggle this help panel");
         ImGui::EndTable();
     }
@@ -13870,16 +13990,12 @@ static void ui_top_bar() {
         project_new_default();
     ImGui::SameLine();
     ui_align_frame_row(row_y);
-    if (ui_icon_text_button("##save_project_button", UI_ICON_SAVE_PROJECT, "Save", "Save project")) {
-        s_project_file_mode = PROJECT_FILE_SAVE;
-        s_project_path_focus = true;
-    }
+    if (ui_icon_text_button("##save_project_button", UI_ICON_SAVE_PROJECT, "Save", "Save project"))
+        ui_open_project_file_bar(PROJECT_FILE_SAVE);
     ImGui::SameLine();
     ui_align_frame_row(row_y);
-    if (ui_icon_text_button("##load_project_button", UI_ICON_LOAD_PROJECT, "Load", "Load project")) {
-        s_project_file_mode = PROJECT_FILE_LOAD;
-        s_project_path_focus = true;
-    }
+    if (ui_icon_text_button("##load_project_button", UI_ICON_LOAD_PROJECT, "Load", "Load project"))
+        ui_open_project_file_bar(PROJECT_FILE_LOAD);
     ImGui::SameLine();
     ui_align_frame_row(row_y);
     if (ui_icon_button("##compile_button", UI_ICON_COMPILE, ImVec2(ui_px(28.0f), 0.0f), "Compile shaders"))
@@ -14317,8 +14433,6 @@ void ui_draw() {
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
     }
-    ui_update_project_load_request();
-
     ImGuiIO& io = ImGui::GetIO();
     bool shader_editor_was_focused = s_shader_source_editor_focused;
     s_shader_source_editor_focused = false;
@@ -14331,7 +14445,9 @@ void ui_draw() {
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false))
         ui_recompile_active_or_selected_shader();
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false) && !shader_editor_was_focused)
-        s_project_file_mode = PROJECT_FILE_SAVE;
+        ui_open_project_file_bar(PROJECT_FILE_SAVE);
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_L, false) && !shader_editor_was_focused)
+        ui_open_project_file_bar(PROJECT_FILE_LOAD);
     if (hotkeys_ok && ImGui::IsKeyPressed(ImGuiKey_F1, false))
         s_help_popup_open = !s_help_popup_open;
     if (hotkeys_ok && ImGui::IsKeyPressed(ImGuiKey_Space, false))
@@ -14389,7 +14505,6 @@ void ui_draw() {
         ui_draw_render_graph_window();
         ui_draw_timeline_window();
         ui_draw_shader_editor_window();
-        ui_draw_project_load_progress_window();
     }
 
     {

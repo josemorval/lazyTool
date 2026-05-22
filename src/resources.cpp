@@ -2703,13 +2703,6 @@ static bool res_upload_gaussian_splat_buffer(Resource* r, const GaussianSplatGPU
 
 typedef void (*ResProgressFn)(void* user, int permille);
 
-static void res_progress_store(void* user, int permille) {
-    if (!user)
-        return;
-    int* value = (int*)user;
-    *value = permille;
-}
-
 #ifndef LAZYTOOL_PLAYER_ONLY
 static void res_progress_store_atomic(void* user, int permille) {
     if (!user)
@@ -2875,9 +2868,7 @@ static bool res_decode_gaussian_splat_disk_binary(const char* path, GaussianSpla
 static bool res_load_gaussian_splat_disk_binary_into(Resource* r, const char* path) {
     char err[512] = {};
     GaussianSplatLoadData data = {};
-    int progress = 0;
-    if (!res_decode_gaussian_splat_disk_binary(path, &data, err, sizeof(err),
-                                               res_progress_store, &progress)) {
+    if (!res_decode_gaussian_splat_disk_binary(path, &data, err, sizeof(err), nullptr, nullptr)) {
         res_set_splat_err(r, err);
         return false;
     }
@@ -3554,8 +3545,7 @@ static bool res_load_nanovdb_file_into(Resource* r, const char* path) {
     unsigned char* bytes = nullptr;
     size_t byte_count = 0;
     char err[512] = {};
-    int progress = 0;
-    if (!res_read_file_chunked(path, &bytes, &byte_count, err, sizeof(err), res_progress_store, &progress)) {
+    if (!res_read_file_chunked(path, &bytes, &byte_count, err, sizeof(err), nullptr, nullptr)) {
         res_set_nanovdb_err(r, err);
         return false;
     }

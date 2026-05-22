@@ -25,12 +25,16 @@ extern AppLog g_log;
 
 #ifdef LAZYTOOL_NO_LOG
 inline void log_init() {}
+inline void log_set_info_suppressed(bool) {}
+inline bool log_info_suppressed() { return false; }
 #define log_info(...)  ((void)0)
 #define log_warn(...)  ((void)0)
 #define log_error(...) ((void)0)
 #else
 void log_init();
 void log_push(LogLevel lvl, const char* fmt, ...);
+void log_set_info_suppressed(bool suppressed);
+bool log_info_suppressed();
 
 #define log_info(...)  log_push(LOG_INFO,  __VA_ARGS__)
 #define log_warn(...)  log_push(LOG_WARN,  __VA_ARGS__)

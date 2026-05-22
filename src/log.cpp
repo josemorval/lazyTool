@@ -6,10 +6,22 @@
 // without allocating during normal frame updates.
 
 AppLog g_log = {};
+static bool s_log_info_suppressed = false;
 
 void log_init() { memset(&g_log, 0, sizeof(g_log)); }
 
+void log_set_info_suppressed(bool suppressed) {
+    s_log_info_suppressed = suppressed;
+}
+
+bool log_info_suppressed() {
+    return s_log_info_suppressed;
+}
+
 void log_push(LogLevel lvl, const char* fmt, ...) {
+    if (lvl == LOG_INFO && s_log_info_suppressed)
+        return;
+
     LogEntry& e = g_log.entries[g_log.head % LOG_MAX_ENTRIES];
     e.level = lvl;
     SYSTEMTIME st = {};

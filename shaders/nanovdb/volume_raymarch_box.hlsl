@@ -13,8 +13,15 @@
 // - The NanoVDB buffer access comes from OpenVDB's PNanoVDB.h.
 //   https://www.openvdb.org/documentation/doxygen/PNanoVDB_8h_source.html
 // - The phase function is the standard Henyey-Greenstein approximation used in
-//   participating media. This file does not copy code from a repo for the
-//   raymarch loop, lighting, normalization, or stochastic jitter.
+//   participating media. See Henyey and Greenstein, "Diffuse radiation in the
+//   Galaxy" (1941). In graphics it is commonly used as a cheap anisotropic
+//   scattering lobe for fog, clouds and smoke.
+// - The small ambient sky term is an artistic approximation inspired by analytic
+//   daylight models such as Preetham et al. (SIGGRAPH 1999). It is not a
+//   physically complete sky probe; it lets the bunny pick up some blue/warm
+//   atmosphere color instead of being lit only by a constant gray ambient.
+// - This file does not copy code from a repo for the raymarch loop, lighting,
+//   normalization, or stochastic jitter.
 #include "nanovdb_common.hlsl"
 
 StructuredBuffer<uint> VolumeNanoVDB : register(t0);
@@ -26,6 +33,8 @@ cbuffer UserCB : register(b2)
     float4 VolumeAlbedoEmission;  // rgb: scattering albedo/tint, w: emission amount.
     float4 VolumeRenderTuning;    // x: max steps, y: alpha cutoff, z: grid byte offset, w: jitter.
     float4 VolumeLightTuning;     // x: light absorption, y: phase forwardness, z: ambient, w: shadow steps.
+    float4 VolumeSkyTuning;       // x: sky intensity, y: turbidity, z/w used by composite sky.
+    float4 VolumeAtmosphereTuning; // x: haze density, y: height falloff, z: sky ambient strength, w: reserved.
     // x: shadow reuse stride, y: shadow linear sample, z: grid mapping mode, w: jitter mode.
     // z = 0 direct NanoVDB world coords, 1 normalized uniform fit, 2 normalized stretch.
     // w = 0 interleaved-gradient jitter, 1 temporal low-discrepancy stochastic jitter.
@@ -62,10 +71,30 @@ VSOut VSMain(VSIn v)
 
 float volume_phase_hg(float cos_theta, float g)
 {
+    // Henyey-Greenstein returns a normalized angular lobe. g > 0 pushes more
+    // light forward in the light direction; g = 0 is isotropic scattering.
     g = clamp(g, -0.85, 0.85);
     float g2 = g * g;
     float denom = max(1.0 + g2 - 2.0 * g * cos_theta, 1e-3);
     return (1.0 - g2) / max(pow(denom, 1.5), 1e-3);
+}
+
+float3 volume_atmosphere_ambient(float3 rd)
+{
+    float3 sun_dir = normalize(-LightDir.xyz);
+    float up = saturate(rd.y * 0.5 + 0.5);
+    float sun_wrap = saturate(dot(rd, sun_dir) * 0.5 + 0.5);
+    float turbidity = max(VolumeSkyTuning.y, 0.05);
+
+    // Two-color sky probe approximation. Up-facing/sky-facing rays receive a
+    // cooler blue, while directions nearer the sun gain a warmer tint. This is
+    // deliberately cheap: evaluating the full sky model at every volume sample
+    // would multiply the raymarch cost.
+    float3 zenith = float3(0.20, 0.30, 0.48) * max(VolumeSkyTuning.x, 0.0);
+    float3 horizon = float3(0.74, 0.55, 0.36) * turbidity;
+    float3 sky = lerp(horizon, zenith, up);
+    float3 sun_bleed = LightColor.rgb * LightDir.w * (0.10 + 0.16 * sun_wrap);
+    return (sky * 0.12 + sun_bleed) * max(VolumeAtmosphereTuning.z, 0.0);
 }
 
 float3 volume_grid_sample_pos(float3 p, float grid_mapping_mode, float3 grid_min, float3 grid_max)
@@ -87,6 +116,10 @@ float3 volume_grid_sample_pos(float3 p, float grid_mapping_mode, float3 grid_min
 float sample_density(float3 p, uint grid_offset, float grid_mapping_mode, float3 grid_min, float3 grid_max)
 {
     float3 gp = volume_grid_sample_pos(p, grid_mapping_mode, grid_min, grid_max);
+    // NanoVDB stores density in sparse tree nodes. `lt_nvdb_sample_linear_float`
+    // performs eight tree reads and lerps them in shader code, because a
+    // NanoVDB tree is not a hardware Texture3D. That is why sample count is the
+    // central performance lever for this renderer.
     return max(lt_nvdb_sample_linear_float(VolumeNanoVDB, grid_offset, gp), 0.0) *
            max(VolumeBoxMaxDensity.w, 0.0);
 }
@@ -126,6 +159,8 @@ float light_transmittance(float3 p, float3 light_dir, uint grid_offset, float st
         optical += sample_shadow_density(p + light_dir * t, grid_offset, grid_mapping_mode, grid_min, grid_max) * ds;
         t += ds;
     }
+    // Beer-Lambert transmittance. Larger VolumeLightTuning.x means a denser
+    // volume blocks more direct sunlight along this short secondary ray.
     return exp(-optical * max(VolumeLightTuning.x, 0.0));
 }
 
@@ -157,6 +192,7 @@ VolumePSOut PSMain(VSOut i)
 
     float3 light_dir = normalize(-LightDir.xyz);
     float phase = volume_phase_hg(dot(rd, light_dir), VolumeLightTuning.y);
+    float3 atmosphere_ambient = volume_atmosphere_ambient(rd);
     float3 albedo = max(VolumeAlbedoEmission.rgb, 0.0);
     float3 accum = 0.0;
     float3 accum_pos = 0.0;
@@ -185,7 +221,7 @@ VolumePSOut PSMain(VSOut i)
                 shadow_countdown = shadow_stride;
             }
             float3 sun = LightColor.rgb * LightDir.w * last_light_visibility * phase;
-            float3 ambient = VolumeLightTuning.z.xxx;
+            float3 ambient = VolumeLightTuning.z.xxx + atmosphere_ambient;
             float3 radiance = albedo * (ambient + sun) + albedo * VolumeAlbedoEmission.w;
             float sample_weight = trans * alpha;
             accum += sample_weight * radiance;

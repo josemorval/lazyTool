@@ -1013,16 +1013,33 @@ static bool project_read_line(const char*& cursor, const char* end, char* out, i
     return true;
 }
 
+static LARGE_INTEGER project_timer_now() {
+    LARGE_INTEGER t = {};
+    QueryPerformanceCounter(&t);
+    return t;
+}
+
+static double project_timer_elapsed_ms(const LARGE_INTEGER& a, const LARGE_INTEGER& b) {
+    static LARGE_INTEGER freq = {};
+    if (freq.QuadPart == 0)
+        QueryPerformanceFrequency(&freq);
+    return ((double)(b.QuadPart - a.QuadPart) * 1000.0) / (double)freq.QuadPart;
+}
+
 // Parse a saved project file and rebuild the in-memory editor state. Only the
 // current project text format is accepted by the runtime loader.
 bool project_load_text(const char* path) {
+    LARGE_INTEGER t_total_begin = project_timer_now();
+    LARGE_INTEGER t_read_begin = t_total_begin;
     void* project_bytes = nullptr;
     size_t project_size = 0;
     if (!lt_read_file(path, &project_bytes, &project_size)) {
         log_error("Project load failed: %s", path);
         return false;
     }
+    LARGE_INTEGER t_read_end = project_timer_now();
 
+    LARGE_INTEGER t_validate_begin = t_read_end;
     {
         bool has_export_settings = false;
         bool has_timeline_global = false;
@@ -1046,10 +1063,17 @@ bool project_load_text(const char* path) {
             return false;
         }
     }
+    LARGE_INTEGER t_validate_end = project_timer_now();
 
+    bool previous_info_log_suppressed = log_info_suppressed();
+    log_set_info_suppressed(true);
+
+    LARGE_INTEGER t_reset_begin = t_validate_end;
     project_clear_user_data();
     project_reset_view_defaults();
+    LARGE_INTEGER t_reset_end = project_timer_now();
 
+    LARGE_INTEGER t_parse_begin = t_reset_end;
     char line[4096] = {};
     Command* cur = nullptr;
     CmdHandle cur_h = INVALID_HANDLE;
@@ -1537,7 +1561,9 @@ bool project_load_text(const char* path) {
             }
         }
     }
+    LARGE_INTEGER t_parse_end = project_timer_now();
 
+    LARGE_INTEGER t_finalize_begin = t_parse_end;
     for (int i = 0; i < pending_parent_count; i++) {
         Command* child = cmd_get(pending_parent_cmds[i]);
         CmdHandle parent = cmd_find_by_name(pending_parent_names[i]);
@@ -1552,11 +1578,13 @@ bool project_load_text(const char* path) {
     cmd_mark_all_dirty();
 
     if (!saw_export_settings) {
+        log_set_info_suppressed(previous_info_log_suppressed);
         lt_free_file(project_bytes);
         log_error("Project load failed: missing or invalid export_settings block.");
         return false;
     }
     if (!saw_timeline_global || timeline_clip_count <= 0) {
+        log_set_info_suppressed(previous_info_log_suppressed);
         lt_free_file(project_bytes);
         log_error("Project load failed: missing current timeline_global/timeline_clip block.");
         return false;
@@ -1564,9 +1592,19 @@ bool project_load_text(const char* path) {
 
     timeline_delete_invalid_user_var_tracks();
 
+    log_set_info_suppressed(previous_info_log_suppressed);
     lt_free_file(project_bytes);
     project_set_current_path(path);
     dx_invalidate_scene_history();
+    LARGE_INTEGER t_total_end = project_timer_now();
     log_info("Project loaded: %s", path);
+    log_info("Project load timing: read %.2f ms, validate %.2f ms, reset %.2f ms",
+             project_timer_elapsed_ms(t_read_begin, t_read_end),
+             project_timer_elapsed_ms(t_validate_begin, t_validate_end),
+             project_timer_elapsed_ms(t_reset_begin, t_reset_end));
+    log_info("Project load timing: parse %.2f ms, finalize %.2f ms, total %.2f ms",
+             project_timer_elapsed_ms(t_parse_begin, t_parse_end),
+             project_timer_elapsed_ms(t_finalize_begin, t_total_end),
+             project_timer_elapsed_ms(t_total_begin, t_total_end));
     return true;
 }
