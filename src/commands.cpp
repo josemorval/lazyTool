@@ -1,4 +1,5 @@
 #include "commands.h"
+#include "build_config.h"
 #include "resources.h"
 #include "dx11_ctx.h"
 #include "user_cb.h"
@@ -47,8 +48,10 @@ static uint64_t  s_plan_revision = 0;
 
 static void cmd_clear_shader_recompute_requests();
 
+#if LAZYTOOL_ENABLE_PROFILER
 #define GPU_PROFILE_LATENCY 6
 #define GPU_PROFILE_MAX_EVENTS 512
+#endif
 static const UINT k_shadow_map_ps_slot = 7;
 
 uint64_t cmd_revision() {
@@ -176,6 +179,7 @@ static void validation_finish(Command& c, const char* issues) {
     log_warn("Command '%s': %s", c.name, issues);
 }
 
+#if LAZYTOOL_ENABLE_PROFILER
 struct GPUProfileEvent {
     CmdHandle    handle;
     ID3D11Query* begin;
@@ -199,6 +203,8 @@ struct GPUProfileFrameSlot {
 static GPUProfileFrameSlot s_gpu_slots[GPU_PROFILE_LATENCY] = {};
 static GPUProfileFrameSlot* s_gpu_active_slot = nullptr;
 
+#endif
+
 const char* cmd_type_str(CmdType t) {
     switch (t) {
     case CMD_CLEAR:             return "Clear";
@@ -216,7 +222,9 @@ const char* cmd_type_str(CmdType t) {
 void cmd_init() {
     memset(g_commands, 0, sizeof(g_commands));
     memset(s_cmd_profile_ms, 0, sizeof(s_cmd_profile_ms));
+#if LAZYTOOL_ENABLE_PROFILER
     memset(s_gpu_slots, 0, sizeof(s_gpu_slots));
+#endif
     // Only the child counts are authoritative; entries past count are never read.
     // Avoid clearing the full children matrix on every graph rebuild.
     memset(s_plan_child_count, 0, sizeof(s_plan_child_count));
@@ -226,6 +234,7 @@ void cmd_init() {
     cmd_clear_shader_recompute_requests();
     g_command_count = 0;
 
+#if LAZYTOOL_ENABLE_PROFILER
     D3D11_QUERY_DESC timestamp_desc = {};
     timestamp_desc.Query = D3D11_QUERY_TIMESTAMP;
     D3D11_QUERY_DESC disjoint_desc = {};
@@ -247,9 +256,13 @@ void cmd_init() {
 
     if (!s_gpu_profiler_ok)
         log_warn("GPU profiler disabled: failed to create D3D11 timestamp queries.");
+#else
+    g_profiler_enabled = false;
+#endif
 }
 
 void cmd_shutdown() {
+#if LAZYTOOL_ENABLE_PROFILER
     s_gpu_active_slot = nullptr;
     for (int f = 0; f < GPU_PROFILE_LATENCY; f++) {
         GPUProfileFrameSlot& slot = s_gpu_slots[f];
@@ -268,12 +281,13 @@ void cmd_shutdown() {
         slot.frame_id = 0;
     }
     s_gpu_profiler_ok = false;
-    s_gpu_profile_ready = false;
     s_prev_profiler_enabled = false;
     s_gpu_overflow_warned = false;
     s_gpu_submit_frame = 0;
     s_gpu_last_ready_frame = 0;
     s_gpu_frame_capture_open = false;
+#endif
+    s_gpu_profile_ready = false;
     memset(s_cmd_profile_ms, 0, sizeof(s_cmd_profile_ms));
     s_frame_profile_ms = 0.0f;
 }
@@ -315,29 +329,54 @@ static void cmd_clear_shader_recompute_requests() {
 }
 
 float cmd_profile_ms(CmdHandle h) {
+#if LAZYTOOL_ENABLE_PROFILER
     if (h == INVALID_HANDLE || h > MAX_COMMANDS)
         return 0.0f;
     return s_cmd_profile_ms[h - 1];
+#else
+    (void)h;
+    return 0.0f;
+#endif
 }
 
 float cmd_profile_frame_ms() {
+#if LAZYTOOL_ENABLE_PROFILER
     return s_frame_profile_ms;
+#else
+    return 0.0f;
+#endif
 }
 
 float cmd_profile_shadow_ms() {
+#if LAZYTOOL_ENABLE_PROFILER
     return s_shadow_profile_ms;
+#else
+    return 0.0f;
+#endif
 }
 
 bool cmd_profile_ready() {
+#if LAZYTOOL_ENABLE_PROFILER
     return s_gpu_profile_ready;
+#else
+    return false;
+#endif
 }
 
 float cmd_profile_total_frame_ms() {
+#if LAZYTOOL_ENABLE_PROFILER
     return s_total_frame_profile_ms;
+#else
+    return 0.0f;
+#endif
 }
 
 bool cmd_profile_total_ready() {
+#if LAZYTOOL_ENABLE_PROFILER
     return s_gpu_total_ready;
+#else
+    return false;
+#endif
 }
 
 static void cmd_profile_reset_results() {
@@ -352,6 +391,7 @@ static void cmd_profile_reset_results() {
 }
 
 static void cmd_profile_reset_slots() {
+#if LAZYTOOL_ENABLE_PROFILER
     s_gpu_active_slot = nullptr;
     s_gpu_submit_frame = 0;
     s_gpu_frame_capture_open = false;
@@ -362,8 +402,10 @@ static void cmd_profile_reset_slots() {
         s_gpu_slots[i].command_range_issued = false;
         s_gpu_slots[i].frame_id = 0;
     }
+#endif
 }
 
+#if LAZYTOOL_ENABLE_PROFILER
 static bool cmd_gpu_get_data(ID3D11Query* query, void* out, UINT out_sz) {
     if (!query || !g_dx.ctx)
         return false;
@@ -518,6 +560,18 @@ static void cmd_gpu_end_command(int event_index) {
         return;
     g_dx.ctx->End(s_gpu_active_slot->events[event_index].end);
 }
+
+#else
+static void cmd_profile_sync_enable_state() {
+    g_profiler_enabled = false;
+    cmd_profile_reset_results();
+}
+
+static void cmd_gpu_end_command_frame() {}
+static int cmd_gpu_begin_command(CmdHandle h) { (void)h; return -1; }
+static int cmd_gpu_begin_shadow_prepass() { return -1; }
+static void cmd_gpu_end_command(int event_index) { (void)event_index; }
+#endif
 
 static bool cmd_name_exists_except(const char* name, CmdHandle except) {
     if (!name || !name[0])
@@ -2293,6 +2347,7 @@ static void execute_command_children(CmdHandle parent_h, bool& shadow_prepass_do
 void cmd_execute_all() {
     bool shadow_prepass_done = false;
     command_state_cache_reset();
+#if LAZYTOOL_ENABLE_PROFILER
     cmd_profile_sync_enable_state();
 
     if (g_profiler_enabled && !s_gpu_active_slot)
@@ -2304,13 +2359,16 @@ void cmd_execute_all() {
         g_dx.ctx->End(s_gpu_active_slot->frame_begin);
         s_gpu_active_slot->command_range_issued = true;
     }
+#endif
 
     cmd_rebuild_execution_plan_if_needed();
     execute_command_children(INVALID_HANDLE, shadow_prepass_done);
     cmd_clear_shader_recompute_requests();
 
+#if LAZYTOOL_ENABLE_PROFILER
     if (g_profiler_enabled)
         cmd_gpu_end_command_frame();
+#endif
 }
 
 void cmd_make_unique_name(const char* base, char* out, int out_sz) {
@@ -2318,6 +2376,7 @@ void cmd_make_unique_name(const char* base, char* out, int out_sz) {
 }
 
 void cmd_profile_begin_frame_capture() {
+#if LAZYTOOL_ENABLE_PROFILER
     cmd_profile_sync_enable_state();
     if (!g_profiler_enabled) {
         s_gpu_active_slot = nullptr;
@@ -2327,9 +2386,13 @@ void cmd_profile_begin_frame_capture() {
 
     cmd_gpu_begin_total_frame();
     s_gpu_frame_capture_open = s_gpu_active_slot != nullptr;
+#else
+    g_profiler_enabled = false;
+#endif
 }
 
 void cmd_profile_end_frame_capture() {
+#if LAZYTOOL_ENABLE_PROFILER
     if (!s_gpu_frame_capture_open)
         return;
 
@@ -2345,4 +2408,5 @@ void cmd_profile_end_frame_capture() {
     }
     cmd_gpu_end_total_frame();
     s_gpu_frame_capture_open = false;
+#endif
 }

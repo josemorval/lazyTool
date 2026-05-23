@@ -1,4 +1,5 @@
 #include "app_settings.h"
+#include "build_config.h"
 #include "dx11_ctx.h"
 #include "commands.h"
 #include "ui.h"
@@ -11,6 +12,24 @@
 // projects, such as VSync, profiling, camera interaction defaults, and UI scale.
 
 static const char* s_settings_path = "lazytool_general.ini";
+
+
+static void app_settings_apply_build_config_constraints() {
+#if !LAZYTOOL_ENABLE_D3D11_VALIDATION
+    g_dx.d3d11_validation = false;
+    g_dx.d3d11_validation_active = false;
+    g_dx.d3d11_validation_supported = false;
+#endif
+#if !LAZYTOOL_ENABLE_SHADER_BINDING_WARNINGS
+    g_dx.shader_validation_warnings = false;
+#endif
+#if !LAZYTOOL_ENABLE_PROFILER
+    g_profiler_enabled = false;
+#endif
+#if !LAZYTOOL_ENABLE_DEBUG_OVERLAYS
+    g_dx.scene_bounds_debug_enabled = false;
+#endif
+}
 
 // Editor-wide defaults live outside project files so project-level export
 // settings cannot unexpectedly re-enable expensive runtime features like profiling.
@@ -37,6 +56,7 @@ static void app_settings_apply_defaults() {
     g_dx.scene_grid_fade_end = 60.0f;
     g_profiler_enabled = false;
     app_set_editor_frame_cap_fps(0.0f);
+    app_settings_apply_build_config_constraints();
 
     g_camera_controls.enabled = true;
     g_camera_controls.mouse_look = true;
@@ -53,6 +73,8 @@ static void app_settings_apply_defaults() {
 }
 
 void app_settings_save() {
+    app_settings_apply_build_config_constraints();
+
     FILE* f = fopen(s_settings_path, "wb");
     if (!f) {
         log_warn("Settings save failed: %s", s_settings_path);
@@ -164,4 +186,5 @@ void app_settings_load_or_create() {
     if (g_dx.scene_grid_fade_start < 0.0f) g_dx.scene_grid_fade_start = 0.0f;
     if (g_dx.scene_grid_fade_end < g_dx.scene_grid_fade_start + 1.0f)
         g_dx.scene_grid_fade_end = g_dx.scene_grid_fade_start + 1.0f;
+    app_settings_apply_build_config_constraints();
 }

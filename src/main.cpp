@@ -9,6 +9,7 @@
 #include "imgui_impl_dx11.h"
 #endif
 #include "types.h"
+#include "build_config.h"
 #include "log.h"
 #include "dx11_ctx.h"
 #include "resources.h"
@@ -791,6 +792,7 @@ static int      g_pending_scene_surface_h = 0;
 static bool     g_pending_scene_surface_resize = false;
 static float    g_time           = 0.f;
 static float    g_dt             = 0.f;
+static float    g_frame_interval_dt = 0.f;
 static uint64_t g_frame          = 0;
 static bool     g_restart_scene_requested = false;
 static bool     g_scene_paused = false;
@@ -821,6 +823,11 @@ static bool     g_cpu_profile_display_valid = false;
 static int      g_imgui_draw_list_count = 0;
 static int      g_imgui_draw_cmd_count = 0;
 
+static float qpc_elapsed_ms(const LARGE_INTEGER& a, const LARGE_INTEGER& b, const LARGE_INTEGER& freq) {
+    return (float)(((double)(b.QuadPart - a.QuadPart) * 1000.0) / (double)freq.QuadPart);
+}
+
+#if LAZYTOOL_ENABLE_PROFILER
 static const int APP_IMGUI_GPU_PROFILE_LATENCY = 4;
 struct AppImGuiGpuProfileSlot {
     ID3D11Query* disjoint;
@@ -836,10 +843,6 @@ static bool s_imgui_gpu_profile_display_valid = false;
 static bool s_imgui_gpu_prev_enabled = false;
 static int s_imgui_gpu_submit_frame = 0;
 static float s_imgui_gpu_ms = 0.0f;
-
-static float qpc_elapsed_ms(const LARGE_INTEGER& a, const LARGE_INTEGER& b, const LARGE_INTEGER& freq) {
-    return (float)(((double)(b.QuadPart - a.QuadPart) * 1000.0) / (double)freq.QuadPart);
-}
 
 static void app_cpu_profile_reset_frame() {
     g_cpu_scene_ms = 0.0f;
@@ -987,6 +990,27 @@ int app_imgui_draw_list_count() { return g_imgui_draw_list_count; }
 int app_imgui_draw_command_count() { return g_imgui_draw_cmd_count; }
 float app_imgui_gpu_ms() { return s_imgui_gpu_ms; }
 bool app_imgui_gpu_ready() { return s_imgui_gpu_profile_ready; }
+#else
+struct AppImGuiGpuProfileSlot {};
+static void app_cpu_profile_reset_frame() {}
+static void app_cpu_profile_publish_frame() {}
+static void app_imgui_gpu_profile_shutdown() {}
+static AppImGuiGpuProfileSlot* app_imgui_gpu_profile_begin() { return nullptr; }
+static void app_imgui_gpu_profile_end(AppImGuiGpuProfileSlot* slot) { (void)slot; }
+float app_cpu_frame_ms() { return 0.0f; }
+float app_cpu_scene_ms() { return 0.0f; }
+float app_cpu_ui_build_ms() { return 0.0f; }
+float app_cpu_ui_render_ms() { return 0.0f; }
+float app_cpu_present_ms() { return 0.0f; }
+float app_cpu_other_ms() { return 0.0f; }
+int app_imgui_draw_list_count() { return g_imgui_draw_list_count; }
+int app_imgui_draw_command_count() { return g_imgui_draw_cmd_count; }
+float app_imgui_gpu_ms() { return 0.0f; }
+bool app_imgui_gpu_ready() { return false; }
+#endif
+
+float app_frame_delta_ms() { return g_frame_interval_dt * 1000.0f; }
+float app_frame_fps() { return g_frame_interval_dt > 0.000001f ? 1.0f / g_frame_interval_dt : 0.0f; }
 float app_editor_frame_cap_fps() { return g_editor_frame_cap_fps; }
 void app_set_editor_frame_cap_fps(float fps) {
     if (fps < 1.0f) fps = 0.0f;
@@ -2412,7 +2436,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         LARGE_INTEGER now_t;
         QueryPerformanceCounter(&now_t);
         LARGE_INTEGER cpu_frame_begin = now_t;
-        bool profile_cpu = g_profiler_enabled;
+        bool profile_cpu = (LAZYTOOL_ENABLE_PROFILER && g_profiler_enabled);
         if (profile_cpu)
             app_cpu_profile_reset_frame();
         else
@@ -2420,6 +2444,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         g_dt = (float)(now_t.QuadPart - prev_t.QuadPart) / (float)freq.QuadPart;
         if (g_dt > 0.1f) g_dt = 0.1f;
         float editor_dt = g_dt;
+        g_frame_interval_dt = editor_dt;
         prev_t  = now_t;
         if (g_restart_scene_requested) {
             g_restart_scene_requested = false;
@@ -2602,7 +2627,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 #ifndef LAZYTOOL_PLAYER_ONLY
     if (!g_player_mode)
         ui_shutdown();
+#if LAZYTOOL_ENABLE_PROFILER
     app_imgui_gpu_profile_shutdown();
+#endif
 #endif
     cmd_shutdown();
     res_shutdown();

@@ -1,4 +1,5 @@
 #include "dx11_ctx.h"
+#include "build_config.h"
 #include "log.h"
 #include "project.h"
 #include <d3d11sdklayers.h>
@@ -427,11 +428,16 @@ bool dx_init(HWND hwnd, int w, int h) {
 
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
     UINT flags = 0;
+#if LAZYTOOL_ENABLE_D3D11_VALIDATION
     if (g_dx.d3d11_validation)
         flags |= D3D11_CREATE_DEVICE_DEBUG;
+    g_dx.d3d11_validation_supported = true;
+#else
+    g_dx.d3d11_validation = false;
+    g_dx.d3d11_validation_supported = false;
+#endif
 
     g_dx.d3d11_validation_active = false;
-    g_dx.d3d11_validation_supported = true;
     safe_release_info_queue();
 
     IDXGIAdapter1* preferred_adapter = choose_high_performance_adapter();
@@ -441,6 +447,7 @@ bool dx_init(HWND hwnd, int w, int h) {
         nullptr,
         flags, &fl, 1, D3D11_SDK_VERSION,
         &scd, &g_dx.sc, &g_dx.dev, nullptr, &g_dx.ctx);
+#if LAZYTOOL_ENABLE_D3D11_VALIDATION
     if (FAILED(hr) && g_dx.d3d11_validation) {
         g_dx.d3d11_validation_supported = false;
         log_warn("D3D11 validation requested, but the debug layer is unavailable. Retrying without it.");
@@ -451,11 +458,16 @@ bool dx_init(HWND hwnd, int w, int h) {
             0, &fl, 1, D3D11_SDK_VERSION,
             &scd, &g_dx.sc, &g_dx.dev, nullptr, &g_dx.ctx);
     }
+#endif
     if (FAILED(hr) && preferred_adapter) {
         log_warn("Preferred adapter failed with 0x%08X. Retrying default hardware adapter.", hr);
         preferred_adapter->Release();
         preferred_adapter = nullptr;
+#if LAZYTOOL_ENABLE_D3D11_VALIDATION
         UINT retry_flags = (g_dx.d3d11_validation && g_dx.d3d11_validation_supported) ? flags : 0;
+#else
+        UINT retry_flags = 0;
+#endif
         hr = D3D11CreateDeviceAndSwapChain(
             nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
             retry_flags,
@@ -470,6 +482,7 @@ bool dx_init(HWND hwnd, int w, int h) {
     if (g_dx.present_allow_tearing)
         log_info("DXGI present tearing enabled for VSync-off presentation.");
 
+#if LAZYTOOL_ENABLE_D3D11_VALIDATION
     if (g_dx.d3d11_validation_active) {
         HRESULT info_hr = g_dx.dev->QueryInterface(__uuidof(ID3D11InfoQueue), (void**)&g_dx.info_queue);
         if (FAILED(info_hr) || !g_dx.info_queue)
@@ -477,6 +490,7 @@ bool dx_init(HWND hwnd, int w, int h) {
         else
             log_info("D3D11 validation active.");
     }
+#endif
 
     IDXGIDevice1* dxgi_dev1 = nullptr;
     hr = g_dx.dev->QueryInterface(__uuidof(IDXGIDevice1), (void**)&dxgi_dev1);
@@ -979,6 +993,7 @@ void dx_present_scene_to_backbuffer() {
     }
 }
 
+#if LAZYTOOL_ENABLE_D3D11_VALIDATION
 void dx_debug_clear_messages() {
     if (g_dx.info_queue)
         g_dx.info_queue->ClearStoredMessages();
@@ -1043,6 +1058,11 @@ void dx_debug_log_messages() {
 
     g_dx.info_queue->ClearStoredMessages();
 }
+
+#else
+void dx_debug_clear_messages() {}
+void dx_debug_log_messages() {}
+#endif
 
 void dx_shutdown() {
     safe_release_scene_rt();

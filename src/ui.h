@@ -40,6 +40,8 @@ int app_imgui_draw_list_count();
 int app_imgui_draw_command_count();
 float app_cpu_present_ms();
 float app_cpu_other_ms();
+float app_frame_delta_ms();
+float app_frame_fps();
 float app_editor_frame_cap_fps();
 void app_set_editor_frame_cap_fps(float fps);
 

@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "build_config.h"
 #include "resources.h"
 #include "commands.h"
 #include "project.h"
@@ -25,9 +26,6 @@
 #include <string>
 #pragma comment(lib, "psapi.lib")
 
-#ifndef LAZYTOOL_BUILD_CONFIG
-#define LAZYTOOL_BUILD_CONFIG "custom"
-#endif
 
 // Lightweight UI build profiler. Values are shown one frame late on purpose:
 // the profiler panel is drawn while the current UI frame is still being built.
@@ -88,6 +86,9 @@ static float ui_profile_elapsed_ms(const LARGE_INTEGER& a, const LARGE_INTEGER& 
 }
 
 static void ui_profile_begin_frame() {
+#if !LAZYTOOL_ENABLE_PROFILER
+    return;
+#else
     ui_profile_ensure_freq();
     if (!g_profiler_enabled) {
         s_ui_profile_display_valid = false;
@@ -107,6 +108,7 @@ static void ui_profile_begin_frame() {
         s_ui_profile[i].accum_ms = 0.0f;
     }
     s_ui_profile_display_valid = true;
+#endif
 }
 
 struct UiProfileScope {
@@ -130,7 +132,11 @@ struct UiProfileScope {
 
 #define UI_PROFILE_CONCAT_INNER(a, b) a##b
 #define UI_PROFILE_CONCAT(a, b) UI_PROFILE_CONCAT_INNER(a, b)
+#if LAZYTOOL_ENABLE_PROFILER
 #define UI_PROFILE_SCOPE(section) UiProfileScope UI_PROFILE_CONCAT(_ui_profile_scope_, __LINE__)(section)
+#else
+#define UI_PROFILE_SCOPE(section) ((void)0)
+#endif
 
 static void ui_release_app_icon_texture() {
     if (s_app_icon_srv) { s_app_icon_srv->Release(); s_app_icon_srv = nullptr; }
@@ -295,8 +301,12 @@ enum ProjectFileMode {
 static ProjectFileMode s_project_file_mode = PROJECT_FILE_NONE;
 static bool s_project_path_focus = false;
 static bool s_project_path_open_popup = false;
-static HWND s_project_load_window = nullptr;
 static char s_project_load_path[MAX_PATH_LEN] = {};
+static bool s_project_load_pending = false;
+static int  s_project_load_defer_frames = 0;
+static bool s_project_load_active = false;
+static bool s_project_load_failed = false;
+static char s_project_load_status[160] = {};
 static bool s_viewport_fullscreen = false;
 static bool s_right_panel_general_open = false;
 static bool s_focus_inspector_panel_next = false;
@@ -434,6 +444,7 @@ struct UiProfilerReadoutCache {
 };
 
 static UiProfilerReadoutCache s_profiler_readout_cache;
+static void ui_draw_basic_monitoring_readout();
 static void ui_refresh_profiler_readout_cache(bool force = false);
 
 struct PathCandidate {
@@ -710,43 +721,6 @@ static void ui_finish_project_load_camera_sync() {
     camera_set_euler(&g_camera, g_camera.yaw, clampf(g_camera.pitch, -1.55334f, 1.55334f), g_camera.roll);
 }
 
-static void ui_show_project_load_window() {
-    if (s_project_load_window)
-        return;
-
-    HWND parent = g_dx.hwnd;
-    RECT rc = {};
-    if (parent)
-        GetWindowRect(parent, &rc);
-    else
-        SystemParametersInfoA(SPI_GETWORKAREA, 0, &rc, 0);
-
-    int w = 260;
-    int h = 76;
-    int x = rc.left + ((rc.right - rc.left) - w) / 2;
-    int y = rc.top + ((rc.bottom - rc.top) - h) / 2;
-    s_project_load_window = CreateWindowExA(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-        "STATIC",
-        "Opening project",
-        WS_POPUP | WS_BORDER | SS_CENTER | SS_CENTERIMAGE,
-        x, y, w, h,
-        parent, nullptr, GetModuleHandleW(nullptr), nullptr);
-    if (!s_project_load_window)
-        return;
-
-    SendMessageA(s_project_load_window, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
-    ShowWindow(s_project_load_window, SW_SHOWNORMAL);
-    UpdateWindow(s_project_load_window);
-}
-
-static void ui_hide_project_load_window() {
-    if (!s_project_load_window)
-        return;
-    DestroyWindow(s_project_load_window);
-    s_project_load_window = nullptr;
-}
-
 static void ui_queue_project_load(const char* path) {
     if (!path || !path[0])
         return;
@@ -754,15 +728,38 @@ static void ui_queue_project_load(const char* path) {
     strncpy(s_project_load_path, path, MAX_PATH_LEN - 1);
     s_project_load_path[MAX_PATH_LEN - 1] = '\0';
     s_project_file_mode = PROJECT_FILE_NONE;
+    s_project_load_pending = true;
+    s_project_load_defer_frames = 0;
+    s_project_load_active = false;
+    s_project_load_failed = false;
+    snprintf(s_project_load_status, sizeof(s_project_load_status), "Opening project...");
+}
+
+static void ui_execute_pending_project_load_if_ready() {
+    if (!s_project_load_pending)
+        return;
+
+    // Defer by one fully drawn ImGui frame so the user sees the editor-native
+    // loading overlay before the synchronous project parse/reset starts. Large
+    // Gaussian splat and NanoVDB payloads still continue through the existing
+    // async resource loader after the project file itself has been parsed.
+    if (s_project_load_defer_frames <= 0) {
+        s_project_load_defer_frames++;
+        return;
+    }
 
     char load_path[MAX_PATH_LEN] = {};
     strncpy(load_path, s_project_load_path, MAX_PATH_LEN - 1);
     load_path[MAX_PATH_LEN - 1] = '\0';
 
-    ui_show_project_load_window();
+    s_project_load_active = true;
+    snprintf(s_project_load_status, sizeof(s_project_load_status), "Opening %s", load_path);
     bool ok = project_load_text(load_path);
-    ui_hide_project_load_window();
+    s_project_load_pending = false;
+    s_project_load_active = false;
+    s_project_load_failed = !ok;
     if (ok) {
+        snprintf(s_project_load_status, sizeof(s_project_load_status), "Project opened");
         ui_finish_project_load_camera_sync();
         // Loading a project replaces commands/resources but should behave like
         // opening it fresh: transient render targets are cleared and
@@ -770,6 +767,8 @@ static void ui_queue_project_load(const char* path) {
         // generated resources such as cloud noise textures could stay black
         // until the user pressed Reset manually.
         app_request_scene_restart();
+    } else {
+        snprintf(s_project_load_status, sizeof(s_project_load_status), "Project load failed");
     }
 }
 
@@ -997,14 +996,23 @@ static PathInputResult ui_path_input_ex(const char* label, char* buf, int buf_sz
                                         ImGuiInputTextFlags extra_flags = 0,
                                         const char* default_dir = nullptr,
                                         bool force_open_popup = false) {
-    ui_path_seed_if_empty(buf, buf_sz, default_dir);
-    ui_canonicalize_path_separators(buf, buf_sz);
-
     static ImGuiID s_refocus_id = 0;
     static ImGuiID s_open_id = 0;
+    static ImGuiID s_default_seed_blocked_id = 0;
     static int s_nav_index = 0;
 
     ImGuiID path_id = ImGui::GetID(label);
+
+    // Seed an empty browser with the preferred folder only as a convenience.
+    // Once the user navigates up to the working directory (for example by
+    // selecting ../ from projects/), keep the empty/root value instead of
+    // forcing the field back to the default folder every frame.
+    if (buf && buf_sz > 0 && !buf[0] && default_dir && default_dir[0] &&
+        s_default_seed_blocked_id != path_id) {
+        ui_path_seed_if_empty(buf, buf_sz, default_dir);
+    }
+    ui_canonicalize_path_separators(buf, buf_sz);
+
     if (s_refocus_id == path_id) {
         ImGui::SetKeyboardFocusHere();
         s_refocus_id = 0;
@@ -1023,10 +1031,16 @@ static PathInputResult ui_path_input_ex(const char* label, char* buf, int buf_sz
     ImGui::SetItemKeyOwner(ImGuiKey_KeypadEnter);
     result.changed = ImGui::IsItemEdited();
     result.submitted = enter_requested;
-    if (result.changed)
+    if (result.changed) {
         ui_canonicalize_path_separators(buf, buf_sz);
+        if (!buf[0])
+            s_default_seed_blocked_id = path_id;
+        else if (s_default_seed_blocked_id == path_id)
+            s_default_seed_blocked_id = 0;
+    }
     bool activated = ImGui::IsItemActivated();
     bool active = ImGui::IsItemActive();
+    bool input_focused = ImGui::IsItemFocused();
     ImVec2 input_min = ImGui::GetItemRectMin();
     ImVec2 input_max = ImGui::GetItemRectMax();
 
@@ -1084,6 +1098,10 @@ static PathInputResult ui_path_input_ex(const char* label, char* buf, int buf_sz
                 if (accept) {
                     result.submitted = true;
                     ui_apply_path_candidate(candidates[s_nav_index], buf, buf_sz, &result);
+                    if (!buf[0])
+                        s_default_seed_blocked_id = path_id;
+                    else if (s_default_seed_blocked_id == path_id)
+                        s_default_seed_blocked_id = 0;
                     if (!candidates[s_nav_index].is_dir)
                         s_open_id = 0;
                     s_refocus_id = path_id;
@@ -1098,6 +1116,10 @@ static PathInputResult ui_path_input_ex(const char* label, char* buf, int buf_sz
                     bool selected = i == s_nav_index;
                     if (ImGui::Selectable(candidates[i].display, selected, flags)) {
                         ui_apply_path_candidate(candidates[i], buf, buf_sz, &result);
+                        if (!buf[0])
+                            s_default_seed_blocked_id = path_id;
+                        else if (s_default_seed_blocked_id == path_id)
+                            s_default_seed_blocked_id = 0;
                         if (!candidates[i].is_dir)
                             s_open_id = 0;
                         s_refocus_id = path_id;
@@ -1119,6 +1141,11 @@ static PathInputResult ui_path_input_ex(const char* label, char* buf, int buf_sz
         ImGui::PopStyleColor();
     }
     ImGui::PopID();
+
+    if (s_default_seed_blocked_id == path_id && !active && s_open_id != path_id &&
+        !force_open_popup && !input_focused) {
+        s_default_seed_blocked_id = 0;
+    }
 
     return result;
 }
@@ -1451,7 +1478,6 @@ static void ui_project_file_bar() {
         return;
 
     const bool save = s_project_file_mode == PROJECT_FILE_SAVE;
-    ui_path_seed_if_empty(s_project_path, MAX_PATH_LEN, "projects");
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {5.0f, 4.0f});
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 0.0f));
     float bar_h = ImGui::GetFrameHeight() + 10.0f;
@@ -9177,10 +9203,14 @@ static void ui_panel_general(bool embedded = false) {
             ImGui::Unindent(ui_margin_px(8.0f));
         }
         settings_dirty |= ImGui::Checkbox("Show Manual Control Overlay", &g_dx.scene_manual_control_overlay_enabled);
+#if LAZYTOOL_ENABLE_DEBUG_OVERLAYS
         if (ImGui::Checkbox("Debug Draw Bounds", &g_dx.scene_bounds_debug_enabled)) {
             settings_dirty = true;
             app_request_scene_render();
         }
+#else
+        g_dx.scene_bounds_debug_enabled = false;
+#endif
         ImGui::TextDisabled("Infinite grid overlay on y=0. Color alpha controls overall intensity; level opacity balances fine/medium/coarse lines.");
     }
 
@@ -9193,6 +9223,7 @@ static void ui_panel_general(bool embedded = false) {
         ImGui::TextDisabled("High-performance GPU hints are exported; on hybrid laptops the final desktop composition may still show iGPU activity.");
         ImGui::Separator();
 
+#if LAZYTOOL_ENABLE_D3D11_VALIDATION
         settings_dirty |= ImGui::Checkbox("D3D11 Runtime Validation", &g_dx.d3d11_validation);
         if (g_dx.d3d11_validation_active) {
             ImGui::TextDisabled("Debug layer active in this session. Adds overhead.");
@@ -9204,10 +9235,21 @@ static void ui_panel_general(bool embedded = false) {
         } else {
             ImGui::TextDisabled("Disabled. Enable and restart to capture D3D11 runtime warnings.");
         }
+#else
+        g_dx.d3d11_validation = false;
+        g_dx.d3d11_validation_active = false;
+        ImGui::TextDisabled("D3D11 validation is compiled out for this build profile.");
+#endif
 
+#if LAZYTOOL_ENABLE_SHADER_BINDING_WARNINGS
         settings_dirty |= ImGui::Checkbox("Shader Binding Warnings##runtime_shader_binding_warnings", &g_dx.shader_validation_warnings);
         ImGui::TextDisabled("Editor/runtime diagnostic only. Export defaults are controlled in Exporter / Standalone.");
+#else
+        g_dx.shader_validation_warnings = false;
+        ImGui::TextDisabled("Shader binding warnings are compiled out for this build profile.");
+#endif
 
+#if LAZYTOOL_ENABLE_D3D11_VALIDATION
         bool can_flush_d3d11 = g_dx.d3d11_validation_active && g_dx.info_queue;
         if (!can_flush_d3d11)
             ImGui::BeginDisabled();
@@ -9215,9 +9257,11 @@ static void ui_panel_general(bool embedded = false) {
             dx_debug_log_messages();
         if (!can_flush_d3d11)
             ImGui::EndDisabled();
+#endif
     }
 
-    if (ui_inspector_section("PROFILER")) {
+    if (ui_inspector_section(LAZYTOOL_ENABLE_PROFILER ? "PROFILER" : "MONITORING")) {
+#if LAZYTOOL_ENABLE_PROFILER
         settings_dirty |= ImGui::Checkbox("Enable profiling", &g_profiler_enabled);
         if (g_profiler_enabled) {
             ui_refresh_profiler_readout_cache();
@@ -9281,7 +9325,29 @@ static void ui_panel_general(bool embedded = false) {
             ImGui::Text("Application memory: %s", s_profiler_readout_cache.app_memory);
             ImGui::Text("Estimated GPU memory: %s", s_profiler_readout_cache.gpu_memory);
             ImGui::TextDisabled("Project GPU resources: %s", s_profiler_readout_cache.project_gpu_memory);
+        } else {
+#if LAZYTOOL_ENABLE_BASIC_MONITORING
+            ui_refresh_profiler_readout_cache();
+            ui_draw_basic_monitoring_readout();
+            ImGui::SeparatorText("Memory");
+            ImGui::Text("Application memory: %s", s_profiler_readout_cache.app_memory);
+            ImGui::Text("Estimated GPU memory: %s", s_profiler_readout_cache.gpu_memory);
+            ImGui::TextDisabled("Project GPU resources: %s", s_profiler_readout_cache.project_gpu_memory);
+            ImGui::TextDisabled("Enable profiling for detailed CPU/GPU timings.");
+#endif
         }
+#else
+        g_profiler_enabled = false;
+#if LAZYTOOL_ENABLE_BASIC_MONITORING
+        ui_refresh_profiler_readout_cache();
+        ui_draw_basic_monitoring_readout();
+        ImGui::SeparatorText("Memory");
+        ImGui::Text("Application memory: %s", s_profiler_readout_cache.app_memory);
+        ImGui::Text("Estimated GPU memory: %s", s_profiler_readout_cache.gpu_memory);
+        ImGui::TextDisabled("Project GPU resources: %s", s_profiler_readout_cache.project_gpu_memory);
+        ImGui::TextDisabled("Detailed CPU/GPU profiling is compiled out for this build profile.");
+#endif
+#endif
     }
 
     if (ui_inspector_section("CAMERA")) {
@@ -9855,7 +9921,7 @@ static void ui_draw_camera_orientation_gizmo(ImVec2 rect_min, ImVec2 rect_max) {
     // axes are outline handles. Size is user-configurable from Settings >
     // Viewport, and the internal details scale with the same factor.
     const float base_size = 104.0f;
-    float gizmo_size = clampf(g_dx.scene_orientation_gizmo_size_px, 50.0f, 150.0f);
+    float gizmo_size = clampf(g_dx.scene_orientation_gizmo_size_px, 72.0f, 180.0f);
     float scale = gizmo_size / base_size;
     float size = ui_px(gizmo_size);
     if (w < size || h < size)
@@ -10088,6 +10154,11 @@ static void ui_draw_projected_bounds_box(ImDrawList* dl, const Mat4& view_proj,
 }
 
 static void ui_draw_viewport_bounds_debug(ImVec2 rect_min, ImVec2 rect_max) {
+#if !LAZYTOOL_ENABLE_DEBUG_OVERLAYS
+    (void)rect_min;
+    (void)rect_max;
+    return;
+#else
     if (!g_dx.scene_bounds_debug_enabled)
         return;
 
@@ -10114,6 +10185,7 @@ static void ui_draw_viewport_bounds_debug(ImVec2 rect_min, ImVec2 rect_max) {
                                      selected ? selected_line : normal_line,
                                      selected ? selected_fill : normal_fill);
     }
+#endif
 }
 
 static float ui_viewport_overlay_text_button_width(const char* label) {
@@ -10140,8 +10212,13 @@ static void ui_viewport_toolbar_rect(ImVec2 rect_min, ImVec2 rect_max, ImVec2* o
 
     x += ui_viewport_overlay_text_button_width(ui_camera_mode_name(g_camera_controls.mode));
     x += spacing + sep;
+#if LAZYTOOL_ENABLE_DEBUG_OVERLAYS
     // Move / rotate / scale, wireframe / grid, bounds debug.
     x += ui_viewport_overlay_icon_button_size() * 6.0f + spacing * 5.0f;
+#else
+    // Move / rotate / scale, wireframe / grid. Bounds debug is compiled out.
+    x += ui_viewport_overlay_icon_button_size() * 5.0f + spacing * 4.0f;
+#endif
 
     if (out_min) *out_min = min;
     if (out_max) *out_max = ImVec2(x, min.y + h);
@@ -10317,12 +10394,16 @@ static void ui_draw_viewport_camera_overlay(ImVec2 rect_min, ImVec2 rect_max) {
         app_settings_save();
         app_request_scene_render();
     }
+#if LAZYTOOL_ENABLE_DEBUG_OVERLAYS
     if (ui_viewport_overlay_icon_button(dl, pos, UI_ICON_BOUNDS,
             g_dx.scene_bounds_debug_enabled ? "Hide bounds" : "Show bounds", g_dx.scene_bounds_debug_enabled, &pos)) {
         g_dx.scene_bounds_debug_enabled = !g_dx.scene_bounds_debug_enabled;
         app_settings_save();
         app_request_scene_render();
     }
+#else
+    g_dx.scene_bounds_debug_enabled = false;
+#endif
 }
 
 static void ui_draw_rotation_feedback_quad(ImDrawList* dl, ImVec2 min, const char* label,
@@ -11473,6 +11554,35 @@ static uint64_t ui_estimated_gpu_memory_bytes() {
     total += (uint64_t)((sizeof(UserCBData) + 15) & ~15);
     total += (uint64_t)((sizeof(UserCBData) + 15) & ~15);
     return total;
+}
+
+
+static int ui_active_resource_count(bool include_builtins) {
+    int count = 0;
+    for (int i = 0; i < MAX_RESOURCES; i++) {
+        if (!g_resources[i].active)
+            continue;
+        if (!include_builtins && g_resources[i].is_builtin)
+            continue;
+        count++;
+    }
+    return count;
+}
+
+static int ui_enabled_command_count() {
+    int count = 0;
+    for (int i = 0; i < MAX_COMMANDS; i++) {
+        if (g_commands[i].active && g_commands[i].enabled)
+            count++;
+    }
+    return count;
+}
+
+static void ui_draw_basic_monitoring_readout() {
+    ImGui::Text("FPS: %.1f  Frame: %.2f ms", app_frame_fps(), app_frame_delta_ms());
+    ImGui::Text("Scene: %d x %d", g_dx.scene_width, g_dx.scene_height);
+    ImGui::Text("Commands: %d enabled / %d total", ui_enabled_command_count(), g_command_count);
+    ImGui::Text("Resources: %d project / %d total", ui_active_resource_count(false), ui_active_resource_count(true));
 }
 
 static void ui_refresh_profiler_readout_cache(bool force) {
@@ -14363,6 +14473,61 @@ void ui_init() {
     ui_init_rt3d_preview_pipeline();
 }
 
+
+static void ui_draw_loading_overlay() {
+    ResourceLoadProgress progress = {};
+    bool resource_loading = res_get_load_progress(&progress) && progress.active;
+    bool project_loading = s_project_load_pending || s_project_load_active;
+    if (!resource_loading && !project_loading)
+        return;
+
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImDrawList* bg = ImGui::GetBackgroundDrawList(vp);
+    ImVec2 vp_min = vp->Pos;
+    ImVec2 vp_max(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y);
+    bg->AddRectFilled(vp_min, vp_max, IM_COL32(8, 7, 8, 135));
+
+    const float card_w = ui_px(420.0f);
+    const float card_h = ui_px(resource_loading ? 132.0f : 82.0f);
+    ImVec2 card_pos(vp->Pos.x + (vp->Size.x - card_w) * 0.5f,
+                    vp->Pos.y + (vp->Size.y - card_h) * 0.5f);
+
+    ImGui::SetNextWindowPos(card_pos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(card_w, card_h), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui_margin_px(12.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_margin_px(18.0f), ui_margin_px(16.0f)));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.075f, 0.071f, 0.078f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.32f, 0.26f, 0.22f, 0.92f));
+    ImGui::Begin("##loading_overlay", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNav |
+                 ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoInputs);
+
+    ImGui::TextUnformatted(project_loading ? "Opening project" : "Loading asset");
+    ImGui::Spacing();
+
+    if (project_loading) {
+        // Project loading is a short synchronous operation after this overlay has
+        // had a frame to appear. Do not show fake progress or async wording here:
+        // keep the modal clean and avoid implying that the bar can advance.
+    } else if (resource_loading) {
+        char title[192] = {};
+        snprintf(title, sizeof(title), "%s", progress.label[0] ? progress.label : "Resource");
+        ImGui::TextColored(ImVec4(0.92f, 0.78f, 0.62f, 1.0f), "%s", title);
+        ImGui::TextDisabled("%s", progress.path);
+        ImGui::Spacing();
+        int pct = (int)(progress.fraction * 100.0f + 0.5f);
+        char pct_text[32] = {};
+        snprintf(pct_text, sizeof(pct_text), "%d%%", pct);
+        ImGui::ProgressBar(progress.fraction, ImVec2(-1.0f, ui_px(9.0f)), pct_text);
+    }
+
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(3);
+}
+
 // Draw one full editor frame on top of the already-rendered scene texture.
 void ui_draw() {
     ui_profile_begin_frame();
@@ -14382,6 +14547,7 @@ void ui_draw() {
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
     }
+    ui_execute_pending_project_load_if_ready();
     ImGuiIO& io = ImGui::GetIO();
     bool shader_editor_was_focused = s_shader_source_editor_focused;
     s_shader_source_editor_focused = false;
@@ -14455,6 +14621,8 @@ void ui_draw() {
         ui_draw_timeline_window();
         ui_draw_shader_editor_window();
     }
+
+    ui_draw_loading_overlay();
 
     {
         UI_PROFILE_SCOPE(UI_PROFILE_IMGUI_RENDER_FINALIZE);
