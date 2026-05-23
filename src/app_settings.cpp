@@ -22,6 +22,7 @@ static void app_settings_apply_defaults() {
     g_dx.shader_validation_warnings = false;
     g_dx.scene_grid_enabled = true;
     g_dx.scene_orientation_gizmo_enabled = true;
+    g_dx.scene_orientation_gizmo_size_px = 80.0f;
     g_dx.scene_manual_control_overlay_enabled = true;
     g_dx.scene_bounds_debug_enabled = false;
     g_dx.scene_grid_color[0] = 1.00f;
@@ -69,6 +70,7 @@ void app_settings_save() {
     fprintf(f, "render_target_preview_columns %d\n", ui_render_target_preview_columns());
     fprintf(f, "scene_grid_enabled %d\n", g_dx.scene_grid_enabled ? 1 : 0);
     fprintf(f, "scene_orientation_gizmo_enabled %d\n", g_dx.scene_orientation_gizmo_enabled ? 1 : 0);
+    fprintf(f, "scene_orientation_gizmo_size_px %.9g\n", g_dx.scene_orientation_gizmo_size_px);
     fprintf(f, "scene_manual_control_overlay_enabled %d\n", g_dx.scene_manual_control_overlay_enabled ? 1 : 0);
     fprintf(f, "scene_bounds_debug_enabled %d\n", g_dx.scene_bounds_debug_enabled ? 1 : 0);
     fprintf(f, "scene_grid_color_r %.9g\n", g_dx.scene_grid_color[0]);
@@ -120,6 +122,7 @@ void app_settings_load_or_create() {
         else if (strcmp(key, "render_target_preview_columns") == 0) ui_set_render_target_preview_columns(atoi(value));
         else if (strcmp(key, "scene_grid_enabled") == 0) g_dx.scene_grid_enabled = atoi(value) != 0;
         else if (strcmp(key, "scene_orientation_gizmo_enabled") == 0) g_dx.scene_orientation_gizmo_enabled = atoi(value) != 0;
+        else if (strcmp(key, "scene_orientation_gizmo_size_px") == 0) g_dx.scene_orientation_gizmo_size_px = (float)atof(value);
         else if (strcmp(key, "scene_manual_control_overlay_enabled") == 0) g_dx.scene_manual_control_overlay_enabled = atoi(value) != 0;
         else if (strcmp(key, "scene_bounds_debug_enabled") == 0) g_dx.scene_bounds_debug_enabled = atoi(value) != 0;
         else if (strcmp(key, "scene_grid_color_r") == 0) g_dx.scene_grid_color[0] = (float)atof(value);
@@ -157,6 +160,7 @@ void app_settings_load_or_create() {
     g_dx.scene_grid_level_alpha[0] = clampf(g_dx.scene_grid_level_alpha[0], 0.0f, 1.0f);
     g_dx.scene_grid_level_alpha[1] = clampf(g_dx.scene_grid_level_alpha[1], 0.0f, 1.0f);
     g_dx.scene_grid_level_alpha[2] = clampf(g_dx.scene_grid_level_alpha[2], 0.0f, 1.0f);
+    g_dx.scene_orientation_gizmo_size_px = clampf(g_dx.scene_orientation_gizmo_size_px, 72.0f, 180.0f);
     if (g_dx.scene_grid_fade_start < 0.0f) g_dx.scene_grid_fade_start = 0.0f;
     if (g_dx.scene_grid_fade_end < g_dx.scene_grid_fade_start + 1.0f)
         g_dx.scene_grid_fade_end = g_dx.scene_grid_fade_start + 1.0f;

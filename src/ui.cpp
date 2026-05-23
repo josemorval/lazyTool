@@ -3350,7 +3350,17 @@ static const char* const k_hlsl_completion_words[] = {
     "tex1D", "tex1Dbias", "tex1Dgrad", "tex1Dlod", "tex1Dproj", "tex2D", "tex2Dbias",
     "tex2Dgrad", "tex2Dlod", "tex2Dproj", "tex3D", "tex3Dbias", "tex3Dgrad",
     "tex3Dlod", "tex3Dproj", "texCUBE", "texCUBEbias", "texCUBEgrad", "texCUBElod",
-    "texCUBEproj", "transpose", "trunc"
+    "texCUBEproj", "transpose", "trunc",
+    "LTPBRMaterial", "LTPBRLighting", "LTAtmosphereParams", "LTRay", "LTRaymarchParams", "LTRaymarchHit",
+    "lt_pbr_material", "lt_pbr_brdf_direct", "lt_pbr_ibl", "lt_pbr_shade", "lt_pbr_default_directional",
+    "lt_pbr_default_light_dir_ws", "lt_pbr_default_light_radiance", "lt_pbr_unpack_normal",
+    "lt_raymarch_camera_ray", "lt_raymarch_camera_ray_near_plane", "lt_raymarch_default_params",
+    "lt_raymarch_trace", "lt_raymarch_estimate_normal", "lt_raymarch_soft_shadow", "lt_raymarch_ambient_occlusion",
+    "lt_sdf_sphere", "lt_sdf_box", "lt_sdf_round_box", "lt_sdf_plane", "lt_sdf_torus", "lt_sdf_capsule",
+    "lt_sdf_union", "lt_sdf_smooth_union", "lt_sdf_subtraction", "lt_sdf_intersection", "lt_rotate2d",
+    "lt_atmosphere_default_params", "lt_atmosphere_sky", "lt_atmosphere_ambient_diffuse",
+    "lt_atmosphere_ambient_specular", "lt_atmosphere_apply_fog", "lt_atmosphere_tonemap",
+    "common_pbr.hlsl", "common_raymarch.hlsl", "common_atmosphere.hlsl"
 };
 
 static int ui_shader_autocomplete_prefix(const UiShaderSourceEditor* ed, int* out_start, char* out, int out_sz) {
@@ -9158,6 +9168,14 @@ static void ui_panel_general(bool embedded = false) {
                 g_dx.scene_grid_fade_end = g_dx.scene_grid_fade_start + 1.0f;
         }
         settings_dirty |= ImGui::Checkbox("Show Camera Orientation Gizmo", &g_dx.scene_orientation_gizmo_enabled);
+        if (g_dx.scene_orientation_gizmo_enabled) {
+            ImGui::Indent(ui_margin_px(8.0f));
+            if (ImGui::SliderFloat("Gizmo Size##scene_orientation_gizmo_size", &g_dx.scene_orientation_gizmo_size_px, 72.0f, 180.0f, "%.0f px")) {
+                settings_dirty = true;
+                g_dx.scene_orientation_gizmo_size_px = clampf(g_dx.scene_orientation_gizmo_size_px, 72.0f, 180.0f);
+            }
+            ImGui::Unindent(ui_margin_px(8.0f));
+        }
         settings_dirty |= ImGui::Checkbox("Show Manual Control Overlay", &g_dx.scene_manual_control_overlay_enabled);
         if (ImGui::Checkbox("Debug Draw Bounds", &g_dx.scene_bounds_debug_enabled)) {
             settings_dirty = true;
@@ -9807,199 +9825,130 @@ static Vec3 ui_camera_up_basis() {
     return camera_up(g_camera);
 }
 
-struct UiViewCubeLine {
-    ImVec2 a;
-    ImVec2 b;
+struct UiOrientationAxisPoint {
+    ImVec2 pos;
     float depth;
-    bool outer;
+    int axis;
+    bool positive;
 };
 
-static ImVec2 ui_view_cube_project(Vec3 p, Vec3 cam_right, Vec3 cam_up,
-                                   ImVec2 center, float scale) {
+static ImVec2 ui_orientation_gizmo_project(Vec3 p, Vec3 cam_right, Vec3 cam_up,
+                                           ImVec2 center, float scale) {
     float sx = v3_dot(p, cam_right);
     float sy = -v3_dot(p, cam_up);
     return ImVec2(center.x + sx * scale, center.y + sy * scale);
 }
 
-static void ui_draw_dashed_line(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col,
-                                float thickness, float dash, float gap) {
-    ImVec2 ab = ui_imvec2_sub(b, a);
-    float len = ui_imvec2_len(ab);
-    if (len <= 0.01f)
-        return;
-    ImVec2 dir = ui_imvec2_scale(ab, 1.0f / len);
-    for (float t = 0.0f; t < len; t += dash + gap) {
-        float t1 = t;
-        float t2 = t + dash;
-        if (t2 > len) t2 = len;
-        dl->AddLine(ui_imvec2_add(a, ui_imvec2_scale(dir, t1)),
-                    ui_imvec2_add(a, ui_imvec2_scale(dir, t2)),
-                    col, thickness);
+static ImU32 ui_axis_color_u32(int axis, float alpha = 1.0f) {
+    switch (axis) {
+    case 0: return ImGui::GetColorU32(ImVec4(1.00f, 0.18f, 0.30f, alpha)); // X
+    case 1: return ImGui::GetColorU32(ImVec4(0.48f, 0.78f, 0.08f, alpha)); // Y
+    default: return ImGui::GetColorU32(ImVec4(0.18f, 0.52f, 0.88f, alpha)); // Z
     }
 }
 
 static void ui_draw_camera_orientation_gizmo(ImVec2 rect_min, ImVec2 rect_max) {
     float w = rect_max.x - rect_min.x;
     float h = rect_max.y - rect_min.y;
-    if (w < 104.0f || h < 104.0f)
+
+    // Classic axis tripod: positive axes are filled labelled handles, opposite
+    // axes are outline handles. Size is user-configurable from Settings >
+    // Viewport, and the internal details scale with the same factor.
+    const float base_size = 104.0f;
+    float gizmo_size = clampf(g_dx.scene_orientation_gizmo_size_px, 50.0f, 150.0f);
+    float scale = gizmo_size / base_size;
+    float size = ui_px(gizmo_size);
+    if (w < size || h < size)
         return;
 
-    float size = ui_px(94.0f);
-    float pad = ui_margin_px(18.0f);
+    float pad = ui_margin_px(18.0f * scale);
+    float min_pad = ui_margin_px(8.0f * scale);
     ImVec2 box_min(rect_max.x - pad - size, rect_min.y + pad);
     ImVec2 box_max(box_min.x + size, box_min.y + size);
-    if (box_min.x < rect_min.x + ui_margin_px(8.0f)) {
-        box_min.x = rect_max.x - ui_margin_px(8.0f) - size;
+    if (box_min.x < rect_min.x + min_pad) {
+        box_min.x = rect_max.x - min_pad - size;
         box_max.x = box_min.x + size;
     }
-    if (box_max.y > rect_max.y - ui_margin_px(8.0f)) {
-        box_min.y = rect_min.y + ui_margin_px(8.0f);
+    if (box_max.y > rect_max.y - min_pad) {
+        box_min.y = rect_min.y + min_pad;
         box_max.y = box_min.y + size;
     }
 
     ImVec2 center((box_min.x + box_max.x) * 0.5f, (box_min.y + box_max.y) * 0.5f);
-    float scale = size * 0.235f;
+    float axis_len = size * 0.34f;
+    float ball_r = ui_px(13.5f * scale);
+    float ring_r = ui_px(12.0f * scale);
+    float line_thick = ui_px(4.0f * scale);
+    float halo_thick = line_thick + ui_px(2.5f * scale);
+
     Vec3 cam_right = ui_camera_right_basis();
     Vec3 cam_up = ui_camera_up_basis();
     Vec3 cam_forward = ui_camera_forward_basis();
+    Vec3 dirs[3] = {
+        v3(1.0f, 0.0f, 0.0f),
+        v3(0.0f, 1.0f, 0.0f),
+        v3(0.0f, 0.0f, 1.0f)
+    };
+    const char* labels[3] = { "X", "Y", "Z" };
+
+    UiOrientationAxisPoint points[6] = {};
+    int point_count = 0;
+    for (int axis = 0; axis < 3; axis++) {
+        points[point_count++] = {
+            ui_orientation_gizmo_project(dirs[axis], cam_right, cam_up, center, axis_len),
+            v3_dot(dirs[axis], cam_forward), axis, true
+        };
+        points[point_count++] = {
+            ui_orientation_gizmo_project(v3_scale(dirs[axis], -1.0f), cam_right, cam_up, center, axis_len),
+            v3_dot(v3_scale(dirs[axis], -1.0f), cam_forward), axis, false
+        };
+    }
+
+    // Farther endpoints first, closer endpoints last. Negative endpoints are
+    // still drawn as rings so the labelled positive axes remain easy to read.
+    for (int a = 0; a < point_count - 1; a++) {
+        for (int b = a + 1; b < point_count; b++) {
+            if (points[a].depth < points[b].depth) {
+                UiOrientationAxisPoint tmp = points[a];
+                points[a] = points[b];
+                points[b] = tmp;
+            }
+        }
+    }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImU32 orange = ImGui::GetColorU32(ImVec4(1.0f, 0.58f, 0.02f, 1.0f));
-    ImU32 orange_sub = ImGui::GetColorU32(ImVec4(1.0f, 0.58f, 0.02f, 0.037f));
+    ImU32 shadow = ImGui::GetColorU32(ImVec4(0.03f, 0.035f, 0.04f, 0.68f));
+    ImU32 ring_fill = ImGui::GetColorU32(ImVec4(0.05f, 0.06f, 0.07f, 0.34f));
+    ImU32 text_col = ImGui::GetColorU32(ImVec4(0.02f, 0.02f, 0.025f, 0.96f));
+    ImU32 border = ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.14f));
 
-    UiViewCubeLine lines[144] = {};
-    int line_count = 0;
-    const float s[4] = { -1.0f, -0.333333f, 0.333333f, 1.0f };
-    auto add_line = [&](Vec3 a, Vec3 b, bool outer) {
-        if (line_count >= (int)(sizeof(lines) / sizeof(lines[0])))
-            return;
-        UiViewCubeLine& line = lines[line_count++];
-        line.a = ui_view_cube_project(a, cam_right, cam_up, center, scale);
-        line.b = ui_view_cube_project(b, cam_right, cam_up, center, scale);
-        Vec3 mid = v3_scale(v3_add(a, b), 0.5f);
-        line.depth = v3_dot(mid, cam_forward);
-        line.outer = outer;
-    };
+    for (int i = 0; i < point_count; i++) {
+        if (points[i].positive)
+            continue;
+        dl->AddCircleFilled(points[i].pos, ring_r + ui_px(1.5f * scale), shadow, 32);
+        dl->AddCircleFilled(points[i].pos, ring_r, ring_fill, 32);
+        dl->AddCircle(points[i].pos, ring_r, ui_axis_color_u32(points[i].axis, 0.70f), 32, ui_px(2.8f * scale));
+    }
 
     for (int axis = 0; axis < 3; axis++) {
-        for (int ia = 0; ia < 4; ia++) {
-            for (int ib = 0; ib < 4; ib++) {
-                float a = s[ia];
-                float b = s[ib];
-                bool outer = (fabsf(a) > 0.99f && fabsf(b) > 0.99f);
-                bool surface_line = outer || fabsf(a) > 0.99f || fabsf(b) > 0.99f;
-                if (!surface_line)
-                    continue;
-                if (axis == 0) add_line(v3(-1.0f, a, b), v3(1.0f, a, b), outer);
-                if (axis == 1) add_line(v3(a, -1.0f, b), v3(a, 1.0f, b), outer);
-                if (axis == 2) add_line(v3(a, b, -1.0f), v3(a, b, 1.0f), outer);
-            }
-        }
+        ImVec2 end = ui_orientation_gizmo_project(dirs[axis], cam_right, cam_up, center, axis_len - ball_r * 0.72f);
+        dl->AddLine(center, end, shadow, halo_thick);
+        dl->AddLine(center, end, ui_axis_color_u32(axis, 0.95f), line_thick);
     }
+    dl->AddCircleFilled(center, ui_px(3.0f * scale), shadow, 18);
 
-    for (int a = 0; a < line_count - 1; a++) {
-        for (int b = a + 1; b < line_count; b++) {
-            if (lines[a].depth > lines[b].depth) {
-                UiViewCubeLine tmp = lines[a];
-                lines[a] = lines[b];
-                lines[b] = tmp;
-            }
-        }
-    }
-
-    for (int i = 0; i < line_count; i++) {
-        float thickness = lines[i].outer ? ui_px(2.1f) : ui_px(1.45f);
-        dl->AddLine(lines[i].a, lines[i].b, lines[i].outer ? orange : orange_sub, thickness);
-    }
-
-    struct FaceLabel {
-        const char* text;
-        Vec3 normal;
-        Vec3 right;
-        Vec3 down;
-        float depth;
-    };
-    FaceLabel labels[4] = {
-        { "+X", v3( 1.0f, 0.0f, 0.0f), v3( 0.0f, 0.0f, -1.0f), v3(0.0f, -1.0f, 0.0f), 0.0f },
-        { "-X", v3(-1.0f, 0.0f, 0.0f), v3( 0.0f, 0.0f,  1.0f), v3(0.0f, -1.0f, 0.0f), 0.0f },
-        { "+Z", v3( 0.0f, 0.0f, 1.0f), v3( 1.0f, 0.0f,  0.0f), v3(0.0f, -1.0f, 0.0f), 0.0f },
-        { "-Z", v3( 0.0f, 0.0f,-1.0f), v3(-1.0f, 0.0f,  0.0f), v3(0.0f, -1.0f, 0.0f), 0.0f },
-    };
-    for (int i = 0; i < 4; i++)
-        labels[i].depth = v3_dot(labels[i].normal, cam_forward);
-    for (int a = 0; a < 3; a++) {
-        for (int b = a + 1; b < 4; b++) {
-            if (labels[a].depth > labels[b].depth) {
-                FaceLabel tmp = labels[a];
-                labels[a] = labels[b];
-                labels[b] = tmp;
-            }
-        }
-    }
-
-    auto label_point = [](const FaceLabel& label, Vec3 top_left, float x, float y) -> Vec3 {
-        return v3_add(top_left, v3_add(v3_scale(label.right, x), v3_scale(label.down, y)));
-    };
-    auto draw_face_line = [&](const FaceLabel& label, Vec3 top_left, float x0, float y0, float x1, float y1,
-                              ImU32 col, float thickness) {
-        ImVec2 p0 = ui_view_cube_project(label_point(label, top_left, x0, y0), cam_right, cam_up, center, scale);
-        ImVec2 p1 = ui_view_cube_project(label_point(label, top_left, x1, y1), cam_right, cam_up, center, scale);
-        dl->AddLine(p0, p1, col, thickness);
-    };
-    auto draw_face_char = [&](char ch, const FaceLabel& label, Vec3 top_left,
-                              float ox, float oy, float cw, float chh,
-                              ImU32 col, float thickness) {
-        auto seg = [&](float x0, float y0, float x1, float y1) {
-            draw_face_line(label, top_left, ox + x0 * cw, oy + y0 * chh,
-                           ox + x1 * cw, oy + y1 * chh, col, thickness);
-        };
-        if (ch == '+') {
-            seg(0.15f, 0.50f, 0.85f, 0.50f);
-            seg(0.50f, 0.15f, 0.50f, 0.85f);
-        } else if (ch == '-') {
-            seg(0.15f, 0.50f, 0.85f, 0.50f);
-        } else if (ch == 'X') {
-            seg(0.10f, 0.10f, 0.90f, 0.90f);
-            seg(0.90f, 0.10f, 0.10f, 0.90f);
-        } else if (ch == 'Y') {
-            seg(0.10f, 0.08f, 0.50f, 0.48f);
-            seg(0.90f, 0.08f, 0.50f, 0.48f);
-            seg(0.50f, 0.48f, 0.50f, 0.92f);
-        } else if (ch == 'Z') {
-            seg(0.12f, 0.12f, 0.88f, 0.12f);
-            seg(0.88f, 0.12f, 0.12f, 0.88f);
-            seg(0.12f, 0.88f, 0.88f, 0.88f);
-        }
-    };
-
-    ImU32 label_shadow = ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.62f));
-    ImU32 label_col = ImGui::GetColorU32(ImVec4(1.0f, 0.58f, 0.02f, 1.0f));
-    for (int li = 0; li < 4; li++) {
-        FaceLabel& label = labels[li];
-        if (label.depth >= -0.05f)
+    for (int i = 0; i < point_count; i++) {
+        if (!points[i].positive)
             continue;
+        int axis = points[i].axis;
+        dl->AddCircleFilled(points[i].pos, ball_r + ui_px(2.0f * scale), shadow, 32);
+        dl->AddCircleFilled(points[i].pos, ball_r, ui_axis_color_u32(axis, 1.0f), 32);
+        dl->AddCircle(points[i].pos, ball_r, border, 32, ui_px(1.0f * scale));
 
-        float glyph_w = 0.40f;
-        float glyph_h = 0.76f;
-        float gap = 0.08f;
-        float text_w = glyph_w * 2.0f + gap;
-        float text_h = glyph_h;
-        float stroke = ui_px(2.0f);
-        Vec3 lower_right = v3_add(label.normal,
-                                  v3_add(v3_scale(label.right, 0.88f),
-                                         v3_scale(label.down, 0.88f)));
-        Vec3 top_left = v3_sub(lower_right,
-                               v3_add(v3_scale(label.right, text_w),
-                                      v3_scale(label.down, text_h)));
-
-        draw_face_char(label.text[0], label, top_left,
-                       0.0f, 0.0f, glyph_w, glyph_h, label_shadow, stroke + ui_px(0.9f));
-        draw_face_char(label.text[1], label, top_left,
-                       glyph_w + gap, 0.0f, glyph_w, glyph_h, label_shadow, stroke + ui_px(0.9f));
-        draw_face_char(label.text[0], label, top_left,
-                       0.0f, 0.0f, glyph_w, glyph_h, label_col, stroke);
-        draw_face_char(label.text[1], label, top_left,
-                       glyph_w + gap, 0.0f, glyph_w, glyph_h, label_col, stroke);
+        ImVec2 text_sz = ImGui::CalcTextSize(labels[axis]);
+        ImVec2 text_pos(points[i].pos.x - text_sz.x * 0.5f,
+                        points[i].pos.y - text_sz.y * 0.5f - ui_px(0.5f * scale));
+        dl->AddText(text_pos, text_col, labels[axis]);
     }
 }
 

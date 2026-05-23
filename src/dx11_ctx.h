@@ -55,6 +55,7 @@ struct DX11Ctx {
     bool                     scene_wireframe;
     bool                     scene_grid_enabled;
     bool                     scene_orientation_gizmo_enabled;
+    float                    scene_orientation_gizmo_size_px;
     bool                     scene_manual_control_overlay_enabled;
     bool                     scene_bounds_debug_enabled;
     float                    scene_grid_color[4];

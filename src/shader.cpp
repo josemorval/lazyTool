@@ -122,29 +122,74 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE Open(D3D_INCLUDE_TYPE, LPCSTR file_name,
-                                   LPCVOID, LPCVOID* out_data, UINT* out_bytes) override {
+                                   LPCVOID parent_data, LPCVOID* out_data, UINT* out_bytes) override {
         if (!file_name || !out_data || !out_bytes)
             return E_INVALIDARG;
+
+        const char* base_dir = root_dir;
+        for (int i = 0; i < include_count; ++i) {
+            if (include_records[i].data == parent_data) {
+                base_dir = include_records[i].dir;
+                break;
+            }
+        }
 
         void* data = nullptr;
         size_t size = 0;
         char full[MAX_PATH_LEN] = {};
-        shader_path_join(root_dir, file_name, full, MAX_PATH_LEN);
-        if (!lt_read_file(full, &data, &size) && !lt_read_file(file_name, &data, &size))
+        char loaded_path[MAX_PATH_LEN] = {};
+
+        shader_path_join(base_dir, file_name, full, MAX_PATH_LEN);
+        if (lt_read_file(full, &data, &size)) {
+            shader_store_path(loaded_path, MAX_PATH_LEN, full);
+        } else {
+            // Fallbacks keep old project-root include behavior and also allow an
+            // include from a nested helper to find files beside the original shader.
+            if (base_dir != root_dir) {
+                shader_path_join(root_dir, file_name, full, MAX_PATH_LEN);
+                if (lt_read_file(full, &data, &size))
+                    shader_store_path(loaded_path, MAX_PATH_LEN, full);
+            }
+            if (!data && lt_read_file(file_name, &data, &size))
+                shader_store_path(loaded_path, MAX_PATH_LEN, file_name);
+        }
+
+        if (!data)
             return E_FAIL;
 
         *out_data = data;
         *out_bytes = (UINT)size;
+
+        if (include_count < LT_MAX_INCLUDE_RECORDS) {
+            include_records[include_count].data = data;
+            shader_path_dirname(loaded_path, include_records[include_count].dir, MAX_PATH_LEN);
+            include_count++;
+        }
         return S_OK;
     }
 
     HRESULT STDMETHODCALLTYPE Close(LPCVOID data) override {
+        for (int i = 0; i < include_count; ++i) {
+            if (include_records[i].data == data) {
+                include_records[i] = include_records[include_count - 1];
+                include_count--;
+                break;
+            }
+        }
         lt_free_file((void*)data);
         return S_OK;
     }
 
 private:
+    struct IncludeRecord {
+        const void* data = nullptr;
+        char dir[MAX_PATH_LEN] = {};
+    };
+
+    static const int LT_MAX_INCLUDE_RECORDS = 64;
     char root_dir[MAX_PATH_LEN] = {};
+    IncludeRecord include_records[LT_MAX_INCLUDE_RECORDS] = {};
+    int include_count = 0;
 };
 
 static bool compile_blob(const char* src, size_t src_len, const char* src_name,

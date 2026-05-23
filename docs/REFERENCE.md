@@ -319,6 +319,7 @@ The editor supports:
 - include navigation/back stack from the shader editor;
 - a floating shader editor window;
 - starter shader template creation when a referenced `.hlsl` path does not exist.
+- optional shared helper includes for PBR, raymarching, and atmospheric lighting; see `docs/SHADER_HELPERS.md`.
 
 Template buttons are available for common VS/PS and compute starting points. They are meant to create a readable first file at the resource path, not to impose a sample project structure.
 
