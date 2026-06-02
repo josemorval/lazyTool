@@ -524,6 +524,7 @@ static bool project_line_is_known_default(const char* line) {
         strcmp(line, "clear 1 0.0500000007 0.0500000007 0.0799999982 1 1 1") == 0 ||
         strcmp(line, "vertex_count 3") == 0 ||
         strcmp(line, "instance 1") == 0 ||
+        strcmp(line, "instance_from -") == 0 ||
         strcmp(line, "threads 1 1 1") == 0 ||
         strcmp(line, "compute_on_reset 0") == 0 ||
         strcmp(line, "dispatch_from -") == 0 ||

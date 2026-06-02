@@ -35,29 +35,29 @@ payloads: base color, metallic, normal, roughness, emissive, and occlusion.
 ```hlsl
 cbuffer SceneCB : register(b0)
 {
+    float4x4 WorldToView;
+    float4x4 ViewToWorld;
     float4x4 ViewProj;
-    float4 TimeVec;
-    float4 LightDir;
-    float4 LightColor;
-    float4 CamPos;
-    float4x4 ShadowViewProj;
     float4x4 InvViewProj;
     float4x4 PrevViewProj;
     float4x4 PrevInvViewProj;
-    float4x4 PrevShadowViewProj;
-    float4 CamDir;
-    float4 ShadowCascadeSplits;
-    float4 ShadowParams;
-    float4 ShadowCascadeRects[4];
-    float4x4 ShadowCascadeViewProj[4];
+    float4 TimeVec;
+    float4 CameraParams;
+    float4 LightDir;
+    float4 LightColor;
     float4 LightPos;
     float4 LightParams;
-    float4 CameraParams;
+    float4 ShadowCascadeSplits;
+    float4 ShadowParams;
+    float4x4 ShadowViewProj;
+    float4x4 PrevShadowViewProj;
+    float4 ShadowCascadeRects[4];
+    float4x4 ShadowCascadeViewProj[4];
 };
 
 cbuffer ObjectCB : register(b1)
 {
-    float4x4 World;
+    float4x4 LocalToWorld;
 };
 
 cbuffer MaterialCB : register(b2)
@@ -102,10 +102,10 @@ float3 encode_normal(float3 n)
 VSOut VSMain(VSIn v)
 {
     VSOut o;
-    float4 world = mul(World, float4(v.pos, 1.0));
+    float4 world = mul(LocalToWorld, float4(v.pos, 1.0));
     o.pos = mul(ViewProj, world);
     o.world_pos = world.xyz;
-    o.normal_ws = safe_normalize(mul(World, float4(v.nor, 0.0)).xyz);
+    o.normal_ws = safe_normalize(mul(LocalToWorld, float4(v.nor, 0.0)).xyz);
     o.uv = v.uv;
     return o;
 }
@@ -138,24 +138,24 @@ Bind:
 ```hlsl
 cbuffer SceneCB : register(b0)
 {
+    float4x4 WorldToView;
+    float4x4 ViewToWorld;
     float4x4 ViewProj;
-    float4 TimeVec;
-    float4 LightDir;
-    float4 LightColor;
-    float4 CamPos;
-    float4x4 ShadowViewProj;
     float4x4 InvViewProj;
     float4x4 PrevViewProj;
     float4x4 PrevInvViewProj;
-    float4x4 PrevShadowViewProj;
-    float4 CamDir;
-    float4 ShadowCascadeSplits;
-    float4 ShadowParams;
-    float4 ShadowCascadeRects[4];
-    float4x4 ShadowCascadeViewProj[4];
+    float4 TimeVec;
+    float4 CameraParams;
+    float4 LightDir;
+    float4 LightColor;
     float4 LightPos;
     float4 LightParams;
-    float4 CameraParams;
+    float4 ShadowCascadeSplits;
+    float4 ShadowParams;
+    float4x4 ShadowViewProj;
+    float4x4 PrevShadowViewProj;
+    float4 ShadowCascadeRects[4];
+    float4x4 ShadowCascadeViewProj[4];
 };
 
 Texture2D<float4> GBufferAlbedoMetal : register(t0);
@@ -253,7 +253,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     float ao = saturate(ea.a);
 
     float3 world_pos = scene_depth_to_world(uv, depth01);
-    float3 v = safe_normalize(CamPos.xyz - world_pos);
+    float3 v = safe_normalize(mul(ViewToWorld, float4(0.0, 0.0, 0.0, 1.0)).xyz - world_pos);
     float3 l = LightParams.x >= 0.5 ? safe_normalize(LightPos.xyz - world_pos)
                                     : safe_normalize(-LightDir.xyz);
 
@@ -367,24 +367,24 @@ Bind `Particles` as SRV `t0`. Set vertex count to `particle_count * 6`.
 ```hlsl
 cbuffer SceneCB : register(b0)
 {
+    float4x4 WorldToView;
+    float4x4 ViewToWorld;
     float4x4 ViewProj;
-    float4 TimeVec;
-    float4 LightDir;
-    float4 LightColor;
-    float4 CamPos;
-    float4x4 ShadowViewProj;
     float4x4 InvViewProj;
     float4x4 PrevViewProj;
     float4x4 PrevInvViewProj;
-    float4x4 PrevShadowViewProj;
-    float4 CamDir;
-    float4 ShadowCascadeSplits;
-    float4 ShadowParams;
-    float4 ShadowCascadeRects[4];
-    float4x4 ShadowCascadeViewProj[4];
+    float4 TimeVec;
+    float4 CameraParams;
+    float4 LightDir;
+    float4 LightColor;
     float4 LightPos;
     float4 LightParams;
-    float4 CameraParams;
+    float4 ShadowCascadeSplits;
+    float4 ShadowParams;
+    float4x4 ShadowViewProj;
+    float4x4 PrevShadowViewProj;
+    float4 ShadowCascadeRects[4];
+    float4x4 ShadowCascadeViewProj[4];
 };
 
 struct Particle
@@ -427,7 +427,7 @@ VSOut VSMain(uint vertex_id : SV_VertexID)
     Particle p = Particles[particle_id];
     float2 q = quad_corner(vertex_in_quad);
 
-    float3 forward = safe_normalize(CamDir.xyz);
+    float3 forward = safe_normalize(mul(ViewToWorld, float4(0.0, 0.0, -1.0, 0.0)).xyz);
     float3 right = safe_normalize(cross(float3(0, 1, 0), forward));
     float3 up = safe_normalize(cross(forward, right));
     float3 world_pos = p.pos + (right * q.x + up * q.y) * p.size;
@@ -512,24 +512,24 @@ Bind `Points` as SRV `t0`. Use the indirect args buffer in the draw command.
 ```hlsl
 cbuffer SceneCB : register(b0)
 {
+    float4x4 WorldToView;
+    float4x4 ViewToWorld;
     float4x4 ViewProj;
-    float4 TimeVec;
-    float4 LightDir;
-    float4 LightColor;
-    float4 CamPos;
-    float4x4 ShadowViewProj;
     float4x4 InvViewProj;
     float4x4 PrevViewProj;
     float4x4 PrevInvViewProj;
-    float4x4 PrevShadowViewProj;
-    float4 CamDir;
-    float4 ShadowCascadeSplits;
-    float4 ShadowParams;
-    float4 ShadowCascadeRects[4];
-    float4x4 ShadowCascadeViewProj[4];
+    float4 TimeVec;
+    float4 CameraParams;
+    float4 LightDir;
+    float4 LightColor;
     float4 LightPos;
     float4 LightParams;
-    float4 CameraParams;
+    float4 ShadowCascadeSplits;
+    float4 ShadowParams;
+    float4x4 ShadowViewProj;
+    float4x4 PrevShadowViewProj;
+    float4 ShadowCascadeRects[4];
+    float4x4 ShadowCascadeViewProj[4];
 };
 
 StructuredBuffer<float4> Points : register(t0);

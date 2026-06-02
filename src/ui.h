@@ -54,6 +54,8 @@ void ui_set_code_font_size(float size);
 float ui_code_font_size();
 void ui_set_show_inspector_notes(bool show);
 bool ui_show_inspector_notes();
+void ui_set_show_interface_hints(bool show);
+bool ui_show_interface_hints();
 void ui_set_render_target_preview_columns(int columns);
 int ui_render_target_preview_columns();
 void ui_request_scene_surface_layout_refresh();

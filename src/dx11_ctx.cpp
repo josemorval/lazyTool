@@ -32,25 +32,28 @@ static bool dx_check_present_allow_tearing() {
 static const char* s_shadow_vs_src = R"HLSL(
 cbuffer SceneCB : register(b0)
 {
+    float4x4 WorldToView;
+    float4x4 ViewToWorld;
     float4x4 ViewProj;
-    float4 TimeVec;
-    float4 LightDir;
-    float4 LightColor;
-    float4 CamPos;
-    float4x4 ShadowViewProj;
     float4x4 InvViewProj;
     float4x4 PrevViewProj;
     float4x4 PrevInvViewProj;
-    float4x4 PrevShadowViewProj;
-    float4 CamDir;
+    float4 TimeVec;
+    float4 CameraParams;
+    float4 LightDir;
+    float4 LightColor;
+    float4 LightPos;
+    float4 LightParams;
     float4 ShadowCascadeSplits;
     float4 ShadowParams;
+    float4x4 ShadowViewProj;
+    float4x4 PrevShadowViewProj;
     float4 ShadowCascadeRects[4];
     float4x4 ShadowCascadeViewProj[4];
 };
 cbuffer ObjectCB : register(b1)
 {
-    float4x4 World;
+    float4x4 LocalToWorld;
 };
 
 struct VSIn {
@@ -65,7 +68,7 @@ struct VSOut {
 
 VSOut VSMain(VSIn v) {
     VSOut o;
-    float4 wpos = mul(World, float4(v.pos, 1.0));
+    float4 wpos = mul(LocalToWorld, float4(v.pos, 1.0));
     o.pos = mul(ShadowViewProj, wpos);
     return o;
 }
@@ -101,6 +104,12 @@ struct EditorGridCache {
 };
 
 static EditorGridCache s_editor_grid_cache = {};
+
+static Vec3 scene_cb_camera_position_ws() {
+    return v3(g_dx.scene_cb_data.view_to_world[12],
+              g_dx.scene_cb_data.view_to_world[13],
+              g_dx.scene_cb_data.view_to_world[14]);
+}
 #endif
 
 static SceneCBData   s_uploaded_scene_cb = {};
@@ -114,19 +123,22 @@ static bool          s_uploaded_object_cb_valid = false;
 static const char* s_editor_grid_vs_src = R"HLSL(
 cbuffer SceneCB : register(b0)
 {
+    float4x4 WorldToView;
+    float4x4 ViewToWorld;
     float4x4 ViewProj;
-    float4 TimeVec;
-    float4 LightDir;
-    float4 LightColor;
-    float4 CamPos;
-    float4x4 ShadowViewProj;
     float4x4 InvViewProj;
     float4x4 PrevViewProj;
     float4x4 PrevInvViewProj;
-    float4x4 PrevShadowViewProj;
-    float4 CamDir;
+    float4 TimeVec;
+    float4 CameraParams;
+    float4 LightDir;
+    float4 LightColor;
+    float4 LightPos;
+    float4 LightParams;
     float4 ShadowCascadeSplits;
     float4 ShadowParams;
+    float4x4 ShadowViewProj;
+    float4x4 PrevShadowViewProj;
     float4 ShadowCascadeRects[4];
     float4x4 ShadowCascadeViewProj[4];
 };
@@ -872,9 +884,10 @@ static int editor_grid_build_vertices(EditorGridVertex* verts) {
     if (!verts)
         return 0;
 
-    float eye_x = g_dx.scene_cb_data.cam_pos[0];
-    float eye_y = g_dx.scene_cb_data.cam_pos[1];
-    float eye_z = g_dx.scene_cb_data.cam_pos[2];
+    Vec3 eye = scene_cb_camera_position_ws();
+    float eye_x = eye.x;
+    float eye_y = eye.y;
+    float eye_z = eye.z;
     float scaled_focus = fmaxf(fabsf(eye_y) * 0.2f, 0.0001f);
     float radius = g_dx.scene_grid_distance_fade ? g_dx.scene_grid_fade_end : 360.0f;
     if (radius < 16.0f)
@@ -903,9 +916,10 @@ static bool editor_grid_cache_matches() {
         return false;
 
     const float eps = 0.0001f;
-    if (fabsf(s_editor_grid_cache.eye[0] - g_dx.scene_cb_data.cam_pos[0]) > eps) return false;
-    if (fabsf(s_editor_grid_cache.eye[1] - g_dx.scene_cb_data.cam_pos[1]) > eps) return false;
-    if (fabsf(s_editor_grid_cache.eye[2] - g_dx.scene_cb_data.cam_pos[2]) > eps) return false;
+    Vec3 eye = scene_cb_camera_position_ws();
+    if (fabsf(s_editor_grid_cache.eye[0] - eye.x) > eps) return false;
+    if (fabsf(s_editor_grid_cache.eye[1] - eye.y) > eps) return false;
+    if (fabsf(s_editor_grid_cache.eye[2] - eye.z) > eps) return false;
     if (fabsf(s_editor_grid_cache.fade_start - g_dx.scene_grid_fade_start) > eps) return false;
     if (fabsf(s_editor_grid_cache.fade_end - g_dx.scene_grid_fade_end) > eps) return false;
     if (fabsf(s_editor_grid_cache.level_alpha[0] - g_dx.scene_grid_level_alpha[0]) > eps) return false;
@@ -917,9 +931,10 @@ static bool editor_grid_cache_matches() {
 
 static void editor_grid_store_cache(int vertex_count) {
     s_editor_grid_cache.valid = true;
-    s_editor_grid_cache.eye[0] = g_dx.scene_cb_data.cam_pos[0];
-    s_editor_grid_cache.eye[1] = g_dx.scene_cb_data.cam_pos[1];
-    s_editor_grid_cache.eye[2] = g_dx.scene_cb_data.cam_pos[2];
+    Vec3 eye = scene_cb_camera_position_ws();
+    s_editor_grid_cache.eye[0] = eye.x;
+    s_editor_grid_cache.eye[1] = eye.y;
+    s_editor_grid_cache.eye[2] = eye.z;
     s_editor_grid_cache.fade_start = g_dx.scene_grid_fade_start;
     s_editor_grid_cache.fade_end = g_dx.scene_grid_fade_end;
     s_editor_grid_cache.level_alpha[0] = g_dx.scene_grid_level_alpha[0];
@@ -964,9 +979,10 @@ void dx_render_scene_grid_overlay() {
     cbd->fade[1] = g_dx.scene_grid_fade_end;
     cbd->fade[2] = g_dx.scene_grid_distance_fade ? 1.0f : 0.0f;
     cbd->fade[3] = 0.0f;
-    cbd->camera[0] = g_dx.scene_cb_data.cam_pos[0];
-    cbd->camera[1] = g_dx.scene_cb_data.cam_pos[1];
-    cbd->camera[2] = g_dx.scene_cb_data.cam_pos[2];
+    Vec3 eye = scene_cb_camera_position_ws();
+    cbd->camera[0] = eye.x;
+    cbd->camera[1] = eye.y;
+    cbd->camera[2] = eye.z;
     cbd->camera[3] = 1.0f;
     g_dx.ctx->Unmap(s_editor_grid_cb, 0);
 

@@ -69,6 +69,7 @@ static void app_settings_apply_defaults() {
 
     ui_set_code_font_size(16.0f);
     ui_set_show_inspector_notes(false);
+    ui_set_show_interface_hints(true);
     ui_set_render_target_preview_columns(4);
 }
 
@@ -89,6 +90,7 @@ void app_settings_save() {
     fprintf(f, "ui_scale %.9g\n", ui_global_scale());
     fprintf(f, "code_font_size %.9g\n", ui_code_font_size());
     fprintf(f, "show_inspector_notes %d\n", ui_show_inspector_notes() ? 1 : 0);
+    fprintf(f, "show_interface_hints %d\n", ui_show_interface_hints() ? 1 : 0);
     fprintf(f, "render_target_preview_columns %d\n", ui_render_target_preview_columns());
     fprintf(f, "scene_grid_enabled %d\n", g_dx.scene_grid_enabled ? 1 : 0);
     fprintf(f, "scene_orientation_gizmo_enabled %d\n", g_dx.scene_orientation_gizmo_enabled ? 1 : 0);
@@ -141,6 +143,7 @@ void app_settings_load_or_create() {
         else if (strcmp(key, "ui_scale") == 0) ui_set_global_scale((float)atof(value));
         else if (strcmp(key, "code_font_size") == 0) ui_set_code_font_size((float)atof(value));
         else if (strcmp(key, "show_inspector_notes") == 0) ui_set_show_inspector_notes(atoi(value) != 0);
+        else if (strcmp(key, "show_interface_hints") == 0) ui_set_show_interface_hints(atoi(value) != 0);
         else if (strcmp(key, "render_target_preview_columns") == 0) ui_set_render_target_preview_columns(atoi(value));
         else if (strcmp(key, "scene_grid_enabled") == 0) g_dx.scene_grid_enabled = atoi(value) != 0;
         else if (strcmp(key, "scene_orientation_gizmo_enabled") == 0) g_dx.scene_orientation_gizmo_enabled = atoi(value) != 0;

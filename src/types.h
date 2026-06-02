@@ -328,6 +328,7 @@ struct Command {
     int      vertex_count;
 
     int      instance_count;
+    ResHandle instance_count_source;
     int      thread_x, thread_y, thread_z;
     bool     compute_on_reset;
     // Optional source for dispatch dimensions. When this is set, thread_x/y/z
@@ -369,24 +370,24 @@ struct UserCBEntry {
 // ?? scene cbuffer (b0, must match shaders/scene.hlsl) ????????????????????
 #pragma pack(push, 16)
 struct SceneCBData {
+    float world_to_view[16];
+    float view_to_world[16];
     float view_proj[16];
-    float time_vec[4];
-    float light_dir[4];
-    float light_color[4];
-    float cam_pos[4];
-    float shadow_view_proj[16];
     float inv_view_proj[16];
     float prev_view_proj[16];
     float prev_inv_view_proj[16];
-    float prev_shadow_view_proj[16];
-    float cam_dir[4];
-    float shadow_cascade_splits[4];
-    float shadow_params[4];
-    float shadow_cascade_rects[MAX_SHADOW_CASCADES][4];
-    float shadow_cascade_view_proj[MAX_SHADOW_CASCADES][16];
+    float time_vec[4];
+    float camera_params[4];
+    float light_dir[4];
+    float light_color[4];
     float light_pos[4];
     float light_params[4];
-    float camera_params[4];
+    float shadow_cascade_splits[4];
+    float shadow_params[4];
+    float shadow_view_proj[16];
+    float prev_shadow_view_proj[16];
+    float shadow_cascade_rects[MAX_SHADOW_CASCADES][4];
+    float shadow_cascade_view_proj[MAX_SHADOW_CASCADES][16];
 };
 
 struct UserCBData {
@@ -394,7 +395,7 @@ struct UserCBData {
 };
 
 struct ObjectCBData {
-    float world[16];
+    float local_to_world[16];
 };
 #pragma pack(pop)
 

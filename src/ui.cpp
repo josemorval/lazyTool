@@ -309,6 +309,8 @@ static bool s_project_load_failed = false;
 static char s_project_load_status[160] = {};
 static bool s_viewport_fullscreen = false;
 static bool s_right_panel_general_open = false;
+static ResHandle s_right_panel_general_base_res = INVALID_HANDLE;
+static CmdHandle s_right_panel_general_base_cmd = INVALID_HANDLE;
 static bool s_focus_inspector_panel_next = false;
 static bool s_focus_general_panel_next = false;
 static bool s_help_popup_open = false;
@@ -340,6 +342,7 @@ static ImFont* s_code_font = nullptr;
 static float s_code_font_size = 14.0f;
 static bool s_shader_source_editor_focused = false;
 static bool s_show_inspector_notes = false;
+static bool s_show_interface_hints = true;
 static bool s_inspector_resource_note_open[MAX_RESOURCES] = {};
 static bool s_inspector_command_note_open[MAX_COMMANDS] = {};
 static bool s_inspector_resource_note_editing[MAX_RESOURCES] = {};
@@ -433,6 +436,26 @@ static void ui_draw_profiler_gpu_command_table();
 static void ui_fit_text_ellipsis(const char* text, float max_w, char* out, int out_sz);
 static bool ui_current_panel_focused();
 static void ui_focus_current_panel_window();
+
+static void ui_open_general_panel() {
+    s_right_panel_general_open = true;
+    s_right_panel_general_base_res = g_sel_res;
+    s_right_panel_general_base_cmd = g_sel_cmd;
+    s_focus_general_panel_next = true;
+}
+
+static void ui_close_general_panel_to_inspector() {
+    s_right_panel_general_open = false;
+    s_focus_inspector_panel_next = true;
+}
+
+static void ui_update_general_panel_selection_autoclose() {
+    if (!s_right_panel_general_open)
+        return;
+    if (g_sel_res == s_right_panel_general_base_res && g_sel_cmd == s_right_panel_general_base_cmd)
+        return;
+    ui_close_general_panel_to_inspector();
+}
 
 struct UiProfilerReadoutCache {
     double next_update_time = -1.0;
@@ -1166,11 +1189,7 @@ static void ui_sync_commands_for_shader(ResHandle shader_h) {
 static bool ui_shader_resource_is_compute(const Resource* r) {
     if (!r || r->type != RES_SHADER)
         return false;
-    if (r->shader_kind == SHADER_PROGRAM_CS)
-        return true;
-    if (r->shader_kind == SHADER_PROGRAM_VSPS)
-        return false;
-    return r->cs != nullptr && r->vs == nullptr && r->ps == nullptr;
+    return r->shader_kind == SHADER_PROGRAM_CS;
 }
 
 static bool ui_recompile_shader_resource(ResHandle h, Resource* r, const char* path) {
@@ -1617,6 +1636,8 @@ static const char* ui_resource_display_type(const Resource& r) {
     case RES_NANOVDB:             return "NanoVDB";
     case RES_BUILTIN_SHADOW_MAP:  return "DepthTexture2D";
     case RES_BUILTIN_LIGHT:    return "Light";
+    case RES_SHADER:
+        return r.shader_kind == SHADER_PROGRAM_CS ? "Compute Shader" : "Vertex/Pixel Shader";
     default:                      return res_type_str(r.type);
     }
 }
@@ -1695,6 +1716,38 @@ static void res_combo_render_target(const char* label, ResHandle* h) {
 
 static void res_combo_depth_target(const char* label, ResHandle* h) {
     res_combo(label, h, RES_RENDER_TEXTURE2D, true, RES_BUILTIN_SCENE_DEPTH);
+}
+
+static bool ui_shader_matches_program_kind(const Resource& r, ShaderProgramKind kind) {
+    if (r.type != RES_SHADER)
+        return false;
+    return r.shader_kind == kind;
+}
+
+static void res_combo_shader_kind(const char* label, ResHandle* h, ShaderProgramKind kind,
+                                  bool allow_invalid = true) {
+    Resource* cur = res_get(*h);
+    if (!cur || !ui_shader_matches_program_kind(*cur, kind))
+        *h = INVALID_HANDLE;
+
+    cur = res_get(*h);
+    const char* prev = cur ? ui_resource_display_name(*cur) : "(none)";
+    ImGui::SetNextItemWidth(ui_labeled_item_compact_width(label));
+    if (ImGui::BeginCombo(label, prev)) {
+        if (allow_invalid && ImGui::Selectable("(none)", *h == INVALID_HANDLE))
+            *h = INVALID_HANDLE;
+        for (int i = 0; i < MAX_RESOURCES; i++) {
+            Resource& r = g_resources[i];
+            if (!r.active || !ui_shader_matches_program_kind(r, kind))
+                continue;
+            bool sel = (*h == (ResHandle)(i + 1));
+            ImGui::PushID(i);
+            if (ImGui::Selectable(ui_resource_display_name(r), sel))
+                *h = (ResHandle)(i + 1);
+            ImGui::PopID();
+        }
+        ImGui::EndCombo();
+    }
 }
 
 static bool ui_resource_is_dispatch_source_candidate(const Resource& r) {
@@ -1799,7 +1852,52 @@ VSOut VSMain(uint vid : SV_VertexID) {
     o.pos = float4(pos, 0.0, 1.0);
     return o;
 }
+
 )HLSL";
+
+static bool ui_resource_is_instance_source_candidate(const Resource& r) {
+    if (r.type != RES_INT)
+        return false;
+    if (!r.is_generated)
+        return true;
+    return ui_resource_is_implicit_size_resource(r);
+}
+
+static ResHandle ui_instance_source_normalize(ResHandle h) {
+    Resource* r = res_get(h);
+    if (!r)
+        return INVALID_HANDLE;
+    if (ui_resource_is_instance_source_candidate(*r))
+        return h;
+    if (r->size_handle == INVALID_HANDLE)
+        return INVALID_HANDLE;
+    Resource* implicit = res_get(r->size_handle);
+    return implicit && ui_resource_is_instance_source_candidate(*implicit) ? r->size_handle : INVALID_HANDLE;
+}
+
+static void res_combo_instance_source(const char* label, ResHandle* h) {
+    ResHandle normalized = ui_instance_source_normalize(*h);
+    if (normalized != *h)
+        *h = normalized;
+    Resource* cur = res_get(*h);
+    const char* prev = cur ? ui_resource_display_name(*cur) : "(hardcoded)";
+    ImGui::SetNextItemWidth(ui_labeled_item_compact_width(label));
+    if (ImGui::BeginCombo(label, prev)) {
+        if (ImGui::Selectable("(hardcoded)", *h == INVALID_HANDLE))
+            *h = INVALID_HANDLE;
+        for (int i = 0; i < MAX_RESOURCES; i++) {
+            Resource& r = g_resources[i];
+            if (!r.active || !ui_resource_is_instance_source_candidate(r))
+                continue;
+            bool sel = (*h == (ResHandle)(i + 1));
+            ImGui::PushID(i);
+            if (ImGui::Selectable(ui_resource_display_name(r), sel))
+                *h = (ResHandle)(i + 1);
+            ImGui::PopID();
+        }
+        ImGui::EndCombo();
+    }
+}
 
 static const char* s_shadow_depth_preview_ps_src = R"HLSL(
 cbuffer PreviewCB : register(b0)
@@ -2714,6 +2812,31 @@ static void ui_inspector_text_disabled_wrapped(const char* fmt, ...) {
     va_end(args);
     ImGui::PopTextWrapPos();
     ImGui::PopStyleColor();
+}
+
+static void ui_hint_text_disabled_wrapped(const char* fmt, ...) {
+    if (!s_show_interface_hints)
+        return;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    float wrap_pos = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - ui_current_vertical_scroll_margin(10.0f);
+    if (wrap_pos < ImGui::GetCursorPosX() + ui_px(48.0f))
+        wrap_pos = ImGui::GetCursorPosX() + ui_px(48.0f);
+    ImGui::PushTextWrapPos(wrap_pos);
+    va_list args;
+    va_start(args, fmt);
+    ImGui::TextV(fmt, args);
+    va_end(args);
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+}
+
+static void ui_hint_text_disabled(const char* fmt, ...) {
+    if (!s_show_interface_hints)
+        return;
+    va_list args;
+    va_start(args, fmt);
+    ImGui::TextDisabledV(fmt, args);
+    va_end(args);
 }
 
 static void ui_inspector_note_preview(const char* note, ImVec2 size) {
@@ -4150,7 +4273,7 @@ static bool ui_shader_code_editor_handle_input(UiShaderSourceEditor* ed,
     }
     if (ImGui::IsKeyPressed(ImGuiKey_Enter, true) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, true))
         changed |= ui_shader_editor_insert_bytes(ed, "\n", 1);
-    if (ImGui::IsKeyPressed(ImGuiKey_Tab, true))
+    if (!shift && ImGui::IsKeyPressed(ImGuiKey_Tab, true))
         changed |= ui_shader_editor_insert_bytes(ed, "\t", 1);
 
     if (!ctrl || io.KeyAlt) {
@@ -4656,33 +4779,33 @@ static const char* k_shader_template_common_scene_cb = R"HLSL(// Built-in scene 
 // fields from your shader; D3D reflection only keeps constants that are read.
 cbuffer SceneCB : register(b0)
 {
+    float4x4 WorldToView;
+    float4x4 ViewToWorld;
     float4x4 ViewProj;
-    float4 TimeVec;              // x=time seconds, y=delta seconds, z=frame index, w=reserved.
-    float4 LightDir;             // xyz=main light direction, w=intensity.
-    float4 LightColor;           // rgb=color, a=reserved.
-    float4 CamPos;               // xyz=camera position.
-    float4x4 ShadowViewProj;
     float4x4 InvViewProj;
     float4x4 PrevViewProj;
     float4x4 PrevInvViewProj;
-    float4x4 PrevShadowViewProj;
-    float4 CamDir;               // xyz=camera forward direction.
-    float4 ShadowCascadeSplits;
-    float4 ShadowParams;
-    float4 ShadowCascadeRects[4];
-    float4x4 ShadowCascadeViewProj[4];
+    float4 TimeVec;              // x=time seconds, y=delta seconds, z=frame index, w=reserved.
+    float4 CameraParams;         // x=0 perspective/1 orthographic, y=ortho height, z/w=near/far.
+    float4 LightDir;             // xyz=main light direction, w=intensity.
+    float4 LightColor;           // rgb=color, a=reserved.
     float4 LightPos;             // xyz=main light position.
     float4 LightParams;          // x=0 directional/1 spot, y/z=spot inner/outer cos, w=range.
-    float4 CameraParams;         // x=0 perspective/1 orthographic, y=ortho height, z/w=near/far.
+    float4 ShadowCascadeSplits;
+    float4 ShadowParams;
+    float4x4 ShadowViewProj;
+    float4x4 PrevShadowViewProj;
+    float4 ShadowCascadeRects[4];
+    float4x4 ShadowCascadeViewProj[4];
 };
 
 )HLSL";
 
 static const char* k_shader_template_object_cb = R"HLSL(// Per-object transform supplied by draw commands in register(b1).
-// Mesh shaders normally multiply POSITION by World and then ViewProj.
+// Mesh shaders normally multiply POSITION by LocalToWorld and then ViewProj.
 cbuffer ObjectCB : register(b1)
 {
-    float4x4 World;
+    float4x4 LocalToWorld;
 };
 
 )HLSL";
@@ -4854,7 +4977,7 @@ struct VSOut
 VSOut VSMain(VSIn v, uint instance_id : SV_InstanceID)
 {
     VSOut o;
-    float4 world_pos = mul(World, float4(v.pos, 1.0));
+    float4 world_pos = mul(LocalToWorld, float4(v.pos, 1.0));
     o.pos = mul(ViewProj, world_pos);
     o.uv = v.uv;
     return o;
@@ -5136,6 +5259,43 @@ static bool ui_shader_editor_selector(ResHandle* h, float width = 0.0f) {
     return changed;
 }
 
+static ResHandle ui_shader_editor_next_shader_handle(ResHandle current) {
+    ResHandle first = INVALID_HANDLE;
+    ResHandle next = INVALID_HANDLE;
+    bool return_next = current == INVALID_HANDLE;
+    for (int i = 0; i < MAX_RESOURCES; i++) {
+        Resource& r = g_resources[i];
+        if (!r.active || r.type != RES_SHADER)
+            continue;
+        ResHandle h = (ResHandle)(i + 1);
+        if (first == INVALID_HANDLE)
+            first = h;
+        if (return_next) {
+            next = h;
+            break;
+        }
+        if (h == current)
+            return_next = true;
+    }
+    return next != INVALID_HANDLE ? next : first;
+}
+
+static void ui_shader_editor_cycle_shader(UiShaderSourceEditor* ed, bool floating) {
+    if (!ed)
+        return;
+    ResHandle current = floating ? s_shader_editor_floating_h : ed->h;
+    ResHandle next = ui_shader_editor_next_shader_handle(current);
+    if (next == INVALID_HANDLE || next == current)
+        return;
+    if (ed->dirty)
+        ui_shader_editor_save_current_file(ed);
+    if (floating)
+        s_shader_editor_floating_h = next;
+    else
+        g_sel_res = next;
+    g_sel_cmd = INVALID_HANDLE;
+}
+
 static void ui_shader_source_editor_toolbar(UiShaderSourceEditor* ed, ResHandle h, Resource* r, bool floating) {
     if (!ed || !r)
         return;
@@ -5185,13 +5345,13 @@ static void ui_shader_source_editor_toolbar(UiShaderSourceEditor* ed, ResHandle 
             s_shader_editor_floating_h = selected_h;
         }
 
-        ui_inspector_text_disabled_wrapped("%s%s  |  %zu bytes%s  |  Ln %d, Col %d  |  Ctrl+S save, Ctrl+D compile root, Ctrl+Z/Y undo/redo",
+        ui_inspector_text_disabled_wrapped("%s%s  |  %zu bytes%s  |  Ln %d, Col %d  |  Ctrl+S save, Ctrl+D compile root, Shift+Tab cycle shader, Ctrl+Z/Y undo/redo",
                             ed->viewing_include ? "include " : "root ",
                             ed->path[0] ? ed->path : "(no file)",
                             ed->text ? strlen(ed->text) : 0, ed->dirty ? "  modified" : "",
                             cursor_line, cursor_col);
     } else {
-        ui_inspector_text_disabled_wrapped("%s%s  |  %zu bytes%s  |  Ln %d, Col %d  |  Ctrl+S save, Ctrl+D compile root, Ctrl+Z/Y undo/redo",
+        ui_inspector_text_disabled_wrapped("%s%s  |  %zu bytes%s  |  Ln %d, Col %d  |  Ctrl+S save, Ctrl+D compile root, Shift+Tab cycle shader, Ctrl+Z/Y undo/redo",
                             ed->viewing_include ? "include " : "root ",
                             ed->path[0] ? ed->path : "(no file)",
                             ed->text ? strlen(ed->text) : 0, ed->dirty ? "  modified" : "",
@@ -5202,9 +5362,12 @@ static void ui_shader_source_editor_toolbar(UiShaderSourceEditor* ed, ResHandle 
 static void ui_shader_source_editor_body(UiShaderSourceEditor* ed, ResHandle h, Resource* r, bool floating) {
     if (!ed || !r)
         return;
+    bool panel_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
     ui_shader_source_editor_toolbar(ed, h, r, floating);
     if (ed->editor_focused && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S))
         ui_shader_editor_save(ed, h, r, false);
+    if (panel_focused && ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_Tab))
+        ui_shader_editor_cycle_shader(ed, floating);
     ui_shader_code_editor(ed, r);
     s_shader_source_editor_focused = ed->editor_focused;
 }
@@ -6501,12 +6664,12 @@ static void ui_panel_resources(bool embedded = false) {
                 s_open_sb_create = true;
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Shader (VS+PS)")) {
+            if (ImGui::MenuItem("Vertex/Pixel Shader")) {
                 res_make_unique_name("shader_0", uname, MAX_NAME);
                 g_sel_res = res_create_shader(uname, "", "VSMain", "PSMain");
                 g_sel_cmd = INVALID_HANDLE;
             }
-            if (ImGui::MenuItem("Shader (CS)")) {
+            if (ImGui::MenuItem("Compute Shader")) {
                 res_make_unique_name("cs_0", uname, MAX_NAME);
                 g_sel_res = res_create_compute_shader(uname, "", "CSMain");
                 g_sel_cmd = INVALID_HANDLE;
@@ -7913,7 +8076,10 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
 
 static bool ui_compute_shader_combo(const char* label, ResHandle* h) {
     Resource* cur = res_get(*h);
-    const char* prev = (cur && cur->type == RES_SHADER && cur->cs) ? cur->name : "(none)";
+    if (!cur || !ui_shader_matches_program_kind(*cur, SHADER_PROGRAM_CS))
+        *h = INVALID_HANDLE;
+    cur = res_get(*h);
+    const char* prev = cur ? cur->name : "(none)";
     bool changed = false;
     if (ImGui::BeginCombo(label, prev)) {
         if (ImGui::Selectable("(none)", *h == INVALID_HANDLE)) {
@@ -7922,7 +8088,7 @@ static bool ui_compute_shader_combo(const char* label, ResHandle* h) {
         }
         for (int i = 0; i < MAX_RESOURCES; i++) {
             Resource& r = g_resources[i];
-            if (!r.active || r.type != RES_SHADER || !r.cs) continue;
+            if (!r.active || !ui_shader_matches_program_kind(r, SHADER_PROGRAM_CS)) continue;
             ResHandle rh = (ResHandle)(i + 1);
             bool sel = *h == rh;
             ImGui::PushID(i);
@@ -8094,7 +8260,7 @@ static void ui_command_compute_resource_bindings(Command* c, const char* id_suff
 
     if (!ui_inspector_section("BINDINGS"))
         return;
-    ui_inspector_text_disabled_wrapped("SRVs are bound to t# in CS. UAVs are bound to u# in CS.");
+    ui_hint_text_disabled_wrapped("SRVs are bound to t# in CS. UAVs are bound to u# in CS.");
     ImGui::Text("SRV Slots t# (%d / %d):", c->srv_count, MAX_SRV_SLOTS);
     for (int s = 0; s < c->srv_count; s++) {
         ImGui::PushID(srv_id_base + s);
@@ -8268,11 +8434,22 @@ static void ui_inspector_command(Command* c) {
                 ui_draw_topology_combo("Topology##dm", &c->draw_topology);
                 ImGui::InputInt("Vertex Count", &c->vertex_count);
                 if (c->vertex_count < 0) c->vertex_count = 0;
-                ui_inspector_text_disabled_wrapped("No mesh is bound. The VS should use SV_VertexID / VS SRVs.");
+                ui_hint_text_disabled_wrapped("No mesh is bound. The VS should use SV_VertexID / VS SRVs.");
             } else {
                 res_combo("Mesh##dm", &c->mesh, RES_MESH, false);
             }
-            res_combo("Shader##dm", &c->shader, RES_SHADER, false);
+            res_combo_shader_kind("Shader##dm", &c->shader, SHADER_PROGRAM_VSPS, false);
+            if (c->type == CMD_DRAW_INSTANCED) {
+                res_combo_instance_source("Instance From##dm", &c->instance_count_source);
+                if (c->instance_count_source != INVALID_HANDLE) {
+                    Resource* src = res_get(c->instance_count_source);
+                    ImGui::Text("Resolved instances: %d", src ? (src->ival[0] > 0 ? src->ival[0] : 1) : 1);
+                } else {
+                    ImGui::InputInt("Instance Count", &c->instance_count);
+                    if (c->instance_count < 1)
+                        c->instance_count = 1;
+                }
+            }
         }
         ui_draw_command_bounds_inspector(c, g_sel_cmd);
 
@@ -8307,18 +8484,17 @@ static void ui_inspector_command(Command* c) {
             ImGui::Checkbox("Shadow Caster", &c->shadow_cast);
             ImGui::Checkbox("Shadow Receiver", &c->shadow_receive);
             if (c->shadow_cast)
-                res_combo("Shadow Shader##dm", &c->shadow_shader, RES_SHADER);
-
-            if (c->type == CMD_DRAW_INSTANCED)
-                ImGui::InputInt("Instance Count", &c->instance_count);
+                res_combo_shader_kind("Shadow Shader##dm", &c->shadow_shader, SHADER_PROGRAM_VSPS);
         }
 
         if (ui_inspector_section("SRV BINDINGS")) {
-            ui_inspector_text_disabled_wrapped("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
-            ui_inspector_text_disabled_wrapped("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
-            if (ImGui::TreeNodeEx("Slot Reference##draw_slots", ImGuiTreeNodeFlags_None)) {
-                ui_draw_texture_slot_reference("##draw_slot_reference");
-                ImGui::TreePop();
+            ui_hint_text_disabled_wrapped("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
+            ui_hint_text_disabled_wrapped("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
+            if (s_show_interface_hints) {
+                if (ImGui::TreeNodeEx("Slot Reference##draw_slots", ImGuiTreeNodeFlags_None)) {
+                    ui_draw_texture_slot_reference("##draw_slot_reference");
+                    ImGui::TreePop();
+                }
             }
             ImGui::Text("SRV Slots (%d / %d):", c->srv_count, MAX_SRV_SLOTS);
             for (int s = 0; s < c->srv_count; s++) {
@@ -8336,8 +8512,8 @@ static void ui_inspector_command(Command* c) {
 
         if (ui_inspector_section("PIXEL UAV OUTPUTS")) {
             UINT draw_rtv_count = ui_draw_command_rtv_count(*c);
-            ui_inspector_text_disabled_wrapped("DX11 output slots are shared by RTVs and PS UAVs.");
-            ui_inspector_text_disabled_wrapped("With %u RTV%s active, the first valid UAV slot is u%u.",
+            ui_hint_text_disabled_wrapped("DX11 output slots are shared by RTVs and PS UAVs.");
+            ui_hint_text_disabled_wrapped("With %u RTV%s active, the first valid UAV slot is u%u.",
                 draw_rtv_count, draw_rtv_count == 1 ? "" : "s", draw_rtv_count);
             ImGui::Text("UAV Slots (%d / %d):", c->uav_count, MAX_UAV_SLOTS);
             for (int u = 0; u < c->uav_count; u++) {
@@ -8357,12 +8533,12 @@ static void ui_inspector_command(Command* c) {
 
     case CMD_DISPATCH: {
         if (ui_inspector_section("COMPUTE")) {
-            res_combo("Compute Shader##dp", &c->shader, RES_SHADER, false);
+            res_combo_shader_kind("Compute Shader##dp", &c->shader, SHADER_PROGRAM_CS, false);
             ImGui::Checkbox("Only On Reset", &c->compute_on_reset);
             res_combo_dispatch_source("Dispatch From##dp", &c->dispatch_size_source);
             if (c->dispatch_size_source != INVALID_HANDLE) {
                 ImGui::InputInt3("Divisor XYZ", &c->thread_x);
-                ui_inspector_text_disabled_wrapped("Dispatch = ceil(source_size / divisor)");
+                ui_hint_text_disabled_wrapped("Dispatch = ceil(source_size / divisor)");
             } else {
                 ImGui::InputInt3("Dispatch XYZ", &c->thread_x);
             }
@@ -8383,14 +8559,14 @@ static void ui_inspector_command(Command* c) {
             Resource* mesh = res_get(c->mesh);
             if (ui_command_uses_procedural_draw(*c)) {
                 ui_draw_topology_combo("Topology##id", &c->draw_topology);
-                ui_inspector_text_disabled_wrapped("Uses DrawInstancedIndirect args.");
+                ui_hint_text_disabled_wrapped("Uses DrawInstancedIndirect args.");
             } else {
                 res_combo("Mesh##id", &c->mesh, RES_MESH, false);
-                ui_inspector_text_disabled_wrapped("%s",
+                ui_hint_text_disabled_wrapped("%s",
                     (mesh && mesh->ib) ? "Uses DrawIndexedInstancedIndirect args."
                                        : "Uses DrawInstancedIndirect args.");
             }
-            res_combo("Shader##id", &c->shader, RES_SHADER, false);
+            res_combo_shader_kind("Shader##id", &c->shader, SHADER_PROGRAM_VSPS, false);
         }
         ui_draw_command_bounds_inspector(c, g_sel_cmd);
         if (ui_inspector_section("SHADER PARAMETERS"))
@@ -8423,15 +8599,17 @@ static void ui_inspector_command(Command* c) {
             ImGui::Checkbox("Shadow Caster", &c->shadow_cast);
             ImGui::Checkbox("Shadow Receiver", &c->shadow_receive);
             if (c->shadow_cast)
-                res_combo("Shadow Shader##id", &c->shadow_shader, RES_SHADER);
+                res_combo_shader_kind("Shadow Shader##id", &c->shadow_shader, SHADER_PROGRAM_VSPS);
         }
 
         if (ui_inspector_section("SRV BINDINGS")) {
-            ui_inspector_text_disabled_wrapped("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
-            ui_inspector_text_disabled_wrapped("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
-            if (ImGui::TreeNodeEx("Slot Reference##indirect_draw_slots", ImGuiTreeNodeFlags_None)) {
-                ui_draw_texture_slot_reference("##indirect_draw_slot_reference");
-                ImGui::TreePop();
+            ui_hint_text_disabled_wrapped("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
+            ui_hint_text_disabled_wrapped("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
+            if (s_show_interface_hints) {
+                if (ImGui::TreeNodeEx("Slot Reference##indirect_draw_slots", ImGuiTreeNodeFlags_None)) {
+                    ui_draw_texture_slot_reference("##indirect_draw_slot_reference");
+                    ImGui::TreePop();
+                }
             }
             ImGui::Text("SRV Slots (%d / %d):", c->srv_count, MAX_SRV_SLOTS);
             for (int s = 0; s < c->srv_count; s++) {
@@ -8449,8 +8627,8 @@ static void ui_inspector_command(Command* c) {
 
         if (ui_inspector_section("PIXEL UAV OUTPUTS")) {
             UINT draw_rtv_count = ui_draw_command_rtv_count(*c);
-            ui_inspector_text_disabled_wrapped("DX11 output slots are shared by RTVs and PS UAVs.");
-            ui_inspector_text_disabled_wrapped("With %u RTV%s active, the first valid UAV slot is u%u.",
+            ui_hint_text_disabled_wrapped("DX11 output slots are shared by RTVs and PS UAVs.");
+            ui_hint_text_disabled_wrapped("With %u RTV%s active, the first valid UAV slot is u%u.",
                 draw_rtv_count, draw_rtv_count == 1 ? "" : "s", draw_rtv_count);
             ImGui::Text("UAV Slots (%d / %d):", c->uav_count, MAX_UAV_SLOTS);
             for (int u = 0; u < c->uav_count; u++) {
@@ -8475,7 +8653,7 @@ static void ui_inspector_command(Command* c) {
 
     case CMD_INDIRECT_DISPATCH: {
         if (ui_inspector_section("INDIRECT COMMAND")) {
-            res_combo("Shader##id", &c->shader, RES_SHADER, false);
+            res_combo_shader_kind("Shader##id", &c->shader, SHADER_PROGRAM_CS, false);
             ImGui::Checkbox("Only On Reset", &c->compute_on_reset);
         }
         if (ui_inspector_section("SHADER PARAMETERS"))
@@ -9381,14 +9559,20 @@ static void ui_panel_general(bool embedded = false) {
             ui_set_global_scale(k_ui_scale_default);
             settings_dirty = true;
         }
-        ImGui::TextDisabled("Scales fonts and layout globally without changing project data.");
+        ui_hint_text_disabled("Scales fonts and layout globally without changing project data.");
+
+        bool show_interface_hints = ui_show_interface_hints();
+        if (ImGui::Checkbox("Show Interface Hints", &show_interface_hints)) {
+            ui_set_show_interface_hints(show_interface_hints);
+            settings_dirty = true;
+        }
 
         bool show_inspector_notes = ui_show_inspector_notes();
         if (ImGui::Checkbox("Show Inspector Notes", &show_inspector_notes)) {
             ui_set_show_inspector_notes(show_inspector_notes);
             settings_dirty = true;
         }
-        ImGui::TextDisabled("Controls whether per-resource and per-command notes appear in the Inspector.");
+        ui_hint_text_disabled("Controls whether per-resource and per-command notes appear in the Inspector.");
 
         int rt_preview_columns = ui_render_target_preview_columns();
         if (ImGui::SliderInt("RT Preview Columns", &rt_preview_columns, 1, 8)) {
@@ -9403,13 +9587,13 @@ static void ui_panel_general(bool embedded = false) {
             ui_set_code_font_size(font_size);
             settings_dirty = true;
         }
-        ImGui::TextDisabled("Shader source editor defaults. Saved outside project files.");
+        ui_hint_text_disabled("Shader source editor defaults. Saved outside project files.");
     }
 
     if (ui_inspector_section("APPLICATION")) {
         settings_dirty |= ImGui::Checkbox("VSync", &g_dx.vsync);
         ImGui::SameLine();
-        ImGui::TextDisabled("%s", g_dx.vsync ? "Present interval 1" :
+        ui_hint_text_disabled("%s", g_dx.vsync ? "Present interval 1" :
             (g_dx.present_allow_tearing ? "Present immediate + tearing" : "Present immediate"));
 
         float frame_cap = app_editor_frame_cap_fps();
@@ -9422,11 +9606,11 @@ static void ui_panel_general(bool embedded = false) {
             app_set_editor_frame_cap_fps(0.0f);
             settings_dirty = true;
         }
-        ImGui::TextDisabled("Editor-only throttle. It is ignored when VSync is enabled and does not affect exported players.");
+        ui_hint_text_disabled("Editor-only throttle. It is ignored when VSync is enabled and does not affect exported players.");
     }
 
     if (ui_inspector_section("EXPORTER / STANDALONE")) {
-        ImGui::TextDisabled("Project settings used by Export EXE and build64k.");
+        ui_hint_text_disabled("Project settings used by Export EXE and build64k.");
         // Keep every item in this section explicitly namespaced. The General panel
         // also has editor/runtime diagnostics with similarly named controls, and
         // Dear ImGui IDs are scoped by window/ID stack, not by visual collapsing
@@ -9434,13 +9618,13 @@ static void ui_panel_general(bool embedded = false) {
         // the visible labels readable.
         ImGui::Checkbox("Camera/Light Controls##export_camera_light_controls", &g_export_settings.camera_light_controls_enabled);
         ImGui::SameLine();
-        ImGui::TextDisabled("off by default for demo playback");
+        ui_hint_text_disabled("off by default for demo playback");
         ImGui::Checkbox("Autoplay Timeline##export_timeline_autoplay", &g_export_settings.timeline_autoplay);
         ImGui::SameLine();
-        ImGui::TextDisabled("starts the sequence from frame 0 in the player");
+        ui_hint_text_disabled("starts the sequence from frame 0 in the player");
         ImGui::Checkbox("Exit After Timeline##export_exit_after_timeline", &g_export_settings.exit_after_timeline);
         ImGui::SameLine();
-        ImGui::TextDisabled("overrides timeline loop in player/export");
+        ui_hint_text_disabled("overrides timeline loop in player/export");
         ImGui::Checkbox("Esc Closes Player##export_escape_closes_player", &g_export_settings.escape_closes_player);
         ImGui::Checkbox("VSync In Export##export_vsync", &g_export_settings.vsync);
         ImGui::Checkbox("Show FPS In Title##export_show_fps_title", &g_export_settings.show_fps_title);
@@ -9466,7 +9650,7 @@ static void ui_panel_general(bool embedded = false) {
         if (ImGui::Button("Reset##export_settings")) {
             g_export_settings = project_default_export_settings();
         }
-        ImGui::TextDisabled("Exported players ignore editor wireframe, grid, profiler and shader diagnostics.");
+        ui_hint_text_disabled("Exported players ignore editor wireframe, grid, profiler and shader diagnostics.");
     }
 
     if (ui_inspector_section("VIEWPORT")) {
@@ -9479,7 +9663,7 @@ static void ui_panel_general(bool embedded = false) {
             settings_dirty = true;
             app_request_scene_render();
         }
-        ImGui::TextDisabled("Grid level opacity");
+        ui_hint_text_disabled("Grid level opacity");
         if (ImGui::SliderFloat("Fine##grid_level_alpha", &g_dx.scene_grid_level_alpha[0], 0.0f, 1.0f, "%.2f")) {
             settings_dirty = true;
             app_request_scene_render();
@@ -9526,7 +9710,7 @@ static void ui_panel_general(bool embedded = false) {
 #else
         g_dx.scene_bounds_debug_enabled = false;
 #endif
-        ImGui::TextDisabled("Infinite grid overlay on y=0. Color alpha controls overall intensity; level opacity balances fine/medium/coarse lines.");
+        ui_hint_text_disabled("Infinite grid overlay on y=0. Color alpha controls overall intensity; level opacity balances fine/medium/coarse lines.");
     }
 
     if (ui_inspector_section("DIAGNOSTICS")) {
@@ -10426,6 +10610,8 @@ static void ui_draw_bounds_values(const char* label, const float bmin[3], const 
 
 static void ui_draw_command_bounds_inspector(Command* c, CmdHandle h) {
     if (!c)
+        return;
+    if (!s_show_interface_hints)
         return;
     if (!ui_inspector_section("BOUNDING BOX"))
         return;
@@ -12159,6 +12345,7 @@ static void ui_draw_help_shortcuts_tab() {
         ui_draw_shortcut_row("F5", "Compile all shaders");
         ui_draw_shortcut_row("Ctrl+D", "Compile edited/selected shader");
         ui_draw_shortcut_row("Ctrl+S", "Save shader source or project");
+        ui_draw_shortcut_row("Shift+Tab", "Cycle shader editor file");
         ui_draw_shortcut_row("Ctrl+L", "Load project");
         ui_draw_shortcut_row("F1", "Toggle this help panel");
         ImGui::EndTable();
@@ -12248,9 +12435,11 @@ static void ui_draw_help_common_tab() {
         ui_draw_common_function_row("float3 lt_camera_forward_ws()", "-", "Normalized camera forward vector.");
         ui_draw_common_function_row("float3 lt_vector_to_camera_ws(float3 world_pos)", "world_pos: position in world space.", "Direction from a point toward the camera.");
         ui_draw_common_function_row("float3 lt_ray_from_camera_ws(float3 world_pos)", "world_pos: position in world space.", "Direction from the camera through a world point.");
-        ui_draw_common_function_row("float4 lt_object_to_world(float3 object_pos)", "object_pos: local/object position.", "Transforms local position with ObjectCB.World.");
+        ui_draw_common_function_row("float4 lt_object_to_world(float3 object_pos)", "object_pos: local/object position.", "Transforms local position with ObjectCB.LocalToWorld.");
         ui_draw_common_function_row("float3 lt_object_normal_to_world(float3 object_normal)", "object_normal: local/object normal.", "Transforms and normalizes a local normal.");
         ui_draw_common_function_row("float4 lt_world_to_clip(float3 world_pos)", "world_pos: position in world space.", "Projects a world point with SceneCB.ViewProj.");
+        ui_draw_common_function_row("float4 lt_world_to_view(float3 world_pos)", "world_pos: position in world space.", "Transforms a world point with SceneCB.WorldToView.");
+        ui_draw_common_function_row("float4 lt_view_to_world(float3 view_pos)", "view_pos: camera/view-space position.", "Transforms a view-space point with SceneCB.ViewToWorld.");
         ui_draw_common_function_row("float3 lt_clip_to_ndc(float4 clip_pos)", "clip_pos: homogeneous clip position.", "Divides xyz by w.");
         ui_draw_common_function_row("float2 lt_ndc_to_uv(float2 ndc)", "ndc: xy in -1..1 clip space.", "Converts NDC to texture UV with D3D y flip.");
         ui_draw_common_function_row("float2 lt_clip_to_uv(float4 clip_pos)", "clip_pos: homogeneous clip position.", "Projects clip space directly to UV.");
@@ -14743,12 +14932,12 @@ static void ui_workspace_layout() {
             expanded_h = avail.y;
         }
 
+        ui_update_general_panel_selection_autoclose();
         if (s_right_panel_general_open) {
             if (collapsed_h > 0.0f) {
                 if (ui_header_only_panel("##inspector_collapsed_panel", "INSPECTOR", ui_inspector_header_detail(),
                                          ImVec2(0.0f, collapsed_h), UI_PANEL_INSPECTOR)) {
-                    s_right_panel_general_open = false;
-                    s_focus_inspector_panel_next = true;
+                    ui_close_general_panel_to_inspector();
                 }
             }
 
@@ -14787,8 +14976,7 @@ static void ui_workspace_layout() {
                 ImGui::SetCursorPosY(ImGui::GetCursorPosY() + col_gap);
                 if (ui_header_only_panel("##general_collapsed_panel", "GENERAL", nullptr,
                                          ImVec2(0.0f, collapsed_h), UI_PANEL_GENERAL)) {
-                    s_right_panel_general_open = true;
-                    s_focus_general_panel_next = true;
+                    ui_open_general_panel();
                 }
             }
         }
@@ -14853,6 +15041,14 @@ void ui_set_show_inspector_notes(bool show) {
 
 bool ui_show_inspector_notes() {
     return s_show_inspector_notes;
+}
+
+void ui_set_show_interface_hints(bool show) {
+    s_show_interface_hints = show;
+}
+
+bool ui_show_interface_hints() {
+    return s_show_interface_hints;
 }
 
 void ui_set_render_target_preview_columns(int columns) {

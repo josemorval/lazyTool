@@ -85,7 +85,7 @@ Commands
 The default shader is intentionally small and useful as a reference. It uses:
 
 - `SceneCB` at `b0` for camera, time, light, and shadow data.
-- `ObjectCB` at `b1` for the command world matrix.
+- `ObjectCB` at `b1` for the command `LocalToWorld` matrix.
 - the built-in shadow map on pixel slot `t7`.
 - cascade data from `SceneCB`.
 
@@ -336,7 +336,7 @@ lazyTool separates engine-owned constant buffers from user-editable shader data.
 | Register | Owner | Purpose |
 |---|---|---|
 | `b0` | Engine | `SceneCB`: camera, time, light, shadow, previous-frame matrices, and frame data. |
-| `b1` | Engine | `ObjectCB`: per-command world matrix for draw shaders. |
+| `b1` | Engine | `ObjectCB`: per-command `LocalToWorld` matrix for draw shaders. |
 | `b2` recommended | User shader | `UserCB`: editable scalar/vector parameters. The actual reflected slot is used at runtime. |
 
 Recommended pattern:
@@ -626,7 +626,7 @@ Use the normal packed EXE export for asset-heavy scenes. Use `build64k/` only fo
 | Register | Name | Bound by | Notes |
 |---|---|---|---|
 | `b0` | `SceneCB` | Engine | Camera, time, light, shadow, previous-frame matrices, frame data. |
-| `b1` | `ObjectCB` | Engine | Per-command world matrix when declared by the shader. |
+| `b1` | `ObjectCB` | Engine | Per-command `LocalToWorld` matrix when declared by the shader. |
 | `b2` recommended | `UserCB` | Engine from reflection | Editable scalar/vector shader data. Actual reflected slot is used. |
 
 ### Draw shader resources

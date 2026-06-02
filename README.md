@@ -84,6 +84,27 @@ For shader-specific examples, see [docs/SHADER_TUTORIAL.md](docs/SHADER_TUTORIAL
 - GPU particles with a compute update and procedural draw shader;
 - indirect draw arguments built in compute and consumed by a procedural triangle draw.
 
+### Shadow Receiver Example
+
+For the common case, include `shaders/common.hlsl`, enable **Shadow Receiver** on the draw command, and use the built-in shadow map convention (`t7` plus comparison sampler `s1`). The helper picks the correct cascade and applies a small normal offset:
+
+```hlsl
+#include "common.hlsl"
+
+float4 PSMain(VSOut i) : SV_Target
+{
+    float3 n = lt_safe_normalize(i.normal_ws);
+    float3 light_dir = LightParams.x >= 0.5
+        ? lt_safe_normalize(LightPos.xyz - i.world_pos)
+        : lt_safe_normalize(-LightDir.xyz);
+
+    float ndl = saturate(dot(n, light_dir));
+    float shadow = lt_sample_shadow_pcf3x3(i.world_pos, n, light_dir);
+    float3 lit = i.albedo * (0.05 + LightColor.xyz * LightDir.w * ndl * shadow);
+    return float4(lit, 1.0);
+}
+```
+
 ## Render Graph
 
 The Render Graph is not the main way to edit a scene. It is a debugging view.

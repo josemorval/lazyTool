@@ -5,29 +5,32 @@
 
 cbuffer SceneCB : register(b0)
 {
+    float4x4 WorldToView;
+    float4x4 ViewToWorld;
     float4x4 ViewProj;
-    float4 TimeVec;       // x = time, y = dt, z = frame
-    float4 LightDir;      // xyz = directional light direction, w = intensity
-    float4 LightColor;    // rgb = directional light color
-    float4 CamPos;        // xyz = camera world position
-    float4x4 ShadowViewProj;
     float4x4 InvViewProj;
     float4x4 PrevViewProj;
     float4x4 PrevInvViewProj;
-    float4x4 PrevShadowViewProj;
-    float4 CamDir;        // xyz = camera forward
-    float4 ShadowCascadeSplits;
-    float4 ShadowParams;  // x = cascade count, y = camera near, z = camera far
-    float4 ShadowCascadeRects[LT_MAX_SHADOW_CASCADES];      // reserved cascade UV rects
-    float4x4 ShadowCascadeViewProj[LT_MAX_SHADOW_CASCADES];
+
+    float4 TimeVec;       // x = time, y = dt, z = frame
+    float4 CameraParams;  // x = 0 perspective, 1 orthographic; y = ortho height; z/w = near/far
+
+    float4 LightDir;      // xyz = directional light direction, w = intensity
+    float4 LightColor;    // rgb = directional light color
     float4 LightPos;      // xyz = light world position
     float4 LightParams;   // x = 0 directional, 1 spot; y/z = spot inner/outer cos; w = range
-    float4 CameraParams;  // x = 0 perspective, 1 orthographic; y = ortho height; z/w = near/far
+
+    float4 ShadowCascadeSplits;
+    float4 ShadowParams;  // x = cascade count, y = camera near, z = camera far
+    float4x4 ShadowViewProj;
+    float4x4 PrevShadowViewProj;
+    float4 ShadowCascadeRects[LT_MAX_SHADOW_CASCADES];      // reserved cascade UV rects
+    float4x4 ShadowCascadeViewProj[LT_MAX_SHADOW_CASCADES];
 };
 
 cbuffer ObjectCB : register(b1)
 {
-    float4x4 World;
+    float4x4 LocalToWorld;
 };
 
 #ifndef LT_NO_DEFAULT_SHADOWMAP
@@ -71,37 +74,47 @@ float3 lt_aces_fitted(float3 color)
 
 float3 lt_camera_position_ws()
 {
-    return CamPos.xyz;
+    return mul(ViewToWorld, float4(0.0, 0.0, 0.0, 1.0)).xyz;
 }
 
 float3 lt_camera_forward_ws()
 {
-    return lt_safe_normalize(CamDir.xyz);
+    return lt_safe_normalize(mul(ViewToWorld, float4(0.0, 0.0, -1.0, 0.0)).xyz);
 }
 
 float3 lt_vector_to_camera_ws(float3 world_pos)
 {
-    return lt_safe_normalize(CamPos.xyz - world_pos);
+    return lt_safe_normalize(lt_camera_position_ws() - world_pos);
 }
 
 float3 lt_ray_from_camera_ws(float3 world_pos)
 {
-    return lt_safe_normalize(world_pos - CamPos.xyz);
+    return lt_safe_normalize(world_pos - lt_camera_position_ws());
 }
 
 float4 lt_object_to_world(float3 object_pos)
 {
-    return mul(World, float4(object_pos, 1.0));
+    return mul(LocalToWorld, float4(object_pos, 1.0));
 }
 
 float3 lt_object_normal_to_world(float3 object_normal)
 {
-    return lt_safe_normalize(mul(World, float4(object_normal, 0.0)).xyz);
+    return lt_safe_normalize(mul(LocalToWorld, float4(object_normal, 0.0)).xyz);
 }
 
 float4 lt_world_to_clip(float3 world_pos)
 {
     return mul(ViewProj, float4(world_pos, 1.0));
+}
+
+float4 lt_world_to_view(float3 world_pos)
+{
+    return mul(WorldToView, float4(world_pos, 1.0));
+}
+
+float4 lt_view_to_world(float3 view_pos)
+{
+    return mul(ViewToWorld, float4(view_pos, 1.0));
 }
 
 float3 lt_clip_to_ndc(float4 clip_pos)
@@ -132,7 +145,8 @@ float3 lt_scene_depth_to_world(float2 uv, float depth01)
 
 float lt_view_depth_from_world(float3 world_pos)
 {
-    return dot(world_pos - CamPos.xyz, lt_camera_forward_ws());
+    float3 view_pos = mul(WorldToView, float4(world_pos, 1.0)).xyz;
+    return -view_pos.z;
 }
 
 float lt_scene_depth_to_view_depth(float2 uv, float depth01)

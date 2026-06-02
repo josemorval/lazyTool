@@ -3,7 +3,7 @@
 The general rule is to keep the helpers separated by responsibility and compose them in shaders that need more than one system.
 
 - `shaders/common_pbr.hlsl` contains GGX/Schlick/Smith PBR helpers, default light helpers, shadow integration, simple IBL approximation, normal-map unpacking, and sRGB/linear conversion.
-- `shaders/common_raymarch.hlsl` contains camera-ray reconstruction from `SceneCB.InvViewProj`, SDF primitives/boolean ops, repeat/rotation helpers, a generic SDF trace loop, normal estimation, soft shadows, ambient occlusion, and debug coloring.
+- `shaders/common_raymarch.hlsl` contains camera-ray reconstruction from `SceneCB.InvViewProj`/`SceneCB.ViewToWorld`, SDF primitives/boolean ops, repeat/rotation helpers, a generic SDF trace loop, normal estimation, soft shadows, ambient occlusion, and debug coloring.
 - `shaders/common_atmosphere.hlsl` contains procedural sky, sun disk/glow, stars, ambient diffuse/specular approximations for PBR, height fog, aerial perspective, and ACES tonemapping.
 - `shaders/examples/raymarch_pbr_atmosphere.hlsl` shows the three commons working together in a single fullscreen raymarch shader.
 
@@ -40,7 +40,7 @@ float scene_sdf(float3 p)
 LTRay ray = lt_raymarch_camera_ray(uv);
 ```
 
-That uses `SceneCB.CamPos` and `SceneCB.InvViewProj`, so the user does not need to manually pass FOV, aspect ratio, projection, near plane, or camera basis for common perspective-camera cases. `lt_raymarch_camera_ray_near_plane(uv)` is also available for shaders that prefer ray origins on the near plane.
+That uses `SceneCB.ViewToWorld` and `SceneCB.InvViewProj`, so the user does not need to manually pass FOV, aspect ratio, projection, near plane, or camera basis for common perspective-camera cases. `lt_raymarch_camera_ray_near_plane(uv)` is also available for shaders that prefer ray origins on the near plane.
 
 ## UserCB parameters that work well
 

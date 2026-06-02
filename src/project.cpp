@@ -909,6 +909,9 @@ bool project_save_text(const char* path) {
         fprintf(f, "  clear_sources %s %s\n", clear_color_ref, clear_depth_ref);
         fprintf(f, "  vertex_count %d\n", c.vertex_count);
         fprintf(f, "  instance %d\n", c.instance_count);
+        char instance_ref[MAX_PATH_LEN] = {};
+        res_ref(c.instance_count_source, instance_ref, MAX_PATH_LEN);
+        fprintf(f, "  instance_from %s\n", instance_ref);
         fprintf(f, "  threads %d %d %d\n", c.thread_x, c.thread_y, c.thread_z);
         fprintf(f, "  compute_on_reset %s\n", bool_str(c.compute_on_reset));
         char dispatch_ref[MAX_PATH_LEN] = {};
@@ -1526,6 +1529,8 @@ bool project_load_text(const char* path) {
                 cur->vertex_count = atoi(strtok(nullptr, " \t\r\n"));
             } else if (strcmp(tag, "instance") == 0) {
                 cur->instance_count = atoi(strtok(nullptr, " \t\r\n"));
+            } else if (strcmp(tag, "instance_from") == 0) {
+                cur->instance_count_source = res_by_ref(strtok(nullptr, " \t\r\n"), res_lookup_types(RES_INT));
             } else if (strcmp(tag, "threads") == 0) {
                 cur->thread_x = atoi(strtok(nullptr, " \t\r\n"));
                 cur->thread_y = atoi(strtok(nullptr, " \t\r\n"));

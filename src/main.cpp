@@ -2022,6 +2022,7 @@ static void update_builtins_and_scene_cb() {
     float aspect = g_dx.scene_height > 0 ? (float)g_dx.scene_width / g_dx.scene_height : 1.f;
 
     Mat4 view = mat4_lookat(eye, at, camera_up(g_camera));
+    Mat4 inv_view = mat4_inverse(view);
     int camera_projection = g_camera.projection_type == CAMERA_PROJECTION_ORTHOGRAPHIC ?
                             CAMERA_PROJECTION_ORTHOGRAPHIC : CAMERA_PROJECTION_PERSPECTIVE;
     float ortho_height = g_camera.ortho_height > 0.001f ? g_camera.ortho_height : 0.001f;
@@ -2036,6 +2037,8 @@ static void update_builtins_and_scene_cb() {
     // Upload the CPU memory as-is: column-major binding interprets it as the
     // transposed matrix needed for column-vector multiplication.
     SceneCBData cb = {};
+    memcpy(cb.world_to_view, view.m, sizeof(view.m));
+    memcpy(cb.view_to_world, inv_view.m, sizeof(inv_view.m));
     memcpy(cb.view_proj, vp.m, sizeof(vp.m));
     memcpy(cb.inv_view_proj, inv_vp.m, sizeof(inv_vp.m));
     if (g_dx.scene_cb_history_valid) {
@@ -2048,11 +2051,6 @@ static void update_builtins_and_scene_cb() {
     cb.time_vec[0] = g_time;
     cb.time_vec[1] = g_dt;
     cb.time_vec[2] = (float)g_frame;
-    cb.cam_pos[0]  = eye.x; cb.cam_pos[1] = eye.y; cb.cam_pos[2] = eye.z;
-    Vec3 cam_dir = camera_forward(g_camera);
-    cb.cam_dir[0] = cam_dir.x;
-    cb.cam_dir[1] = cam_dir.y;
-    cb.cam_dir[2] = cam_dir.z;
     cb.camera_params[0] = (float)camera_projection;
     cb.camera_params[1] = ortho_height;
     cb.camera_params[2] = g_camera.near_z;

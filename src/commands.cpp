@@ -657,6 +657,7 @@ CmdHandle cmd_alloc(const char* name, CmdType type) {
             g_commands[i].depth_clear_val  = 1.0f;
             g_commands[i].vertex_count     = 3;
             g_commands[i].instance_count   = 1;
+            g_commands[i].instance_count_source = INVALID_HANDLE;
             g_commands[i].thread_x         = 1;
             g_commands[i].thread_y         = 1;
             g_commands[i].thread_z         = 1;
@@ -1469,7 +1470,7 @@ static void update_object_cb_for_command(const Command& c, const MeshPart* part)
     }
     // See main.cpp: with default column-major HLSL and mul(M, v), upload the
     // CPU row-major matrix as-is so the shader sees the required transpose.
-    memcpy(cb.world, world.m, sizeof(world.m));
+    memcpy(cb.local_to_world, world.m, sizeof(world.m));
     dx_update_object_cb(cb);
 }
 
@@ -1494,8 +1495,18 @@ static void bind_command_geometry(const Command& c, Resource* mesh) {
     bind_mesh_geometry(mesh);
 }
 
-static void draw_command_geometry(const Command& c, Resource* mesh, const MeshPart* part) {
+static int resolve_draw_instance_count(const Command& c) {
     int inst = (c.type == CMD_DRAW_INSTANCED) ? c.instance_count : 1;
+    Resource* source = res_get(c.instance_count_source);
+    if (source && source->type == RES_INT)
+        inst = source->ival[0];
+    if (inst < 1)
+        inst = 1;
+    return inst;
+}
+
+static void draw_command_geometry(const Command& c, Resource* mesh, const MeshPart* part) {
+    int inst = resolve_draw_instance_count(c);
     if (command_uses_procedural_draw(c)) {
         if (c.vertex_count > 0)
             g_dx.ctx->DrawInstanced((UINT)c.vertex_count, (UINT)inst, 0, 0);
