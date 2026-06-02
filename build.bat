@@ -45,9 +45,27 @@ if exist bin rmdir /S /Q bin
 mkdir bin
 mkdir bin\obj_editor
 mkdir bin\obj_player
+mkdir bin\generated
+if not exist build mkdir build
+rem Persist the monotonic counter only after a successful build. The visible
+rem build code folds local yyMMddHHmm + counter into base36 so it looks compact.
+set "BUILD_NUMBER_FILE=build\build_number.txt"
+set /a LAST_BUILD_NUMBER=0
+if exist "%BUILD_NUMBER_FILE%" set /p LAST_BUILD_NUMBER=<"%BUILD_NUMBER_FILE%"
+set /a BUILD_NUMBER=LAST_BUILD_NUMBER+1
+set "BUILD_CODE=%BUILD_NUMBER%"
+for /f "usebackq delims=" %%B in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$n=[int64]$env:BUILD_NUMBER; $stamp=[int64](Get-Date -Format 'yyMMddHHmm'); $chars='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'; function b36([int64]$v){ $s=''; do { $s=$chars[[int]($v%%36)]+$s; $v=[math]::Floor($v/36) } while ($v -gt 0); $s }; 'LT'+(b36 $stamp)+'-'+(b36 $n)"`) do set "BUILD_CODE=%%B"
+(
+    echo #pragma once
+    echo #define LAZYTOOL_BUILD_NUMBER %BUILD_NUMBER%
+    echo #define LAZYTOOL_BUILD_NUMBER_STR "%BUILD_NUMBER%"
+    echo #define LAZYTOOL_BUILD_CODE_STR "%BUILD_CODE%"
+) > bin\generated\build_info.h
+echo [BUILD] %BUILD_CODE% ^(#%BUILD_NUMBER%^)
+set "RELEASE_ZIP=dist\lazyTool_build_%BUILD_CODE%.zip"
 call :stamp STEP_START "Clean"
 
-set "INCLUDES=/I""%ROOT%\src"" /I""%ROOT%\external"" /I""%ROOT%\external\imgui"" /I""%ROOT%\external\imgui\backends"" /I""%ROOT%\external\cgltf"" /I""%ROOT%\external\stb"""
+set "INCLUDES=/I""%ROOT%\src"" /I""%ROOT%\bin\generated"" /I""%ROOT%\external"" /I""%ROOT%\external\imgui"" /I""%ROOT%\external\imgui\backends"" /I""%ROOT%\external\cgltf"" /I""%ROOT%\external\stb"""
 set "DEFINES=/DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /DLAZYTOOL_UNITY_BUILD"
 set "LIBS=d3d11.lib dxgi.lib d3dcompiler.lib user32.lib gdi32.lib shell32.lib psapi.lib"
 set "COMMON=/nologo /std:c++17 /EHsc /W3 /MT /DNDEBUG"
@@ -87,6 +105,24 @@ if exist assets\NUL xcopy assets bin\assets /E /I /Y >nul
 if exist projects\NUL xcopy projects bin\projects /E /I /Y >nul
 if exist shaders\NUL xcopy shaders bin\shaders /E /I /Y >nul
 call :stamp STEP_START "Copy"
+
+if /I "%CONFIG%"=="release" (
+    call :clock STEP_START
+    if exist bin\obj_editor rmdir /S /Q bin\obj_editor
+    if exist bin\obj_player rmdir /S /Q bin\obj_player
+    if exist bin\generated rmdir /S /Q bin\generated
+    del /Q bin\*.obj bin\*.res bin\*.exp bin\*.lib bin\*.ilk bin\*.pdb bin\*.idb bin\*.manifest 2>nul
+    call :stamp STEP_START "Release cleanup"
+
+    call :clock STEP_START
+    if not exist dist mkdir dist
+    if exist "%RELEASE_ZIP%" del /Q "%RELEASE_ZIP%"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path 'bin\*' -DestinationPath '%RELEASE_ZIP%' -CompressionLevel Fastest -Force" || goto failed
+    echo [ZIP] %RELEASE_ZIP%
+    call :stamp STEP_START "Release zip"
+)
+
+> "%BUILD_NUMBER_FILE%" echo %BUILD_NUMBER%
 call :stamp TOTAL_START "Total"
 
 if "%RUN_AFTER_BUILD%"=="0" (

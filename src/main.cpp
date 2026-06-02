@@ -43,7 +43,7 @@ bool g_viewport_manual_light_active = false;
 // main.cpp ties the whole application together: math helpers, global runtime
 // state, per-frame updates, Win32 setup, and the editor/render main loop.
 
-// ── math impl ────────────────────────────────────────────────────────────
+// ?? math impl ????????????????????????????????????????????????????????????
 
 Mat4 mat4_identity() {
     Mat4 r = {};
@@ -718,6 +718,15 @@ static void shadow_atlas_rect_for_cascade(int cascade_index, int cascade_count, 
     }
 }
 
+static void shadow_array_rect_for_cascade(float out_rect[4]) {
+    if (!out_rect)
+        return;
+    out_rect[0] = 1.0f;
+    out_rect[1] = 1.0f;
+    out_rect[2] = 0.0f;
+    out_rect[3] = 0.0f;
+}
+
 static void shadow_compute_cascade_splits(float near_z, float far_z, int cascade_count,
                                           float lambda, float out_splits[MAX_SHADOW_CASCADES]) {
     if (!out_splits)
@@ -781,7 +790,7 @@ static Mat4 shadow_build_manual_cascade_matrix(const Mat4& light_view,
     return mat4_mul(light_view, shadow_proj);
 }
 
-// ── globals ───────────────────────────────────────────────────────────────
+// ?? globals ???????????????????????????????????????????????????????????????
 
 static bool     g_running        = true;
 static int      g_pending_w      = 0;
@@ -1140,9 +1149,11 @@ uint64_t app_scene_frame() {
 static void app_restart_scene_runtime() {
     app_rewind_scene_runtime_state();
     dx_create_scene_rt(g_dx.scene_width, g_dx.scene_height);
-    Resource* dl = res_get(g_builtin_dirlight);
+    Resource* dl = res_get(g_builtin_light);
     if (dl && dl->shadow_width > 0 && dl->shadow_height > 0)
-        dx_create_shadow_map(dl->shadow_width, dl->shadow_height);
+        dx_create_shadow_map(dl->shadow_width, dl->shadow_height,
+                             dl->light_type == LIGHT_TYPE_SPOT ? 1 :
+                             (dl->shadow_cascade_count > 0 ? dl->shadow_cascade_count : 1));
     else
         dx_create_shadow_map(g_dx.shadow_width, g_dx.shadow_height);
     res_reset_transient_gpu_resources();
@@ -1616,10 +1627,10 @@ static bool update_camera_wheel_zoom() {
     return camera_zoom_about_orbit_target(units);
 }
 
-// Holding L rotates the built-in directional light around its target. The edit
+// Holding L rotates the built-in light around its target. The edit
 // keeps distance stable and only changes azimuth/elevation, which matches the
 // inspector fields and makes it easy to extend with gizmos later.
-static bool update_dirlight_orbit() {
+static bool update_light_orbit() {
     if (g_player_mode && !g_export_settings.camera_light_controls_enabled)
         return false;
     if (imgui_mouse_capture_requested()) {
@@ -1640,7 +1651,7 @@ static bool update_dirlight_orbit() {
 
     end_viewport_mouse_gesture(&s_camera_mouse_gesture);
 
-    Resource* dl = res_get(g_builtin_dirlight);
+    Resource* dl = res_get(g_builtin_light);
     if (!dl)
         return true;
 
@@ -1963,7 +1974,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// ── frame update ──────────────────────────────────────────────────────────
+// ?? frame update ??????????????????????????????????????????????????????????
 
 // Gather transient engine state and expose it through built-in resources and
 // the shared SceneCB before commands begin rendering this frame.
@@ -1999,6 +2010,7 @@ static void update_builtins_and_scene_cb() {
         sm->dsv = g_dx.shadow_dsv;
         sm->width = g_dx.shadow_width;
         sm->height = g_dx.shadow_height;
+        sm->depth = g_dx.shadow_layers;
         sm->tex_fmt = DXGI_FORMAT_R24G8_TYPELESS;
         sm->has_srv = true;
         sm->has_dsv = true;
@@ -2010,7 +2022,12 @@ static void update_builtins_and_scene_cb() {
     float aspect = g_dx.scene_height > 0 ? (float)g_dx.scene_width / g_dx.scene_height : 1.f;
 
     Mat4 view = mat4_lookat(eye, at, camera_up(g_camera));
-    Mat4 proj = mat4_perspective(g_camera.fov_y, aspect, g_camera.near_z, g_camera.far_z);
+    int camera_projection = g_camera.projection_type == CAMERA_PROJECTION_ORTHOGRAPHIC ?
+                            CAMERA_PROJECTION_ORTHOGRAPHIC : CAMERA_PROJECTION_PERSPECTIVE;
+    float ortho_height = g_camera.ortho_height > 0.001f ? g_camera.ortho_height : 0.001f;
+    Mat4 proj = camera_projection == CAMERA_PROJECTION_ORTHOGRAPHIC ?
+                mat4_orthographic(ortho_height * aspect, ortho_height, g_camera.near_z, g_camera.far_z) :
+                mat4_perspective(g_camera.fov_y, aspect, g_camera.near_z, g_camera.far_z);
     Mat4 vp   = mat4_mul(view, proj);
     Mat4 inv_vp = mat4_inverse(vp);
 
@@ -2036,15 +2053,19 @@ static void update_builtins_and_scene_cb() {
     cb.cam_dir[0] = cam_dir.x;
     cb.cam_dir[1] = cam_dir.y;
     cb.cam_dir[2] = cam_dir.z;
+    cb.camera_params[0] = (float)camera_projection;
+    cb.camera_params[1] = ortho_height;
+    cb.camera_params[2] = g_camera.near_z;
+    cb.camera_params[3] = g_camera.far_z;
 
-    static Resource s_default_dirlight = {};
-    static bool s_default_dirlight_ready = false;
-    if (!s_default_dirlight_ready) {
-        project_apply_default_dirlight(&s_default_dirlight);
-        s_default_dirlight_ready = true;
+    static Resource s_default_light = {};
+    static bool s_default_light_ready = false;
+    if (!s_default_light_ready) {
+        project_apply_default_light(&s_default_light);
+        s_default_light_ready = true;
     }
-    const Resource& default_dl = s_default_dirlight;
-    Resource* dl = res_get(g_builtin_dirlight);
+    const Resource& default_dl = s_default_light;
+    Resource* dl = res_get(g_builtin_light);
     Vec3 light_dir = v3(default_dl.light_dir[0], default_dl.light_dir[1], default_dl.light_dir[2]);
     Vec3 light_pos = v3(default_dl.light_pos[0], default_dl.light_pos[1], default_dl.light_pos[2]);
     Vec3 light_target = v3(default_dl.light_target[0], default_dl.light_target[1], default_dl.light_target[2]);
@@ -2052,6 +2073,9 @@ static void update_builtins_and_scene_cb() {
     float shadow_h = default_dl.shadow_extent[1];
     float shadow_near = default_dl.shadow_near;
     float shadow_far = default_dl.shadow_far;
+    int light_type = default_dl.light_type == LIGHT_TYPE_SPOT ? LIGHT_TYPE_SPOT : LIGHT_TYPE_DIRECTIONAL;
+    float spot_angle = default_dl.spot_angle;
+    float spot_softness = default_dl.spot_softness;
     cb.light_dir[0] = default_dl.light_dir[0];
     cb.light_dir[1] = default_dl.light_dir[1];
     cb.light_dir[2] = default_dl.light_dir[2];
@@ -2062,7 +2086,7 @@ static void update_builtins_and_scene_cb() {
     if (dl) {
         if (dl->shadow_width > 0 && dl->shadow_height > 0 &&
             (dl->shadow_width != g_dx.shadow_width || dl->shadow_height != g_dx.shadow_height)) {
-            dx_create_shadow_map(dl->shadow_width, dl->shadow_height);
+            dx_create_shadow_map(dl->shadow_width, dl->shadow_height, g_dx.shadow_layers > 0 ? g_dx.shadow_layers : 1);
         }
 
         light_pos = v3(dl->light_pos[0], dl->light_pos[1], dl->light_pos[2]);
@@ -2076,6 +2100,9 @@ static void update_builtins_and_scene_cb() {
         shadow_h = dl->shadow_extent[1] > 0.01f ? dl->shadow_extent[1] : 0.01f;
         shadow_near = dl->shadow_near > 0.0001f ? dl->shadow_near : 0.0001f;
         shadow_far = dl->shadow_far > shadow_near + 0.001f ? dl->shadow_far : shadow_near + 0.001f;
+        light_type = dl->light_type == LIGHT_TYPE_SPOT ? LIGHT_TYPE_SPOT : LIGHT_TYPE_DIRECTIONAL;
+        spot_angle = dl->spot_angle;
+        spot_softness = dl->spot_softness;
 
         cb.light_dir[0] = light_dir.x;
         cb.light_dir[1] = light_dir.y;
@@ -2089,8 +2116,20 @@ static void update_builtins_and_scene_cb() {
     light_dir = v3_norm(light_dir);
     Vec3 shadow_up = fabsf(v3_dot(light_dir, v3(0.0f, 1.0f, 0.0f))) > 0.92f ? v3(0.0f, 0.0f, 1.0f) : v3(0.0f, 1.0f, 0.0f);
     Mat4 shadow_view = mat4_lookat(light_pos, light_target, shadow_up);
-    Mat4 shadow_proj = mat4_orthographic(shadow_w, shadow_h, shadow_near, shadow_far);
+    float spot_outer = clampf(spot_angle, 0.05f, 3.0f);
+    float spot_inner = spot_outer * (1.0f - clampf(spot_softness, 0.0f, 0.95f));
+    Mat4 shadow_proj = light_type == LIGHT_TYPE_SPOT ?
+        mat4_perspective(spot_outer, g_dx.shadow_height > 0 ? (float)g_dx.shadow_width / g_dx.shadow_height : 1.0f, shadow_near, shadow_far) :
+        mat4_orthographic(shadow_w, shadow_h, shadow_near, shadow_far);
     Mat4 shadow_vp = mat4_mul(shadow_view, shadow_proj);
+
+    cb.light_pos[0] = light_pos.x;
+    cb.light_pos[1] = light_pos.y;
+    cb.light_pos[2] = light_pos.z;
+    cb.light_params[0] = (float)light_type;
+    cb.light_params[1] = cosf(spot_inner * 0.5f);
+    cb.light_params[2] = cosf(spot_outer * 0.5f);
+    cb.light_params[3] = shadow_far;
 
     for (int i = 0; i < MAX_SHADOW_CASCADES; i++) {
         cb.shadow_cascade_splits[i] = g_camera.far_z;
@@ -2101,12 +2140,17 @@ static void update_builtins_and_scene_cb() {
         memcpy(cb.shadow_cascade_view_proj[i], shadow_vp.m, sizeof(shadow_vp.m));
     }
 
-    int cascade_count = dl ? dl->shadow_cascade_count : 1;
+    int cascade_count = light_type == LIGHT_TYPE_SPOT ? 1 : (dl ? dl->shadow_cascade_count : 1);
     if (cascade_count < 1) cascade_count = 1;
     if (cascade_count > MAX_SHADOW_CASCADES) cascade_count = MAX_SHADOW_CASCADES;
+    if (g_dx.dev && g_dx.shadow_layers != cascade_count)
+        dx_create_shadow_map(g_dx.shadow_width > 0 ? g_dx.shadow_width : (dl ? dl->shadow_width : default_dl.shadow_width),
+                             g_dx.shadow_height > 0 ? g_dx.shadow_height : (dl ? dl->shadow_height : default_dl.shadow_height),
+                             cascade_count);
     cb.shadow_params[0] = (float)cascade_count;
     cb.shadow_params[1] = g_camera.near_z;
     cb.shadow_params[2] = g_camera.far_z;
+    cb.shadow_params[3] = (float)light_type;
 
     if (cascade_count > 1) {
         float prev_split = g_camera.near_z;
@@ -2129,7 +2173,7 @@ static void update_builtins_and_scene_cb() {
                 shadow_view,
                 cascade_extent_x, cascade_extent_y,
                 cascade_near, cascade_far);
-            shadow_atlas_rect_for_cascade(cascade, cascade_count, cb.shadow_cascade_rects[cascade]);
+            shadow_array_rect_for_cascade(cb.shadow_cascade_rects[cascade]);
             memcpy(cb.shadow_cascade_view_proj[cascade], cascade_vp.m, sizeof(cascade_vp.m));
             cb.shadow_cascade_splits[cascade] = slice_far;
             prev_split = slice_far;
@@ -2138,7 +2182,7 @@ static void update_builtins_and_scene_cb() {
         }
         cb.shadow_params[2] = cb.shadow_cascade_splits[cascade_count - 1];
     } else {
-        shadow_atlas_rect_for_cascade(0, 1, cb.shadow_cascade_rects[0]);
+        shadow_array_rect_for_cascade(cb.shadow_cascade_rects[0]);
         memcpy(cb.shadow_view_proj, shadow_vp.m, sizeof(shadow_vp.m));
         memcpy(cb.shadow_cascade_view_proj[0], shadow_vp.m, sizeof(shadow_vp.m));
         cb.shadow_cascade_splits[0] = shadow_far;
@@ -2152,7 +2196,7 @@ static void update_builtins_and_scene_cb() {
     dx_update_scene_cb(cb);
 }
 
-// ── entry point ───────────────────────────────────────────────────────────
+// ?? entry point ???????????????????????????????????????????????????????????
 
 static void update_default_example_commands() {
     static uint64_t s_pixelize_lookup_revision = 0;
@@ -2510,7 +2554,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
                 timeline_apply_current();
         }
         Camera camera_before_controls = g_camera;
-        light_orbit_active = update_dirlight_orbit();
+        light_orbit_active = update_light_orbit();
         if (!light_orbit_active)
             update_camera_controls(g_scene_paused ? editor_dt : g_dt);
         if (memcmp(&camera_before_controls, &g_camera, sizeof(g_camera)) != 0) {
@@ -2521,7 +2565,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         if (light_orbit_active) {
             force_scene_render = true;
             g_viewport_manual_light_active = true;
-            timeline_capture_if_tracked(TIMELINE_TRACK_DIRLIGHT, "dirlight", RES_NONE);
+            timeline_capture_if_tracked(TIMELINE_TRACK_LIGHT, "light", RES_NONE);
         }
         if (force_scene_render)
             g_scene_render_requested = false;

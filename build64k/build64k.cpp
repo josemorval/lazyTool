@@ -357,7 +357,7 @@ enum TrackKind {
     TK_COMMAND_TRANSFORM,
     TK_COMMAND_ENABLED,
     TK_CAMERA,
-    TK_DIRLIGHT
+    TK_LIGHT
 };
 
 enum SourceKind {
@@ -368,8 +368,8 @@ enum SourceKind {
     SRC_CMD_SCALE,
     SRC_CAMERA_POS,
     SRC_CAMERA_ROT,
-    SRC_DIRLIGHT_POS,
-    SRC_DIRLIGHT_TARGET
+    SRC_LIGHT_POS,
+    SRC_LIGHT_TARGET
 };
 
 static ValType parse_val_type(const std::string& s) {
@@ -398,8 +398,8 @@ static bool val_integral(ValType t) { return t == VT_INT || t == VT_INT2 || t ==
 static int timeline_value_count(TrackKind kind, ValType type) {
     if (kind == TK_COMMAND_TRANSFORM) return 10; // pos3 + quat4 + scale3
     if (kind == TK_COMMAND_ENABLED) return 1;
-    if (kind == TK_CAMERA) return 8;
-    if (kind == TK_DIRLIGHT) return 10; // light pos/target/color/intensity; shadow setup comes from dirlight base data
+    if (kind == TK_CAMERA) return 11;
+    if (kind == TK_LIGHT) return 13; // light pos/target/color/intensity/type/spot; shadow setup comes from light base data
     return val_components(type);
 }
 
@@ -414,11 +414,11 @@ static CmdType parse_cmd_type(const std::string& s) {
 }
 
 static TrackKind parse_track_kind(const std::string& s) {
-    if (s == "user" || s == "user_var") return TK_USER_VAR;
+    if (s == "user") return TK_USER_VAR;
     if (s == "cmd_transform") return TK_COMMAND_TRANSFORM;
     if (s == "cmd_enabled") return TK_COMMAND_ENABLED;
     if (s == "camera") return TK_CAMERA;
-    if (s == "dirlight") return TK_DIRLIGHT;
+    if (s == "light") return TK_LIGHT;
     return TK_NONE;
 }
 
@@ -429,8 +429,8 @@ static SourceKind parse_source_kind(const std::string& s) {
     if (s == "cmd_scale") return SRC_CMD_SCALE;
     if (s == "camera_pos") return SRC_CAMERA_POS;
     if (s == "camera_rot") return SRC_CAMERA_ROT;
-    if (s == "dirlight_pos") return SRC_DIRLIGHT_POS;
-    if (s == "dirlight_target") return SRC_DIRLIGHT_TARGET;
+    if (s == "light_pos") return SRC_LIGHT_POS;
+    if (s == "light_target") return SRC_LIGHT_TARGET;
     return SRC_NONE;
 }
 
@@ -521,6 +521,8 @@ struct CommandDef {
 
 struct TimelineKeyDef {
     int frame = 0;
+    int interpolation_mode = 3;
+    float tangent_scale = 1.0f;
     int ival[4] = {};
     float fval[16] = {};
 };
@@ -538,15 +540,14 @@ struct TimelineClipDef {
     int fps = 24;
     int length = 240;
     bool enabled = true;
-    int interpolation_mode = 0;
     std::vector<TimelineTrackDef> tracks;
 };
 
 // The in-memory project is intentionally small. It is an intermediate format
 // between the verbose editor .lt file and the emitted C arrays.
 struct Project {
-    float camera[8] = {5,5,5,-2.3561945f,-0.6154797f,1.047f,0.001f,100.0f};
-    float dirlight[39] = {5,5,5,0,0,0,1,0.95f,0.9f,1,1024,1024,0.01f,10,8,8,1,5,0.65f,5,8,8,0.01f,10,100,8,8,0.01f,10,100,8,8,0.01f,10,100,8,8,0.01f,10};
+    float camera[11] = {5,5,5,-2.3561945f,-0.6154797f,1.047f,0.001f,1000.0f,0,0,8};
+    float light[42] = {5,5,5,0,0,0,1,0.95f,0.9f,1,1024,1024,0.01f,10,8,8,1,5,0.65f,5,8,8,0.01f,10,100,8,8,0.01f,10,100,8,8,0.01f,10,100,8,8,0.01f,10,0,0.78539816339f,0.15f};
     std::vector<ResourceDef> resources;
     std::vector<UserVarDef> user_vars;
     std::vector<CommandDef> commands;
@@ -618,7 +619,7 @@ static Project parse_lt(const std::string& lt_path) {
         if (t.empty()) continue;
         const std::string& tag = t[0];
         if (tag == "export_settings") {
-            if (t.size() != 6 && t.size() != 7)
+            if (t.size() != 7)
                 die("lt export_settings must use current format");
             saw_export_settings = true;
             p.export_camera_light_controls = toki(t,1,0) != 0;
@@ -628,9 +629,13 @@ static Project parse_lt(const std::string& lt_path) {
             p.export_vsync = toki(t,5,0) != 0;
             p.export_show_fps_title = toki(t,6,0) != 0;
         } else if (tag == "camera_fps") {
-            for (int i = 0; i < 8; i++) p.camera[i] = tokf(t, (size_t)i + 1, p.camera[i]);
-        } else if (tag == "dirlight") {
-            for (int i = 0; i < 39; i++) p.dirlight[i] = tokf(t, (size_t)i + 1, p.dirlight[i]);
+            if (t.size() != 12)
+                die("camera_fps must use the current 11-value format");
+            for (int i = 0; i < 11; i++) p.camera[i] = tokf(t, (size_t)i + 1, p.camera[i]);
+        } else if (tag == "light") {
+            if (t.size() != 44)
+                die("light must use the current 43-value format");
+            for (int i = 0; i < 42; i++) p.light[i] = tokf(t, (size_t)i + 1, p.light[i]);
         } else if (tag == "resource" && t.size() >= 3) {
             ResourceDef r;
             std::string kind = t[1];
@@ -680,7 +685,9 @@ static Project parse_lt(const std::string& lt_path) {
                 r.ival[4] = toki(t,7,0); // indirect args buffer
             }
             if (!r.name.empty()) p.resources.push_back(r);
-        } else if (tag == "user_var" && t.size() >= 4) {
+        } else if (tag == "user_var") {
+            if (t.size() != 12)
+                die("user_var must be: user_var name type source i0 i1 i2 i3 f0 f1 f2 f3");
             UserVarDef u;
             u.name = t[1]; u.type = parse_val_type(t[2]);
             u.source_target = ref_name(t[3]);
@@ -688,12 +695,18 @@ static Project parse_lt(const std::string& lt_path) {
             for (int i = 0; i < 4; i++) u.ival[i] = toki(t, (size_t)4 + i, 0);
             for (int i = 0; i < 4; i++) u.fval[i] = tokf(t, (size_t)8 + i, 0);
             p.user_vars.push_back(u);
-        } else if (tag == "user_var_source" && t.size() >= 4) {
+        } else if (tag == "user_var_source") {
+            if (t.size() != 4)
+                die("user_var_source must be: user_var_source name kind target");
             int ui = find_user_var(p, t[1]);
             if (ui >= 0) {
-                p.user_vars[(size_t)ui].source_kind = parse_source_kind(t[2]);
+                SourceKind source_kind = parse_source_kind(t[2]);
+                if (source_kind == SRC_NONE)
+                    die("user_var_source has an unknown source kind");
+                p.user_vars[(size_t)ui].source_kind = source_kind;
                 p.user_vars[(size_t)ui].source_target = t[3] == "-" ? std::string() : t[3];
-            }
+            } else
+                die("user_var_source references an unknown user_var");
         } else if (tag == "command" && t.size() >= 3) {
             CommandDef c;
             c.type = parse_cmd_type(t[1]);
@@ -795,14 +808,13 @@ static Project parse_lt(const std::string& lt_path) {
             p.timeline_loop = toki(t,2,0) != 0;
             p.timeline_enabled = toki(t,3,0) != 0;
         } else if (tag == "timeline_clip") {
+            if (t.size() != 6)
+                die("timeline_clip must be: timeline_clip name fps length frame enabled");
             TimelineClipDef tl;
-            tl.name = t.size() > 1 ? t[1] : std::string("Timeline");
+            tl.name = t[1];
             tl.fps = toki(t,2,24);
             tl.length = toki(t,3,240);
             tl.enabled = toki(t,5,1) != 0;
-            tl.interpolation_mode = toki(t,6,0);
-            if (tl.interpolation_mode < 0) tl.interpolation_mode = 0;
-            if (tl.interpolation_mode > 3) tl.interpolation_mode = 3;
             if (tl.fps < 1) tl.fps = 1;
             if (tl.length < 1) tl.length = 1;
             p.timelines.push_back(tl);
@@ -811,9 +823,13 @@ static Project parse_lt(const std::string& lt_path) {
         } else if (tag == "end_timeline_clip") {
             cur_timeline = nullptr;
             cur_track = nullptr;
-        } else if (tag == "timeline_track" && t.size() >= 6) {
+        } else if (tag == "timeline_track") {
+            if (t.size() != 6)
+                die("timeline_track must be: timeline_track kind target type key_count enabled");
             TimelineTrackDef tr;
             tr.kind = parse_track_kind(t[1]);
+            if (tr.kind == TK_NONE)
+                die("timeline_track has an unknown kind");
             tr.target = t[2];
             tr.type = parse_val_type(t[3]);
             tr.enabled = toki(t,5,1) != 0;
@@ -823,14 +839,24 @@ static Project parse_lt(const std::string& lt_path) {
             } else {
                 cur_track = nullptr;
             }
-        } else if (tag == "timeline_key" && cur_track && t.size() >= 2) {
+        } else if (tag == "timeline_key" && cur_track) {
             TimelineKeyDef k;
+            if (t.size() < 4)
+                die("timeline_key must be: timeline_key frame mode tangent values...");
             k.frame = toki(t,1,0);
+            k.interpolation_mode = toki(t,2,3);
+            if (k.interpolation_mode < 0) k.interpolation_mode = 0;
+            if (k.interpolation_mode > 3) k.interpolation_mode = 3;
+            k.tangent_scale = tokf(t,3,1.0f);
+            if (k.tangent_scale < 0.0f) k.tangent_scale = 0.0f;
+            if (k.tangent_scale > 4.0f) k.tangent_scale = 4.0f;
             int n = timeline_value_count(cur_track->kind, cur_track->type);
+            if (t.size() != (size_t)(4 + n))
+                die("timeline_key value count does not match its track type");
             if (val_integral(cur_track->type) || cur_track->kind == TK_COMMAND_ENABLED) {
-                for (int i = 0; i < n && i < 4; i++) k.ival[i] = toki(t, (size_t)2 + i, 0);
+                for (int i = 0; i < n && i < 4; i++) k.ival[i] = toki(t, (size_t)4 + i, 0);
             } else {
-                for (int i = 0; i < n && i < 16; i++) k.fval[i] = tokf(t, (size_t)2 + i, 0.0f);
+                for (int i = 0; i < n && i < 16; i++) k.fval[i] = tokf(t, (size_t)4 + i, 0.0f);
                 if (cur_track->kind == TK_COMMAND_TRANSFORM) {
                     Q4 q = {k.fval[3], k.fval[4], k.fval[5], k.fval[6]};
                     q = qnorm(q);
@@ -1205,7 +1231,7 @@ static void pretty_format_c_file(const std::string& path) {
 // incorrect: it normally writes camera ViewProj clip space, not light
 // ShadowViewProj clip space. This tiny fallback VS uses the same primitive input
 // layout as the generated cube/quad/sphere buffers and writes the light-space
-// position expected by the shadow atlas.
+// position expected by the shadow texture array.
 //
 // For draw_source procedural commands that synthesize geometry from SV_VertexID,
 // the exporter still needs either an explicit shadow_shader or a material VS that
@@ -1591,12 +1617,14 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     // int[4] and float[16] even when a track is a single float. Instead, each track
     // records how many components it owns and points into one of two typed streams.
     // This preserves all useful timeline features while avoiding the worst bloat.
-    struct FlatTimeline { int fps, length, enabled, interpolation_mode; };
+    struct FlatTimeline { int fps, length, enabled; };
     struct FlatTrack { int timeline, kind, target, type, integral, frame_start, data_start, count, comp, enabled; };
     std::vector<FlatTimeline> flat_timelines;
     std::vector<FlatTrack> flat_tracks;
     std::vector<int> flat_key_frames;
+    std::vector<int> flat_key_modes;
     std::vector<int> flat_key_ints;
+    std::vector<float> flat_key_tangents;
     std::vector<float> flat_key_floats;
     for (size_t ti = 0; ti < p.timelines.size(); ti++) {
         const TimelineClipDef& tl = p.timelines[ti];
@@ -1604,7 +1632,6 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
         ftl.fps = tl.fps < 1 ? 1 : tl.fps;
         ftl.length = tl.length < 1 ? 1 : tl.length;
         ftl.enabled = tl.enabled ? 1 : 0;
-        ftl.interpolation_mode = tl.interpolation_mode;
         flat_timelines.push_back(ftl);
 
         if (!tl.enabled) continue;
@@ -1634,6 +1661,8 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
             for (size_t k = 0; k < tr.keys.size(); k++) {
                 const TimelineKeyDef& tk = tr.keys[k];
                 flat_key_frames.push_back(tk.frame);
+                flat_key_modes.push_back(tk.interpolation_mode);
+                flat_key_tangents.push_back(tk.tangent_scale);
                 if (ft.integral) {
                     for (int c = 0; c < ft.comp; c++) flat_key_ints.push_back(c < 4 ? tk.ival[c] : 0);
                 } else {
@@ -1720,8 +1749,12 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     if (uses_shaders) fprintf(f, "#include <d3dcompiler.h>\n");
     fprintf(f, "\n");
     fprintf(f, "#define LT_WNDCLS \"lt64k_window\"\n#define LT_PI 3.14159265358979323846f\n");
-    int shadow_tex_w = (int)(p.dirlight[10] > 16.0f ? p.dirlight[10] : 16.0f);
-    int shadow_tex_h = (int)(p.dirlight[11] > 16.0f ? p.dirlight[11] : 16.0f);
+    int shadow_tex_w = (int)(p.light[10] > 16.0f ? p.light[10] : 16.0f);
+    int shadow_tex_h = (int)(p.light[11] > 16.0f ? p.light[11] : 16.0f);
+    int light_type = p.light[39] >= 0.5f ? 1 : 0;
+    int shadow_layers = light_type ? 1 : (int)p.light[16];
+    if (shadow_layers < 1) shadow_layers = 1;
+    if (shadow_layers > 4) shadow_layers = 4;
     // The 64k player is now intentionally fullscreen-only.  This removes the
     // ambiguous split between "window size", "internal size" and "project size":
     //
@@ -1745,7 +1778,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     fprintf(f, "// output in the same resolution space. Fixed custom RTs still keep the size\n");
     fprintf(f, "// authored in the .lt file when scene_scale_divisor == 0.\n");
     fprintf(f, "// -----------------------------------------------------------------------------\n");
-    fprintf(f, "#define LT_PROJECT_W %d\n#define LT_PROJECT_H %d\n#define LT_SHADOW_W %d\n#define LT_SHADOW_H %d\n#define LT_VSYNC %d\n#define LT_ESC_CLOSE %d\n#define LT_EXIT_AFTER_TIMELINE %d\n#define LT_SHOW_FPS_TITLE %d\n", project_w, project_h, shadow_tex_w, shadow_tex_h, p.export_vsync ? 1 : 0, p.export_escape_close ? 1 : 0, p.export_exit_after_timeline ? 1 : 0, p.export_show_fps_title ? 1 : 0);
+    fprintf(f, "#define LT_PROJECT_W %d\n#define LT_PROJECT_H %d\n#define LT_SHADOW_W %d\n#define LT_SHADOW_H %d\n#define LT_SHADOW_LAYERS %d\n#define LT_VSYNC %d\n#define LT_ESC_CLOSE %d\n#define LT_EXIT_AFTER_TIMELINE %d\n#define LT_SHOW_FPS_TITLE %d\n", project_w, project_h, shadow_tex_w, shadow_tex_h, shadow_layers, p.export_vsync ? 1 : 0, p.export_escape_close ? 1 : 0, p.export_exit_after_timeline ? 1 : 0, p.export_show_fps_title ? 1 : 0);
     fprintf(f, "// Minimal CRT replacements and tiny math types. /NODEFAULTLIB builds need these.\n");
     fprintf(f, "int _fltused=0; typedef unsigned int u32;");
     if (!clear_only) fprintf(f, " typedef struct { float m[16]; } M4;");
@@ -1754,7 +1787,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     fprintf(f, "void* __cdecl memcpy(void* d,const void* s,size_t n){ unsigned char* p=(unsigned char*)d; const unsigned char* q=(const unsigned char*)s; while(n--)*p++=*q++; return d; }\n");
     if (!clear_only) {
         fprintf(f, "// Constant buffers shared with the HLSL files. Keep layout in sync with shaders.\n");
-        fprintf(f, "typedef struct { float view_proj[16]; float time_vec[4]; float light_dir[4]; float light_color[4]; float cam_pos[4]; float shadow_view_proj[16]; float inv_view_proj[16]; float prev_view_proj[16]; float prev_inv_view_proj[16]; float prev_shadow_view_proj[16]; float cam_dir[4]; float shadow_cascade_splits[4]; float shadow_params[4]; float shadow_cascade_rects[4][4]; float shadow_cascade_view_proj[4][16]; } SceneCB;\n");
+        fprintf(f, "typedef struct { float view_proj[16]; float time_vec[4]; float light_dir[4]; float light_color[4]; float cam_pos[4]; float shadow_view_proj[16]; float inv_view_proj[16]; float prev_view_proj[16]; float prev_inv_view_proj[16]; float prev_shadow_view_proj[16]; float cam_dir[4]; float shadow_cascade_splits[4]; float shadow_params[4]; float shadow_cascade_rects[4][4]; float shadow_cascade_view_proj[4][16]; float light_pos[4]; float light_params[4]; float camera_params[4]; } SceneCB;\n");
         fprintf(f, "typedef union { float f[64][4]; int i[64][4]; } UserCB; typedef struct { float world[16]; } ObjectCB;\n");
     }
     fprintf(f, "// Global D3D handles and runtime sizes. This player is fullscreen-only, so\n");
@@ -1764,7 +1797,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     if (clear_only) {
         fprintf(f, "static ID3D11Device* dev; static ID3D11DeviceContext* ctx; static IDXGISwapChain* swp; static ID3D11RenderTargetView* rtv; static HWND wh; static int W,H;\n");
     } else {
-        fprintf(f, "static ID3D11Device* dev; static ID3D11DeviceContext* ctx; static IDXGISwapChain* swp; static ID3D11RenderTargetView* rtv; static ID3D11Texture2D* depth_tex; static ID3D11DepthStencilView* dsv; static ID3D11ShaderResourceView* depth_srv; static ID3D11Texture2D* shadow_tex; static ID3D11DepthStencilView* shadow_dsv; static ID3D11ShaderResourceView* shadow_srv; static ID3D11SamplerState* smp_lin; static ID3D11SamplerState* smp_cmp; static ID3D11DepthStencilState* ds[4]; static ID3D11RasterizerState* rs[2]; static ID3D11BlendState* bs[4]; static ID3D11Buffer* scene_cb; static ID3D11Buffer* object_cb; static ID3D11Buffer* user_cb; static ID3D11Buffer* prim_vb[6]; static HWND wh; static int W,H,RW,RH;\n");
+        fprintf(f, "static ID3D11Device* dev; static ID3D11DeviceContext* ctx; static IDXGISwapChain* swp; static ID3D11RenderTargetView* rtv; static ID3D11Texture2D* depth_tex; static ID3D11DepthStencilView* dsv; static ID3D11ShaderResourceView* depth_srv; static ID3D11Texture2D* shadow_tex; static ID3D11DepthStencilView* shadow_dsv[4]; static ID3D11ShaderResourceView* shadow_srv; static ID3D11SamplerState* smp_lin; static ID3D11SamplerState* smp_cmp; static ID3D11DepthStencilState* ds[4]; static ID3D11RasterizerState* rs[2]; static ID3D11BlendState* bs[4]; static ID3D11Buffer* scene_cb; static ID3D11Buffer* object_cb; static ID3D11Buffer* user_cb; static ID3D11Buffer* prim_vb[6]; static HWND wh; static int W,H,RW,RH;\n");
         if (uses_compute)
             fprintf(f, "typedef struct { const char* src; unsigned int len; int cs_kind; ID3D11VertexShader* vs; ID3D11PixelShader* ps; ID3D11ComputeShader* cs; ID3D11InputLayout* il; } Sh;\n");
         else
@@ -1884,15 +1917,19 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     if (uses_timeline) {
         fprintf(f, "// Timeline data. Frames are separate from values, and values are split into\n");
         fprintf(f, "// int and float streams so a float track does not carry unused int/quaternion data.\n");
-        fprintf(f, "typedef struct { int fps,len,enabled,mode; } Tl; typedef struct { int tl,kind,target,type,integral,fs,ds,count,comp,enabled; } Tr;\n");
+        fprintf(f, "typedef struct { int fps,len,enabled; } Tl; typedef struct { int tl,kind,target,type,integral,fs,ds,count,comp,enabled; } Tr;\n");
         fprintf(f, "static Tl tls[%u]={\n", (unsigned)flat_timelines.size());
         for (size_t i = 0; i < flat_timelines.size(); i++) {
             const FlatTimeline& tl = flat_timelines[i];
-            fprintf(f, " {%d,%d,%d,%d},\n", tl.fps, tl.length, tl.enabled, tl.interpolation_mode);
+            fprintf(f, " {%d,%d,%d},\n", tl.fps, tl.length, tl.enabled);
         }
         fprintf(f, "};\n");
         fprintf(f, "static int kfr[%u]={", (unsigned)flat_key_frames.size());
         for (size_t i = 0; i < flat_key_frames.size(); i++) { if (i) fprintf(f, ","); fprintf(f, "%d", flat_key_frames[i]); }
+        fprintf(f, "};\nstatic int km[%u]={", (unsigned)flat_key_modes.size());
+        for (size_t i = 0; i < flat_key_modes.size(); i++) { if (i) fprintf(f, ","); fprintf(f, "%d", flat_key_modes[i]); }
+        fprintf(f, "};\nstatic float kt[%u]={", (unsigned)flat_key_tangents.size());
+        for (size_t i = 0; i < flat_key_tangents.size(); i++) { if (i) fprintf(f, ","); emit_float_literal(f, flat_key_tangents[i]); }
         fprintf(f, "};\nstatic int ki[%u]={", (unsigned)(flat_key_ints.empty() ? 1 : flat_key_ints.size()));
         if (flat_key_ints.empty()) fprintf(f, "0");
         for (size_t i = 0; i < flat_key_ints.size(); i++) { if (i) fprintf(f, ","); fprintf(f, "%d", flat_key_ints[i]); }
@@ -1907,7 +1944,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
         fprintf(f, "};\n");
     }
     if (!clear_only) {
-        fprintf(f, "static float cam0[8]={"); emit_float_array(f, p.camera, 8); fprintf(f, "}; static float dl0[39]={"); emit_float_array(f, p.dirlight, 39); fprintf(f, "}; static float cam[8],dl[39];\n");
+        fprintf(f, "static float cam0[11]={"); emit_float_array(f, p.camera, 11); fprintf(f, "}; static float dl0[42]={"); emit_float_array(f, p.light, 42); fprintf(f, "}; static float cam[11],dl[42];\n");
     }
     fprintf(f, "enum{ CMDN=%u, SHN=%u, RTN=%u, SBN=%u, UVN=%u, PN=%u, TLN=%u, TRN=%u, KEYN=%u, TL_LOOP=%d, TL_ON=%d };\n",
             (unsigned)out_cmds.size(), (unsigned)shader_sources.size(), (unsigned)rt_res_indices.size(), (unsigned)buffer_res_indices.size(), (unsigned)p.user_vars.size(), (unsigned)flat_params.size(), (unsigned)emit_timeline_count, (unsigned)emit_track_count, (unsigned)emit_key_count, (uses_timeline && p.timeline_loop && !p.export_exit_after_timeline)?1:0, uses_timeline?1:0);
@@ -1921,13 +1958,17 @@ static float lerp(float a,float b,float t){return a+(b-a)*t;}
 static int comps(int t){ return (t==1||t==4)?1:((t==2||t==5)?2:((t==3||t==6)?3:(t==7?4:0))); }
 static int isint(int t){ return t>=1&&t<=3; }
 static int tr_frame(Tr* r,int k){ return kfr[r->fs+k]; }
+static int tr_mode(Tr* r,int k){ return km[r->fs+k]; }
+static float tr_tan(Tr* r,int k){ return kt[r->fs+k]; }
 static float tr_f(Tr* r,int k,int c){ return kf[r->ds+k*r->comp+c]; }
 static int tr_i(Tr* r,int k,int c){ return ki[r->ds+k*r->comp+c]; }
 static float ease(int m,float t){ t=cl(t,0,1); if(m==2){ if(t<0.5f)return 2*t*t; float u=1-t; return 1-2*u*u; } return t; }
-static void apply_track(Tr* r,float fr){ if(r->kind!=1||r->target<0||r->target>=UVN)return; int a=-1,b=-1,i,n=r->count,mode=(r->tl>=0&&r->tl<TLN)?tls[r->tl].mode:1; for(i=0;i<n;i++){ int k0=tr_frame(r,i); if((float)k0<=fr)a=i; if((float)k0>=fr){b=i;break;} } if(a<0)a=b>=0?b:0; if(b<0)b=a; if(isint(uv[r->target].type)){ for(i=0;i<r->comp&&i<4;i++)uv[r->target].iv[i]=tr_i(r,a,i); return; } float o[4]={0,0,0,0}; for(i=0;i<r->comp&&i<4;i++)o[i]=tr_f(r,a,i); if(a!=b){ int fa=tr_frame(r,a),fb=tr_frame(r,b); float tt=fb>fa?(fr-(float)fa)/(float)(fb-fa):0,et=ease(mode,tt); for(i=0;i<r->comp&&i<4;i++)o[i]=lerp(tr_f(r,a,i),tr_f(r,b,i),et); } int c=comps(uv[r->target].type); for(i=0;i<c&&i<4;i++)uv[r->target].fv[i]=o[i]; }
+static float cub(float p0,float p1,float p2,float p3,int f0,int f1,int f2,int f3,float s1,float s2,float t){ float sp=(float)(f2-f1),m1=f2!=f0?(p2-p0)*sp/(float)(f2-f0):0,m2=f3!=f1?(p3-p1)*sp/(float)(f3-f1):0,t2=t*t,t3=t2*t; m1*=s1;m2*=s2; return (2*t3-3*t2+1)*p1+(t3-2*t2+t)*m1+(-2*t3+3*t2)*p2+(t3-t2)*m2; }
+static float cval(Tr* r,int p0,int p1,int p2,int p3,int c,float t){ return cub(tr_f(r,p0,c),tr_f(r,p1,c),tr_f(r,p2,c),tr_f(r,p3,c),tr_frame(r,p0),tr_frame(r,p1),tr_frame(r,p2),tr_frame(r,p3),tr_tan(r,p1),tr_tan(r,p2),t); }
+static void apply_track(Tr* r,float fr){ if(r->kind!=1||r->target<0||r->target>=UVN)return; int a=-1,b=-1,p0,p3,i,n=r->count,mode=3; for(i=0;i<n;i++){ int k0=tr_frame(r,i); if((float)k0<=fr)a=i; if((float)k0>=fr){b=i;break;} } if(a<0)a=b>=0?b:0; if(b<0)b=a; p0=a>0?a-1:a; p3=b+1<n?b+1:b; mode=tr_mode(r,a); if(isint(uv[r->target].type)){ for(i=0;i<r->comp&&i<4;i++)uv[r->target].iv[i]=tr_i(r,a,i); return; } float o[4]={0,0,0,0}; for(i=0;i<r->comp&&i<4;i++)o[i]=tr_f(r,a,i); if(a!=b&&mode){ int fa=tr_frame(r,a),fb=tr_frame(r,b); float tt=fb>fa?(fr-(float)fa)/(float)(fb-fa):0,et=ease(mode,tt); for(i=0;i<r->comp&&i<4;i++)o[i]=mode==3?cval(r,p0,a,b,p3,i,tt):lerp(tr_f(r,a,i),tr_f(r,b,i),et); } int c=comps(uv[r->target].type); for(i=0;i<c&&i<4;i++)uv[r->target].fv[i]=o[i]; }
 static float tldur(Tl* t){ if(!t->enabled||t->fps<=0||t->len<=0)return 0; return (float)t->len/(float)t->fps; }
 static float tltotal(void){ float total=0; int i; for(i=0;i<TLN;i++)total+=tldur(tls+i); return total; }
-static void timeline(float sec){ if(!TL_ON||TLN<1)return; float total=tltotal(),acc=0,local=0,fr=0,d; int i,ci=-1,last=-1; if(total<=0)return; if(TL_LOOP)while(sec>=total)sec-=total; else if(sec>total)sec=total; for(i=0;i<TLN;i++){ if(!tls[i].enabled)continue; last=i; d=tldur(tls+i); if(ci<0&&sec<acc+d){ci=i;local=sec-acc;break;} acc+=d; } if(ci<0&&last>=0){ci=last;local=tldur(tls+ci);} if(ci<0||tls[ci].fps<=0)return; fr=local*(float)tls[ci].fps; d=(float)(tls[ci].len-1); if(fr>d)fr=d; if(!tls[ci].mode)fr=(float)((int)(fr+0.0001f)); for(i=0;i<TRN;i++)if(tr[i].enabled&&tr[i].tl==ci)apply_track(tr+i,fr); }
+static void timeline(float sec){ if(!TL_ON||TLN<1)return; float total=tltotal(),acc=0,local=0,fr=0,d; int i,ci=-1,last=-1; if(total<=0)return; if(TL_LOOP)while(sec>=total)sec-=total; else if(sec>total)sec=total; for(i=0;i<TLN;i++){ if(!tls[i].enabled)continue; last=i; d=tldur(tls+i); if(ci<0&&sec<acc+d){ci=i;local=sec-acc;break;} acc+=d; } if(ci<0&&last>=0){ci=last;local=tldur(tls+ci);} if(ci<0||tls[ci].fps<=0)return; fr=local*(float)tls[ci].fps; d=(float)(tls[ci].len-1); if(fr>d)fr=d; for(i=0;i<TRN;i++)if(tr[i].enabled&&tr[i].tl==ci)apply_track(tr+i,fr); }
 static void clear_vals(Cmd* c,float* cc){ int i; for(i=0;i<4;i++)cc[i]=c->cc[i]; if(c->ccs>=0&&c->ccs<UVN&&uv[c->ccs].type==7)for(i=0;i<4;i++)cc[i]=uv[c->ccs].fv[i]; }
 static void fps_title(void){}
 static void render(float sec){ timeline(sec); for(int i=0;i<CMDN;i++){ Cmd* c=cmd+i; if(c->enabled&&c->type==1&&c->rt==-2&&c->ccen){ float cc[4]; clear_vals(c,cc); ID3D11DeviceContext_ClearRenderTargetView(ctx,rtv,cc); } } IDXGISwapChain_Present(swp,LT_VSYNC?1:0,0); fps_title(); }
@@ -1983,13 +2024,15 @@ static Q ql(Q a,Q b,float t){ Q q; float d; a=qn(a); b=qn(b); d=a.x*b.x+a.y*b.y+
 static M4 qmat(Q q){ M4 m; float xx,yy,zz,xy,xz,yz,xw,yw,zw; q=qn(q); xx=q.x*q.x;yy=q.y*q.y;zz=q.z*q.z;xy=q.x*q.y;xz=q.x*q.z;yz=q.y*q.z;xw=q.x*q.w;yw=q.y*q.w;zw=q.z*q.w; mid(&m); m.m[0]=1.0f-2.0f*(yy+zz);m.m[1]=2.0f*(xy+zw);m.m[2]=2.0f*(xz-yw);m.m[4]=2.0f*(xy-zw);m.m[5]=1.0f-2.0f*(xx+zz);m.m[6]=2.0f*(yz+xw);m.m[8]=2.0f*(xz+yw);m.m[9]=2.0f*(yz-xw);m.m[10]=1.0f-2.0f*(xx+yy); return m; }
 static void world(Cmd* c,M4* out){ M4 s,t,r; Q q; mid(&s);mid(&t); s.m[0]=c->scl[0];s.m[5]=c->scl[1];s.m[10]=c->scl[2]; t.m[12]=c->pos[0];t.m[13]=c->pos[1];t.m[14]=c->pos[2]; q.x=c->q[0];q.y=c->q[1];q.z=c->q[2];q.w=c->q[3]; r=qmat(q); *out=mmul(mmul(s,r),t); }
 static void lookat(M4* r,float* eye,float* at,float* up){ float z[3]={eye[0]-at[0],eye[1]-at[1],eye[2]-at[2]}; float iz=rsq(z[0]*z[0]+z[1]*z[1]+z[2]*z[2]); z[0]*=iz;z[1]*=iz;z[2]*=iz; float x[3]={z[1]*up[2]-z[2]*up[1],z[2]*up[0]-z[0]*up[2],z[0]*up[1]-z[1]*up[0]}; float ix=rsq(x[0]*x[0]+x[1]*x[1]+x[2]*x[2]); if(ix==0){x[0]=1;x[1]=x[2]=0;} else {x[0]*=ix;x[1]*=ix;x[2]*=ix;} float y[3]={x[1]*z[2]-x[2]*z[1],x[2]*z[0]-x[0]*z[2],x[0]*z[1]-x[1]*z[0]}; mid(r); r->m[0]=x[0];r->m[1]=y[0];r->m[2]=z[0]; r->m[4]=x[1];r->m[5]=y[1];r->m[6]=z[1]; r->m[8]=x[2];r->m[9]=y[2];r->m[10]=z[2]; r->m[12]=-(x[0]*eye[0]+x[1]*eye[1]+x[2]*eye[2]); r->m[13]=-(y[0]*eye[0]+y[1]*eye[1]+y[2]*eye[2]); r->m[14]=-(z[0]*eye[0]+z[1]*eye[1]+z[2]*eye[2]); }
-static void persp(M4* p){ zmem(p,sizeof(M4)); float f=cs(cam[5]*0.5f)/sn(cam[5]*0.5f),asp=(float)RW/(float)RH; p->m[0]=f/asp;p->m[5]=f;p->m[10]=cam[7]/(cam[6]-cam[7]);p->m[11]=-1;p->m[14]=(cam[6]*cam[7])/(cam[6]-cam[7]); }
+static void perspf(M4* p,float fov,float asp,float n,float fa){ zmem(p,sizeof(M4)); float f=cs(fov*0.5f)/sn(fov*0.5f); if(n<0.0001f)n=0.0001f; if(fa<=n+0.001f)fa=n+0.001f; p->m[0]=f/asp;p->m[5]=f;p->m[10]=fa/(n-fa);p->m[11]=-1;p->m[14]=(n*fa)/(n-fa); }
+static void persp(M4* p){ perspf(p,cam[5],(float)RW/(float)RH,cam[6],cam[7]); }
 static void ortho(M4* p,float w,float h,float n,float fa){ if(w<0.01f)w=0.01f; if(h<0.01f)h=0.01f; if(n<0.0001f)n=0.0001f; if(fa<=n+0.001f)fa=n+0.001f; zmem(p,sizeof(M4)); p->m[0]=2.0f/w;p->m[5]=2.0f/h;p->m[10]=1.0f/(n-fa);p->m[14]=n/(n-fa);p->m[15]=1.0f; }
-static void viewproj(M4* out,float tsec){ float cp=cs(cam[4]), fwd[3]={sn(cam[3])*cp,sn(cam[4]),cs(cam[3])*cp}; float eye[3]={cam[0],cam[1],cam[2]}, at[3]={eye[0]+fwd[0],eye[1]+fwd[1],eye[2]+fwd[2]}, up[3]={0,1,0}; M4 v,p; lookat(&v,eye,at,up); persp(&p); *out=mmul(v,p); }
+static void viewproj(M4* out,float tsec){ float cp=cs(cam[4]), fwd[3]={sn(cam[3])*cp,sn(cam[4]),cs(cam[3])*cp}; float eye[3]={cam[0],cam[1],cam[2]}, at[3]={eye[0]+fwd[0],eye[1]+fwd[1],eye[2]+fwd[2]}, up[3]={0,1,0}; M4 v,p; lookat(&v,eye,at,up); if(cam[9]>=0.5f){ float oh=cam[10]>0.001f?cam[10]:0.001f; ortho(&p,oh*(float)RW/(float)RH,oh,cam[6],cam[7]); } else persp(&p); *out=mmul(v,p); }
 static void atlas(int ci,int cc,float* r){ if(cc<=1){r[0]=r[1]=1;r[2]=r[3]=0;return;} if(ci<0)ci=0; if(ci>3)ci=3; float x=0,y=0,w=1,h=1; for(int i=0;i<=ci;i++){ if((i&1)==0){r[0]=w*0.5f;r[1]=h;r[2]=x;r[3]=y;x+=r[0];w-=r[0];} else {r[0]=w;r[1]=h*0.5f;r[2]=x;r[3]=y;y+=r[1];h-=r[1];} } }
-// Build the directional-light shadow matrices. One cascade uses the base
-// ortho settings; 2-4 cascades use the split/size entries stored in dirlight.
-static void shadowvp(SceneCB* sc){ float eye[3]={dl[0],dl[1],dl[2]},at[3]={dl[3],dl[4],dl[5]}; float ldx=at[0]-eye[0],ldy=at[1]-eye[1],ldz=at[2]-eye[2],li=rsq(ldx*ldx+ldy*ldy+ldz*ldz); float up[3]={0,1,0}; if(ab(ldy*li)>0.92f){up[1]=0;up[2]=1;} M4 lv,op,svp; lookat(&lv,eye,at,up); int cc=(int)dl[16]; if(cc<1)cc=1; if(cc>4)cc=4; sc->shadow_params[0]=(float)cc; sc->shadow_params[1]=cam[6]; sc->shadow_params[2]=cam[7]; ortho(&op,dl[14],dl[15],dl[12],dl[13]); svp=mmul(lv,op); for(int i=0;i<4;i++){ sc->shadow_cascade_splits[i]=cam[7]; sc->shadow_cascade_rects[i][0]=sc->shadow_cascade_rects[i][1]=sc->shadow_cascade_rects[i][2]=sc->shadow_cascade_rects[i][3]=0; cpy(sc->shadow_cascade_view_proj[i],svp.m,64); } if(cc>1){ float prev=cam[6]; for(int c=0;c<cc;c++){ int b=19+c*5; float sf=dl[b],mn=prev+0.001f; if(mn>cam[7])mn=cam[7]; if(sf<mn)sf=mn; if(sf>cam[7])sf=cam[7]; ortho(&op,dl[b+1],dl[b+2],dl[b+3],dl[b+4]); svp=mmul(lv,op); cpy(sc->shadow_cascade_view_proj[c],svp.m,64); sc->shadow_cascade_splits[c]=sf; atlas(c,cc,sc->shadow_cascade_rects[c]); prev=sf; if(c==0)cpy(sc->shadow_view_proj,svp.m,64); } sc->shadow_params[2]=sc->shadow_cascade_splits[cc-1]; } else { atlas(0,1,sc->shadow_cascade_rects[0]); cpy(sc->shadow_view_proj,svp.m,64); cpy(sc->shadow_cascade_view_proj[0],svp.m,64); sc->shadow_cascade_splits[0]=dl[13]; } cpy(sc->prev_shadow_view_proj,sc->shadow_view_proj,64); }
+// Build the main-light shadow matrices. Spot uses one perspective layer;
+// directional one-cascade uses the base ortho settings; 2-4 cascades use the
+// split/size entries stored in the light block.
+static void shadowvp(SceneCB* sc){ float eye[3]={dl[0],dl[1],dl[2]},at[3]={dl[3],dl[4],dl[5]}; float ldx=at[0]-eye[0],ldy=at[1]-eye[1],ldz=at[2]-eye[2],li=rsq(ldx*ldx+ldy*ldy+ldz*ldz); float up[3]={0,1,0}; if(ab(ldy*li)>0.92f){up[1]=0;up[2]=1;} M4 lv,op,svp; lookat(&lv,eye,at,up); int lt=dl[39]>=0.5f?1:0,cc=lt?1:(int)dl[16]; if(cc<1)cc=1; if(cc>4)cc=4; sc->shadow_params[0]=(float)cc; sc->shadow_params[1]=cam[6]; sc->shadow_params[2]=cam[7]; sc->shadow_params[3]=(float)lt; sc->light_pos[0]=eye[0];sc->light_pos[1]=eye[1];sc->light_pos[2]=eye[2]; float so=cl(dl[40],0.05f,3.0f),si=so*(1.0f-cl(dl[41],0,0.95f)); sc->light_params[0]=(float)lt;sc->light_params[1]=cs(si*0.5f);sc->light_params[2]=cs(so*0.5f);sc->light_params[3]=dl[13]; if(lt)perspf(&op,so,(float)LT_SHADOW_W/(float)LT_SHADOW_H,dl[12],dl[13]); else ortho(&op,dl[14],dl[15],dl[12],dl[13]); svp=mmul(lv,op); for(int i=0;i<4;i++){ sc->shadow_cascade_splits[i]=cam[7]; sc->shadow_cascade_rects[i][0]=1;sc->shadow_cascade_rects[i][1]=1;sc->shadow_cascade_rects[i][2]=0;sc->shadow_cascade_rects[i][3]=0; cpy(sc->shadow_cascade_view_proj[i],svp.m,64); } if(!lt&&cc>1){ float prev=cam[6]; for(int c=0;c<cc;c++){ int b=19+c*5; float sf=dl[b],mn=prev+0.001f; if(mn>cam[7])mn=cam[7]; if(sf<mn)sf=mn; if(sf>cam[7])sf=cam[7]; ortho(&op,dl[b+1],dl[b+2],dl[b+3],dl[b+4]); svp=mmul(lv,op); cpy(sc->shadow_cascade_view_proj[c],svp.m,64); sc->shadow_cascade_splits[c]=sf; prev=sf; if(c==0)cpy(sc->shadow_view_proj,svp.m,64); } sc->shadow_params[2]=sc->shadow_cascade_splits[cc-1]; } else { cpy(sc->shadow_view_proj,svp.m,64); cpy(sc->shadow_cascade_view_proj[0],svp.m,64); sc->shadow_cascade_splits[0]=lt?dl[13]:cam[7]; } cpy(sc->prev_shadow_view_proj,sc->shadow_view_proj,64); }
 static int comps(int ty){ return (ty==1||ty==4)?1:(ty==2||ty==5)?2:(ty==3||ty==6)?3:(ty==7)?4:0; }
 static int isint(int ty){ return ty>=1&&ty<=3; }
 )LT64K", f);
@@ -1997,19 +2040,21 @@ static int isint(int ty){ return ty>=1&&ty<=3; }
         fputs(R"LT64K(// Timeline evaluation for compact key streams.
 // Each track points to frame numbers in kfr[] and to either ki[] or kf[].
 static int tr_frame(Tr* r,int k){ return kfr[r->fs+k]; }
+static int tr_mode(Tr* r,int k){ return km[r->fs+k]; }
+static float tr_tan(Tr* r,int k){ return kt[r->fs+k]; }
 static int tr_i(Tr* r,int k,int c){ return ki[r->ds+k*r->comp+c]; }
 static float tr_f(Tr* r,int k,int c){ return kf[r->ds+k*r->comp+c]; }
 static float ease(int m,float t){ t=cl(t,0,1); if(m==2){ if(t<0.5f)return 2*t*t; float u=1-t; return 1-2*u*u; } return t; }
-static float cubic(float p0,float p1,float p2,float p3,int f0,int f1,int f2,int f3,float t){ float sp=(float)(f2-f1),m1=f2!=f0?(p2-p0)*sp/(float)(f2-f0):0,m2=f3!=f1?(p3-p1)*sp/(float)(f3-f1):0,t2=t*t,t3=t2*t; return (2*t3-3*t2+1)*p1+(t3-2*t2+t)*m1+(-2*t3+3*t2)*p2+(t3-t2)*m2; }
-static float cval(Tr* r,int p0,int p1,int p2,int p3,int c,float t){ return cubic(tr_f(r,p0,c),tr_f(r,p1,c),tr_f(r,p2,c),tr_f(r,p3,c),tr_frame(r,p0),tr_frame(r,p1),tr_frame(r,p2),tr_frame(r,p3),t); }
+static float cubic(float p0,float p1,float p2,float p3,int f0,int f1,int f2,int f3,float s1,float s2,float t){ float sp=(float)(f2-f1),m1=f2!=f0?(p2-p0)*sp/(float)(f2-f0):0,m2=f3!=f1?(p3-p1)*sp/(float)(f3-f1):0,t2=t*t,t3=t2*t; m1*=s1;m2*=s2; return (2*t3-3*t2+1)*p1+(t3-2*t2+t)*m1+(-2*t3+3*t2)*p2+(t3-t2)*m2; }
+static float cval(Tr* r,int p0,int p1,int p2,int p3,int c,float t){ return cubic(tr_f(r,p0,c),tr_f(r,p1,c),tr_f(r,p2,c),tr_f(r,p3,c),tr_frame(r,p0),tr_frame(r,p1),tr_frame(r,p2),tr_frame(r,p3),tr_tan(r,p1),tr_tan(r,p2),t); }
 
 // Evaluate one timeline track at the sampled frame and write the result directly
 // into the live command, camera, light or user-variable array.
 //
-// mode 0 floors to integer frames; mode 1 linear; mode 2 quadratic ease;
-// mode 3 cubic Hermite for continuous values.
+// The previous key owns the outgoing segment mode: 0 step, 1 linear,
+// 2 quadratic ease, 3 cubic Hermite for continuous values.
 static void apply_track(Tr* r, float fr){
-    int a=-1,b=-1,p0,p3,i,n=r->count,mode=(r->tl>=0&&r->tl<TLN)?tls[r->tl].mode:1;
+    int a=-1,b=-1,p0,p3,i,n=r->count,mode=3;
     int oi[4]={0,0,0,0};
     float A[16],B[16],O[16];
     Q qq;
@@ -2025,6 +2070,7 @@ static void apply_track(Tr* r, float fr){
     if(b<0)b=a;
     p0=a>0?a-1:a;
     p3=b+1<n?b+1:b;
+    mode=tr_mode(r,a);
 
     if(r->integral){
         // Integral tracks are always stepped. Currently this is mainly command enabled.
@@ -2035,7 +2081,7 @@ static void apply_track(Tr* r, float fr){
             B[i]=tr_f(r,b,i);
             O[i]=A[i];
         }
-        if(a!=b){
+        if(a!=b&&mode){
             int fa=tr_frame(r,a),fb=tr_frame(r,b);
             float tt=fb>fa?(fr-(float)fa)/(float)(fb-fa):0;
             tt=cl(tt,0,1);
@@ -2049,7 +2095,8 @@ static void apply_track(Tr* r, float fr){
                 for(i=7;i<10;i++)O[i]=mode==3?cval(r,p0,a,b,p3,i,tt):lerp(A[i],B[i],et);
             } else if(r->kind==4){
                 // Camera: interpolate yaw as an angle so it wraps correctly.
-                for(i=0;i<8;i++)O[i]=(i==3)?lerpa(A[i],B[i],et):(mode==3?cval(r,p0,a,b,p3,i,tt):lerp(A[i],B[i],et));
+                for(i=0;i<11;i++)O[i]=(i==3||i==8)?lerpa(A[i],B[i],et):(mode==3?cval(r,p0,a,b,p3,i,tt):lerp(A[i],B[i],et));
+                O[9]=tt<0.5f?A[9]:B[9];
             } else {
                 int cnt=r->comp;
                 // User rotation sources can be stored either as Euler float3 or quaternion float4.
@@ -2087,10 +2134,11 @@ static void apply_track(Tr* r, float fr){
     } else if(r->kind==3 && r->target>=0&&r->target<CMDN){
         cmd[r->target].enabled=oi[0]!=0;
     } else if(r->kind==4){
-        for(i=0;i<8;i++)cam[i]=O[i];
+        for(i=0;i<11;i++)cam[i]=O[i];
         cam[3]=wrap(cam[3]); cam[4]=cl(cam[4],-1.50f,1.50f);
     } else if(r->kind==5){
         for(i=0;i<10;i++)dl[i]=O[i];
+        dl[39]=O[10]; dl[40]=O[11]>0.001f?O[11]:dl[40]; dl[41]=cl(O[12],0,0.95f);
     }
 }
 
@@ -2115,7 +2163,6 @@ static void timeline(float sec){
     if(fr<0)fr=0;
     d=(float)(tls[ci].len-1);
     if(fr>d)fr=d;
-    if(!tls[ci].mode)fr=(float)((int)(fr+0.0001f));
     for(i=0;i<TRN;i++)if(tr[i].enabled&&tr[i].tl==ci)apply_track(tr+i,fr);
 }
 )LT64K", f);
@@ -2186,9 +2233,9 @@ static DXGI_FORMAT srvfmt(DXGI_FORMAT f){ if(f==DXGI_FORMAT_D24_UNORM_S8_UINT||f
         fputs("static void init_sbs(){}\n", f);
     }
     fputs(R"LT64K(
-// Create the main depth buffer and the shared shadow-map atlas. Both also have
+// Create the main depth buffer and the shared shadow-map texture array. Both also have
 // SRVs so post effects and material shaders can sample them.
-static void init_depth_shadow(){ D3D11_TEXTURE2D_DESC d; D3D11_DEPTH_STENCIL_VIEW_DESC dv; D3D11_SHADER_RESOURCE_VIEW_DESC sv; zmem(&d,sizeof(d)); d.Width=RW;d.Height=RH;d.MipLevels=1;d.ArraySize=1;d.Format=DXGI_FORMAT_R24G8_TYPELESS;d.SampleDesc.Count=1;d.BindFlags=D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE; if(SUCCEEDED(ID3D11Device_CreateTexture2D(dev,&d,0,&depth_tex))){ zmem(&dv,sizeof(dv)); zmem(&sv,sizeof(sv)); dv.Format=DXGI_FORMAT_D24_UNORM_S8_UINT; dv.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2D; ID3D11Device_CreateDepthStencilView(dev,(ID3D11Resource*)depth_tex,&dv,&dsv); sv.Format=DXGI_FORMAT_R24_UNORM_X8_TYPELESS; sv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels=1; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)depth_tex,&sv,&depth_srv); } zmem(&d,sizeof(d)); d.Width=LT_SHADOW_W;d.Height=LT_SHADOW_H;d.MipLevels=1;d.ArraySize=1;d.Format=DXGI_FORMAT_R24G8_TYPELESS;d.SampleDesc.Count=1;d.BindFlags=D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE; if(SUCCEEDED(ID3D11Device_CreateTexture2D(dev,&d,0,&shadow_tex))){ zmem(&dv,sizeof(dv)); zmem(&sv,sizeof(sv)); dv.Format=DXGI_FORMAT_D24_UNORM_S8_UINT; dv.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2D; ID3D11Device_CreateDepthStencilView(dev,(ID3D11Resource*)shadow_tex,&dv,&shadow_dsv); sv.Format=DXGI_FORMAT_R24_UNORM_X8_TYPELESS; sv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels=1; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)shadow_tex,&sv,&shadow_srv); } }
+static void init_depth_shadow(){ D3D11_TEXTURE2D_DESC d; D3D11_DEPTH_STENCIL_VIEW_DESC dv; D3D11_SHADER_RESOURCE_VIEW_DESC sv; zmem(&d,sizeof(d)); d.Width=RW;d.Height=RH;d.MipLevels=1;d.ArraySize=1;d.Format=DXGI_FORMAT_R24G8_TYPELESS;d.SampleDesc.Count=1;d.BindFlags=D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE; if(SUCCEEDED(ID3D11Device_CreateTexture2D(dev,&d,0,&depth_tex))){ zmem(&dv,sizeof(dv)); zmem(&sv,sizeof(sv)); dv.Format=DXGI_FORMAT_D24_UNORM_S8_UINT; dv.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2D; ID3D11Device_CreateDepthStencilView(dev,(ID3D11Resource*)depth_tex,&dv,&dsv); sv.Format=DXGI_FORMAT_R24_UNORM_X8_TYPELESS; sv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels=1; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)depth_tex,&sv,&depth_srv); } zmem(&d,sizeof(d)); d.Width=LT_SHADOW_W;d.Height=LT_SHADOW_H;d.MipLevels=1;d.ArraySize=LT_SHADOW_LAYERS;d.Format=DXGI_FORMAT_R24G8_TYPELESS;d.SampleDesc.Count=1;d.BindFlags=D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE; if(SUCCEEDED(ID3D11Device_CreateTexture2D(dev,&d,0,&shadow_tex))){ for(int i=0;i<LT_SHADOW_LAYERS;i++){ zmem(&dv,sizeof(dv)); dv.Format=DXGI_FORMAT_D24_UNORM_S8_UINT; dv.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2DARRAY; dv.Texture2DArray.MipSlice=0; dv.Texture2DArray.FirstArraySlice=i; dv.Texture2DArray.ArraySize=1; ID3D11Device_CreateDepthStencilView(dev,(ID3D11Resource*)shadow_tex,&dv,&shadow_dsv[i]); } zmem(&sv,sizeof(sv)); sv.Format=DXGI_FORMAT_R24_UNORM_X8_TYPELESS; sv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2DARRAY; sv.Texture2DArray.MipLevels=1; sv.Texture2DArray.ArraySize=LT_SHADOW_LAYERS; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)shadow_tex,&sv,&shadow_srv); } }
 static void init_states(){ D3D11_SAMPLER_DESC sp; zmem(&sp,sizeof(sp)); sp.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR; sp.AddressU=sp.AddressV=sp.AddressW=D3D11_TEXTURE_ADDRESS_WRAP; sp.MaxLOD=3.402823466e38f; ID3D11Device_CreateSamplerState(dev,&sp,&smp_lin); sp.Filter=D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT; sp.ComparisonFunc=D3D11_COMPARISON_LESS_EQUAL; sp.AddressU=sp.AddressV=sp.AddressW=D3D11_TEXTURE_ADDRESS_BORDER; sp.BorderColor[0]=sp.BorderColor[1]=sp.BorderColor[2]=sp.BorderColor[3]=1.0f; ID3D11Device_CreateSamplerState(dev,&sp,&smp_cmp); for(int i=0;i<4;i++){ D3D11_DEPTH_STENCIL_DESC dd; zmem(&dd,sizeof(dd)); dd.DepthEnable=(i&1)!=0; dd.DepthWriteMask=(i&2)?D3D11_DEPTH_WRITE_MASK_ALL:D3D11_DEPTH_WRITE_MASK_ZERO; /* The tiny player keeps LESS_EQUAL depth testing because procedural primitives and generated shadow shaders can otherwise hit avoidable precision edge cases. */ dd.DepthFunc=D3D11_COMPARISON_LESS_EQUAL; ID3D11Device_CreateDepthStencilState(dev,&dd,&ds[i]); D3D11_BLEND_DESC bd; zmem(&bd,sizeof(bd)); bd.RenderTarget[0].BlendEnable=(i&1)!=0; bd.RenderTarget[0].SrcBlend=D3D11_BLEND_SRC_ALPHA; bd.RenderTarget[0].DestBlend=D3D11_BLEND_INV_SRC_ALPHA; bd.RenderTarget[0].BlendOp=D3D11_BLEND_OP_ADD; bd.RenderTarget[0].SrcBlendAlpha=D3D11_BLEND_ONE; bd.RenderTarget[0].DestBlendAlpha=D3D11_BLEND_INV_SRC_ALPHA; bd.RenderTarget[0].BlendOpAlpha=D3D11_BLEND_OP_ADD; bd.RenderTarget[0].RenderTargetWriteMask=(i&2)?D3D11_COLOR_WRITE_ENABLE_ALL:0; ID3D11Device_CreateBlendState(dev,&bd,&bs[i]); } for(int i=0;i<2;i++){ D3D11_RASTERIZER_DESC rd; zmem(&rd,sizeof(rd)); rd.FillMode=D3D11_FILL_SOLID; rd.CullMode=i?D3D11_CULL_BACK:D3D11_CULL_NONE; rd.DepthClipEnable=TRUE; ID3D11Device_CreateRasterizerState(dev,&rd,&rs[i]); } }
 static void cb_make(ID3D11Buffer** b, unsigned int sz){ D3D11_BUFFER_DESC d; zmem(&d,sizeof(d)); d.ByteWidth=(sz+15)&~15; d.Usage=D3D11_USAGE_DYNAMIC; d.BindFlags=D3D11_BIND_CONSTANT_BUFFER; d.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE; ID3D11Device_CreateBuffer(dev,&d,0,b); }
 static void cb_up(ID3D11Buffer* b, void* data, unsigned int sz){ D3D11_MAPPED_SUBRESOURCE m; if(SUCCEEDED(ID3D11DeviceContext_Map(ctx,(ID3D11Resource*)b,0,D3D11_MAP_WRITE_DISCARD,0,&m))){ cpy(m.pData,data,sz); ID3D11DeviceContext_Unmap(ctx,(ID3D11Resource*)b,0); } }
@@ -2218,8 +2265,8 @@ static void cb_up(ID3D11Buffer* b, void* data, unsigned int sz){ D3D11_MAPPED_SU
     }
     fputs(R"LT64K(
 static void shadow_draw(Cmd* c){ if(!c->enabled||!c->scast||c->shs<0||c->shs>=SHN||!sh[c->shs].vs)return; UserCB uc; ObjectCB oc; M4 w; world(c,&w); cpy(oc.world,w.m,64); fill_user_cmd(&uc,c); cb_up(object_cb,&oc,sizeof(oc)); cb_up(user_cb,&uc,sizeof(uc)); ID3D11DeviceContext_RSSetState(ctx,rs[c->cb?1:0]); ID3D11DeviceContext_VSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,2,1,&user_cb); if(c->mk>0&&c->mk<6&&prim_vb[c->mk]){ unsigned int st=32,off=0; ID3D11DeviceContext_IASetInputLayout(ctx,sh[c->shs].il); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,1,&prim_vb[c->mk],&st,&off); } else { ID3D11DeviceContext_IASetInputLayout(ctx,0); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,0,0,0,0); } ID3D11DeviceContext_IASetIndexBuffer(ctx,0,DXGI_FORMAT_R32_UINT,0); ID3D11DeviceContext_IASetPrimitiveTopology(ctx,c->topology?D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST:D3D11_PRIMITIVE_TOPOLOGY_POINTLIST); ID3D11DeviceContext_VSSetShader(ctx,sh[c->shs].vs,0,0); ID3D11DeviceContext_PSSetShader(ctx,0,0,0); ID3D11DeviceContext_DrawInstanced(ctx,c->vc,c->ic,0,0); }
-// Render all shadow-casting commands into the atlas before the main pass.
-static void shadowpass(SceneCB* sc){ if(!shadow_dsv)return; int need=0; for(int i=0;i<CMDN;i++)if(cmd[i].enabled&&cmd[i].scast)need=1; if(!need)return; ID3D11ShaderResourceView* nulls[16]; zmem(nulls,sizeof(nulls)); ID3D11DeviceContext_PSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_VSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_OMSetRenderTargets(ctx,0,0,shadow_dsv); ID3D11DeviceContext_ClearDepthStencilView(ctx,shadow_dsv,D3D11_CLEAR_DEPTH,1,0); ID3D11DeviceContext_OMSetDepthStencilState(ctx,ds[3],0); float bf[4]={0,0,0,0}; ID3D11DeviceContext_OMSetBlendState(ctx,bs[0],bf,0xffffffff); int cc=(int)sc->shadow_params[0]; if(cc<1)cc=1;if(cc>4)cc=4; for(int ci=0;ci<cc;ci++){ float* r=sc->shadow_cascade_rects[ci]; D3D11_VIEWPORT vp; zmem(&vp,sizeof(vp)); vp.TopLeftX=r[2]*(float)LT_SHADOW_W;vp.TopLeftY=r[3]*(float)LT_SHADOW_H;vp.Width=(r[0]>0?r[0]:1)*(float)LT_SHADOW_W;vp.Height=(r[1]>0?r[1]:1)*(float)LT_SHADOW_H;vp.MinDepth=0;vp.MaxDepth=1; ID3D11DeviceContext_RSSetViewports(ctx,1,&vp); SceneCB t=*sc; cpy(t.shadow_view_proj,sc->shadow_cascade_view_proj[ci],64); cb_up(scene_cb,&t,sizeof(t)); for(int i=0;i<CMDN;i++)shadow_draw(cmd+i); } cb_up(scene_cb,sc,sizeof(*sc)); }
+// Render all shadow-casting commands into the shadow array before the main pass.
+static void shadowpass(SceneCB* sc){ if(!shadow_dsv[0])return; int need=0; for(int i=0;i<CMDN;i++)if(cmd[i].enabled&&cmd[i].scast)need=1; if(!need)return; ID3D11ShaderResourceView* nulls[16]; zmem(nulls,sizeof(nulls)); ID3D11DeviceContext_PSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_VSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_OMSetDepthStencilState(ctx,ds[3],0); float bf[4]={0,0,0,0}; ID3D11DeviceContext_OMSetBlendState(ctx,bs[0],bf,0xffffffff); int cc=(int)sc->shadow_params[0]; if(cc<1)cc=1;if(cc>LT_SHADOW_LAYERS)cc=LT_SHADOW_LAYERS; for(int ci=0;ci<cc;ci++){ ID3D11DeviceContext_OMSetRenderTargets(ctx,0,0,shadow_dsv[ci]); ID3D11DeviceContext_ClearDepthStencilView(ctx,shadow_dsv[ci],D3D11_CLEAR_DEPTH,1,0); D3D11_VIEWPORT vp; zmem(&vp,sizeof(vp)); vp.Width=(float)LT_SHADOW_W;vp.Height=(float)LT_SHADOW_H;vp.MinDepth=0;vp.MaxDepth=1; ID3D11DeviceContext_RSSetViewports(ctx,1,&vp); SceneCB t=*sc; cpy(t.shadow_view_proj,sc->shadow_cascade_view_proj[ci],64); cb_up(scene_cb,&t,sizeof(t)); for(int i=0;i<CMDN;i++)shadow_draw(cmd+i); } cb_up(scene_cb,sc,sizeof(*sc)); }
 )LT64K", f);
     fputs(R"LT64K(// Main frame: update animation, render shadows, then execute the command list.
 #if LT_SHOW_FPS_TITLE
@@ -2242,7 +2289,7 @@ static int reset_compute_done=0; static float prev_render_sec=0;
 static void render(float sec){ float dt=sec-prev_render_sec; if(dt<0)dt=0; if(dt>0.10f)dt=0.10f; prev_render_sec=sec; cpy(cam,cam0,sizeof(cam));cpy(dl,dl0,sizeof(dl));
 )LT64K", f);
     if (uses_timeline) fputs(" timeline(sec);", f);
-    fputs(R"LT64K( float clr[4]={0,0,0,1},bf[4]={0,0,0,0}; SceneCB sc; ObjectCB oc; M4 vp,ivp; zmem(&sc,sizeof(sc)); viewproj(&vp,sec); invm(&vp,&ivp); cpy(sc.view_proj,vp.m,64); cpy(sc.prev_view_proj,vp.m,64); cpy(sc.inv_view_proj,ivp.m,64); cpy(sc.prev_inv_view_proj,ivp.m,64); shadowvp(&sc); sc.time_vec[0]=sec; sc.time_vec[1]=dt; sc.time_vec[2]=sec*60.0f; sc.cam_pos[0]=cam[0];sc.cam_pos[1]=cam[1];sc.cam_pos[2]=cam[2]; float cp=cs(cam[4]); sc.cam_dir[0]=sn(cam[3])*cp;sc.cam_dir[1]=sn(cam[4]);sc.cam_dir[2]=cs(cam[3])*cp; float ldx=dl[3]-dl[0],ldy=dl[4]-dl[1],ldz=dl[5]-dl[2],li=rsq(ldx*ldx+ldy*ldy+ldz*ldz); sc.light_dir[0]=ldx*li;sc.light_dir[1]=ldy*li;sc.light_dir[2]=ldz*li;sc.light_dir[3]=dl[9]; sc.light_color[0]=dl[6];sc.light_color[1]=dl[7];sc.light_color[2]=dl[8]; shadowpass(&sc); cb_up(scene_cb,&sc,sizeof(sc)); ID3D11DeviceContext_ClearRenderTargetView(ctx,rtv,clr); if(dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,1,0); for(int i=0;i<CMDN;i++){ Cmd* c=cmd+i; if(!c->enabled)continue; set_target(c); if(c->type==1){ ID3D11RenderTargetView* rv=rtvof(c->rt); float cc[4],dc; clear_vals(c,cc,&dc); if(c->ccen&&rv)ID3D11DeviceContext_ClearRenderTargetView(ctx,rv,cc); if(c->cden&&c->dep==-2&&dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,dc,0); } else if(c->type==3){ if(!c->reset||!reset_compute_done)run_compute(c); } else if(c->type==2 && c->shader>=0&&c->shader<SHN&&sh[c->shader].vs&&sh[c->shader].ps){ UserCB uc; M4 w; world(c,&w); cpy(oc.world,w.m,64); fill_user_cmd(&uc,c); cb_up(object_cb,&oc,sizeof(oc)); cb_up(user_cb,&uc,sizeof(uc)); ID3D11DeviceContext_OMSetDepthStencilState(ctx,ds[(c->dt?1:0)|(c->dw?2:0)],0); ID3D11DeviceContext_RSSetState(ctx,rs[c->cb?1:0]); ID3D11DeviceContext_OMSetBlendState(ctx,bs[(c->ab?1:0)|(c->cw?2:0)],bf,0xffffffff); ID3D11DeviceContext_VSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetSamplers(ctx,0,1,&smp_lin); ID3D11DeviceContext_PSSetSamplers(ctx,1,1,&smp_cmp); for(int t=0;t<c->tc;t++){ ID3D11ShaderResourceView* sv=srvof(c->tex[t]); ID3D11DeviceContext_PSSetShaderResources(ctx,c->tsl[t],1,&sv); } if(c->srecv){ ID3D11ShaderResourceView* sv=shadow_srv; ID3D11DeviceContext_PSSetShaderResources(ctx,7,1,&sv); } for(int t=0;t<c->sc;t++){ ID3D11ShaderResourceView* sv=srvof(c->srv[t]); ID3D11DeviceContext_VSSetShaderResources(ctx,c->ssl[t],1,&sv); ID3D11DeviceContext_PSSetShaderResources(ctx,c->ssl[t],1,&sv); } if(c->mk>0&&c->mk<6&&prim_vb[c->mk]){ unsigned int st=32,off=0; ID3D11DeviceContext_IASetInputLayout(ctx,sh[c->shader].il); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,1,&prim_vb[c->mk],&st,&off); } else { ID3D11DeviceContext_IASetInputLayout(ctx,0); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,0,0,0,0); } ID3D11DeviceContext_IASetIndexBuffer(ctx,0,DXGI_FORMAT_R32_UINT,0); ID3D11DeviceContext_IASetPrimitiveTopology(ctx,c->topology?D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST:D3D11_PRIMITIVE_TOPOLOGY_POINTLIST); ID3D11DeviceContext_VSSetShader(ctx,sh[c->shader].vs,0,0); ID3D11DeviceContext_PSSetShader(ctx,sh[c->shader].ps,0,0); ID3D11DeviceContext_DrawInstanced(ctx,c->vc,c->ic,0,0); } } reset_compute_done=1; IDXGISwapChain_Present(swp,LT_VSYNC?1:0,0); fps_title(); }
+    fputs(R"LT64K( float clr[4]={0,0,0,1},bf[4]={0,0,0,0}; SceneCB sc; ObjectCB oc; M4 vp,ivp; zmem(&sc,sizeof(sc)); viewproj(&vp,sec); invm(&vp,&ivp); cpy(sc.view_proj,vp.m,64); cpy(sc.prev_view_proj,vp.m,64); cpy(sc.inv_view_proj,ivp.m,64); cpy(sc.prev_inv_view_proj,ivp.m,64); shadowvp(&sc); sc.time_vec[0]=sec; sc.time_vec[1]=dt; sc.time_vec[2]=sec*60.0f; sc.cam_pos[0]=cam[0];sc.cam_pos[1]=cam[1];sc.cam_pos[2]=cam[2]; float cp=cs(cam[4]); sc.cam_dir[0]=sn(cam[3])*cp;sc.cam_dir[1]=sn(cam[4]);sc.cam_dir[2]=cs(cam[3])*cp; sc.camera_params[0]=cam[9]>=0.5f?1.0f:0.0f;sc.camera_params[1]=cam[10];sc.camera_params[2]=cam[6];sc.camera_params[3]=cam[7]; float ldx=dl[3]-dl[0],ldy=dl[4]-dl[1],ldz=dl[5]-dl[2],li=rsq(ldx*ldx+ldy*ldy+ldz*ldz); sc.light_dir[0]=ldx*li;sc.light_dir[1]=ldy*li;sc.light_dir[2]=ldz*li;sc.light_dir[3]=dl[9]; sc.light_color[0]=dl[6];sc.light_color[1]=dl[7];sc.light_color[2]=dl[8]; shadowpass(&sc); cb_up(scene_cb,&sc,sizeof(sc)); ID3D11DeviceContext_ClearRenderTargetView(ctx,rtv,clr); if(dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,1,0); for(int i=0;i<CMDN;i++){ Cmd* c=cmd+i; if(!c->enabled)continue; set_target(c); if(c->type==1){ ID3D11RenderTargetView* rv=rtvof(c->rt); float cc[4],dc; clear_vals(c,cc,&dc); if(c->ccen&&rv)ID3D11DeviceContext_ClearRenderTargetView(ctx,rv,cc); if(c->cden&&c->dep==-2&&dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,dc,0); } else if(c->type==3){ if(!c->reset||!reset_compute_done)run_compute(c); } else if(c->type==2 && c->shader>=0&&c->shader<SHN&&sh[c->shader].vs&&sh[c->shader].ps){ UserCB uc; M4 w; world(c,&w); cpy(oc.world,w.m,64); fill_user_cmd(&uc,c); cb_up(object_cb,&oc,sizeof(oc)); cb_up(user_cb,&uc,sizeof(uc)); ID3D11DeviceContext_OMSetDepthStencilState(ctx,ds[(c->dt?1:0)|(c->dw?2:0)],0); ID3D11DeviceContext_RSSetState(ctx,rs[c->cb?1:0]); ID3D11DeviceContext_OMSetBlendState(ctx,bs[(c->ab?1:0)|(c->cw?2:0)],bf,0xffffffff); ID3D11DeviceContext_VSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetSamplers(ctx,0,1,&smp_lin); ID3D11DeviceContext_PSSetSamplers(ctx,1,1,&smp_cmp); for(int t=0;t<c->tc;t++){ ID3D11ShaderResourceView* sv=srvof(c->tex[t]); ID3D11DeviceContext_PSSetShaderResources(ctx,c->tsl[t],1,&sv); } if(c->srecv){ ID3D11ShaderResourceView* sv=shadow_srv; ID3D11DeviceContext_PSSetShaderResources(ctx,7,1,&sv); } for(int t=0;t<c->sc;t++){ ID3D11ShaderResourceView* sv=srvof(c->srv[t]); ID3D11DeviceContext_VSSetShaderResources(ctx,c->ssl[t],1,&sv); ID3D11DeviceContext_PSSetShaderResources(ctx,c->ssl[t],1,&sv); } if(c->mk>0&&c->mk<6&&prim_vb[c->mk]){ unsigned int st=32,off=0; ID3D11DeviceContext_IASetInputLayout(ctx,sh[c->shader].il); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,1,&prim_vb[c->mk],&st,&off); } else { ID3D11DeviceContext_IASetInputLayout(ctx,0); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,0,0,0,0); } ID3D11DeviceContext_IASetIndexBuffer(ctx,0,DXGI_FORMAT_R32_UINT,0); ID3D11DeviceContext_IASetPrimitiveTopology(ctx,c->topology?D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST:D3D11_PRIMITIVE_TOPOLOGY_POINTLIST); ID3D11DeviceContext_VSSetShader(ctx,sh[c->shader].vs,0,0); ID3D11DeviceContext_PSSetShader(ctx,sh[c->shader].ps,0,0); ID3D11DeviceContext_DrawInstanced(ctx,c->vc,c->ic,0,0); } } reset_compute_done=1; IDXGISwapChain_Present(swp,LT_VSYNC?1:0,0); fps_title(); }
 static LRESULT CALLBACK wp(HWND h,UINT m,WPARAM w,LPARAM l){
     if(LT_ESC_CLOSE&&m==WM_KEYDOWN&&w==VK_ESCAPE)PostQuitMessage(0);
     if(m==WM_CLOSE||m==WM_DESTROY){PostQuitMessage(0);return 0;}
@@ -2273,7 +2320,11 @@ W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); DWORD st=LT_SH
     }
     size_t cmd_bytes = out_cmds.size() * sizeof(CommandDef);
     size_t param_bytes = flat_params.size() * sizeof(FlatParam);
-    size_t key_bytes = uses_timeline ? (flat_key_frames.size() * sizeof(int) + flat_key_ints.size() * sizeof(int) + flat_key_floats.size() * sizeof(float)) : 0;
+    size_t key_bytes = uses_timeline ? (flat_key_frames.size() * sizeof(int) +
+                                        flat_key_modes.size() * sizeof(int) +
+                                        flat_key_tangents.size() * sizeof(float) +
+                                        flat_key_ints.size() * sizeof(int) +
+                                        flat_key_floats.size() * sizeof(float)) : 0;
     size_t rt_bytes = rt_res_indices.size() * sizeof(ResourceDef);
     float timeline_total_seconds_for_report = 0.0f;
     if (uses_timeline) {

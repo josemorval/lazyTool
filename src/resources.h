@@ -11,7 +11,7 @@ extern ResHandle g_builtin_time;
 extern ResHandle g_builtin_scene_color;
 extern ResHandle g_builtin_scene_depth;
 extern ResHandle g_builtin_shadow_map;
-extern ResHandle g_builtin_dirlight;
+extern ResHandle g_builtin_light;
 
 struct ResourceLoadProgress {
     bool  active;

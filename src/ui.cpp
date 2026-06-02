@@ -419,6 +419,7 @@ static bool ui_project_world_to_screen(const Mat4& view_proj, ImVec2 rect_min, I
                                        Vec3 world, ImVec2* out_screen);
 static void ui_draw_camera_orientation_gizmo(ImVec2 rect_min, ImVec2 rect_max);
 static void ui_draw_viewport_bounds_debug(ImVec2 rect_min, ImVec2 rect_max);
+static void ui_draw_viewport_light_debug(ImVec2 rect_min, ImVec2 rect_max);
 static void ui_draw_viewport_camera_overlay(ImVec2 rect_min, ImVec2 rect_max);
 static bool ui_viewport_toolbar_hit_test(ImVec2 rect_min, ImVec2 rect_max);
 static void ui_draw_icon_shape(UiIconKind icon, ImVec2 min, ImVec2 max, ImU32 col);
@@ -1561,7 +1562,7 @@ static const char* ui_resource_base_display_name(const Resource& r) {
     case RES_BUILTIN_SCENE_COLOR: return "Scene Color";
     case RES_BUILTIN_SCENE_DEPTH: return "Scene Depth";
     case RES_BUILTIN_SHADOW_MAP:  return "Shadow Map";
-    case RES_BUILTIN_DIRLIGHT:    return "Directional Light";
+    case RES_BUILTIN_LIGHT:    return "Light";
     default:                      return r.name;
     }
 }
@@ -1615,7 +1616,7 @@ static const char* ui_resource_display_type(const Resource& r) {
     case RES_GAUSSIAN_SPLAT:      return "GaussianSplat";
     case RES_NANOVDB:             return "NanoVDB";
     case RES_BUILTIN_SHADOW_MAP:  return "DepthTexture2D";
-    case RES_BUILTIN_DIRLIGHT:    return "DirectionalLight";
+    case RES_BUILTIN_LIGHT:    return "Light";
     default:                      return res_type_str(r.type);
     }
 }
@@ -1763,6 +1764,26 @@ static ID3D11Buffer*              s_rt3d_preview_cb = nullptr;
 static int                        s_rt3d_preview_w = 0;
 static int                        s_rt3d_preview_h = 0;
 
+struct UiShadowPreviewCBData {
+    UINT layer;
+    UINT mode;
+    float near_z;
+    float far_z;
+    UINT width;
+    UINT height;
+    UINT pad0;
+    UINT pad1;
+};
+
+static ID3D11Texture2D*           s_shadow_depth_preview_tex = nullptr;
+static ID3D11RenderTargetView*    s_shadow_depth_preview_rtv = nullptr;
+static ID3D11ShaderResourceView*  s_shadow_depth_preview_srv = nullptr;
+static ID3D11VertexShader*        s_shadow_depth_preview_vs = nullptr;
+static ID3D11PixelShader*         s_shadow_depth_preview_ps = nullptr;
+static ID3D11Buffer*              s_shadow_depth_preview_cb = nullptr;
+static int                        s_shadow_depth_preview_w = 0;
+static int                        s_shadow_depth_preview_h = 0;
+
 static const char* s_rt3d_preview_vs_src = R"HLSL(
 struct VSOut {
     float4 pos : SV_Position;
@@ -1777,6 +1798,50 @@ VSOut VSMain(uint vid : SV_VertexID) {
     VSOut o;
     o.pos = float4(pos, 0.0, 1.0);
     return o;
+}
+)HLSL";
+
+static const char* s_shadow_depth_preview_ps_src = R"HLSL(
+cbuffer PreviewCB : register(b0)
+{
+    uint Layer;
+    uint Mode;
+    float NearZ;
+    float FarZ;
+    uint Width;
+    uint Height;
+    uint Pad0;
+    uint Pad1;
+};
+
+Texture2DArray<float> ShadowTex : register(t0);
+
+float4 PSMain(float4 pos : SV_Position) : SV_Target
+{
+    uint shadow_w = 0;
+    uint shadow_h = 0;
+    uint shadow_layers = 0;
+    ShadowTex.GetDimensions(shadow_w, shadow_h, shadow_layers);
+    if (shadow_w == 0 || shadow_h == 0 || shadow_layers == 0)
+        return float4(0.04, 0.04, 0.04, 1.0);
+
+    uint x = min((uint)pos.x, shadow_w - 1);
+    uint y = min((uint)pos.y, shadow_h - 1);
+    uint layer = min(Layer, shadow_layers - 1);
+    float depth01 = ShadowTex.Load(int4((int)x, (int)y, (int)layer, 0));
+    if (depth01 >= 0.999999)
+        return float4(0.03, 0.03, 0.03, 1.0);
+
+    float normalized = depth01;
+    if (Mode != 0) {
+        float n = max(NearZ, 1e-5);
+        float f = max(FarZ, n + 1e-4);
+        float view_depth = (n * f) / max(f - depth01 * (f - n), 1e-6);
+        normalized = saturate((view_depth - n) / max(f - n, 1e-5));
+    }
+
+    float gray = 1.0 - saturate(normalized);
+    return float4(gray, gray, gray, 1.0);
 }
 )HLSL";
 
@@ -1839,6 +1904,21 @@ static void ui_release_rt3d_preview_pipeline() {
     if (s_rt3d_preview_vs) { s_rt3d_preview_vs->Release(); s_rt3d_preview_vs = nullptr; }
 }
 
+static void ui_release_shadow_depth_preview_surface() {
+    if (s_shadow_depth_preview_srv) { s_shadow_depth_preview_srv->Release(); s_shadow_depth_preview_srv = nullptr; }
+    if (s_shadow_depth_preview_rtv) { s_shadow_depth_preview_rtv->Release(); s_shadow_depth_preview_rtv = nullptr; }
+    if (s_shadow_depth_preview_tex) { s_shadow_depth_preview_tex->Release(); s_shadow_depth_preview_tex = nullptr; }
+    s_shadow_depth_preview_w = 0;
+    s_shadow_depth_preview_h = 0;
+}
+
+static void ui_release_shadow_depth_preview_pipeline() {
+    ui_release_shadow_depth_preview_surface();
+    if (s_shadow_depth_preview_cb) { s_shadow_depth_preview_cb->Release(); s_shadow_depth_preview_cb = nullptr; }
+    if (s_shadow_depth_preview_ps) { s_shadow_depth_preview_ps->Release(); s_shadow_depth_preview_ps = nullptr; }
+    if (s_shadow_depth_preview_vs) { s_shadow_depth_preview_vs->Release(); s_shadow_depth_preview_vs = nullptr; }
+}
+
 static bool ui_compile_preview_shader_blob(const char* source, const char* entry,
                                            const char* target, ID3DBlob** out_blob)
 {
@@ -1859,6 +1939,97 @@ static bool ui_compile_preview_shader_blob(const char* source, const char* entry
     }
     if (err) err->Release();
     *out_blob = blob;
+    return true;
+}
+
+static bool ui_init_shadow_depth_preview_pipeline() {
+    if (!g_dx.dev || !g_dx.ctx)
+        return false;
+    if (s_shadow_depth_preview_vs && s_shadow_depth_preview_ps && s_shadow_depth_preview_cb)
+        return true;
+
+    ui_release_shadow_depth_preview_pipeline();
+
+    ID3DBlob* vs_blob = nullptr;
+    ID3DBlob* ps_blob = nullptr;
+    if (!ui_compile_preview_shader_blob(s_rt3d_preview_vs_src, "VSMain", "vs_5_0", &vs_blob))
+        return false;
+    if (!ui_compile_preview_shader_blob(s_shadow_depth_preview_ps_src, "PSMain", "ps_5_0", &ps_blob)) {
+        vs_blob->Release();
+        return false;
+    }
+
+    HRESULT hr = g_dx.dev->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+                                              nullptr, &s_shadow_depth_preview_vs);
+    if (SUCCEEDED(hr))
+        hr = g_dx.dev->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(),
+                                         nullptr, &s_shadow_depth_preview_ps);
+
+    vs_blob->Release();
+    ps_blob->Release();
+
+    if (FAILED(hr)) {
+        log_error("Shadow depth preview shader create failed: 0x%08X", hr);
+        ui_release_shadow_depth_preview_pipeline();
+        return false;
+    }
+
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.ByteWidth = (UINT)((sizeof(UiShadowPreviewCBData) + 15) & ~15);
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = g_dx.dev->CreateBuffer(&cbd, nullptr, &s_shadow_depth_preview_cb);
+    if (FAILED(hr) || !s_shadow_depth_preview_cb) {
+        log_error("Shadow depth preview cbuffer create failed: 0x%08X", hr);
+        ui_release_shadow_depth_preview_pipeline();
+        return false;
+    }
+
+    return true;
+}
+
+static bool ui_ensure_shadow_depth_preview_surface(int width, int height) {
+    if (width < 1) width = 1;
+    if (height < 1) height = 1;
+    if (s_shadow_depth_preview_tex && s_shadow_depth_preview_w == width && s_shadow_depth_preview_h == height)
+        return true;
+
+    ui_release_shadow_depth_preview_surface();
+
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = (UINT)width;
+    td.Height = (UINT)height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    HRESULT hr = g_dx.dev->CreateTexture2D(&td, nullptr, &s_shadow_depth_preview_tex);
+    if (FAILED(hr) || !s_shadow_depth_preview_tex) {
+        log_error("Shadow depth preview texture create failed: 0x%08X", hr);
+        ui_release_shadow_depth_preview_surface();
+        return false;
+    }
+
+    hr = g_dx.dev->CreateRenderTargetView(s_shadow_depth_preview_tex, nullptr, &s_shadow_depth_preview_rtv);
+    if (FAILED(hr) || !s_shadow_depth_preview_rtv) {
+        log_error("Shadow depth preview RTV create failed: 0x%08X", hr);
+        ui_release_shadow_depth_preview_surface();
+        return false;
+    }
+
+    hr = g_dx.dev->CreateShaderResourceView(s_shadow_depth_preview_tex, nullptr, &s_shadow_depth_preview_srv);
+    if (FAILED(hr) || !s_shadow_depth_preview_srv) {
+        log_error("Shadow depth preview SRV create failed: 0x%08X", hr);
+        ui_release_shadow_depth_preview_surface();
+        return false;
+    }
+
+    s_shadow_depth_preview_w = width;
+    s_shadow_depth_preview_h = height;
     return true;
 }
 
@@ -2050,6 +2221,87 @@ static ID3D11ShaderResourceView* ui_render_texture3d_preview_slice(Resource* r, 
     return s_rt3d_preview_srv;
 }
 
+static ID3D11ShaderResourceView* ui_render_shadow_depth_preview(int width, int height, int layer) {
+    if (!g_dx.shadow_srv || width <= 0 || height <= 0)
+        return nullptr;
+    if (!ui_init_shadow_depth_preview_pipeline())
+        return nullptr;
+    if (!ui_ensure_shadow_depth_preview_surface(width, height))
+        return nullptr;
+
+    if (layer < 0) layer = 0;
+    if (g_dx.shadow_layers > 0 && layer >= g_dx.shadow_layers)
+        layer = g_dx.shadow_layers - 1;
+    if (layer < 0) layer = 0;
+
+    D3D11_MAPPED_SUBRESOURCE ms = {};
+    HRESULT hr = g_dx.ctx->Map(s_shadow_depth_preview_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+    if (FAILED(hr)) {
+        log_error("Shadow depth preview cbuffer map failed: 0x%08X", hr);
+        return nullptr;
+    }
+    UiShadowPreviewCBData* cb = (UiShadowPreviewCBData*)ms.pData;
+    cb->layer = (UINT)layer;
+    cb->mode = g_dx.scene_cb_data.light_params[0] >= 0.5f ? 1u : 0u;
+    cb->near_z = g_dx.scene_cb_data.shadow_params[1];
+    cb->far_z = g_dx.scene_cb_data.shadow_params[2];
+    if (cb->mode) {
+        if (Resource* dl = res_get(g_builtin_light)) {
+            cb->near_z = dl->shadow_near;
+            cb->far_z = dl->shadow_far;
+        } else {
+            cb->near_z = 0.0001f;
+            cb->far_z = g_dx.scene_cb_data.light_params[3];
+        }
+    }
+    cb->width = (UINT)width;
+    cb->height = (UINT)height;
+    cb->pad0 = 0;
+    cb->pad1 = 0;
+    g_dx.ctx->Unmap(s_shadow_depth_preview_cb, 0);
+
+    ID3D11ShaderResourceView* null_srvs[MAX_SRV_SLOTS] = {};
+    ID3D11UnorderedAccessView* null_uavs[MAX_UAV_SLOTS] = {};
+    UINT null_counts[MAX_UAV_SLOTS] = {};
+    ID3D11RenderTargetView* null_rtv = nullptr;
+    g_dx.ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+    g_dx.ctx->PSSetShaderResources(0, MAX_SRV_SLOTS, null_srvs);
+    g_dx.ctx->CSSetShaderResources(0, MAX_SRV_SLOTS, null_srvs);
+    g_dx.ctx->CSSetUnorderedAccessViews(0, MAX_UAV_SLOTS, null_uavs, null_counts);
+
+    float clear[4] = {};
+    g_dx.ctx->OMSetRenderTargets(1, &s_shadow_depth_preview_rtv, nullptr);
+    g_dx.ctx->ClearRenderTargetView(s_shadow_depth_preview_rtv, clear);
+
+    D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f };
+    g_dx.ctx->RSSetViewports(1, &vp);
+    g_dx.ctx->RSSetState(g_dx.rs_cull_none);
+    g_dx.ctx->OMSetDepthStencilState(g_dx.dss_depth_off, 0);
+    float blend_factor[4] = {};
+    g_dx.ctx->OMSetBlendState(g_dx.bs_opaque, blend_factor, 0xFFFFFFFF);
+    g_dx.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_dx.ctx->IASetInputLayout(nullptr);
+    ID3D11Buffer* null_vb = nullptr;
+    UINT stride = 0;
+    UINT offset = 0;
+    g_dx.ctx->IASetVertexBuffers(0, 1, &null_vb, &stride, &offset);
+    g_dx.ctx->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
+    g_dx.ctx->VSSetShader(s_shadow_depth_preview_vs, nullptr, 0);
+    g_dx.ctx->GSSetShader(nullptr, nullptr, 0);
+    g_dx.ctx->HSSetShader(nullptr, nullptr, 0);
+    g_dx.ctx->DSSetShader(nullptr, nullptr, 0);
+    g_dx.ctx->PSSetShader(s_shadow_depth_preview_ps, nullptr, 0);
+    g_dx.ctx->PSSetConstantBuffers(0, 1, &s_shadow_depth_preview_cb);
+    ID3D11ShaderResourceView* src_srv = g_dx.shadow_srv;
+    g_dx.ctx->PSSetShaderResources(0, 1, &src_srv);
+    g_dx.ctx->Draw(3, 0);
+
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    g_dx.ctx->PSSetShaderResources(0, 1, &null_srv);
+    g_dx.ctx->OMSetRenderTargets(1, &g_dx.back_rtv, nullptr);
+    return s_shadow_depth_preview_srv;
+}
+
 static void ui_imgui_set_preview_sampler(const ImDrawList*, const ImDrawCmd* cmd) {
     ImGui_ImplDX11_RenderState* rs = (ImGui_ImplDX11_RenderState*)ImGui::GetPlatformIO().Renderer_RenderState;
     if (!rs || !rs->DeviceContext)
@@ -2226,10 +2478,10 @@ static void ui_command_param_source_combo(CommandParam* p) {
         snprintf(label, sizeof(label), "Camera Position");
     } else if (source_kind == USER_CB_SOURCE_CAMERA_ROTATION) {
         snprintf(label, sizeof(label), "Camera Rotation");
-    } else if (source_kind == USER_CB_SOURCE_DIRLIGHT_POSITION) {
-        snprintf(label, sizeof(label), "Dir Light Position");
-    } else if (source_kind == USER_CB_SOURCE_DIRLIGHT_TARGET) {
-        snprintf(label, sizeof(label), "Dir Light Target");
+    } else if (source_kind == USER_CB_SOURCE_LIGHT_POSITION) {
+        snprintf(label, sizeof(label), "Light Position");
+    } else if (source_kind == USER_CB_SOURCE_LIGHT_TARGET) {
+        snprintf(label, sizeof(label), "Light Target");
     } else {
         snprintf(label, sizeof(label), "(hardcoded)");
     }
@@ -2293,15 +2545,15 @@ static void ui_command_param_source_combo(CommandParam* p) {
                 p->source_kind = USER_CB_SOURCE_CAMERA_ROTATION;
                 snprintf(p->source_target, MAX_NAME, "camera");
             }
-            if (ImGui::Selectable("Dir Light Position", source_kind == USER_CB_SOURCE_DIRLIGHT_POSITION)) {
+            if (ImGui::Selectable("Light Position", source_kind == USER_CB_SOURCE_LIGHT_POSITION)) {
                 p->source = INVALID_HANDLE;
-                p->source_kind = USER_CB_SOURCE_DIRLIGHT_POSITION;
-                snprintf(p->source_target, MAX_NAME, "dirlight");
+                p->source_kind = USER_CB_SOURCE_LIGHT_POSITION;
+                snprintf(p->source_target, MAX_NAME, "light");
             }
-            if (ImGui::Selectable("Dir Light Target", source_kind == USER_CB_SOURCE_DIRLIGHT_TARGET)) {
+            if (ImGui::Selectable("Light Target", source_kind == USER_CB_SOURCE_LIGHT_TARGET)) {
                 p->source = INVALID_HANDLE;
-                p->source_kind = USER_CB_SOURCE_DIRLIGHT_TARGET;
-                snprintf(p->source_target, MAX_NAME, "dirlight");
+                p->source_kind = USER_CB_SOURCE_LIGHT_TARGET;
+                snprintf(p->source_target, MAX_NAME, "light");
             }
             for (int c_i = 0; c_i < MAX_COMMANDS; c_i++) {
                 Command& c = g_commands[c_i];
@@ -4419,6 +4671,9 @@ cbuffer SceneCB : register(b0)
     float4 ShadowParams;
     float4 ShadowCascadeRects[4];
     float4x4 ShadowCascadeViewProj[4];
+    float4 LightPos;             // xyz=main light position.
+    float4 LightParams;          // x=0 directional/1 spot, y/z=spot inner/outer cos, w=range.
+    float4 CameraParams;         // x=0 perspective/1 orthographic, y=ortho height, z/w=near/far.
 };
 
 )HLSL";
@@ -5237,7 +5492,7 @@ static bool ui_resource_filter_match(const Resource& r, int filter) {
                    r.type == RES_NANOVDB || r.type == RES_BUILTIN_SCENE_DEPTH;
     case 5: return r.type == RES_INT || r.type == RES_INT2 || r.type == RES_INT3 || r.type == RES_FLOAT ||
                    r.type == RES_FLOAT2 || r.type == RES_FLOAT3 || r.type == RES_FLOAT4 ||
-                   r.type == RES_BUILTIN_TIME || r.type == RES_BUILTIN_DIRLIGHT;
+                   r.type == RES_BUILTIN_TIME || r.type == RES_BUILTIN_LIGHT;
     default: return true;
     }
 }
@@ -5254,7 +5509,7 @@ static bool ui_resource_is_variable_inspector_candidate(const Resource& r) {
     case RES_FLOAT3:
     case RES_FLOAT4:
     case RES_BUILTIN_TIME:
-    case RES_BUILTIN_DIRLIGHT:
+    case RES_BUILTIN_LIGHT:
         return true;
     default:
         return false;
@@ -5307,6 +5562,19 @@ static void ui_inline_badge(const char* id, const char* text, ImVec4 tint, float
     ImGui::InvisibleButton(id, size);
     float badge_y = pos.y + floorf((size.y - badge_h) * 0.5f);
     ui_draw_badge(ImGui::GetWindowDrawList(), ImVec2(pos.x, badge_y), text, tint);
+}
+
+static void ui_inline_small_text(const char* id, const char* text, ImVec4 color, float min_h = 0.0f, float scale = 0.82f) {
+    if (!text || !text[0])
+        return;
+    ImFont* font = ImGui::GetFont();
+    float font_size = ImGui::GetFontSize() * scale;
+    ImVec2 text_size = font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, text);
+    ImVec2 size(text_size.x, text_size.y > min_h ? text_size.y : min_h);
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, size);
+    float y = pos.y + floorf((size.y - text_size.y) * 0.5f);
+    ImGui::GetWindowDrawList()->AddText(font, font_size, ImVec2(pos.x, y), ImGui::GetColorU32(color), text);
 }
 
 static bool ui_has_draw_rtv(ResHandle h) {
@@ -5883,9 +6151,9 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
         ImVec4(0.48f, 0.49f, 0.51f, 1.0f));
     char display_name[MAX_NAME + 48] = {};
     if (c.type == CMD_GROUP)
-        snprintf(display_name, sizeof(display_name), "Group · %s", c.name);
+        snprintf(display_name, sizeof(display_name), "Group ? %s", c.name);
     else if (c.type == CMD_REPEAT)
-        snprintf(display_name, sizeof(display_name), "Repeat x%d · %s", c.repeat_count, c.name);
+        snprintf(display_name, sizeof(display_name), "Repeat x%d ? %s", c.repeat_count, c.name);
     else
         snprintf(display_name, sizeof(display_name), "%s", c.name);
     ImVec2 name_pos = ImVec2(row_x + 28.0f, text_y);
@@ -6854,7 +7122,7 @@ static void ui_compute_default_cascade_splits(float near_z, float far_z, int cas
     }
 }
 
-static void ui_seed_dirlight_cascade_range(Resource* r, int from_index, int cascade_count) {
+static void ui_seed_light_cascade_range(Resource* r, int from_index, int cascade_count) {
     if (!r)
         return;
 
@@ -6885,7 +7153,7 @@ static void ui_seed_dirlight_cascade_range(Resource* r, int from_index, int casc
     }
 }
 
-static void ui_validate_dirlight_cascades(Resource* r) {
+static void ui_validate_light_cascades(Resource* r) {
     if (!r)
         return;
 
@@ -7456,7 +7724,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         break;
     }
 
-    case RES_BUILTIN_DIRLIGHT: {
+    case RES_BUILTIN_LIGHT: {
         Vec3 target = v3(r->light_target[0], r->light_target[1], r->light_target[2]);
         Vec3 pos = v3(r->light_pos[0], r->light_pos[1], r->light_pos[2]);
         Vec3 offset = v3_sub(pos, target);
@@ -7467,6 +7735,12 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         }
 
         bool light_changed = false;
+        const char* light_types[] = { "Directional", "Spot" };
+        int light_type = r->light_type == LIGHT_TYPE_SPOT ? 1 : 0;
+        if (ImGui::Combo("Light Type", &light_type, light_types, 2)) {
+            r->light_type = light_type == 1 ? LIGHT_TYPE_SPOT : LIGHT_TYPE_DIRECTIONAL;
+            light_changed = true;
+        }
         float edit_target[3] = { target.x, target.y, target.z };
         if (ImGui::DragFloat3("Target", edit_target, 0.01f)) {
             Vec3 new_target = v3(edit_target[0], edit_target[1], edit_target[2]);
@@ -7496,8 +7770,16 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
 
         light_changed |= ImGui::ColorEdit3("Color", r->light_color);
         light_changed |= ImGui::DragFloat("Intensity", &r->light_intensity, 0.01f, 0.f, 10.f);
+        if (ImGui::Checkbox("Debug Draw Light", &r->light_debug_draw))
+            app_request_scene_render();
+        if (r->light_type == LIGHT_TYPE_SPOT) {
+            light_changed |= ImGui::DragFloat("Spot Angle", &r->spot_angle, 0.01f, 0.05f, 3.0f);
+            light_changed |= ImGui::DragFloat("Spot Softness", &r->spot_softness, 0.01f, 0.0f, 0.95f);
+            r->spot_angle = clampf(r->spot_angle, 0.05f, 3.0f);
+            r->spot_softness = clampf(r->spot_softness, 0.0f, 0.95f);
+        }
         if (light_changed)
-            timeline_capture_if_tracked(TIMELINE_TRACK_DIRLIGHT, "dirlight", RES_NONE);
+            timeline_capture_if_tracked(TIMELINE_TRACK_LIGHT, "light", RES_NONE);
         ImGui::Separator();
         int shadow_size[2] = {
             r->shadow_width > 0 ? r->shadow_width : g_dx.shadow_width,
@@ -7510,19 +7792,23 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             if (shadow_size[1] > 8192) shadow_size[1] = 8192;
             r->shadow_width = shadow_size[0];
             r->shadow_height = shadow_size[1];
-            dx_create_shadow_map(r->shadow_width, r->shadow_height);
+            dx_create_shadow_map(r->shadow_width, r->shadow_height,
+                                 r->light_type == LIGHT_TYPE_SPOT ? 1 : r->shadow_cascade_count);
         }
-        int cascade_count = r->shadow_cascade_count > 0 ? r->shadow_cascade_count : 1;
-        int prev_cascade_count = cascade_count;
-        if (ImGui::InputInt("Shadow Cascades", &cascade_count)) {
-            if (cascade_count < 1) cascade_count = 1;
-            if (cascade_count > MAX_SHADOW_CASCADES) cascade_count = MAX_SHADOW_CASCADES;
-            r->shadow_cascade_count = cascade_count;
-            if (cascade_count > prev_cascade_count)
-                ui_seed_dirlight_cascade_range(r, prev_cascade_count, cascade_count);
+        if (r->light_type == LIGHT_TYPE_DIRECTIONAL) {
+            int cascade_count = r->shadow_cascade_count > 0 ? r->shadow_cascade_count : 1;
+            int prev_cascade_count = cascade_count;
+            if (ImGui::InputInt("Shadow Cascades", &cascade_count)) {
+                if (cascade_count < 1) cascade_count = 1;
+                if (cascade_count > MAX_SHADOW_CASCADES) cascade_count = MAX_SHADOW_CASCADES;
+                r->shadow_cascade_count = cascade_count;
+                if (cascade_count > prev_cascade_count)
+                    ui_seed_light_cascade_range(r, prev_cascade_count, cascade_count);
+                dx_create_shadow_map(r->shadow_width, r->shadow_height, r->shadow_cascade_count);
+            }
         }
-        ui_validate_dirlight_cascades(r);
-        if (r->shadow_cascade_count > 1) {
+        ui_validate_light_cascades(r);
+        if (r->light_type == LIGHT_TYPE_DIRECTIONAL && r->shadow_cascade_count > 1) {
             for (int cascade = 0; cascade < r->shadow_cascade_count; cascade++) {
                 ImGui::PushID(cascade);
                 if (cascade > 0)
@@ -7534,21 +7820,32 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
                 ImGui::DragFloat("Far", &r->shadow_cascade_far[cascade], 0.01f, 0.001f, 1000.0f);
                 ImGui::PopID();
             }
-            ui_validate_dirlight_cascades(r);
-            ui_inspector_text_disabled_wrapped("Each cascade uses a manual ortho box and manual split distance.");
+            ui_validate_light_cascades(r);
+            ui_inspector_text_disabled_wrapped("Each cascade is stored in a separate Texture2DArray slice.");
         } else {
-            ImGui::DragFloat2("Shadow Ortho Size", r->shadow_extent, 0.01f, 0.01f, 100.0f);
+            if (r->light_type == LIGHT_TYPE_DIRECTIONAL)
+                ImGui::DragFloat2("Shadow Ortho Size", r->shadow_extent, 0.01f, 0.01f, 100.0f);
             ImGui::DragFloat("Shadow Near", &r->shadow_near, 0.001f, 0.0001f, 100.0f);
             ImGui::DragFloat("Shadow Far", &r->shadow_far, 0.01f, 0.001f, 1000.0f);
             if (r->shadow_far <= r->shadow_near + 0.001f)
                 r->shadow_far = r->shadow_near + 0.001f;
-            ui_inspector_text_disabled_wrapped("Single-cascade mode uses the manual ortho box above.");
+            ui_inspector_text_disabled_wrapped(r->light_type == LIGHT_TYPE_SPOT ?
+                "Spot shadows use a perspective shadow projection in the first array slice." :
+                "Single-cascade mode uses the manual ortho box above.");
         }
         ImGui::Separator();
         if (Resource* shadow_map = res_get(g_builtin_shadow_map)) {
-            ImGui::Text("Shadow Atlas Preview (%dx%d, %d cascades)",
-                        shadow_map->width, shadow_map->height, r->shadow_cascade_count > 0 ? r->shadow_cascade_count : 1);
-            ui_image_fill_panel_width(shadow_map->srv, shadow_map->width, shadow_map->height);
+            ImGui::Text("Shadow Array Preview (%dx%d, %d layer%s)",
+                        shadow_map->width, shadow_map->height,
+                        g_dx.shadow_layers > 0 ? g_dx.shadow_layers : 1,
+                        (g_dx.shadow_layers == 1 ? "" : "s"));
+            ID3D11ShaderResourceView* preview_srv = ui_render_shadow_depth_preview(shadow_map->width, shadow_map->height, 0);
+            if (preview_srv) {
+                ui_inspector_text_disabled_wrapped(g_dx.scene_cb_data.light_params[0] >= 0.5f ?
+                    "Preview is linearized and inverted for spot depth readability." :
+                    "Preview is inverted so nearer shadow casters are brighter.");
+                ui_image_fill_panel_width(preview_srv, shadow_map->width, shadow_map->height);
+            }
         }
         break;
     }
@@ -7568,7 +7865,7 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
 
     case RES_BUILTIN_SHADOW_MAP: {
         ImGui::Text("Shadow Map (%dx%d)", r->width, r->height);
-        Resource* dl = res_get(g_builtin_dirlight);
+        Resource* dl = res_get(g_builtin_light);
         int shadow_size[2] = {
             dl && dl->shadow_width > 0 ? dl->shadow_width : g_dx.shadow_width,
             dl && dl->shadow_height > 0 ? dl->shadow_height : g_dx.shadow_height
@@ -7582,14 +7879,18 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
                 dl->shadow_width = shadow_size[0];
                 dl->shadow_height = shadow_size[1];
             }
-            dx_create_shadow_map(shadow_size[0], shadow_size[1]);
+            dx_create_shadow_map(shadow_size[0], shadow_size[1],
+                                 dl && dl->light_type == LIGHT_TYPE_SPOT ? 1 :
+                                 (dl && dl->shadow_cascade_count > 0 ? dl->shadow_cascade_count : 1));
         }
         if (dl) {
-            ui_inspector_text_disabled_wrapped("%d cascades%s",
-                                dl->shadow_cascade_count > 0 ? dl->shadow_cascade_count : 1,
-                                dl->shadow_cascade_count > 1 ? " (atlas)" : "");
+            ui_inspector_text_disabled_wrapped("%d array layer%s%s",
+                                g_dx.shadow_layers > 0 ? g_dx.shadow_layers : 1,
+                                g_dx.shadow_layers == 1 ? "" : "s",
+                                dl->light_type == LIGHT_TYPE_SPOT ? " (spot)" : "");
         }
-        ui_image_fill_panel_width(r->srv, r->width, r->height);
+        if (ID3D11ShaderResourceView* preview_srv = ui_render_shadow_depth_preview(r->width, r->height, 0))
+            ui_image_fill_panel_width(preview_srv, r->width, r->height);
         break;
     }
 
@@ -8265,7 +8566,7 @@ static void ui_inspector_variable_resource_row(ResHandle h) {
     float row_w = ImGui::GetContentRegionAvail().x - ui_current_vertical_scroll_margin(6.0f);
     if (row_w < ui_px(96.0f)) row_w = ui_px(96.0f);
     float spacing = ImGui::GetStyle().ItemSpacing.x;
-    bool show_type_badge = r->type == RES_BUILTIN_TIME || r->type == RES_BUILTIN_DIRLIGHT;
+    bool show_type_badge = r->type == RES_BUILTIN_TIME || r->type == RES_BUILTIN_LIGHT;
     float name_w = ImMin(ui_px(show_type_badge ? 118.0f : 185.0f), row_w * (show_type_badge ? 0.34f : 0.42f));
     float type_w = show_type_badge ? ImMin(ui_px(74.0f), row_w * 0.22f) : 0.0f;
     if (name_w < ui_px(54.0f)) name_w = ui_px(54.0f);
@@ -8305,17 +8606,31 @@ static void ui_inspector_variable_resource_row(ResHandle h) {
     ImGui::PopID();
 }
 
-static void ui_inspector_builtin_dirlight_summary(Resource* r) {
+static void ui_inspector_builtin_light_summary(Resource* r) {
     if (!r)
         return;
 
     bool changed = false;
+    const char* light_types[] = { "Directional", "Spot" };
+    int light_type = r->light_type == LIGHT_TYPE_SPOT ? 1 : 0;
+    if (ImGui::Combo("Light Type", &light_type, light_types, 2)) {
+        r->light_type = light_type == 1 ? LIGHT_TYPE_SPOT : LIGHT_TYPE_DIRECTIONAL;
+        changed = true;
+    }
     changed |= ImGui::ColorEdit3("Light Color", r->light_color);
     changed |= ImGui::DragFloat("Light Intensity", &r->light_intensity, 0.01f, 0.0f, 10.0f);
     changed |= ImGui::DragFloat3("Light Target", r->light_target, 0.01f);
     changed |= ImGui::DragFloat3("Light Position", r->light_pos, 0.01f);
+    if (ImGui::Checkbox("Debug Draw Light", &r->light_debug_draw))
+        app_request_scene_render();
+    if (r->light_type == LIGHT_TYPE_SPOT) {
+        changed |= ImGui::DragFloat("Spot Angle", &r->spot_angle, 0.01f, 0.05f, 3.0f);
+        changed |= ImGui::DragFloat("Spot Softness", &r->spot_softness, 0.01f, 0.0f, 0.95f);
+        r->spot_angle = clampf(r->spot_angle, 0.05f, 3.0f);
+        r->spot_softness = clampf(r->spot_softness, 0.0f, 0.95f);
+    }
     if (changed) {
-        timeline_capture_if_tracked(TIMELINE_TRACK_DIRLIGHT, "dirlight", RES_NONE);
+        timeline_capture_if_tracked(TIMELINE_TRACK_LIGHT, "light", RES_NONE);
         app_request_scene_render();
     }
 }
@@ -8326,7 +8641,7 @@ static ID3D11ShaderResourceView* ui_runtime_preview_srv(const Resource* r) {
     switch (r->type) {
     case RES_BUILTIN_SCENE_COLOR: return g_dx.scene_srv;
     case RES_BUILTIN_SCENE_DEPTH: return g_dx.depth_srv;
-    case RES_BUILTIN_SHADOW_MAP:  return g_dx.shadow_srv;
+    case RES_BUILTIN_SHADOW_MAP:  return ui_render_shadow_depth_preview(g_dx.shadow_width, g_dx.shadow_height, 0);
     case RES_RENDER_TEXTURE2D:    return r->srv;
     default:                      return nullptr;
     }
@@ -8474,10 +8789,10 @@ static void ui_inspector_variables_tab() {
     if (ui_inspector_section("BUILT-IN VARIABLES")) {
         if (Resource* t = res_get(g_builtin_time))
             ui_inspector_variable_resource_row(g_builtin_time);
-        if (Resource* dl = res_get(g_builtin_dirlight)) {
-            ImGui::PushID((int)g_builtin_dirlight);
+        if (Resource* dl = res_get(g_builtin_light)) {
+            ImGui::PushID((int)g_builtin_light);
             ImGui::TextUnformatted(ui_resource_display_name(*dl));
-            ui_inspector_builtin_dirlight_summary(dl);
+            ui_inspector_builtin_light_summary(dl);
             ImGui::PopID();
         }
     }
@@ -8853,10 +9168,10 @@ static void ui_panel_user_cb() {
                 snprintf(source_label, sizeof(source_label), "Camera Position");
             } else if (e.source_kind == USER_CB_SOURCE_CAMERA_ROTATION) {
                 snprintf(source_label, sizeof(source_label), "Camera Rotation");
-            } else if (e.source_kind == USER_CB_SOURCE_DIRLIGHT_POSITION) {
-                snprintf(source_label, sizeof(source_label), "Dir Light Position");
-            } else if (e.source_kind == USER_CB_SOURCE_DIRLIGHT_TARGET) {
-                snprintf(source_label, sizeof(source_label), "Dir Light Target");
+            } else if (e.source_kind == USER_CB_SOURCE_LIGHT_POSITION) {
+                snprintf(source_label, sizeof(source_label), "Light Position");
+            } else if (e.source_kind == USER_CB_SOURCE_LIGHT_TARGET) {
+                snprintf(source_label, sizeof(source_label), "Light Target");
             } else {
                 snprintf(source_label, sizeof(source_label), "(hardcoded)");
             }
@@ -8912,11 +9227,11 @@ static void ui_panel_user_cb() {
                     if (ImGui::Selectable("Camera Rotation", e.source_kind == USER_CB_SOURCE_CAMERA_ROTATION)) {
                         user_changed |= user_cb_set_scene_source(i, USER_CB_SOURCE_CAMERA_ROTATION, "camera");
                     }
-                    if (ImGui::Selectable("Dir Light Position", e.source_kind == USER_CB_SOURCE_DIRLIGHT_POSITION)) {
-                        user_changed |= user_cb_set_scene_source(i, USER_CB_SOURCE_DIRLIGHT_POSITION, "dirlight");
+                    if (ImGui::Selectable("Light Position", e.source_kind == USER_CB_SOURCE_LIGHT_POSITION)) {
+                        user_changed |= user_cb_set_scene_source(i, USER_CB_SOURCE_LIGHT_POSITION, "light");
                     }
-                    if (ImGui::Selectable("Dir Light Target", e.source_kind == USER_CB_SOURCE_DIRLIGHT_TARGET)) {
-                        user_changed |= user_cb_set_scene_source(i, USER_CB_SOURCE_DIRLIGHT_TARGET, "dirlight");
+                    if (ImGui::Selectable("Light Target", e.source_kind == USER_CB_SOURCE_LIGHT_TARGET)) {
+                        user_changed |= user_cb_set_scene_source(i, USER_CB_SOURCE_LIGHT_TARGET, "light");
                     }
                     for (int c_i = 0; c_i < MAX_COMMANDS; c_i++) {
                         Command& c = g_commands[c_i];
@@ -9380,7 +9695,16 @@ static void ui_panel_general(bool embedded = false) {
         camera_rotation_changed |= ImGui::DragFloat("Pitch", &g_camera.pitch, 0.01f);
         camera_rotation_changed |= ImGui::DragFloat("Roll", &g_camera.roll, 0.01f);
         camera_changed |= camera_rotation_changed;
-        camera_changed |= ImGui::DragFloat("FOV", &g_camera.fov_y, 0.01f, 0.10f, 2.80f);
+        const char* projection_types[] = { "Perspective", "Orthographic" };
+        int projection_type = g_camera.projection_type == CAMERA_PROJECTION_ORTHOGRAPHIC ? 1 : 0;
+        if (ImGui::Combo("Projection", &projection_type, projection_types, 2)) {
+            g_camera.projection_type = projection_type == 1 ? CAMERA_PROJECTION_ORTHOGRAPHIC : CAMERA_PROJECTION_PERSPECTIVE;
+            camera_changed = true;
+        }
+        if (g_camera.projection_type == CAMERA_PROJECTION_ORTHOGRAPHIC)
+            camera_changed |= ImGui::DragFloat("Ortho Height", &g_camera.ortho_height, 0.01f, 0.001f, 10000.0f);
+        else
+            camera_changed |= ImGui::DragFloat("FOV", &g_camera.fov_y, 0.01f, 0.10f, 2.80f);
         camera_changed |= ImGui::DragFloat("Near Plane", &g_camera.near_z, 0.001f, 0.0001f, 100.0f);
         camera_changed |= ImGui::DragFloat("Far Plane", &g_camera.far_z, 0.05f, 0.001f, 10000.0f);
 
@@ -9388,6 +9712,7 @@ static void ui_panel_general(bool embedded = false) {
             camera_set_euler(&g_camera, g_camera.yaw, g_camera.pitch, g_camera.roll);
         if (g_camera.fov_y < 0.10f) g_camera.fov_y = 0.10f;
         if (g_camera.fov_y > 2.80f) g_camera.fov_y = 2.80f;
+        if (g_camera.ortho_height < 0.001f) g_camera.ortho_height = 0.001f;
         if (g_camera.near_z < 0.0001f) g_camera.near_z = 0.0001f;
         if (g_camera.far_z <= g_camera.near_z + 0.001f)
             g_camera.far_z = g_camera.near_z + 0.001f;
@@ -10188,6 +10513,74 @@ static void ui_draw_viewport_bounds_debug(ImVec2 rect_min, ImVec2 rect_max) {
 #endif
 }
 
+static void ui_draw_viewport_light_debug(ImVec2 rect_min, ImVec2 rect_max) {
+    Resource* light = res_get(g_builtin_light);
+    if (!light || !light->light_debug_draw)
+        return;
+
+    Mat4 view_proj = ui_mat4_from_raw(g_dx.scene_cb_data.view_proj);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 line_col = ImGui::GetColorU32(ImVec4(1.0f, 0.78f, 0.22f, 0.95f));
+    ImU32 soft_col = ImGui::GetColorU32(ImVec4(1.0f, 0.58f, 0.18f, 0.58f));
+    ImU32 fill_col = ImGui::GetColorU32(ImVec4(1.0f, 0.62f, 0.16f, 0.08f));
+
+    Vec3 pos = v3(light->light_pos[0], light->light_pos[1], light->light_pos[2]);
+    Vec3 target = v3(light->light_target[0], light->light_target[1], light->light_target[2]);
+    Vec3 delta = v3_sub(target, pos);
+    Vec3 dir = v3_norm(delta);
+    if (v3_dot(dir, dir) < 0.0001f)
+        dir = v3(0.0f, -1.0f, 0.0f);
+
+    float range = light->light_type == LIGHT_TYPE_SPOT ? light->shadow_far : sqrtf(v3_dot(delta, delta));
+    if (range < 0.05f)
+        range = 0.05f;
+    Vec3 tip = v3_add(pos, v3_scale(dir, range));
+
+    ImVec2 pos_s = {};
+    ImVec2 tip_s = {};
+    bool pos_ok = ui_project_world_to_screen(view_proj, rect_min, rect_max, pos, &pos_s);
+    bool tip_ok = ui_project_world_to_screen(view_proj, rect_min, rect_max, tip, &tip_s);
+    if (pos_ok) {
+        dl->AddCircleFilled(pos_s, ui_px(4.0f), line_col, 18);
+        dl->AddCircle(pos_s, ui_px(7.0f), line_col, 24, ui_px(1.4f));
+    }
+    if (pos_ok && tip_ok)
+        ui_draw_translate_axis(dl, pos_s, tip_s, line_col, ui_px(1.8f));
+
+    if (light->light_type != LIGHT_TYPE_SPOT)
+        return;
+
+    Vec3 up_seed = fabsf(v3_dot(dir, v3(0.0f, 1.0f, 0.0f))) > 0.92f ? v3(0.0f, 0.0f, 1.0f) : v3(0.0f, 1.0f, 0.0f);
+    Vec3 right = v3_norm(v3_cross(up_seed, dir));
+    Vec3 up = v3_norm(v3_cross(dir, right));
+    float angle = clampf(light->spot_angle, 0.05f, 3.0f);
+    float radius = tanf(angle * 0.5f) * range;
+    Vec3 center = tip;
+    const int segments = 36;
+    ImVec2 ring[segments] = {};
+    bool ring_ok[segments] = {};
+    for (int i = 0; i < segments; i++) {
+        float a = 6.28318530718f * (float)i / (float)segments;
+        Vec3 p = v3_add(center,
+                        v3_add(v3_scale(right, cosf(a) * radius),
+                               v3_scale(up, sinf(a) * radius)));
+        ring_ok[i] = ui_project_world_to_screen(view_proj, rect_min, rect_max, p, &ring[i]);
+    }
+    for (int i = 0; i < segments; i++) {
+        int j = (i + 1) % segments;
+        if (ring_ok[i] && ring_ok[j])
+            dl->AddLine(ring[i], ring[j], soft_col, ui_px(1.3f));
+    }
+    for (int i = 0; i < segments; i += segments / 4) {
+        if (pos_ok && ring_ok[i])
+            dl->AddLine(pos_s, ring[i], soft_col, ui_px(1.2f));
+    }
+    if (ring_ok[0] && ring_ok[9] && ring_ok[18])
+        dl->AddTriangleFilled(ring[0], ring[9], ring[18], fill_col);
+    if (ring_ok[0] && ring_ok[18] && ring_ok[27])
+        dl->AddTriangleFilled(ring[0], ring[18], ring[27], fill_col);
+}
+
 static float ui_viewport_overlay_text_button_width(const char* label) {
     float pad_x = ui_px(8.0f);
     float min_h = ui_px(22.0f);
@@ -10469,7 +10862,7 @@ static void ui_draw_manual_control_feedback(ImVec2 rect_min, ImVec2 rect_max) {
         pos.x += size + gap;
     }
     if (s_light_feedback > 0.001f) {
-        Resource* dl_res = res_get(g_builtin_dirlight);
+        Resource* dl_res = res_get(g_builtin_light);
         float yaw = 0.0f;
         float pitch = 0.0f;
         if (dl_res) {
@@ -10522,6 +10915,7 @@ static void ui_panel_scene(bool embedded = false) {
     g_scene_view_pointer_over = pointer_over_viewport;
     if (g_dx.scene_srv && image_max.x > image_min.x && image_max.y > image_min.y) {
         ui_draw_viewport_bounds_debug(image_min, image_max);
+        ui_draw_viewport_light_debug(image_min, image_max);
         ui_draw_viewport_gizmo(image_min, image_max, viewport_hovered);
         if (g_dx.scene_orientation_gizmo_enabled)
             ui_draw_camera_orientation_gizmo(image_min, image_max);
@@ -11216,7 +11610,7 @@ static void ui_draw_shader_editor_window() {
     char detail[128] = {};
     if (r) {
         const char* shader_name = (r->name && r->name[0]) ? r->name : "(unnamed)";
-        snprintf(detail, sizeof(detail), "%s  ·  %s  ·  %d shader%s",
+        snprintf(detail, sizeof(detail), "%s  ?  %s  ?  %d shader%s",
                  shader_name,
                  r->compiled_ok && !r->using_fallback ? "compiled" : "fallback",
                  shader_count, shader_count == 1 ? "" : "s");
@@ -11805,7 +12199,7 @@ static void ui_draw_help_shortcuts_tab() {
         ui_draw_shortcut_row("F", "Frame selected/scene bounding box");
         ui_draw_shortcut_row("Shift", "Faster movement");
         ui_draw_shortcut_row("Ctrl", "Slower movement");
-        ui_draw_shortcut_row("L", "Orbit directional light");
+        ui_draw_shortcut_row("L", "Orbit light");
         ImGui::EndTable();
     }
 
@@ -11873,7 +12267,7 @@ static void ui_draw_help_common_tab() {
         ui_draw_common_function_row("float3 lt_scene_depth_to_world(float2 uv, float depth01)", "uv: texture coordinates. depth01: sampled scene depth.", "Reconstructs world position using InvViewProj.");
         ui_draw_common_function_row("float lt_view_depth_from_world(float3 world_pos)", "world_pos: position in world space.", "Signed camera-forward distance.");
         ui_draw_common_function_row("float lt_scene_depth_to_view_depth(float2 uv, float depth01)", "uv/depth01: sampled depth pixel.", "Reconstructs world and returns view depth.");
-        ui_draw_common_function_row("float lt_depth01_to_view_depth(float depth01)", "depth01: D3D hardware depth.", "Approximate linear depth using near/far from ShadowParams.y/z.");
+        ui_draw_common_function_row("float lt_depth01_to_view_depth(float depth01)", "depth01: D3D hardware depth.", "Linear depth using camera near/far; supports perspective and orthographic.");
         ui_draw_common_function_row("float lt_view_depth_to_depth01(float view_depth)", "view_depth: camera-forward distance.", "Converts linear view depth back to hardware depth.");
         ui_draw_common_function_row("float2 lt_sv_position_to_uv(float4 sv_position, float2 render_size)", "sv_position: pixel position. render_size: target size.", "Pixel shader SV_POSITION to UV.");
         ui_draw_common_function_row("float2 lt_uv_to_pixel(float2 uv, float2 render_size)", "uv, render_size.", "UV to pixel coordinates.");
@@ -11894,13 +12288,13 @@ static void ui_draw_help_common_tab() {
         ui_draw_common_function_row("float4 lt_shadow_clip(int cascade_index, float3 world_pos)", "cascade_index, world_pos.", "Projects to cascade clip space.");
         ui_draw_common_function_row("float3 lt_shadow_ndc(int cascade_index, float3 world_pos)", "cascade_index, world_pos.", "Cascade projection divided by w.");
         ui_draw_common_function_row("float2 lt_shadow_local_uv_from_ndc(float3 shadow_ndc)", "shadow_ndc: cascade NDC.", "Cascade-local shadow UV.");
-        ui_draw_common_function_row("float2 lt_shadow_atlas_uv(int cascade_index, float2 local_uv)", "cascade_index, local_uv.", "Maps cascade-local UV into atlas UV.");
+        ui_draw_common_function_row("float3 lt_shadow_array_uv(int cascade_index, float2 local_uv)", "cascade_index, local_uv.", "Maps cascade-local UV into Texture2DArray UV.");
         ui_draw_common_function_row("bool lt_shadow_inside(float3 shadow_ndc, float2 local_uv)", "shadow_ndc, local_uv.", "Checks cascade UV and depth bounds.");
         ui_draw_common_function_row("float lt_shadow_bias(float ndl)", "ndl: normal dot light.", "Default slope-ish bias used by PCF helpers.");
         ui_draw_common_function_row("float lt_sample_shadow_cascade_pcf3x3(int cascade_index, float3 world_pos, float ndl)", "cascade_index, world_pos, ndl.", "Samples default ShadowMap/ShadowSampler at one cascade.");
         ui_draw_common_function_row("float lt_sample_shadow_pcf3x3(float3 world_pos, float3 normal_ws, float3 light_dir_ws)", "world_pos, normal_ws, light_dir_ws.", "Selects cascade and samples default 3x3 PCF.");
-        ui_draw_common_function_row("float lt_sample_shadow_cascade_pcf3x3(Texture2D shadow_map, SamplerComparisonState shadow_sampler, int cascade_index, float3 world_pos, float ndl)", "custom shadow map/sampler plus cascade data.", "Expert overload for custom bindings.");
-        ui_draw_common_function_row("float lt_sample_shadow_pcf3x3(Texture2D shadow_map, SamplerComparisonState shadow_sampler, float3 world_pos, float3 normal_ws, float3 light_dir_ws)", "custom shadow map/sampler plus surface data.", "Expert overload with custom bindings.");
+        ui_draw_common_function_row("float lt_sample_shadow_cascade_pcf3x3(Texture2DArray shadow_map, SamplerComparisonState shadow_sampler, int cascade_index, float3 world_pos, float ndl)", "custom shadow map/sampler plus cascade data.", "Expert overload for custom bindings.");
+        ui_draw_common_function_row("float lt_sample_shadow_pcf3x3(Texture2DArray shadow_map, SamplerComparisonState shadow_sampler, float3 world_pos, float3 normal_ws, float3 light_dir_ws)", "custom shadow map/sampler plus surface data.", "Expert overload with custom bindings.");
         ImGui::EndTable();
     }
 
@@ -12090,6 +12484,29 @@ static bool ui_timeline_clipboard_compatible(const TimelineTrack& track) {
     return true;
 }
 
+static const char* ui_timeline_interpolation_label(int mode) {
+    switch (mode) {
+    case TIMELINE_INTERP_STEP:      return "Step / Flat";
+    case TIMELINE_INTERP_LINEAR:    return "Linear";
+    case TIMELINE_INTERP_QUADRATIC: return "Quadratic";
+    case TIMELINE_INTERP_CUBIC:     return "Cubic";
+    default:                        return "Cubic";
+    }
+}
+
+static void ui_timeline_set_key_interpolation(TimelineKey& key, int mode) {
+    if (mode < TIMELINE_INTERP_STEP)
+        mode = TIMELINE_INTERP_STEP;
+    if (mode > TIMELINE_INTERP_CUBIC)
+        mode = TIMELINE_INTERP_CUBIC;
+    if (key.interpolation_mode == mode)
+        return;
+    key.interpolation_mode = mode;
+    if (key.tangent_scale < 0.0f || key.tangent_scale > 4.0f)
+        key.tangent_scale = 1.0f;
+    app_request_scene_render();
+}
+
 static void ui_timeline_copy_selected_slot() {
     if (!ui_timeline_slot_selection_valid())
         return;
@@ -12203,7 +12620,7 @@ static void ui_timeline_add_tracks() {
 
     ui_timeline_add_track_button("Camera", TIMELINE_TRACK_CAMERA, "camera", RES_NONE);
     ImGui::SameLine();
-    ui_timeline_add_track_button("Dir Light", TIMELINE_TRACK_DIRLIGHT, "dirlight", RES_NONE);
+    ui_timeline_add_track_button("Light", TIMELINE_TRACK_LIGHT, "light", RES_NONE);
 
     Command* selected_cmd = cmd_get(g_sel_cmd);
     if (selected_cmd) {
@@ -12246,8 +12663,8 @@ static void ui_timeline_track_label(const TimelineTrack& track, char* out, int o
     case TIMELINE_TRACK_CAMERA:
         snprintf(out, out_sz, "Camera");
         break;
-    case TIMELINE_TRACK_DIRLIGHT:
-        snprintf(out, out_sz, "Dir Light");
+    case TIMELINE_TRACK_LIGHT:
+        snprintf(out, out_sz, "Light");
         break;
     default:
         snprintf(out, out_sz, "Track");
@@ -12291,7 +12708,9 @@ static bool ui_timeline_track_enable_checkbox(const char* id, bool* value, float
 
 static void ui_timeline_draw_slot(int track_index, int frame, ImVec2 slot_size) {
     TimelineTrack& track = g_timeline_tracks[track_index];
-    bool has_key = timeline_find_key_index(track, frame) >= 0;
+    int key_index = timeline_find_key_index(track, frame);
+    bool has_key = key_index >= 0;
+    TimelineKey* key = has_key ? &track.keys[key_index] : nullptr;
     bool selected = ui_timeline_slot_selected(track_index, frame);
 
     // Keep the interactive item constrained to the slot size. Using
@@ -12329,6 +12748,30 @@ static void ui_timeline_draw_slot(int track_index, int frame, ImVec2 slot_size) 
         bool can_paste = ui_timeline_clipboard_compatible(track);
         if (ImGui::MenuItem("Paste Key", "Ctrl+V", false, can_paste))
             ui_timeline_paste_selected_slot();
+        if (has_key && key) {
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Interpolation")) {
+                if (ImGui::MenuItem("Step / Flat", nullptr, key->interpolation_mode == TIMELINE_INTERP_STEP))
+                    ui_timeline_set_key_interpolation(*key, TIMELINE_INTERP_STEP);
+                if (ImGui::MenuItem("Linear", nullptr, key->interpolation_mode == TIMELINE_INTERP_LINEAR))
+                    ui_timeline_set_key_interpolation(*key, TIMELINE_INTERP_LINEAR);
+                if (ImGui::MenuItem("Quadratic", nullptr, key->interpolation_mode == TIMELINE_INTERP_QUADRATIC))
+                    ui_timeline_set_key_interpolation(*key, TIMELINE_INTERP_QUADRATIC);
+                if (ImGui::MenuItem("Cubic", nullptr, key->interpolation_mode == TIMELINE_INTERP_CUBIC))
+                    ui_timeline_set_key_interpolation(*key, TIMELINE_INTERP_CUBIC);
+                ImGui::EndMenu();
+            }
+            if (key->interpolation_mode == TIMELINE_INTERP_CUBIC) {
+                float tangent = clampf(key->tangent_scale, 0.0f, 4.0f);
+                ImGui::SetNextItemWidth(ui_px(140.0f));
+                if (ImGui::SliderFloat("Tangent", &tangent, 0.0f, 3.0f, "%.2f")) {
+                    key->tangent_scale = clampf(tangent, 0.0f, 4.0f);
+                    app_request_scene_render();
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Cubic tangent scale. 0 is flat, 1 is automatic, higher values overshoot more.");
+            }
+        }
         if (has_key && ImGui::MenuItem("Delete Key"))
             timeline_delete_key(track_index, frame);
         ImGui::EndPopup();
@@ -12363,6 +12806,15 @@ static void ui_timeline_draw_slot(int track_index, int frame, ImVec2 slot_size) 
         dl->AddConvexPolyFilled(pts, 4, ImGui::GetColorU32(ImVec4(0.83f, 0.55f, 0.22f, 1.0f)));
         dl->AddPolyline(pts, 4, ImGui::GetColorU32(ImVec4(0.18f, 0.12f, 0.06f, 1.0f)),
             true, ui_px(1.0f));
+        if (hovered && key) {
+            if (key->interpolation_mode == TIMELINE_INTERP_CUBIC) {
+                ImGui::SetTooltip("%s, tangent %.2f",
+                                  ui_timeline_interpolation_label(key->interpolation_mode),
+                                  key->tangent_scale);
+            } else {
+                ImGui::SetTooltip("%s", ui_timeline_interpolation_label(key->interpolation_mode));
+            }
+        }
     }
 }
 
@@ -12689,41 +13141,9 @@ static void ui_draw_timeline_window() {
         timeline_set_loop(!loop);
     if (loop)
         ImGui::PopStyleColor(3);
-    ImGui::SameLine(0.0f, ui_margin_px(10.0f));
-    int interpolation_mode = timeline_interpolation_mode();
-    const char* interpolation_label =
-        interpolation_mode == TIMELINE_INTERP_CUBIC ? "Cubic" :
-        interpolation_mode == TIMELINE_INTERP_QUADRATIC ? "Quadratic" :
-        interpolation_mode == TIMELINE_INTERP_LINEAR ? "Linear" : "Step";
-    bool interpolation_active = interpolation_mode != TIMELINE_INTERP_STEP;
-    if (interpolation_active) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.33f, 0.18f, 0.10f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.24f, 0.12f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.58f, 0.30f, 0.14f, 1.0f));
-    }
-    if (ImGui::Button(interpolation_label)) {
-        int next_mode = interpolation_mode + 1;
-        if (next_mode > TIMELINE_INTERP_CUBIC)
-            next_mode = TIMELINE_INTERP_STEP;
-        timeline_set_interpolation_mode(next_mode);
-    }
-    if (interpolation_active)
-        ImGui::PopStyleColor(3);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(interpolation_mode == TIMELINE_INTERP_CUBIC ?
-                          "Cubic Hermite interpolation with continuous velocity across keyed frames" :
-                          interpolation_mode == TIMELINE_INTERP_QUADRATIC ?
-                          "Quadratic ease-in/out between real timeline frames" :
-                          interpolation_mode == TIMELINE_INTERP_LINEAR ?
-                          "Linear interpolation between real timeline frames" :
-                          "Stepped playback: hold each real timeline frame");
     ImGui::SameLine(0.0f, ui_margin_px(18.0f));
     ImGui::SetNextItemWidth(ui_px(112.0f));
     ImGui::SliderFloat("zoom", &s_timeline_slot_zoom, 0.55f, 1.60f, "%.2f");
-    ImGui::SameLine(0.0f, ui_margin_px(18.0f));
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextDisabled("Current frame %d / %d  -  scene %.2fs",
-                        timeline_current_frame(), timeline_length_frames() - 1, app_scene_time());
     ImGui::PopStyleVar();
 
     ui_timeline_add_tracks();
@@ -14113,6 +14533,13 @@ static void ui_top_bar() {
     ui_align_frame_row(row_y);
     ui_inline_badge("##project_name_badge", project_current_name() ? project_current_name() : "untitled",
                     ImVec4(0.74f, 0.53f, 0.42f, 1.0f), row_h);
+    ImGui::SameLine(0.0f, ui_margin_px(7.0f));
+    ui_align_text_row(row_y);
+    char build_label[64] = {};
+    snprintf(build_label, sizeof(build_label), "build %s", LAZYTOOL_BUILD_CODE_STR);
+    ui_inline_small_text("##workspace_build_label", build_label, ImVec4(0.48f, 0.46f, 0.45f, 1.0f), row_h, 0.78f);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+        ImGui::SetTooltip("Build %s (#%s)", LAZYTOOL_BUILD_CODE_STR, LAZYTOOL_BUILD_NUMBER_STR);
     ui_top_bar_load_progress(row_y, row_h);
 
     static bool s_frame_ms_display_valid = false;
@@ -14634,6 +15061,7 @@ void ui_shutdown() {
     ui_release_app_icon_texture();
     ui_release_app_logo_text_texture();
     ui_release_rt3d_preview_pipeline();
+    ui_release_shadow_depth_preview_pipeline();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

@@ -29,7 +29,7 @@ ResHandle g_builtin_time        = INVALID_HANDLE;
 ResHandle g_builtin_scene_color = INVALID_HANDLE;
 ResHandle g_builtin_scene_depth = INVALID_HANDLE;
 ResHandle g_builtin_shadow_map  = INVALID_HANDLE;
-ResHandle g_builtin_dirlight    = INVALID_HANDLE;
+ResHandle g_builtin_light    = INVALID_HANDLE;
 
 #ifndef LAZYTOOL_PLAYER_ONLY
 static void res_finish_async_loads(bool wait);
@@ -567,7 +567,7 @@ const char* res_type_str(ResType t) {
     case RES_BUILTIN_SCENE_COLOR: return "[scene_color]";
     case RES_BUILTIN_SCENE_DEPTH: return "[scene_depth]";
     case RES_BUILTIN_SHADOW_MAP:  return "[shadow_map]";
-    case RES_BUILTIN_DIRLIGHT:    return "[dirlight]";
+    case RES_BUILTIN_LIGHT:    return "[light]";
     default:                      return "?";
     }
 }
@@ -655,10 +655,10 @@ void res_init() {
     g_builtin_shadow_map = res_alloc("shadow_map", RES_BUILTIN_SHADOW_MAP);
     g_resources[g_builtin_shadow_map - 1].is_builtin = true;
 
-    g_builtin_dirlight = res_alloc("directional_light", RES_BUILTIN_DIRLIGHT);
-    Resource* dl       = res_get(g_builtin_dirlight);
+    g_builtin_light = res_alloc("light", RES_BUILTIN_LIGHT);
+    Resource* dl       = res_get(g_builtin_light);
     dl->is_builtin = true;
-    project_apply_default_dirlight(dl);
+    project_apply_default_light(dl);
 
     res_sync_size_resource(g_builtin_scene_color);
     res_sync_size_resource(g_builtin_scene_depth);
@@ -2165,7 +2165,7 @@ ResHandle res_load_mesh(const char* name, const char* path) {
 }
 
 
-// ── Gaussian Splat PLY resources ──────────────────────────────────────────
+// ?? Gaussian Splat PLY resources ??????????????????????????????????????????
 // The runtime representation is intentionally simple and shader-friendly:
 // one immutable read-only StructuredBuffer exposed as SRV.  It stores one
 // decoded splat per element and leaves sorting/culling to user shaders or
@@ -3242,7 +3242,7 @@ ResHandle res_load_gaussian_splat(const char* name, const char* path) {
     return handle;
 }
 
-// ── NanoVDB resources ────────────────────────────────────────────────────
+// ?? NanoVDB resources ????????????????????????????????????????????????????
 // NanoVDB is uploaded as an immutable uint StructuredBuffer. PNanoVDB.h uses
 // uint-addressed StructuredBuffer reads in HLSL, so this keeps the runtime
 // representation directly shader-friendly and avoids dense Texture3D baking.

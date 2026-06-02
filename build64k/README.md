@@ -47,7 +47,7 @@ Use this exporter for procedural projects built from:
 - render target/depth bindings;
 - command parameters and UserCB values;
 - supported timeline tracks;
-- directional light and shadow data;
+- light and shadow data;
 - export settings such as VSync, Escape-to-close, timeline exit behavior, and FPS-in-title.
 
 The exporter can inline shader includes and minify project/shader text where useful.
@@ -72,7 +72,8 @@ Use the normal packed EXE exporter from the root editor when a project needs ext
 
 ## Practical notes
 
-- Save the project from the editor before exporting so `export_settings`, `timeline_global`, and `timeline_clip` blocks are current.
+- Save the project from the editor before exporting so `export_settings`, `timeline_global`, `timeline_clip`, and per-key `timeline_key` interpolation data are current.
+- The parser accepts the current `.lt` format only. It does not repair old light aliases, old camera records, or timeline clips with the former global interpolation field.
 - A good 64k candidate should avoid asset paths and keep resources internal/procedural.
 - Prefer primitive meshes, procedural vertex IDs, generated render targets, and UserCB/timeline data.
 - Keep shaders self-contained or use includes that can be inlined by the exporter.

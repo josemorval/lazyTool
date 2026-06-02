@@ -206,8 +206,8 @@ const char* user_cb_source_kind_token(UserCBSourceKind kind) {
     case USER_CB_SOURCE_COMMAND_SCALE:    return "cmd_scale";
     case USER_CB_SOURCE_CAMERA_POSITION:  return "camera_pos";
     case USER_CB_SOURCE_CAMERA_ROTATION:  return "camera_rot";
-    case USER_CB_SOURCE_DIRLIGHT_POSITION:return "dirlight_pos";
-    case USER_CB_SOURCE_DIRLIGHT_TARGET:  return "dirlight_target";
+    case USER_CB_SOURCE_LIGHT_POSITION:return "light_pos";
+    case USER_CB_SOURCE_LIGHT_TARGET:  return "light_target";
     default:                             return "none";
     }
 }
@@ -220,8 +220,8 @@ UserCBSourceKind user_cb_source_kind_from_token(const char* token) {
     if (strcmp(token, "cmd_scale") == 0)       return USER_CB_SOURCE_COMMAND_SCALE;
     if (strcmp(token, "camera_pos") == 0)      return USER_CB_SOURCE_CAMERA_POSITION;
     if (strcmp(token, "camera_rot") == 0)      return USER_CB_SOURCE_CAMERA_ROTATION;
-    if (strcmp(token, "dirlight_pos") == 0)    return USER_CB_SOURCE_DIRLIGHT_POSITION;
-    if (strcmp(token, "dirlight_target") == 0) return USER_CB_SOURCE_DIRLIGHT_TARGET;
+    if (strcmp(token, "light_pos") == 0)       return USER_CB_SOURCE_LIGHT_POSITION;
+    if (strcmp(token, "light_target") == 0)    return USER_CB_SOURCE_LIGHT_TARGET;
     return USER_CB_SOURCE_NONE;
 }
 
@@ -291,8 +291,8 @@ static bool user_cb_read_scene_source(UserCBSourceKind kind, const char* target,
         out[2] = g_camera.roll;
         out[3] = 0.0f;
         return true;
-    case USER_CB_SOURCE_DIRLIGHT_POSITION: {
-        Resource* dl = res_get(g_builtin_dirlight);
+    case USER_CB_SOURCE_LIGHT_POSITION: {
+        Resource* dl = res_get(g_builtin_light);
         if (!dl)
             return false;
         out[0] = dl->light_pos[0];
@@ -301,8 +301,8 @@ static bool user_cb_read_scene_source(UserCBSourceKind kind, const char* target,
         out[3] = 1.0f;
         return true;
     }
-    case USER_CB_SOURCE_DIRLIGHT_TARGET: {
-        Resource* dl = res_get(g_builtin_dirlight);
+    case USER_CB_SOURCE_LIGHT_TARGET: {
+        Resource* dl = res_get(g_builtin_light);
         if (!dl)
             return false;
         out[0] = dl->light_target[0];

@@ -194,9 +194,17 @@ static void safe_release_scene_rt() {
 }
 
 static void safe_release_shadow_map() {
+    if (g_dx.shadow_preview_srv) { g_dx.shadow_preview_srv->Release(); g_dx.shadow_preview_srv = nullptr; }
     if (g_dx.shadow_srv) { g_dx.shadow_srv->Release(); g_dx.shadow_srv = nullptr; }
     if (g_dx.shadow_dsv) { g_dx.shadow_dsv->Release(); g_dx.shadow_dsv = nullptr; }
+    for (int i = 0; i < MAX_SHADOW_CASCADES; i++) {
+        if (g_dx.shadow_slice_dsv[i]) {
+            g_dx.shadow_slice_dsv[i]->Release();
+            g_dx.shadow_slice_dsv[i] = nullptr;
+        }
+    }
     if (g_dx.shadow_tex) { g_dx.shadow_tex->Release(); g_dx.shadow_tex = nullptr; }
+    g_dx.shadow_layers = 0;
 }
 
 static void safe_release_info_queue() {
@@ -576,7 +584,7 @@ bool dx_init(HWND hwnd, int w, int h) {
 
     dx_create_scene_rt(w, h);
     Resource default_dl = {};
-    project_apply_default_dirlight(&default_dl);
+    project_apply_default_light(&default_dl);
     dx_create_shadow_map(default_dl.shadow_width, default_dl.shadow_height);
     create_builtin_shadow_shader();
 #ifndef LAZYTOOL_PLAYER_ONLY
@@ -640,16 +648,18 @@ void dx_create_scene_rt(int w, int h) {
 
 void dx_destroy_scene_rt() { safe_release_scene_rt(); }
 
-void dx_create_shadow_map(int w, int h) {
+void dx_create_shadow_map(int w, int h, int layers) {
     if (w < 1) w = 1;
     if (h < 1) h = 1;
+    if (layers < 1) layers = 1;
+    if (layers > MAX_SHADOW_CASCADES) layers = MAX_SHADOW_CASCADES;
     safe_release_shadow_map();
 
     D3D11_TEXTURE2D_DESC td = {};
     td.Width     = (UINT)w;
     td.Height    = (UINT)h;
     td.MipLevels = 1;
-    td.ArraySize = 1;
+    td.ArraySize = (UINT)layers;
     td.Format    = DXGI_FORMAT_R24G8_TYPELESS;
     td.SampleDesc.Count = 1;
     td.Usage     = D3D11_USAGE_DEFAULT;
@@ -662,19 +672,46 @@ void dx_create_shadow_map(int w, int h) {
 
     D3D11_DEPTH_STENCIL_VIEW_DESC dsvd = {};
     dsvd.Format        = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    dsvd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    dsvd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+    dsvd.Texture2DArray.FirstArraySlice = 0;
+    dsvd.Texture2DArray.ArraySize = (UINT)layers;
+    dsvd.Texture2DArray.MipSlice = 0;
     hr = g_dx.dev->CreateDepthStencilView(g_dx.shadow_tex, &dsvd, &g_dx.shadow_dsv);
     if (FAILED(hr)) log_error("Shadow map DSV create failed: 0x%08X", hr);
 
+    for (int i = 0; i < layers; i++) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC slice_dsvd = {};
+        slice_dsvd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        slice_dsvd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+        slice_dsvd.Texture2DArray.MipSlice = 0;
+        slice_dsvd.Texture2DArray.FirstArraySlice = (UINT)i;
+        slice_dsvd.Texture2DArray.ArraySize = 1;
+        hr = g_dx.dev->CreateDepthStencilView(g_dx.shadow_tex, &slice_dsvd, &g_dx.shadow_slice_dsv[i]);
+        if (FAILED(hr)) log_error("Shadow map slice DSV create failed: 0x%08X", hr);
+    }
+
     D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
     srvd.Format              = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-    srvd.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
-    srvd.Texture2D.MipLevels = 1;
+    srvd.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+    srvd.Texture2DArray.MostDetailedMip = 0;
+    srvd.Texture2DArray.MipLevels = 1;
+    srvd.Texture2DArray.FirstArraySlice = 0;
+    srvd.Texture2DArray.ArraySize = (UINT)layers;
     hr = g_dx.dev->CreateShaderResourceView(g_dx.shadow_tex, &srvd, &g_dx.shadow_srv);
     if (FAILED(hr)) log_error("Shadow map SRV create failed: 0x%08X", hr);
 
+    if (layers == 1) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC preview_srvd = {};
+        preview_srvd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        preview_srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        preview_srvd.Texture2D.MipLevels = 1;
+        hr = g_dx.dev->CreateShaderResourceView(g_dx.shadow_tex, &preview_srvd, &g_dx.shadow_preview_srv);
+        if (FAILED(hr)) g_dx.shadow_preview_srv = nullptr;
+    }
+
     g_dx.shadow_width = w;
     g_dx.shadow_height = h;
+    g_dx.shadow_layers = layers;
 }
 
 void dx_resize(int w, int h) {

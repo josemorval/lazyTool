@@ -10,6 +10,6 @@ end_command
 
 timeline
 timeline_global 0 0 0
-timeline_clip Timeline_1 24 240 0 1 0
+timeline_clip Timeline_1 24 240 0 1
 end_timeline_clip
 end_timeline

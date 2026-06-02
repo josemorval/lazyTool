@@ -510,9 +510,7 @@ static bool project_line_is_known_default(const char* line) {
     // load this minified project directly.
 
     // Exported runtime projects start from the same defaults before parsing.
-    if (strcmp(line, "camera_fps 5 5 5 -2.3561945 -0.615479767 1.04700005 0.00100000005 100") == 0)
-        return true;
-    if (strcmp(line, "dirlight 5 5 5 0 0 0 1 0.949999988 0.899999976 1 1024 1204 0.00999999978 10 8 8 1 5 0.649999976 0.443228424 8 8 0.00999999978 10 0.921136975 8 8 0.00999999978 10 1.69907975 8 8 0.00999999978 10 5 8 8 0.00999999978 10") == 0)
+    if (strcmp(line, "camera_fps 5 5 5 -2.3561945 -0.615479767 1.04700005 0.00100000005 1000 0 0 8") == 0)
         return true;
 
     if (strcmp(line, "mrts 0") == 0 ||

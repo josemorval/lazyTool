@@ -145,7 +145,7 @@ static const char* res_type_token(ResType t) {
     case RES_BUILTIN_SCENE_COLOR: return "builtin_scene_color";
     case RES_BUILTIN_SCENE_DEPTH: return "builtin_scene_depth";
     case RES_BUILTIN_SHADOW_MAP:  return "builtin_shadow_map";
-    case RES_BUILTIN_DIRLIGHT:    return "builtin_dirlight";
+    case RES_BUILTIN_LIGHT:    return "builtin_light";
     default:                      return "none";
     }
 }
@@ -171,7 +171,7 @@ static ResType res_type_from_token(const char* name) {
     if (strcmp(name, "builtin_scene_color") == 0) return RES_BUILTIN_SCENE_COLOR;
     if (strcmp(name, "builtin_scene_depth") == 0) return RES_BUILTIN_SCENE_DEPTH;
     if (strcmp(name, "builtin_shadow_map") == 0) return RES_BUILTIN_SHADOW_MAP;
-    if (strcmp(name, "builtin_dirlight") == 0) return RES_BUILTIN_DIRLIGHT;
+    if (strcmp(name, "builtin_light") == 0) return RES_BUILTIN_LIGHT;
     return RES_NONE;
 }
 
@@ -267,12 +267,14 @@ void project_apply_default_camera(Camera* camera) {
     project_angles_from_direction(k_project_view_defaults.view_dir, &camera->yaw, &camera->pitch);
     camera->roll = 0.0f;
     camera_set_euler(camera, camera->yaw, camera->pitch, camera->roll);
+    camera->projection_type = CAMERA_PROJECTION_PERSPECTIVE;
     camera->fov_y = k_project_view_defaults.camera_fov_y;
+    camera->ortho_height = 8.0f;
     camera->near_z = k_project_view_defaults.camera_near_z;
     camera->far_z = k_project_view_defaults.camera_far_z;
 }
 
-void project_apply_default_dirlight(Resource* dl) {
+void project_apply_default_light(Resource* dl) {
     if (!dl)
         return;
 
@@ -292,6 +294,10 @@ void project_apply_default_dirlight(Resource* dl) {
     dl->light_color[1] = k_project_view_defaults.light_color[1];
     dl->light_color[2] = k_project_view_defaults.light_color[2];
     dl->light_intensity = k_project_view_defaults.light_intensity;
+    dl->light_type = LIGHT_TYPE_DIRECTIONAL;
+    dl->spot_angle = 0.78539816339f;
+    dl->spot_softness = 0.15f;
+    dl->light_debug_draw = false;
     dl->shadow_extent[0] = k_project_view_defaults.shadow_extent[0];
     dl->shadow_extent[1] = k_project_view_defaults.shadow_extent[1];
     dl->shadow_near = k_project_view_defaults.shadow_near;
@@ -310,20 +316,22 @@ void project_reset_camera_defaults() {
     project_apply_default_camera(&g_camera);
 }
 
-void project_reset_dirlight_defaults() {
-    Resource* dl = res_get(g_builtin_dirlight);
+void project_reset_light_defaults() {
+    Resource* dl = res_get(g_builtin_light);
     if (!dl)
         return;
 
-    project_apply_default_dirlight(dl);
+    project_apply_default_light(dl);
 
-    if (g_dx.dev && (g_dx.shadow_width != dl->shadow_width || g_dx.shadow_height != dl->shadow_height))
-        dx_create_shadow_map(dl->shadow_width, dl->shadow_height);
+    int shadow_layers = dl->light_type == LIGHT_TYPE_SPOT ? 1 : dl->shadow_cascade_count;
+    if (g_dx.dev && (g_dx.shadow_width != dl->shadow_width || g_dx.shadow_height != dl->shadow_height ||
+                     g_dx.shadow_layers != shadow_layers))
+        dx_create_shadow_map(dl->shadow_width, dl->shadow_height, shadow_layers);
 }
 
 void project_reset_view_defaults() {
     project_reset_camera_defaults();
-    project_reset_dirlight_defaults();
+    project_reset_light_defaults();
 }
 
 static void res_ref(ResHandle h, char* out, int out_sz) {
@@ -633,8 +641,8 @@ static void project_clear_user_data() {
 void project_new_default() {
     project_clear_user_data();
     project_reset_camera_defaults();
-    if (Resource* dl = res_get(g_builtin_dirlight))
-        project_apply_default_dirlight(dl);
+    if (Resource* dl = res_get(g_builtin_light))
+        project_apply_default_light(dl);
     dx_invalidate_scene_history();
     project_set_current_path("");
 
@@ -717,13 +725,15 @@ bool project_save_text(const char* path) {
 
     fprintf(f, "lazyTool_project 1\n\n");
     camera_sync_euler_from_quat(&g_camera);
-    fprintf(f, "camera_fps %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n\n",
+    fprintf(f, "camera_fps %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d %.9g\n\n",
         g_camera.position[0], g_camera.position[1], g_camera.position[2],
         g_camera.yaw, g_camera.pitch,
-        g_camera.fov_y, g_camera.near_z, g_camera.far_z, g_camera.roll);
+        g_camera.fov_y, g_camera.near_z, g_camera.far_z, g_camera.roll,
+        g_camera.projection_type == CAMERA_PROJECTION_ORTHOGRAPHIC ? 1 : 0,
+        g_camera.ortho_height);
 
-    if (Resource* dl = res_get(g_builtin_dirlight)) {
-        fprintf(f, "dirlight %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d %d %.9g %.9g %.9g %.9g %d %.9g %.9g",
+    if (Resource* dl = res_get(g_builtin_light)) {
+        fprintf(f, "light %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d %d %.9g %.9g %.9g %.9g %d %.9g %.9g",
             dl->light_pos[0], dl->light_pos[1], dl->light_pos[2],
             dl->light_target[0], dl->light_target[1], dl->light_target[2],
             dl->light_color[0], dl->light_color[1], dl->light_color[2],
@@ -737,6 +747,10 @@ bool project_save_text(const char* path) {
                 dl->shadow_cascade_extent[i][0], dl->shadow_cascade_extent[i][1],
                 dl->shadow_cascade_near[i], dl->shadow_cascade_far[i]);
         }
+        fprintf(f, " %d %.9g %.9g %d",
+            dl->light_type == LIGHT_TYPE_SPOT ? 1 : 0,
+            dl->spot_angle, dl->spot_softness,
+            dl->light_debug_draw ? 1 : 0);
         fprintf(f, "\n\n");
     }
 
@@ -1067,6 +1081,12 @@ bool project_load_text(const char* path) {
 
     bool previous_info_log_suppressed = log_info_suppressed();
     log_set_info_suppressed(true);
+    auto fail_current_project_load = [&](const char* message) -> bool {
+        log_set_info_suppressed(previous_info_log_suppressed);
+        lt_free_file(project_bytes);
+        log_error("Project load failed: %s", message ? message : "invalid current .lt format");
+        return false;
+    };
 
     LARGE_INTEGER t_reset_begin = t_validate_end;
     project_clear_user_data();
@@ -1080,37 +1100,6 @@ bool project_load_text(const char* path) {
     CmdHandle pending_parent_cmds[MAX_COMMANDS] = {};
     char pending_parent_names[MAX_COMMANDS][MAX_NAME] = {};
     int pending_parent_count = 0;
-    struct UserVarNameRemap {
-        char old_name[MAX_NAME];
-        char new_name[MAX_NAME];
-        ResType type;
-    };
-    UserVarNameRemap user_var_remaps[MAX_USER_CB_VARS] = {};
-    int user_var_remap_count = 0;
-    auto remember_user_var_name = [&](const char* old_name, ResType type, const char* new_name) {
-        if (!old_name || !old_name[0] || !new_name || !new_name[0] ||
-            strcmp(old_name, new_name) == 0 || user_var_remap_count >= MAX_USER_CB_VARS)
-            return;
-        UserVarNameRemap& remap = user_var_remaps[user_var_remap_count++];
-        strncpy(remap.old_name, old_name, MAX_NAME - 1);
-        remap.old_name[MAX_NAME - 1] = '\0';
-        strncpy(remap.new_name, new_name, MAX_NAME - 1);
-        remap.new_name[MAX_NAME - 1] = '\0';
-        remap.type = type;
-    };
-    auto remap_user_var_name = [&](const char* name, ResType type) -> const char* {
-        if (!name)
-            return "";
-        for (int i = user_var_remap_count - 1; i >= 0; i--) {
-            const UserVarNameRemap& remap = user_var_remaps[i];
-            if (strcmp(remap.old_name, name) != 0)
-                continue;
-            if (type != RES_NONE && remap.type != type)
-                continue;
-            return remap.new_name;
-        }
-        return name;
-    };
     int timeline_load_track = -1;
     int timeline_clip_count = 0;
     int timeline_current_clip = -1;
@@ -1138,15 +1127,16 @@ bool project_load_text(const char* path) {
             char* show_fps_title = strtok(nullptr, " \t\r\n");
             char* extra = strtok(nullptr, " \t\r\n");
             if (camera_light_controls && timeline_autoplay && exit_after_timeline &&
-                esc_close && vsync && !extra) {
+                esc_close && vsync && show_fps_title && !extra) {
                 saw_export_settings = true;
                 g_export_settings.camera_light_controls_enabled = atoi(camera_light_controls) != 0;
                 g_export_settings.timeline_autoplay = atoi(timeline_autoplay) != 0;
                 g_export_settings.exit_after_timeline = atoi(exit_after_timeline) != 0;
                 g_export_settings.escape_closes_player = atoi(esc_close) != 0;
                 g_export_settings.vsync = atoi(vsync) != 0;
-                g_export_settings.show_fps_title = show_fps_title && atoi(show_fps_title) != 0;
-            }
+                g_export_settings.show_fps_title = atoi(show_fps_title) != 0;
+            } else
+                return fail_current_project_load("export_settings must be: export_settings camera_light_controls timeline_autoplay exit_after_timeline esc_close vsync show_fps_title");
         } else if (strcmp(tag, "timeline") == 0) {
             timeline_reset();
             timeline_load_track = -1;
@@ -1172,17 +1162,22 @@ bool project_load_text(const char* path) {
             char* current = strtok(nullptr, " \t\r\n");
             char* loop = strtok(nullptr, " \t\r\n");
             char* enabled = strtok(nullptr, " \t\r\n");
+            char* extra = strtok(nullptr, " \t\r\n");
+            if (!current || !loop || !enabled || extra)
+                return fail_current_project_load("timeline_global must be: timeline_global current loop enabled");
             saw_timeline_global = true;
-            if (current) timeline_global_current = atoi(current);
-            if (loop) timeline_global_loop = atoi(loop) != 0;
-            if (enabled) timeline_global_enabled = atoi(enabled) != 0;
+            timeline_global_current = atoi(current);
+            timeline_global_loop = atoi(loop) != 0;
+            timeline_global_enabled = atoi(enabled) != 0;
         } else if (strcmp(tag, "timeline_clip") == 0) {
             char* name = strtok(nullptr, " \t\r\n");
             char* fps = strtok(nullptr, " \t\r\n");
             char* length = strtok(nullptr, " \t\r\n");
             char* frame = strtok(nullptr, " \t\r\n");
             char* enabled = strtok(nullptr, " \t\r\n");
-            char* interpolation_mode = strtok(nullptr, " \t\r\n");
+            char* extra = strtok(nullptr, " \t\r\n");
+            if (!name || !fps || !length || !frame || !enabled || extra)
+                return fail_current_project_load("timeline_clip must be: timeline_clip name fps length frame enabled");
             int clip_index = timeline_clip_count;
             if (clip_index == 0)
                 timeline_set_current_index(0);
@@ -1190,13 +1185,12 @@ bool project_load_text(const char* path) {
                 clip_index = timeline_add(name ? name : nullptr);
             if (clip_index >= 0) {
                 timeline_set_current_index(clip_index);
-                if (name) timeline_set_name(clip_index, name);
-                if (fps) timeline_set_fps(atoi(fps));
-                if (length) timeline_set_length_frames(atoi(length));
-                if (frame) timeline_set_current_frame(atoi(frame));
-                if (interpolation_mode) timeline_set_interpolation_mode(atoi(interpolation_mode));
+                timeline_set_name(clip_index, name);
+                timeline_set_fps(atoi(fps));
+                timeline_set_length_frames(atoi(length));
+                timeline_set_current_frame(atoi(frame));
                 if (clip_index < MAX_TIMELINES)
-                    timeline_clip_enabled_load[clip_index] = enabled ? (atoi(enabled) != 0) : true;
+                    timeline_clip_enabled_load[clip_index] = atoi(enabled) != 0;
                 timeline_current_clip = clip_index;
                 timeline_clip_count++;
             }
@@ -1207,98 +1201,127 @@ bool project_load_text(const char* path) {
             char* type = strtok(nullptr, " \t\r\n");
             strtok(nullptr, " \t\r\n"); // key_count, kept for readability in the text format.
             char* enabled = strtok(nullptr, " \t\r\n");
+            char* extra = strtok(nullptr, " \t\r\n");
+            if (!kind || !target || !type || !enabled || extra)
+                return fail_current_project_load("timeline_track must be: timeline_track kind target type key_count enabled");
             if (timeline_current_clip < 0) {
                 timeline_load_track = -1;
                 continue;
             }
             TimelineTrackKind track_kind = timeline_track_kind_from_token(kind);
+            if (track_kind == TIMELINE_TRACK_NONE)
+                return fail_current_project_load("timeline_track has an unknown kind");
             ResType track_type = res_type_from_token(type);
-            const char* remapped_target = track_kind == TIMELINE_TRACK_USER_VAR ?
-                remap_user_var_name(target ? target : "", track_type) : (target ? target : "");
             timeline_load_track = timeline_add_track(
                 track_kind,
-                remapped_target,
+                target,
                 track_type);
             if (timeline_load_track >= 0 && enabled)
                 g_timeline_tracks[timeline_load_track].enabled = atoi(enabled) != 0;
         } else if (strcmp(tag, "timeline_key") == 0) {
             char* frame_tok = strtok(nullptr, " \t\r\n");
-            TimelineKey* key = frame_tok ? timeline_set_key(timeline_load_track, atoi(frame_tok)) : nullptr;
-            if (key && timeline_load_track >= 0 && timeline_load_track < g_timeline_track_count) {
-                TimelineTrack& track = g_timeline_tracks[timeline_load_track];
-                int n = timeline_track_value_count(track);
-                if (timeline_track_uses_integral_values(track)) {
-                    for (int i = 0; i < n; i++) {
-                        char* v = strtok(nullptr, " \t\r\n");
-                        key->ival[i] = v ? atoi(v) : 0;
-                    }
-                } else {
-                    float values[16] = {};
-                    int value_count = 0;
-                    for (char* v = strtok(nullptr, " \t\r\n");
-                         v && value_count < 16;
-                         v = strtok(nullptr, " \t\r\n")) {
-                        values[value_count++] = (float)atof(v);
-                    }
-
-                    for (int i = 0; i < n && i < value_count; i++)
-                        key->fval[i] = values[i];
-                    if (track.kind == TIMELINE_TRACK_COMMAND_TRANSFORM)
-                        quat_to_array(quat_from_array(&key->fval[3]), &key->fval[3]);
-                }
+            char* interpolation_tok = strtok(nullptr, " \t\r\n");
+            char* tangent_tok = strtok(nullptr, " \t\r\n");
+            if (!frame_tok || !interpolation_tok || !tangent_tok)
+                return fail_current_project_load("timeline_key must be: timeline_key frame interpolation tangent values...");
+            if (timeline_load_track < 0 || timeline_load_track >= g_timeline_track_count)
+                return fail_current_project_load("timeline_key appears outside a valid timeline_track");
+            TimelineTrack& track = g_timeline_tracks[timeline_load_track];
+            int n = timeline_track_value_count(track);
+            char* values[16] = {};
+            int value_count = 0;
+            for (char* v = strtok(nullptr, " \t\r\n"); v; v = strtok(nullptr, " \t\r\n")) {
+                if (value_count >= 16)
+                    return fail_current_project_load("timeline_key has too many values");
+                values[value_count++] = v;
+            }
+            if (value_count != n)
+                return fail_current_project_load("timeline_key value count does not match its track type");
+            TimelineKey* key = timeline_set_key(timeline_load_track, atoi(frame_tok));
+            if (!key)
+                return fail_current_project_load("timeline_key could not be added");
+            key->interpolation_mode = atoi(interpolation_tok);
+            if (key->interpolation_mode < TIMELINE_INTERP_STEP)
+                key->interpolation_mode = TIMELINE_INTERP_STEP;
+            if (key->interpolation_mode > TIMELINE_INTERP_CUBIC)
+                key->interpolation_mode = TIMELINE_INTERP_CUBIC;
+            key->tangent_scale = clampf((float)atof(tangent_tok), 0.0f, 4.0f);
+            if (timeline_track_uses_integral_values(track)) {
+                for (int i = 0; i < n; i++)
+                    key->ival[i] = atoi(values[i]);
+            } else {
+                for (int i = 0; i < n; i++)
+                    key->fval[i] = (float)atof(values[i]);
+                if (track.kind == TIMELINE_TRACK_COMMAND_TRANSFORM)
+                    quat_to_array(quat_from_array(&key->fval[3]), &key->fval[3]);
             }
         } else if (strcmp(tag, "camera_fps") == 0) {
-            g_camera.position[0] = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.position[1] = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.position[2] = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.yaw = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.pitch = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.fov_y = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.near_z = (float)atof(strtok(nullptr, " \t\r\n"));
-            g_camera.far_z = (float)atof(strtok(nullptr, " \t\r\n"));
-            char* roll_tok = strtok(nullptr, " \t\r\n");
-            g_camera.roll = roll_tok ? (float)atof(roll_tok) : 0.0f;
+            char* c[11] = {};
+            for (int i = 0; i < 11; i++)
+                c[i] = strtok(nullptr, " \t\r\n");
+            char* extra = strtok(nullptr, " \t\r\n");
+            if (!c[0] || !c[1] || !c[2] || !c[3] || !c[4] || !c[5] || !c[6] || !c[7] ||
+                !c[8] || !c[9] || !c[10] || extra)
+                return fail_current_project_load("camera_fps must be: camera_fps px py pz yaw pitch fov near far roll projection ortho_height");
+            g_camera.position[0] = (float)atof(c[0]);
+            g_camera.position[1] = (float)atof(c[1]);
+            g_camera.position[2] = (float)atof(c[2]);
+            g_camera.yaw = (float)atof(c[3]);
+            g_camera.pitch = (float)atof(c[4]);
+            g_camera.fov_y = (float)atof(c[5]);
+            g_camera.near_z = (float)atof(c[6]);
+            g_camera.far_z = (float)atof(c[7]);
+            g_camera.roll = (float)atof(c[8]);
+            g_camera.projection_type = atoi(c[9]) != 0 ?
+                CAMERA_PROJECTION_ORTHOGRAPHIC : CAMERA_PROJECTION_PERSPECTIVE;
+            g_camera.ortho_height = (float)atof(c[10]);
+            if (g_camera.ortho_height < 0.001f)
+                g_camera.ortho_height = 8.0f;
             camera_set_euler(&g_camera, g_camera.yaw, g_camera.pitch, g_camera.roll);
-        } else if (strcmp(tag, "dirlight") == 0) {
-            Resource* dl = res_get(g_builtin_dirlight);
+        } else if (strcmp(tag, "light") == 0) {
+            char* light_values[43] = {};
+            for (int i = 0; i < 43; i++)
+                light_values[i] = strtok(nullptr, " \t\r\n");
+            char* extra = strtok(nullptr, " \t\r\n");
+            if (!light_values[42] || extra)
+                return fail_current_project_load("light must use the current 43-value format");
+            Resource* dl = res_get(g_builtin_light);
             if (!dl) continue;
-            for (int i = 0; i < 3; i++) dl->light_pos[i] = (float)atof(strtok(nullptr, " \t\r\n"));
-            for (int i = 0; i < 3; i++) dl->light_target[i] = (float)atof(strtok(nullptr, " \t\r\n"));
-            for (int i = 0; i < 3; i++) dl->light_color[i] = (float)atof(strtok(nullptr, " \t\r\n"));
-            dl->light_intensity = (float)atof(strtok(nullptr, " \t\r\n"));
-            dl->shadow_width = atoi(strtok(nullptr, " \t\r\n"));
-            dl->shadow_height = atoi(strtok(nullptr, " \t\r\n"));
-            dl->shadow_near = (float)atof(strtok(nullptr, " \t\r\n"));
-            dl->shadow_far = (float)atof(strtok(nullptr, " \t\r\n"));
-            dl->shadow_extent[0] = (float)atof(strtok(nullptr, " \t\r\n"));
-            dl->shadow_extent[1] = (float)atof(strtok(nullptr, " \t\r\n"));
-            char* cascade_count_tok = strtok(nullptr, " \t\r\n");
-            char* shadow_distance_tok = strtok(nullptr, " \t\r\n");
-            char* split_lambda_tok = strtok(nullptr, " \t\r\n");
-            dl->shadow_cascade_count = cascade_count_tok ? atoi(cascade_count_tok) : 1;
-            dl->shadow_distance = shadow_distance_tok ? (float)atof(shadow_distance_tok) : dl->shadow_distance;
-            dl->shadow_split_lambda = split_lambda_tok ? (float)atof(split_lambda_tok) : dl->shadow_split_lambda;
+            int li = 0;
+            for (int i = 0; i < 3; i++) dl->light_pos[i] = (float)atof(light_values[li++]);
+            for (int i = 0; i < 3; i++) dl->light_target[i] = (float)atof(light_values[li++]);
+            for (int i = 0; i < 3; i++) dl->light_color[i] = (float)atof(light_values[li++]);
+            dl->light_intensity = (float)atof(light_values[li++]);
+            dl->shadow_width = atoi(light_values[li++]);
+            dl->shadow_height = atoi(light_values[li++]);
+            dl->shadow_near = (float)atof(light_values[li++]);
+            dl->shadow_far = (float)atof(light_values[li++]);
+            dl->shadow_extent[0] = (float)atof(light_values[li++]);
+            dl->shadow_extent[1] = (float)atof(light_values[li++]);
+            dl->shadow_cascade_count = atoi(light_values[li++]);
+            dl->shadow_distance = (float)atof(light_values[li++]);
+            dl->shadow_split_lambda = (float)atof(light_values[li++]);
             if (dl->shadow_cascade_count < 1) dl->shadow_cascade_count = 1;
             if (dl->shadow_cascade_count > MAX_SHADOW_CASCADES) dl->shadow_cascade_count = MAX_SHADOW_CASCADES;
             if (dl->shadow_distance < 0.1f) dl->shadow_distance = 0.1f;
             dl->shadow_split_lambda = clampf(dl->shadow_split_lambda, 0.0f, 1.0f);
             for (int i = 0; i < MAX_SHADOW_CASCADES; i++) {
-                char* split_tok = strtok(nullptr, " \t\r\n");
-                char* extent_x_tok = strtok(nullptr, " \t\r\n");
-                char* extent_y_tok = strtok(nullptr, " \t\r\n");
-                char* near_tok = strtok(nullptr, " \t\r\n");
-                char* far_tok = strtok(nullptr, " \t\r\n");
-                if (!split_tok || !extent_x_tok || !extent_y_tok || !near_tok || !far_tok)
-                    break;
-                dl->shadow_cascade_split[i] = (float)atof(split_tok);
-                dl->shadow_cascade_extent[i][0] = (float)atof(extent_x_tok);
-                dl->shadow_cascade_extent[i][1] = (float)atof(extent_y_tok);
-                dl->shadow_cascade_near[i] = (float)atof(near_tok);
-                dl->shadow_cascade_far[i] = (float)atof(far_tok);
+                dl->shadow_cascade_split[i] = (float)atof(light_values[li++]);
+                dl->shadow_cascade_extent[i][0] = (float)atof(light_values[li++]);
+                dl->shadow_cascade_extent[i][1] = (float)atof(light_values[li++]);
+                dl->shadow_cascade_near[i] = (float)atof(light_values[li++]);
+                dl->shadow_cascade_far[i] = (float)atof(light_values[li++]);
             }
+            dl->light_type = atoi(light_values[li++]) != 0 ? LIGHT_TYPE_SPOT : LIGHT_TYPE_DIRECTIONAL;
+            dl->spot_angle = (float)atof(light_values[li++]);
+            dl->spot_softness = (float)atof(light_values[li++]);
+            dl->light_debug_draw = atoi(light_values[li++]) != 0;
+            dl->spot_angle = clampf(dl->spot_angle > 0.001f ? dl->spot_angle : 0.78539816339f, 0.05f, 3.0f);
+            dl->spot_softness = clampf(dl->spot_softness, 0.0f, 0.95f);
             project_validate_manual_shadow_cascades(dl, g_camera.near_z, g_camera.far_z);
             if (dl->shadow_width > 0 && dl->shadow_height > 0 && g_dx.dev)
-                dx_create_shadow_map(dl->shadow_width, dl->shadow_height);
+                dx_create_shadow_map(dl->shadow_width, dl->shadow_height,
+                                     dl->light_type == LIGHT_TYPE_SPOT ? 1 : dl->shadow_cascade_count);
         } else if (strcmp(tag, "resource") == 0) {
             char* kind = strtok(nullptr, " \t\r\n");
             char* name = strtok(nullptr, " \t\r\n");
@@ -1385,35 +1408,50 @@ bool project_load_text(const char* path) {
             char* type_name = strtok(nullptr, " \t\r\n");
             char* source = strtok(nullptr, " \t\r\n");
             ResType type = res_type_from_token(type_name);
-            if (name && type != RES_NONE && user_cb_add_var(name, type)) {
+            char* ivals[4] = {};
+            char* fvals[4] = {};
+            for (int i = 0; i < 4; i++)
+                ivals[i] = strtok(nullptr, " \t\r\n");
+            for (int i = 0; i < 4; i++)
+                fvals[i] = strtok(nullptr, " \t\r\n");
+            char* extra = strtok(nullptr, " \t\r\n");
+            if (!name || type == RES_NONE || !source || !ivals[3] || !fvals[3] || extra)
+                return fail_current_project_load("user_var must be: user_var name type source i0 i1 i2 i3 f0 f1 f2 f3");
+            if (user_cb_find(name) >= 0)
+                return fail_current_project_load("user_var names must be unique");
+            if (user_cb_add_var(name, type)) {
                 int idx = g_user_cb_count - 1;
                 UserCBEntry& e = g_user_cb_entries[idx];
-                remember_user_var_name(name, type, e.name);
-                for (int i = 0; i < 4; i++) {
-                    char* v = strtok(nullptr, " \t\r\n");
-                    e.ival[i] = v ? atoi(v) : 0;
-                }
-                for (int i = 0; i < 4; i++) {
-                    char* v = strtok(nullptr, " \t\r\n");
-                    e.fval[i] = v ? (float)atof(v) : 0.0f;
-                }
+                for (int i = 0; i < 4; i++)
+                    e.ival[i] = atoi(ivals[i]);
+                for (int i = 0; i < 4; i++)
+                    e.fval[i] = (float)atof(fvals[i]);
                 ResHandle source_h = res_by_ref(source, res_lookup_types(type));
                 if (source_h != INVALID_HANDLE)
                     user_cb_set_source(idx, source_h);
-            }
+            } else
+                return fail_current_project_load("user_var could not be added");
         } else if (strcmp(tag, "user_var_source") == 0) {
             char* name = strtok(nullptr, " \t\r\n");
             char* kind_tok = strtok(nullptr, " \t\r\n");
             char* target = strtok(nullptr, " \t\r\n");
-            if (name && kind_tok) {
-                const char* actual_name = remap_user_var_name(name, RES_NONE);
+            char* extra = strtok(nullptr, " \t\r\n");
+            if (!name || !kind_tok || !target || extra)
+                return fail_current_project_load("user_var_source must be: user_var_source name kind target");
+            {
+                UserCBSourceKind source_kind = user_cb_source_kind_from_token(kind_tok);
+                if (source_kind == USER_CB_SOURCE_NONE)
+                    return fail_current_project_load("user_var_source has an unknown source kind");
+                bool found_user_var = false;
                 for (int i = 0; i < g_user_cb_count; i++) {
-                    if (strcmp(g_user_cb_entries[i].name, actual_name) != 0)
+                    if (strcmp(g_user_cb_entries[i].name, name) != 0)
                         continue;
-                    user_cb_set_scene_source(i, user_cb_source_kind_from_token(kind_tok),
-                                             target && strcmp(target, "-") != 0 ? target : "");
+                    found_user_var = true;
+                    user_cb_set_scene_source(i, source_kind, strcmp(target, "-") != 0 ? target : "");
                     break;
                 }
+                if (!found_user_var)
+                    return fail_current_project_load("user_var_source references an unknown user_var");
             }
         } else if (strcmp(tag, "command") == 0) {
             char* kind = strtok(nullptr, " \t\r\n");

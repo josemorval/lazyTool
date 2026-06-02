@@ -17,6 +17,24 @@
 #  endif
 #endif
 
+#if defined(__has_include)
+#  if __has_include("build_info.h")
+#    include "build_info.h"
+#  endif
+#endif
+
+#ifndef LAZYTOOL_BUILD_NUMBER
+#  define LAZYTOOL_BUILD_NUMBER 0
+#endif
+
+#ifndef LAZYTOOL_BUILD_NUMBER_STR
+#  define LAZYTOOL_BUILD_NUMBER_STR "0"
+#endif
+
+#ifndef LAZYTOOL_BUILD_CODE_STR
+#  define LAZYTOOL_BUILD_CODE_STR LAZYTOOL_BUILD_NUMBER_STR
+#endif
+
 #ifndef LAZYTOOL_ENABLE_PROFILER
 #  if defined(LAZYTOOL_CONFIG_RELEASE) || defined(LAZYTOOL_PLAYER_ONLY)
 #    define LAZYTOOL_ENABLE_PROFILER 0

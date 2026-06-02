@@ -1927,7 +1927,6 @@ static void execute_shadow_prepass() {
 
     ID3D11ShaderResourceView* null_srv = nullptr;
     bind_srv_range(SrvBindStage::PS, 1, 1, &null_srv);
-    g_dx.ctx->OMSetRenderTargets(0, nullptr, g_dx.shadow_dsv);
     g_dx.ctx->ClearDepthStencilView(g_dx.shadow_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
     set_cached_depth_state(g_dx.dss_default, 0);
     float bf[4] = {};
@@ -1940,17 +1939,14 @@ static void execute_shadow_prepass() {
     if (cascade_count > MAX_SHADOW_CASCADES) cascade_count = MAX_SHADOW_CASCADES;
 
     for (int cascade = 0; cascade < cascade_count; cascade++) {
-        const float* rect = scene_cb_backup.shadow_cascade_rects[cascade];
-        float scale_x = rect[0] > 0.0f ? rect[0] : 1.0f;
-        float scale_y = rect[1] > 0.0f ? rect[1] : 1.0f;
-        float offset_x = rect[2];
-        float offset_y = rect[3];
+        ID3D11DepthStencilView* layer_dsv = g_dx.shadow_slice_dsv[cascade] ? g_dx.shadow_slice_dsv[cascade] : g_dx.shadow_dsv;
+        g_dx.ctx->OMSetRenderTargets(0, nullptr, layer_dsv);
 
         D3D11_VIEWPORT vp = {};
-        vp.TopLeftX = offset_x * (float)g_dx.shadow_width;
-        vp.TopLeftY = offset_y * (float)g_dx.shadow_height;
-        vp.Width = scale_x * (float)g_dx.shadow_width;
-        vp.Height = scale_y * (float)g_dx.shadow_height;
+        vp.TopLeftX = 0.0f;
+        vp.TopLeftY = 0.0f;
+        vp.Width = (float)g_dx.shadow_width;
+        vp.Height = (float)g_dx.shadow_height;
         vp.MinDepth = 0.0f;
         vp.MaxDepth = 1.0f;
         g_dx.ctx->RSSetViewports(1, &vp);

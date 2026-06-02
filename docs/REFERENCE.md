@@ -60,7 +60,7 @@ It is closer to a low-level graphics workbench than to a traditional game editor
 | Draw path | Mesh/procedural draws, instancing, indirect draw, MRTs, PS SRVs, OM UAVs, render state toggles, shadows |
 | Compute path | Direct and indirect dispatch, SRV/UAV binding, dispatch size from source resource, optional reset-only dispatch |
 | Parameters | Reflected `UserCB`, global User CB panel, command-local parameters, source-driven variables, timeline animation |
-| Animation | Multiple timeline clips, sparse keys, interpolation, UserCB/value tracks, command transform/enabled tracks, camera and directional-light tracks |
+| Animation | Multiple timeline clips, sparse keys, interpolation, UserCB/value tracks, command transform/enabled tracks, camera and light tracks |
 | Debugging | Log panel, shader diagnostics, D3D11 validation toggle, binding warnings, resource previews, debug bounds |
 | Profiling | CPU frame breakdown, GPU timestamp profiler, per-command timing, shadow-pass timing, memory readouts |
 | Persistence | Plain-text `.lt` project files |
@@ -116,7 +116,7 @@ Main source files:
 | `src/shader.cpp` | HLSL compilation, fallback shaders, shader reflection for `SceneCB`, `ObjectCB`, `UserCB`, SRVs, UAVs, samplers. |
 | `src/user_cb.cpp` | Global and command-local UserCB packing, source-driven variables, reflected parameter synchronization. |
 | `src/timeline.cpp` | Timeline clips, tracks, keys, interpolation, runtime application. |
-| `src/project.cpp` | Text `.lt` save/load, default scene creation, export settings, backwards-compatible parsing. |
+| `src/project.cpp` | Strict current-format `.lt` save/load, default scene creation, and export settings. |
 | `src/embedded_pack.cpp` | Normal standalone EXE export by appending project/assets/shaders to the player executable. |
 | `src/ui.cpp` | Dear ImGui shell: toolbar, panels, inspector, viewport, shader editor, render graph, timeline, logs. |
 | `src/app_settings.cpp` | Editor preferences stored outside project data: UI scale, profiler, validation, camera controls, grid. |
@@ -161,7 +161,11 @@ Outputs:
 | `bin/lazyTool.exe` | Full editor and normal exporter. |
 | `bin/lazyPlayer.exe` | Player stub used by packed standalone exports. |
 
-The script currently cleans `bin/`, builds both executables, copies runtime folders when present, and launches the editor.
+The script cleans `bin/`, creates a generated build-info header, builds both executables, copies runtime folders when present, and launches the editor unless `norun` is passed.
+
+Every successful build increments `build/build_number.txt`. The visible build code folds local `yyMMddHHmm` plus the counter into base36 and appears after the workspace name in the top bar.
+
+Release builds also remove intermediate files from `bin/` and create `dist/lazyTool_build_<build-code>.zip`.
 
 ---
 
@@ -226,8 +230,8 @@ Built-ins are available as resources too:
 | `time` | Runtime time/delta/frame data. |
 | `scene_color` | Main editor/player scene color target. |
 | `scene_depth` | Main scene depth target. |
-| `shadow_map` | Directional-light shadow atlas/depth resource. |
-| `dirlight` | Directional light and shadow settings. |
+| `shadow_map` | Main-light shadow `Texture2DArray` depth resource. |
+| `light` | Main light and shadow settings. |
 
 Some resources generate helper resources. For example, resources with dimensions/counts can expose implicit size values that may be linked into UserCB variables.
 
@@ -372,7 +376,7 @@ UserCB variables can be:
 - linked to compatible value resources;
 - driven by command transform data;
 - driven by camera position/rotation;
-- driven by directional-light position/target;
+- driven by light position/target;
 - animated on the timeline.
 
 Command-local reflected parameters can also be hardcoded or source-driven.
@@ -391,7 +395,7 @@ Supported timeline tracks:
 | Command transform | Position, rotation quaternion, and scale. |
 | Command enabled | On/off state for a pipeline step. |
 | Camera | Camera position/orientation/FOV-related state. |
-| Directional light | Light position, target, color, intensity, and shadow-related setup. |
+| Light | Light position, target, color, intensity, type, spot settings, and shadow-related setup. |
 
 Timeline features:
 
@@ -400,7 +404,8 @@ Timeline features:
 - sequential playback/export of enabled clips;
 - FPS and frame-count controls;
 - play direction and looping;
-- interpolation modes: Step, Linear, Quadratic, Cubic;
+- per-keyframe interpolation modes: Step/Flat, Linear, Quadratic, Cubic;
+- per-keyframe cubic tangent scale;
 - keyboard editing for insert/update/delete/copy/cut/paste keys;
 - horizontal scrolling and zoom;
 - automatic key capture when editing tracked values.
@@ -451,7 +456,7 @@ Common controls:
 | `Ctrl` | Slower movement. |
 | `Alt + LMB` | Orbit selected bounds, or scene bounds if nothing specific is selected. |
 | `F` | Frame selected bounds, or scene bounds. |
-| `L` | Orbit directional light. |
+| `L` | Orbit light. |
 | `1` / `2` / `3` | Move / rotate / scale gizmo while hovering the viewport. |
 | `Esc` | Disable active viewport gizmo. |
 
@@ -459,7 +464,7 @@ Common controls:
 
 ## Lighting and shadows
 
-The built-in directional light is exposed as the `dirlight` resource.
+The built-in main light is exposed as the `light` resource. It can be directional or spot depending on its `Light Type`.
 
 It stores:
 
@@ -476,7 +481,7 @@ Draw commands can opt into:
 - explicit shadow shader;
 - built-in primitive shadow fallback where supported.
 
-`SceneCB` exposes both the single shadow view-projection and the cascade atlas data. The built-in shadow map is conventionally bound to pixel shader slot `t7` when shadow receiving is enabled.
+`SceneCB` exposes both the single shadow view-projection and per-layer cascade data. The built-in shadow map is a `Texture2DArray` conventionally bound to pixel shader slot `t7` when shadow receiving is enabled.
 
 ---
 
@@ -514,7 +519,7 @@ Projects are saved as plain-text `.lt` files.
 Saved data includes:
 
 - camera state;
-- directional light and shadow setup;
+- light and shadow setup;
 - export settings;
 - resources and resource notes;
 - mesh part/material enable state;
@@ -599,7 +604,7 @@ Supported in the procedural path:
 - clears, draw calls, render-target/depth binding;
 - command parameters and UserCB values;
 - supported timeline tracks;
-- directional light and shadow data;
+- light and shadow data;
 - selected export settings such as VSync, Escape-to-close, timeline exit behavior, and FPS title.
 
 Not supported by design:

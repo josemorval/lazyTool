@@ -17,7 +17,7 @@ typedef enum {
     TIMELINE_TRACK_COMMAND_TRANSFORM,
     TIMELINE_TRACK_COMMAND_ENABLED,
     TIMELINE_TRACK_CAMERA,
-    TIMELINE_TRACK_DIRLIGHT
+    TIMELINE_TRACK_LIGHT
 } TimelineTrackKind;
 
 typedef enum {
@@ -29,6 +29,8 @@ typedef enum {
 
 struct TimelineKey {
     int   frame;
+    int   interpolation_mode;
+    float tangent_scale;
     int   ival[4];
     float fval[16];
 };
@@ -78,8 +80,6 @@ bool timeline_enabled();
 void timeline_set_enabled(bool enabled);
 bool timeline_loop();
 void timeline_set_loop(bool loop);
-int  timeline_interpolation_mode();
-void timeline_set_interpolation_mode(int mode);
 int  timeline_play_dir();
 void timeline_set_play_dir(int dir);
 

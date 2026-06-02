@@ -140,19 +140,8 @@ public:
         char loaded_path[MAX_PATH_LEN] = {};
 
         shader_path_join(base_dir, file_name, full, MAX_PATH_LEN);
-        if (lt_read_file(full, &data, &size)) {
+        if (lt_read_file(full, &data, &size))
             shader_store_path(loaded_path, MAX_PATH_LEN, full);
-        } else {
-            // Fallbacks keep old project-root include behavior and also allow an
-            // include from a nested helper to find files beside the original shader.
-            if (base_dir != root_dir) {
-                shader_path_join(root_dir, file_name, full, MAX_PATH_LEN);
-                if (lt_read_file(full, &data, &size))
-                    shader_store_path(loaded_path, MAX_PATH_LEN, full);
-            }
-            if (!data && lt_read_file(file_name, &data, &size))
-                shader_store_path(loaded_path, MAX_PATH_LEN, file_name);
-        }
 
         if (!data)
             return E_FAIL;

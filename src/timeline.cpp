@@ -16,7 +16,6 @@ struct TimelineState {
     int length_frames;
     int current_frame;
     float sample_frame;
-    int interpolation_mode;
     int track_count;
     TimelineTrack tracks[MAX_TIMELINE_TRACKS];
 };
@@ -57,6 +56,10 @@ static int timeline_clamp_interpolation_mode(int mode) {
     return mode;
 }
 
+static float timeline_clamp_tangent_scale(float scale) {
+    return clampf(scale, 0.0f, 4.0f);
+}
+
 static float timeline_ease_t(int mode, float t) {
     t = clampf(t, 0.0f, 1.0f);
     if (mode == TIMELINE_INTERP_QUADRATIC) {
@@ -69,10 +72,13 @@ static float timeline_ease_t(int mode, float t) {
 }
 
 static float timeline_cubic_hermite(float p0, float p1, float p2, float p3,
-                                    int f0, int f1, int f2, int f3, float t) {
+                                    int f0, int f1, int f2, int f3,
+                                    float m1_scale, float m2_scale, float t) {
     float span = (float)(f2 - f1);
     float m1 = (f2 != f0) ? (p2 - p0) * span / (float)(f2 - f0) : 0.0f;
     float m2 = (f3 != f1) ? (p3 - p1) * span / (float)(f3 - f1) : 0.0f;
+    m1 *= timeline_clamp_tangent_scale(m1_scale);
+    m2 *= timeline_clamp_tangent_scale(m2_scale);
     float t2 = t * t;
     float t3 = t2 * t;
     return (2.0f * t3 - 3.0f * t2 + 1.0f) * p1 +
@@ -82,12 +88,14 @@ static float timeline_cubic_hermite(float p0, float p1, float p2, float p3,
 }
 
 static float timeline_cubic_hermite_angle(float p0, float p1, float p2, float p3,
-                                          int f0, int f1, int f2, int f3, float t) {
+                                          int f0, int f1, int f2, int f3,
+                                          float m1_scale, float m2_scale, float t) {
     float u1 = p1;
     float u0 = u1 - timeline_wrap_angle(u1 - p0);
     float u2 = u1 + timeline_wrap_angle(p2 - p1);
     float u3 = u2 + timeline_wrap_angle(p3 - p2);
-    return timeline_wrap_angle(timeline_cubic_hermite(u0, u1, u2, u3, f0, f1, f2, f3, t));
+    return timeline_wrap_angle(timeline_cubic_hermite(u0, u1, u2, u3, f0, f1, f2, f3,
+                                                      m1_scale, m2_scale, t));
 }
 
 static float timeline_sample_float_component(const TimelineKey& k0,
@@ -102,11 +110,13 @@ static float timeline_sample_float_component(const TimelineKey& k0,
         if (angle) {
             return timeline_cubic_hermite_angle(
                 k0.fval[component], k1.fval[component], k2.fval[component], k3.fval[component],
-                k0.frame, k1.frame, k2.frame, k3.frame, t);
+                k0.frame, k1.frame, k2.frame, k3.frame,
+                k1.tangent_scale, k2.tangent_scale, t);
         }
         return timeline_cubic_hermite(
             k0.fval[component], k1.fval[component], k2.fval[component], k3.fval[component],
-            k0.frame, k1.frame, k2.frame, k3.frame, t);
+            k0.frame, k1.frame, k2.frame, k3.frame,
+            k1.tangent_scale, k2.tangent_scale, t);
     }
     float st = timeline_ease_t(mode, t);
     return angle ?
@@ -122,7 +132,6 @@ static void timeline_init_state(TimelineState& tl, int index, const char* name) 
     tl.length_frames = 240;
     tl.current_frame = 0;
     tl.sample_frame = 0.0f;
-    tl.interpolation_mode = TIMELINE_INTERP_STEP;
     tl.track_count = 0;
     if (name && name[0]) {
         strncpy(tl.name, name, MAX_NAME - 1);
@@ -262,9 +271,9 @@ int timeline_track_value_count(const TimelineTrack& track) {
     case TIMELINE_TRACK_COMMAND_ENABLED:
         return 1;
     case TIMELINE_TRACK_CAMERA:
-        return 9;
-    case TIMELINE_TRACK_DIRLIGHT:
-        return 10;
+        return 11;
+    case TIMELINE_TRACK_LIGHT:
+        return 13;
     default:
         return 0;
     }
@@ -526,17 +535,6 @@ void timeline_set_loop(bool loop) {
     s_timeline_loop = loop;
 }
 
-int timeline_interpolation_mode() {
-    return timeline_current_state().interpolation_mode;
-}
-
-void timeline_set_interpolation_mode(int mode) {
-    TimelineState& tl = timeline_current_state();
-    tl.interpolation_mode = timeline_clamp_interpolation_mode(mode);
-    tl.sample_frame = tl.interpolation_mode != TIMELINE_INTERP_STEP ? tl.sample_frame : (float)tl.current_frame;
-    app_request_scene_render();
-}
-
 int timeline_play_dir() {
     return 0;
 }
@@ -623,11 +621,10 @@ void timeline_update(float scene_time_seconds) {
     int frame = (int)floorf(frame_f + 0.0001f);
     tl.current_frame = timeline_clamp_frame_for(tl, frame);
 
-    // The visible/current frame remains discrete, but when enabled the sampler
-    // evaluates at the true fractional timeline position. This keeps low-FPS
-    // timelines intentionally steppy by default while allowing smooth in-between
-    // evaluation during playback.
-    tl.sample_frame = tl.interpolation_mode != TIMELINE_INTERP_STEP ? frame_f : (float)tl.current_frame;
+    // The visible/current frame remains discrete, but the sampler evaluates at
+    // the true fractional timeline position. Each key decides how its outgoing
+    // segment handles that fraction.
+    tl.sample_frame = frame_f;
 }
 
 static int timeline_find_track_in(const TimelineState& tl, TimelineTrackKind kind, const char* target, ResType value_type) {
@@ -806,8 +803,8 @@ bool timeline_track_target_exists(const TimelineTrack& track) {
         return cmd_find_by_name(track.target) != INVALID_HANDLE;
     case TIMELINE_TRACK_CAMERA:
         return true;
-    case TIMELINE_TRACK_DIRLIGHT:
-        return res_get(g_builtin_dirlight) != nullptr;
+    case TIMELINE_TRACK_LIGHT:
+        return res_get(g_builtin_light) != nullptr;
     default:
         return false;
     }
@@ -819,7 +816,7 @@ const char* timeline_track_kind_token(TimelineTrackKind kind) {
     case TIMELINE_TRACK_COMMAND_TRANSFORM: return "cmd_transform";
     case TIMELINE_TRACK_COMMAND_ENABLED:   return "cmd_enabled";
     case TIMELINE_TRACK_CAMERA:            return "camera";
-    case TIMELINE_TRACK_DIRLIGHT:          return "dirlight";
+    case TIMELINE_TRACK_LIGHT:          return "light";
     default:                               return "none";
     }
 }
@@ -830,7 +827,7 @@ TimelineTrackKind timeline_track_kind_from_token(const char* token) {
     if (strcmp(token, "cmd_transform") == 0) return TIMELINE_TRACK_COMMAND_TRANSFORM;
     if (strcmp(token, "cmd_enabled") == 0) return TIMELINE_TRACK_COMMAND_ENABLED;
     if (strcmp(token, "camera") == 0) return TIMELINE_TRACK_CAMERA;
-    if (strcmp(token, "dirlight") == 0) return TIMELINE_TRACK_DIRLIGHT;
+    if (strcmp(token, "light") == 0) return TIMELINE_TRACK_LIGHT;
     return TIMELINE_TRACK_NONE;
 }
 
@@ -864,6 +861,8 @@ TimelineKey* timeline_set_key(int track_index, int frame) {
     track.key_count++;
     memset(&track.keys[insert], 0, sizeof(TimelineKey));
     track.keys[insert].frame = frame;
+    track.keys[insert].interpolation_mode = TIMELINE_INTERP_CUBIC;
+    track.keys[insert].tangent_scale = 1.0f;
     return &track.keys[insert];
 }
 
@@ -911,17 +910,22 @@ static bool timeline_capture_camera(TimelineKey& key) {
     key.fval[6] = g_camera.near_z;
     key.fval[7] = g_camera.far_z;
     key.fval[8] = timeline_wrap_angle(g_camera.roll);
+    key.fval[9] = (float)(g_camera.projection_type == CAMERA_PROJECTION_ORTHOGRAPHIC ? 1 : 0);
+    key.fval[10] = g_camera.ortho_height;
     return true;
 }
 
-static bool timeline_capture_dirlight(TimelineKey& key) {
-    Resource* dl = res_get(g_builtin_dirlight);
+static bool timeline_capture_light(TimelineKey& key) {
+    Resource* dl = res_get(g_builtin_light);
     if (!dl)
         return false;
     for (int i = 0; i < 3; i++) key.fval[i] = dl->light_pos[i];
     for (int i = 0; i < 3; i++) key.fval[3 + i] = dl->light_target[i];
     for (int i = 0; i < 3; i++) key.fval[6 + i] = dl->light_color[i];
     key.fval[9] = dl->light_intensity;
+    key.fval[10] = (float)(dl->light_type == LIGHT_TYPE_SPOT ? 1 : 0);
+    key.fval[11] = dl->spot_angle;
+    key.fval[12] = dl->spot_softness;
     return true;
 }
 
@@ -941,7 +945,7 @@ bool timeline_capture_key(int track_index, int frame) {
     case TIMELINE_TRACK_COMMAND_TRANSFORM: ok = timeline_capture_command_transform(track, *key); break;
     case TIMELINE_TRACK_COMMAND_ENABLED:   ok = timeline_capture_command_enabled(track, *key); break;
     case TIMELINE_TRACK_CAMERA:            ok = timeline_capture_camera(*key); break;
-    case TIMELINE_TRACK_DIRLIGHT:          ok = timeline_capture_dirlight(*key); break;
+    case TIMELINE_TRACK_LIGHT:          ok = timeline_capture_light(*key); break;
     default: break;
     }
     if (!ok)
@@ -1048,13 +1052,15 @@ static void timeline_sample_camera(const TimelineKey& k0, const TimelineKey& a,
     out->fval[6] = timeline_sample_float_component(k0, a, b, k3, 6, t, mode, false);
     out->fval[7] = timeline_sample_float_component(k0, a, b, k3, 7, t, mode, false);
     out->fval[8] = timeline_sample_float_component(k0, a, b, k3, 8, t, mode, true);
+    out->fval[9] = t < 0.5f ? a.fval[9] : b.fval[9];
+    out->fval[10] = timeline_sample_float_component(k0, a, b, k3, 10, t, mode, false);
 }
 
 static void timeline_sample_key(const TimelineState& tl, const TimelineTrack& track, TimelineKey* out) {
     if (!out || track.key_count <= 0)
         return;
 
-    float sample_frame = tl.interpolation_mode != TIMELINE_INTERP_STEP ? tl.sample_frame : (float)tl.current_frame;
+    float sample_frame = tl.sample_frame;
     if (sample_frame < 0.0f) sample_frame = 0.0f;
     float max_sample_frame = (float)(tl.length_frames - 1);
     if (sample_frame > max_sample_frame) sample_frame = max_sample_frame;
@@ -1086,26 +1092,30 @@ static void timeline_sample_key(const TimelineState& tl, const TimelineTrack& tr
     if (prev == next || timeline_track_uses_integral_values(track))
         return;
 
+    int mode = timeline_clamp_interpolation_mode(a.interpolation_mode);
+    if (mode == TIMELINE_INTERP_STEP)
+        return;
+
     int span = b.frame - a.frame;
     float t = span > 0 ? (sample_frame - (float)a.frame) / (float)span : 0.0f;
     t = clampf(t, 0.0f, 1.0f);
 
     if (track.kind == TIMELINE_TRACK_COMMAND_TRANSFORM) {
-        timeline_sample_command_transform(k0, a, b, k3, t, tl.interpolation_mode, out);
+        timeline_sample_command_transform(k0, a, b, k3, t, mode, out);
         return;
     }
     if (track.kind == TIMELINE_TRACK_CAMERA) {
-        timeline_sample_camera(k0, a, b, k3, t, tl.interpolation_mode, out);
+        timeline_sample_camera(k0, a, b, k3, t, mode, out);
         return;
     }
     if (track.kind == TIMELINE_TRACK_USER_VAR &&
-        timeline_sample_user_var_special_rotation(track, a, b, t, tl.interpolation_mode, out)) {
+        timeline_sample_user_var_special_rotation(track, a, b, t, mode, out)) {
         return;
     }
 
     int n = timeline_track_value_count(track);
     for (int i = 0; i < n; i++)
-        out->fval[i] = timeline_sample_float_component(k0, a, b, k3, i, t, tl.interpolation_mode, false);
+        out->fval[i] = timeline_sample_float_component(k0, a, b, k3, i, t, mode, false);
 }
 
 static void timeline_apply_user_var_to_source(UserCBEntry& e, const TimelineKey& key) {
@@ -1170,12 +1180,12 @@ static void timeline_apply_user_var_to_source(UserCBEntry& e, const TimelineKey&
         return;
     }
 
-    if (source_kind == USER_CB_SOURCE_DIRLIGHT_POSITION ||
-        source_kind == USER_CB_SOURCE_DIRLIGHT_TARGET) {
-        Resource* dl = res_get(g_builtin_dirlight);
+    if (source_kind == USER_CB_SOURCE_LIGHT_POSITION ||
+        source_kind == USER_CB_SOURCE_LIGHT_TARGET) {
+        Resource* dl = res_get(g_builtin_light);
         if (!dl)
             return;
-        float* dst = source_kind == USER_CB_SOURCE_DIRLIGHT_POSITION ? dl->light_pos : dl->light_target;
+        float* dst = source_kind == USER_CB_SOURCE_LIGHT_POSITION ? dl->light_pos : dl->light_target;
         for (int i = 0; i < 3; i++)
             dst[i] = key.fval[i];
         Vec3 pos = v3(dl->light_pos[0], dl->light_pos[1], dl->light_pos[2]);
@@ -1230,16 +1240,23 @@ static void timeline_apply_camera(const TimelineKey& key) {
     g_camera.far_z = key.fval[7];
     if (g_camera.far_z <= g_camera.near_z + 0.001f)
         g_camera.far_z = g_camera.near_z + 0.001f;
+    g_camera.projection_type = key.fval[9] >= 0.5f ? CAMERA_PROJECTION_ORTHOGRAPHIC : CAMERA_PROJECTION_PERSPECTIVE;
+    if (key.fval[10] > 0.001f)
+        g_camera.ortho_height = key.fval[10];
 }
 
-static void timeline_apply_dirlight(const TimelineKey& key) {
-    Resource* dl = res_get(g_builtin_dirlight);
+static void timeline_apply_light(const TimelineKey& key) {
+    Resource* dl = res_get(g_builtin_light);
     if (!dl)
         return;
     for (int i = 0; i < 3; i++) dl->light_pos[i] = key.fval[i];
     for (int i = 0; i < 3; i++) dl->light_target[i] = key.fval[3 + i];
     for (int i = 0; i < 3; i++) dl->light_color[i] = key.fval[6 + i];
     dl->light_intensity = key.fval[9];
+    dl->light_type = key.fval[10] >= 0.5f ? LIGHT_TYPE_SPOT : LIGHT_TYPE_DIRECTIONAL;
+    if (key.fval[11] > 0.001f)
+        dl->spot_angle = key.fval[11];
+    dl->spot_softness = clampf(key.fval[12], 0.0f, 0.95f);
 }
 
 void timeline_apply_current() {
@@ -1258,7 +1275,7 @@ void timeline_apply_current() {
         case TIMELINE_TRACK_COMMAND_TRANSFORM: timeline_apply_command_transform(track, sampled); break;
         case TIMELINE_TRACK_COMMAND_ENABLED:   timeline_apply_command_enabled(track, sampled); break;
         case TIMELINE_TRACK_CAMERA:            timeline_apply_camera(sampled); break;
-        case TIMELINE_TRACK_DIRLIGHT:          timeline_apply_dirlight(sampled); break;
+        case TIMELINE_TRACK_LIGHT:          timeline_apply_light(sampled); break;
         default: break;
         }
     }
@@ -1281,7 +1298,10 @@ static void timeline_write_tracks(FILE* f, const TimelineState& tl) {
         bool integral = timeline_track_uses_integral_values(track);
         for (int k = 0; k < track.key_count; k++) {
             const TimelineKey& key = track.keys[k];
-            fprintf(f, "timeline_key %d", key.frame);
+            fprintf(f, "timeline_key %d %d %.9g",
+                    key.frame,
+                    timeline_clamp_interpolation_mode(key.interpolation_mode),
+                    timeline_clamp_tangent_scale(key.tangent_scale));
             if (integral) {
                 for (int v = 0; v < n; v++)
                     fprintf(f, " %d", key.ival[v]);
@@ -1308,11 +1328,10 @@ void timeline_write_project(FILE* f) {
 
     for (int i = 0; i < s_timeline_count; i++) {
         const TimelineState& tl = s_timelines[i];
-        fprintf(f, "timeline_clip %s %d %d %d %d %d\n",
+        fprintf(f, "timeline_clip %s %d %d %d %d\n",
                 tl.name[0] ? tl.name : "Timeline",
                 tl.fps, tl.length_frames, tl.current_frame,
-                tl.enabled ? 1 : 0,
-                timeline_clamp_interpolation_mode(tl.interpolation_mode));
+                tl.enabled ? 1 : 0);
         timeline_write_tracks(f, tl);
         fprintf(f, "end_timeline_clip\n");
     }

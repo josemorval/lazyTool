@@ -21,7 +21,7 @@ It does not try to hide the technical side. The goal is that you can open the to
 - Move the camera, enable a grid, frame objects, and use transform controls.
 - Read warnings, errors, and useful messages in the log.
 - Inspect relationships between commands and resources in a graph view.
-- Animate values, camera state, lights, and command state with a timeline.
+- Animate values, camera state, lights, and command state with per-keyframe timeline interpolation.
 - Export a scene as a standalone executable.
 - Generate a stricter 64k/procedural build when the content allows it.
 
@@ -41,7 +41,7 @@ You do not need to understand the entire engine to start. A good first approach 
 | **Inspector** | Edits the selected resource or command. |
 | **User CB** | Edits values sent to the GPU as parameters. |
 | **Render Graph** | Helps you see which command reads or writes each resource. |
-| **Timeline** | Animates values and states with keyed clips. |
+| **Timeline** | Animates values and states with keyed clips. Each key stores its own interpolation. |
 | **Log** | Shows errors, warnings, validation messages, and export output. |
 
 ## Basic Workflow
@@ -70,9 +70,19 @@ Some commands clear a texture, some draw, some run compute work, and some group 
 
 ## Timeline
 
-The timeline lets you animate values without writing new code for every change. It can drive parameters, command on/off state, transforms, camera state, and directional light state.
+The timeline lets you animate values without writing new code for every change. It can drive parameters, command on/off state, transforms, camera state, and light state.
+
+Keys default to cubic interpolation. Right-click a key to choose `Step / Flat`, `Linear`, `Quadratic`, or `Cubic`; cubic keys also expose a tangent scale. Interpolation is stored per key, so one track can mix held values, linear moves, and smoother sections.
 
 It is meant for quick iteration: add keys, play the scene, adjust, and repeat.
+
+## Shader Tutorial
+
+For shader-specific examples, see [docs/SHADER_TUTORIAL.md](docs/SHADER_TUTORIAL.md). It includes self-contained HLSL snippets for:
+
+- a small PBR-style G-buffer pass and compute composition pass;
+- GPU particles with a compute update and procedural draw shader;
+- indirect draw arguments built in compute and consumed by a procedural triangle draw.
 
 ## Render Graph
 
@@ -90,6 +100,8 @@ lazyTool has two output paths:
 | **build64k** | Generates a compact C player for procedural scenes and removes unused runtime features. |
 
 The 64k path is intentionally stricter. It is designed to reduce size and keep only what is needed. If a scene does not use timeline data, compute work, buffers, or draw commands, those parts do not need to be included in the generated player.
+
+Project files use the current `.lt` text format. The loader is intentionally strict: old aliases and incomplete timeline/camera/light records should be resaved or migrated instead of being silently repaired.
 
 ## Building
 
@@ -109,7 +121,15 @@ build.bat profile
 build.bat release
 ```
 
-The build writes executables to `bin/` and launches the editor.
+Every successful build increments `build/build_number.txt`. The visible build code combines the local build date/time with that counter in a compact base36 form, and the editor shows it after the workspace name in the top bar.
+
+The build writes executables to `bin/` and launches the editor. Use `norun` to compile without launching:
+
+```bat
+build.bat release norun
+```
+
+`release` removes intermediate files from `bin/` and writes a package to `dist/lazyTool_build_<build-code>.zip`.
 
 ## Useful Shortcuts
 
@@ -137,6 +157,8 @@ If you are just starting, change a few values at a time and watch the result. Th
 | `docs/` | Screenshots and supporting documentation. |
 | `build64k/` | Compact procedural exporter and generated-player code. |
 | `external/` | Third-party dependencies included with the repository. |
+| `build/` | Build counter state. |
+| `dist/` | Release zip output. |
 
 ## Licenses And Dependencies
 

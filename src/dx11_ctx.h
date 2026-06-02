@@ -36,8 +36,10 @@ struct DX11Ctx {
 
     ID3D11Texture2D*            shadow_tex;
     ID3D11DepthStencilView*     shadow_dsv;
+    ID3D11DepthStencilView*     shadow_slice_dsv[MAX_SHADOW_CASCADES];
     ID3D11ShaderResourceView*   shadow_srv;
-    int                         shadow_width, shadow_height;
+    ID3D11ShaderResourceView*   shadow_preview_srv;
+    int                         shadow_width, shadow_height, shadow_layers;
     ID3D11VertexShader*         shadow_vs;
     ID3D11InputLayout*          shadow_il;
 
@@ -78,7 +80,7 @@ bool dx_init(HWND hwnd, int w, int h);
 void dx_resize(int w, int h);
 void dx_create_scene_rt(int w, int h);
 void dx_destroy_scene_rt();
-void dx_create_shadow_map(int w, int h);
+void dx_create_shadow_map(int w, int h, int layers = 1);
 void dx_invalidate_scene_history();
 void dx_update_scene_cb(const SceneCBData& d);
 void dx_update_object_cb(const ObjectCBData& d);

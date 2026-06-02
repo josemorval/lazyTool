@@ -2,7 +2,7 @@
 
 The general rule is to keep the helpers separated by responsibility and compose them in shaders that need more than one system.
 
-- `shaders/common_pbr.hlsl` contains GGX/Schlick/Smith PBR helpers, default directional-light helpers, shadow integration, simple IBL approximation, normal-map unpacking, and sRGB/linear conversion.
+- `shaders/common_pbr.hlsl` contains GGX/Schlick/Smith PBR helpers, default light helpers, shadow integration, simple IBL approximation, normal-map unpacking, and sRGB/linear conversion.
 - `shaders/common_raymarch.hlsl` contains camera-ray reconstruction from `SceneCB.InvViewProj`, SDF primitives/boolean ops, repeat/rotation helpers, a generic SDF trace loop, normal estimation, soft shadows, ambient occlusion, and debug coloring.
 - `shaders/common_atmosphere.hlsl` contains procedural sky, sun disk/glow, stars, ambient diffuse/specular approximations for PBR, height fog, aerial perspective, and ACES tonemapping.
 - `shaders/examples/raymarch_pbr_atmosphere.hlsl` shows the three commons working together in a single fullscreen raymarch shader.
@@ -76,7 +76,7 @@ Practical defaults:
 
 ## How the modules fit together
 
-`common_raymarch.hlsl` produces a hit position and normal. `common_pbr.hlsl` shades that hit using the engine directional light. `common_atmosphere.hlsl` can provide procedural diffuse/specular environment colors and then fog the final result.
+`common_raymarch.hlsl` produces a hit position and normal. `common_pbr.hlsl` shades that hit using the engine light. `common_atmosphere.hlsl` can provide procedural diffuse/specular environment colors and then fog the final result.
 
 The systems are intentionally not one giant file. Keeping them separate avoids pulling raymarch code into normal mesh materials, avoids forcing atmosphere into simple PBR materials, and makes the include dependency easy to understand.
 
