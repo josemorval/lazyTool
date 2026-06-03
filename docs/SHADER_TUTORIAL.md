@@ -1,8 +1,9 @@
 # Shader Tutorial
 
-This document is only about shader-side patterns in lazyTool. The examples are
-self-contained on purpose: no `#include`, no hidden helper file, and no engine
-abstractions beyond the resource bindings shown in each snippet.
+This document is only about shader-side patterns in lazyTool. Most examples are
+self-contained on purpose. When an example uses a shared helper include, the
+include is shown explicitly and the required command/resource bindings are
+listed with it.
 
 The register choices are examples. Match them with the command inspector:
 
@@ -10,6 +11,295 @@ The register choices are examples. Match them with the command inspector:
 - `ObjectCB` at `b1` is the built-in object constant buffer for draw commands.
 - `b2` is a practical slot for your own UserCB/material constants.
 - Texture/SRV/UAV slots must match the command resource bindings.
+
+## Shadow Receiver With `common.hlsl`
+
+Use this pattern for normal mesh or primitive draw shaders that should receive
+the built-in lazyTool shadow map.
+
+Setup:
+
+- Put the shader under `shaders/` and include `common.hlsl`.
+- Enable **Shadow Receiver** on the draw command.
+- Any command that should write into the shadow map must have **Shadow Caster**
+  enabled.
+- lazyTool binds the shadow map as `Texture2DArray ShadowMap : register(t7)`
+  and the comparison sampler as `SamplerComparisonState ShadowSampler :
+  register(s1)` when shadow receiving is enabled.
+
+`lt_sample_shadow_pcf3x3()` selects the cascade, offsets the sample along the
+normal to reduce acne, and runs a small 3x3 PCF filter.
+
+```hlsl
+#include "common.hlsl"
+
+struct VSIn
+{
+    float3 pos : POSITION;
+    float3 nor : NORMAL;
+    float2 uv  : TEXCOORD0;
+};
+
+struct VSOut
+{
+    float4 pos       : SV_POSITION;
+    float3 world_pos : TEXCOORD0;
+    float3 normal_ws : TEXCOORD1;
+    float2 uv        : TEXCOORD2;
+};
+
+VSOut VSMain(VSIn v)
+{
+    VSOut o;
+    float4 world = lt_object_to_world(v.pos);
+    o.pos = lt_world_to_clip(world.xyz);
+    o.world_pos = world.xyz;
+    o.normal_ws = lt_object_normal_to_world(v.nor);
+    o.uv = v.uv;
+    return o;
+}
+
+float3 main_light_dir_ws(float3 world_pos)
+{
+    if (LightParams.x >= 0.5)
+        return lt_safe_normalize(LightPos.xyz - world_pos);
+    return lt_safe_normalize(-LightDir.xyz);
+}
+
+float4 PSMain(VSOut i) : SV_Target
+{
+    float3 n = lt_safe_normalize(i.normal_ws);
+    float3 l = main_light_dir_ws(i.world_pos);
+    float ndl = saturate(dot(n, l));
+
+    float shadow = lt_sample_shadow_pcf3x3(i.world_pos, n, l);
+
+    float3 base = lerp(float3(0.18, 0.21, 0.24),
+                       float3(0.85, 0.70, 0.48),
+                       saturate(i.uv.y));
+    float3 ambient = base * 0.05;
+    float3 direct = base * LightColor.rgb * LightDir.w * ndl * shadow;
+    return float4(ambient + direct, 1.0);
+}
+```
+
+If you need custom shadow resources, define `LT_NO_DEFAULT_SHADOWMAP` before the
+include and call the overload that takes a `Texture2DArray` and
+`SamplerComparisonState` explicitly.
+
+## Raymarched Sphere And Floor With Shadows
+
+This example draws a full-screen procedural raymarch shader: a sphere over a
+floor, with the sphere casting a raymarched soft shadow onto the floor. This is
+not using the engine shadow-map prepass; the shadow is evaluated inside the SDF
+scene. Use this when the object exists only in the pixel shader and therefore
+cannot be seen by the regular mesh shadow pass.
+
+Setup:
+
+- Use a VS/PS shader on a procedural draw command.
+- Set topology to triangle list and vertex count to `6`.
+- Bind a render target as usual. No SRV/UAV bindings are required.
+
+```hlsl
+#include "common.hlsl"
+
+struct VSOut
+{
+    float4 pos : SV_POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VSOut VSMain(uint vertex_id : SV_VertexID)
+{
+    float2 p[6] = {
+        float2(-1, -1), float2( 1, -1), float2( 1,  1),
+        float2(-1, -1), float2( 1,  1), float2(-1,  1)
+    };
+
+    VSOut o;
+    o.pos = float4(p[vertex_id], 0.0, 1.0);
+    o.uv = p[vertex_id] * float2(0.5, -0.5) + 0.5;
+    return o;
+}
+
+float sd_sphere(float3 p, float r)
+{
+    return length(p) - r;
+}
+
+float2 scene_sdf(float3 p)
+{
+    float sphere = sd_sphere(p - float3(0.0, 1.0, 0.0), 1.0);
+    float floor_d = p.y;
+
+    // x = signed distance, y = material id
+    return sphere < floor_d ? float2(sphere, 1.0) : float2(floor_d, 2.0);
+}
+
+float3 scene_normal(float3 p)
+{
+    float e = 0.002;
+    float2 h = float2(e, 0.0);
+    return lt_safe_normalize(float3(
+        scene_sdf(p + h.xyy).x - scene_sdf(p - h.xyy).x,
+        scene_sdf(p + h.yxy).x - scene_sdf(p - h.yxy).x,
+        scene_sdf(p + h.yyx).x - scene_sdf(p - h.yyx).x));
+}
+
+float trace_scene(float3 ro, float3 rd, out float mat_id)
+{
+    float t = 0.0;
+    mat_id = 0.0;
+
+    [loop]
+    for (int i = 0; i < 128; ++i) {
+        float2 hit = scene_sdf(ro + rd * t);
+        if (hit.x < 0.001) {
+            mat_id = hit.y;
+            return t;
+        }
+        t += hit.x;
+        if (t > 80.0)
+            break;
+    }
+
+    return -1.0;
+}
+
+float soft_shadow(float3 ro, float3 rd, float max_t)
+{
+    float shade = 1.0;
+    float t = 0.04;
+
+    [loop]
+    for (int i = 0; i < 64; ++i) {
+        float h = scene_sdf(ro + rd * t).x;
+        if (h < 0.001)
+            return 0.0;
+        shade = min(shade, 12.0 * h / t);
+        t += clamp(h, 0.02, 0.45);
+        if (t > max_t)
+            break;
+    }
+
+    return saturate(shade);
+}
+
+float3 ray_dir_from_uv(float2 uv)
+{
+    float4 far_clip = lt_uv_depth_to_clip(uv, 1.0);
+    float4 far_world = mul(InvViewProj, far_clip);
+    far_world.xyz /= max(abs(far_world.w), LT_EPS);
+    return lt_safe_normalize(far_world.xyz - lt_camera_position_ws());
+}
+
+float3 material_color(float3 p, float mat_id)
+{
+    if (mat_id < 1.5)
+        return float3(0.95, 0.34, 0.18);
+
+    float2 grid = abs(frac(p.xz * 0.5) - 0.5);
+    float line = smoothstep(0.48, 0.50, max(grid.x, grid.y));
+    return lerp(float3(0.22, 0.23, 0.24), float3(0.38, 0.39, 0.40), line);
+}
+
+float4 PSMain(VSOut i) : SV_Target
+{
+    float3 ro = lt_camera_position_ws();
+    float3 rd = ray_dir_from_uv(i.uv);
+
+    float mat_id = 0.0;
+    float t = trace_scene(ro, rd, mat_id);
+    if (t < 0.0)
+        return float4(0.025, 0.035, 0.055, 1.0);
+
+    float3 p = ro + rd * t;
+    float3 n = scene_normal(p);
+    float3 l = LightParams.x >= 0.5
+        ? lt_safe_normalize(LightPos.xyz - p)
+        : lt_safe_normalize(-LightDir.xyz);
+
+    float ndl = saturate(dot(n, l));
+    float shadow = soft_shadow(p + n * 0.015, l, 40.0);
+    float3 base = material_color(p, mat_id);
+    float3 color = base * 0.055 + base * LightColor.rgb * LightDir.w * ndl * shadow;
+
+    return float4(color, 1.0);
+}
+```
+
+## Noise Helpers With `noises.hlsl`
+
+`shaders/noises.hlsl` is a small include for deterministic GPU hashes, value
+noise, Worley/cellular noise, interleaved gradient noise, and helper functions
+for sampling a real blue-noise texture.
+
+Use it like this from a shader directly under `shaders/`:
+
+```hlsl
+#include "noises.hlsl"
+```
+
+The hash helpers are based on integer math, which is more stable across GPUs
+than classic `frac(sin(x) * big_number)` float hashes.
+
+```hlsl
+float random_cell = lt_hash12(uint2(cell_x, cell_y));
+float2 random_offset = lt_hash22(uint2(cell_x, cell_y));
+float3 random_dir = lt_hash_unit_vector3(uint3(cell_x, cell_y, frame_index));
+```
+
+For cellular/Worley patterns:
+
+```hlsl
+float2 f = lt_worley2(world_pos.xz * 3.0);
+float cell_fill = 1.0 - smoothstep(0.0, 0.55, f.x);
+float cell_edges = 1.0 - smoothstep(0.02, 0.08, f.y - f.x);
+```
+
+For low-cost procedural masks:
+
+```hlsl
+float clouds = lt_fbm2(world_pos.xz * 0.08 + TimeVec.x * 0.03, 5);
+float breakup = lt_value_noise3(world_pos * 0.7);
+```
+
+For screen-space dithering without a texture, use interleaved gradient noise:
+
+```hlsl
+float dither = lt_interleaved_gradient_noise(pixel_xy, (uint)TimeVec.z);
+alpha = alpha > dither ? 1.0 : 0.0;
+```
+
+For actual blue-noise sampling, bind a blue-noise texture and use the helper to
+wrap and animate UVs:
+
+```hlsl
+Texture2D<float> BlueNoise : register(t0);
+SamplerState BlueNoiseSampler : register(s0);
+
+float n = lt_sample_blue_noise(BlueNoise,
+                               BlueNoiseSampler,
+                               pixel_xy,
+                               float2(128.0, 128.0),
+                               (uint)TimeVec.z);
+```
+
+Reference material:
+
+- Jarzynski and Olano, "Hash Functions for GPU Rendering", JCGT 2020:
+  <https://jcgt.org/published/0009/03/02/>
+- Steven Worley, "A Cellular Texture Basis Function", SIGGRAPH 1996:
+  <https://dl.acm.org/doi/10.1145/237170.237267>
+- Jorge Jimenez, "Next Generation Post Processing in Call of Duty: Advanced
+  Warfare", SIGGRAPH 2014:
+  <https://www.iryoku.com/next-generation-post-processing-in-call-of-duty-advanced-warfare/>
+- Christoph Peters, "Free blue noise textures":
+  <https://momentsingraphics.de/BlueNoise.html>
+- Wolfe, Morrical, Akenine-Moller and Ramamoorthi, "Spatiotemporal Blue Noise
+  Masks", EGSR 2022:
+  <https://diglib.eg.org/items/a96087bb-abe8-4851-968c-cccc7f17e08c>
 
 ## Mini PBR Pipeline
 

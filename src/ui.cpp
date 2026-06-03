@@ -3104,6 +3104,13 @@ struct UiCodeLine {
     int         offset;
 };
 
+struct UiShaderCompletionItem {
+    std::string word;
+    std::string signature;
+    std::string source;
+    bool        from_shader;
+};
+
 struct UiShaderSourceEditor {
     ResHandle h;
     char      root_path[MAX_PATH_LEN];
@@ -3124,6 +3131,8 @@ struct UiShaderSourceEditor {
     bool      autocomplete_open;
     int       autocomplete_index;
     int       autocomplete_start;
+    bool      completion_cache_dirty;
+    std::vector<UiShaderCompletionItem> completion_cache;
     std::vector<UiCodeLine> line_cache;
     int       line_cache_max_cols;
     bool      line_cache_dirty;
@@ -3297,6 +3306,41 @@ static void ui_shader_resolve_include_path(const UiShaderSourceEditor* ed, const
     ui_normalize_path_text(include_name, out, out_sz);
 }
 
+static void ui_shader_resolve_include_from_path(const char* root_path, const char* parent_path,
+                                                const char* include_name, char* out, int out_sz) {
+    if (!out || out_sz <= 0)
+        return;
+    out[0] = '\0';
+    if (!include_name || !include_name[0])
+        return;
+
+    if (ui_shader_path_is_absolute(include_name)) {
+        ui_normalize_path_text(include_name, out, out_sz);
+        return;
+    }
+
+    char current_dir[MAX_PATH_LEN] = {};
+    ui_path_parent_dir(parent_path, current_dir, MAX_PATH_LEN);
+    if (current_dir[0]) {
+        char candidate[MAX_PATH_LEN] = {};
+        snprintf(candidate, sizeof(candidate), "%s/%s", current_dir, include_name);
+        ui_normalize_path_text(candidate, out, out_sz);
+        if (ui_file_exists(out))
+            return;
+    }
+
+    char root_dir[MAX_PATH_LEN] = {};
+    ui_path_parent_dir(root_path, root_dir, MAX_PATH_LEN);
+    if (root_dir[0]) {
+        char candidate[MAX_PATH_LEN] = {};
+        snprintf(candidate, sizeof(candidate), "%s/%s", root_dir, include_name);
+        ui_normalize_path_text(candidate, out, out_sz);
+        return;
+    }
+
+    ui_normalize_path_text(include_name, out, out_sz);
+}
+
 static bool ui_shader_parse_include_line(const UiCodeLine& line, char* out_path, int out_sz,
                                          int* out_start = nullptr, int* out_end = nullptr) {
     if (out_path && out_sz > 0)
@@ -3447,6 +3491,7 @@ static void ui_shader_editor_mark_dirty(UiShaderSourceEditor* ed) {
         return;
     ed->dirty = true;
     ed->line_cache_dirty = true;
+    ed->completion_cache_dirty = true;
     ed->last_edit_time = ImGui::GetTime();
 }
 
@@ -3702,70 +3747,406 @@ static bool ui_ascii_starts_with_ci(const char* word, const char* prefix, int pr
     return true;
 }
 
-static const char* const k_hlsl_completion_words[] = {
-    "AppendStructuredBuffer", "BlendState", "Buffer", "ByteAddressBuffer", "ComputeShader",
-    "ConsumeStructuredBuffer", "DepthStencilState", "DomainShader", "GeometryShader",
-    "HullShader", "InputPatch", "LineStream", "OutputPatch", "PixelShader", "PointStream",
-    "RasterizerState", "RenderTargetView", "RWBuffer", "RWByteAddressBuffer",
-    "RWStructuredBuffer", "RWTexture1D", "RWTexture1DArray", "RWTexture2D",
-    "RWTexture2DArray", "RWTexture3D", "SamplerComparisonState", "SamplerState",
-    "StructuredBuffer", "Texture1D", "Texture1DArray", "Texture2D", "Texture2DArray",
-    "Texture3D", "TextureCube", "TextureCubeArray", "TriangleStream", "VertexShader",
-    "SV_ClipDistance", "SV_CullDistance", "SV_Coverage", "SV_Depth", "SV_DepthGreaterEqual",
-    "SV_DepthLessEqual", "SV_DispatchThreadID", "SV_DomainLocation", "SV_GroupID",
-    "SV_GroupIndex", "SV_GroupThreadID", "SV_GSInstanceID", "SV_InnerCoverage",
-    "SV_InstanceID", "SV_IsFrontFace", "SV_OutputControlPointID", "SV_Position",
-    "SV_PrimitiveID", "SV_RenderTargetArrayIndex", "SV_SampleIndex", "SV_StencilRef",
-    "SV_Target", "SV_Target0", "SV_Target1", "SV_Target2", "SV_Target3", "SV_VertexID",
-    "SV_ViewportArrayIndex", "POSITION", "NORMAL", "TANGENT", "BINORMAL", "TEXCOORD0",
-    "TEXCOORD1", "TEXCOORD2", "TEXCOORD3", "COLOR", "COLOR0", "COLOR1",
-    "bool", "bool2", "bool3", "bool4", "break", "case", "cbuffer", "centroid",
-    "class", "column_major", "const", "continue", "default", "discard", "do", "double",
-    "else", "false", "float", "float2", "float2x2", "float2x3", "float2x4",
-    "float3", "float3x2", "float3x3", "float3x4", "float4", "float4x2",
-    "float4x3", "float4x4", "for", "groupshared", "half", "half2", "half3",
-    "half4", "if", "in", "inline", "inout", "int", "int2", "int3", "int4",
-    "linear", "matrix", "namespace", "nointerpolation", "numthreads", "out", "packoffset",
-    "precise", "register", "return", "row_major", "sampler", "shared", "static", "struct",
-    "switch", "true", "tbuffer", "uint", "uint2", "uint3", "uint4", "uniform",
-    "void", "volatile", "while",
-    "abort", "abs", "acos", "all", "AllMemoryBarrier", "AllMemoryBarrierWithGroupSync",
-    "any", "asdouble", "asfloat", "asin", "asint", "asuint", "atan", "atan2", "ceil",
-    "CheckAccessFullyMapped", "clamp", "clip", "cos", "cosh", "countbits", "cross",
-    "D3DCOLORtoUBYTE4", "ddx", "ddx_coarse", "ddx_fine", "ddy", "ddy_coarse",
-    "ddy_fine", "degrees", "determinant", "DeviceMemoryBarrier",
-    "DeviceMemoryBarrierWithGroupSync", "distance", "dot", "dst", "EvaluateAttributeAtCentroid",
-    "EvaluateAttributeAtSample", "EvaluateAttributeSnapped", "exp", "exp2", "f16tof32",
-    "f32tof16", "faceforward", "firstbithigh", "firstbitlow", "floor", "fma", "fmod",
-    "frac", "frexp", "fwidth", "GetRenderTargetSampleCount", "GetRenderTargetSamplePosition",
-    "GroupMemoryBarrier", "GroupMemoryBarrierWithGroupSync", "InterlockedAdd", "InterlockedAnd",
-    "InterlockedCompareExchange", "InterlockedCompareStore", "InterlockedExchange", "InterlockedMax",
-    "InterlockedMin", "InterlockedOr", "InterlockedXor", "isfinite", "isinf", "isnan",
-    "ldexp", "length", "lerp", "lit", "log", "log10", "log2", "mad", "max", "min",
-    "modf", "mul", "noise", "normalize", "pow", "printf", "Process2DQuadTessFactorsAvg",
-    "Process2DQuadTessFactorsMax", "Process2DQuadTessFactorsMin", "ProcessIsolineTessFactors",
-    "ProcessQuadTessFactorsAvg", "ProcessQuadTessFactorsMax", "ProcessQuadTessFactorsMin",
-    "ProcessTriTessFactorsAvg", "ProcessTriTessFactorsMax", "ProcessTriTessFactorsMin",
-    "radians", "rcp", "reflect", "refract", "reversebits", "round", "rsqrt", "saturate",
-    "sign", "sin", "sincos", "sinh", "smoothstep", "sqrt", "step", "tan", "tanh",
-    "tex1D", "tex1Dbias", "tex1Dgrad", "tex1Dlod", "tex1Dproj", "tex2D", "tex2Dbias",
-    "tex2Dgrad", "tex2Dlod", "tex2Dproj", "tex3D", "tex3Dbias", "tex3Dgrad",
-    "tex3Dlod", "tex3Dproj", "texCUBE", "texCUBEbias", "texCUBEgrad", "texCUBElod",
-    "texCUBEproj", "transpose", "trunc",
-    "LTPBRMaterial", "LTPBRLighting", "LTAtmosphereParams", "LTRay", "LTRaymarchParams", "LTRaymarchHit",
-    "lt_pbr_material", "lt_pbr_brdf_direct", "lt_pbr_ibl", "lt_pbr_shade", "lt_pbr_default_directional",
-    "lt_pbr_default_light_dir_ws", "lt_pbr_default_light_radiance", "lt_pbr_unpack_normal",
-    "lt_raymarch_camera_ray", "lt_raymarch_camera_ray_near_plane", "lt_raymarch_default_params",
-    "lt_raymarch_trace", "lt_raymarch_estimate_normal", "lt_raymarch_soft_shadow", "lt_raymarch_ambient_occlusion",
-    "lt_sdf_sphere", "lt_sdf_box", "lt_sdf_round_box", "lt_sdf_plane", "lt_sdf_torus", "lt_sdf_capsule",
-    "lt_sdf_union", "lt_sdf_smooth_union", "lt_sdf_subtraction", "lt_sdf_intersection", "lt_rotate2d",
-    "lt_atmosphere_default_params", "lt_atmosphere_sky", "lt_atmosphere_ambient_diffuse",
-    "lt_atmosphere_ambient_specular", "lt_atmosphere_apply_fog", "lt_atmosphere_tonemap",
-    "common_pbr.hlsl", "common_raymarch.hlsl", "common_atmosphere.hlsl"
-};
+static const char* ui_shader_path_basename(const char* path) {
+    if (!path || !path[0])
+        return "";
+    const char* slash1 = strrchr(path, '/');
+    const char* slash2 = strrchr(path, '\\');
+    const char* slash = slash1 > slash2 ? slash1 : slash2;
+    return slash ? slash + 1 : path;
+}
 
-static int ui_shader_autocomplete_prefix(const UiShaderSourceEditor* ed, int* out_start, char* out, int out_sz) {
+static bool ui_shader_completion_word_valid(const char* word) {
+    if (!word || !ui_ascii_ident_start(word[0]))
+        return false;
+    for (int i = 1; word[i]; i++) {
+        if (!ui_ascii_ident_char(word[i]))
+            return false;
+    }
+    return true;
+}
+
+static bool ui_shader_completion_is_entry_point(const char* word) {
+    return word && (_stricmp(word, "VSMain") == 0 ||
+                    _stricmp(word, "PSMain") == 0 ||
+                    _stricmp(word, "CSMain") == 0);
+}
+
+static bool ui_shader_completion_add(std::vector<UiShaderCompletionItem>& items,
+                                     const char* word, const char* signature,
+                                     const char* source, bool from_shader) {
+    if (!ui_shader_completion_word_valid(word) || ui_shader_completion_is_entry_point(word))
+        return false;
+    for (size_t i = 0; i < items.size(); i++) {
+        if (items[i].word == word &&
+            items[i].signature == (signature ? signature : "") &&
+            items[i].source == (source ? source : ""))
+            return false;
+    }
+
+    UiShaderCompletionItem item = {};
+    item.word = word;
+    item.signature = signature ? signature : word;
+    item.source = source ? source : "";
+    item.from_shader = from_shader;
+    items.push_back(item);
+    return true;
+}
+
+static void ui_shader_completion_clean_source(const char* text, std::string* out) {
+    if (!out)
+        return;
+    out->assign(text ? text : "");
+    std::string& s = *out;
+    int len = (int)s.size();
+    for (int i = 0; i < len; ) {
+        if (s[i] == '/' && i + 1 < len && s[i + 1] == '/') {
+            s[i++] = ' ';
+            s[i++] = ' ';
+            while (i < len && s[i] != '\n' && s[i] != '\r')
+                s[i++] = ' ';
+            continue;
+        }
+        if (s[i] == '/' && i + 1 < len && s[i + 1] == '*') {
+            s[i++] = ' ';
+            s[i++] = ' ';
+            while (i < len) {
+                if (s[i] == '*' && i + 1 < len && s[i + 1] == '/') {
+                    s[i++] = ' ';
+                    s[i++] = ' ';
+                    break;
+                }
+                if (s[i] != '\n' && s[i] != '\r')
+                    s[i] = ' ';
+                i++;
+            }
+            continue;
+        }
+        if (s[i] == '"' || s[i] == '\'') {
+            char quote = s[i];
+            s[i++] = ' ';
+            while (i < len) {
+                if (s[i] == '\\' && i + 1 < len) {
+                    s[i++] = ' ';
+                    if (s[i] != '\n' && s[i] != '\r')
+                        s[i] = ' ';
+                    i++;
+                    continue;
+                }
+                char c = s[i];
+                if (s[i] != '\n' && s[i] != '\r')
+                    s[i] = ' ';
+                i++;
+                if (c == quote)
+                    break;
+            }
+            continue;
+        }
+        i++;
+    }
+}
+
+static int ui_shader_completion_skip_space(const std::string& s, int p) {
+    int len = (int)s.size();
+    while (p < len && (s[p] == ' ' || s[p] == '\t' || s[p] == '\n' || s[p] == '\r'))
+        p++;
+    return p;
+}
+
+static int ui_shader_completion_matching_paren(const std::string& s, int open) {
+    int len = (int)s.size();
+    int depth = 0;
+    for (int p = open; p < len; p++) {
+        if (s[p] == '(')
+            depth++;
+        else if (s[p] == ')') {
+            depth--;
+            if (depth == 0)
+                return p;
+        }
+    }
+    return -1;
+}
+
+static bool ui_shader_completion_prefix_allows_function(const char* begin, const char* end) {
+    if (!begin || !end || begin >= end)
+        return false;
+
+    std::string prefix;
+    int attr_depth = 0;
+    for (const char* p = begin; p < end; p++) {
+        if (*p == '[') {
+            attr_depth++;
+            continue;
+        }
+        if (*p == ']' && attr_depth > 0) {
+            attr_depth--;
+            continue;
+        }
+        if (attr_depth == 0)
+            prefix.push_back(*p);
+    }
+
+    int a = 0;
+    int b = (int)prefix.size();
+    while (a < b && (prefix[a] == ' ' || prefix[a] == '\t'))
+        a++;
+    while (b > a && (prefix[b - 1] == ' ' || prefix[b - 1] == '\t'))
+        b--;
+    if (a >= b)
+        return false;
+
+    for (int i = a; i < b; i++) {
+        char c = prefix[i];
+        if (c == '=' || c == ',' || c == '(' || c == ')' || c == '.' ||
+            c == '+' || c == '-' || c == '*' || c == '/' || c == '%' ||
+            c == '?' || c == '!' || c == '&' || c == '|' || c == '^' ||
+            c == '~' || c == '<' || c == '>' ||
+            c == ';' || c == ':' || c == '{' || c == '}')
+            return false;
+    }
+
+    int word_end = b;
+    while (word_end > a && !ui_ascii_ident_char(prefix[word_end - 1]))
+        word_end--;
+    int word_start = word_end;
+    while (word_start > a && ui_ascii_ident_char(prefix[word_start - 1]))
+        word_start--;
+    if (word_start >= word_end)
+        return false;
+
+    int word_len = word_end - word_start;
+    const char* word = prefix.c_str() + word_start;
+    if (ui_hlsl_keyword(word, word_len) && !ui_hlsl_type_keyword(word, word_len))
+        return false;
+    return true;
+}
+
+static bool ui_shader_completion_after_paren_allows_function(const std::string& clean, int close) {
+    int len = (int)clean.size();
+    int p = ui_shader_completion_skip_space(clean, close + 1);
+    if (p < len && clean[p] == ':') {
+        while (p < len && clean[p] != '{' && clean[p] != ';')
+            p++;
+    }
+    p = ui_shader_completion_skip_space(clean, p);
+    return p < len && (clean[p] == '{' || clean[p] == ';');
+}
+
+static void ui_shader_completion_normalize_signature(const std::string& clean,
+                                                     int begin, int end,
+                                                     char* out, int out_sz) {
+    if (!out || out_sz <= 0)
+        return;
+    out[0] = '\0';
+    int len = (int)clean.size();
+    if (begin < 0) begin = 0;
+    if (end > len) end = len;
+    if (begin >= end)
+        return;
+
+    int oi = 0;
+    bool pending_space = false;
+    for (int i = begin; i < end && oi < out_sz - 1; i++) {
+        char c = clean[i];
+        bool space = c == ' ' || c == '\t' || c == '\n' || c == '\r';
+        if (space) {
+            pending_space = oi > 0;
+            continue;
+        }
+        if (c == '(' || c == ')' || c == ',' || c == '[' || c == ']') {
+            while (oi > 0 && out[oi - 1] == ' ')
+                oi--;
+            if (oi < out_sz - 1)
+                out[oi++] = c;
+            if (c == ',')
+                pending_space = true;
+            else
+                pending_space = false;
+            continue;
+        }
+        if (pending_space && oi > 0 && oi < out_sz - 1)
+            out[oi++] = ' ';
+        pending_space = false;
+        out[oi++] = c;
+    }
+    while (oi > 0 && out[oi - 1] == ' ')
+        oi--;
+    out[oi] = '\0';
+}
+
+static void ui_shader_completion_collect_functions_from_text(const char* text, const char* source,
+                                                             std::vector<UiShaderCompletionItem>& items) {
+    std::string clean;
+    ui_shader_completion_clean_source(text, &clean);
+    int len = (int)clean.size();
+    for (int open = 0; open < len; open++) {
+        if (clean[open] != '(')
+            continue;
+
+        int name_end = open;
+        while (name_end > 0 && (clean[name_end - 1] == ' ' || clean[name_end - 1] == '\t'))
+            name_end--;
+        int name_start = name_end;
+        while (name_start > 0 && ui_ascii_ident_char(clean[name_start - 1]))
+            name_start--;
+        if (name_start >= name_end || !ui_ascii_ident_start(clean[name_start]))
+            continue;
+
+        int name_len = name_end - name_start;
+        const char* name = clean.c_str() + name_start;
+        if (ui_hlsl_keyword(name, name_len) || ui_hlsl_type_keyword(name, name_len))
+            continue;
+
+        int prefix_start = name_start;
+        while (prefix_start > 0) {
+            char c = clean[prefix_start - 1];
+            if (c == ';' || c == '{' || c == '}' || c == '\n' || c == '\r')
+                break;
+            prefix_start--;
+        }
+        if (!ui_shader_completion_prefix_allows_function(clean.c_str() + prefix_start,
+                                                         clean.c_str() + name_start))
+            continue;
+
+        int close = ui_shader_completion_matching_paren(clean, open);
+        if (close < 0 || !ui_shader_completion_after_paren_allows_function(clean, close))
+            continue;
+
+        char word[MAX_NAME] = {};
+        int copy_len = name_len < MAX_NAME ? name_len : MAX_NAME - 1;
+        memcpy(word, name, (size_t)copy_len);
+        word[copy_len] = '\0';
+        char signature[256] = {};
+        ui_shader_completion_normalize_signature(clean, prefix_start, close + 1,
+                                                 signature, sizeof(signature));
+        ui_shader_completion_add(items, word, signature, source, true);
+        open = close;
+    }
+}
+
+static bool ui_shader_completion_path_seen(const std::vector<std::string>& seen, const char* path) {
+    if (!path || !path[0])
+        return true;
+    for (size_t i = 0; i < seen.size(); i++) {
+        if (_stricmp(seen[i].c_str(), path) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool ui_shader_completion_text_for_path(UiShaderSourceEditor* ed, const char* path,
+                                               std::string* storage, const char** out_text) {
+    if (out_text)
+        *out_text = nullptr;
+    if (!path || !path[0] || !out_text)
+        return false;
+
+    char clean_path[MAX_PATH_LEN] = {};
+    ui_normalize_path_text(path, clean_path, MAX_PATH_LEN);
+    if (ed && ed->text && ed->path[0] && _stricmp(clean_path, ed->path) == 0) {
+        *out_text = ed->text;
+        return true;
+    }
+
+    void* data = nullptr;
+    size_t size = 0;
+    if (!lt_read_file(clean_path, &data, &size))
+        return false;
+    if (storage)
+        storage->assign((const char*)data, (const char*)data + size);
+    lt_free_file(data);
+    if (storage)
+        *out_text = storage->c_str();
+    return storage != nullptr;
+}
+
+static const int UI_SHADER_COMPLETION_MAX_INCLUDE_DEPTH = 8;
+
+static void ui_shader_completion_collect_file(UiShaderSourceEditor* ed, const char* path, int depth,
+                                              std::vector<std::string>& seen,
+                                              std::vector<UiShaderCompletionItem>& items) {
+    if (!path || !path[0] || depth > UI_SHADER_COMPLETION_MAX_INCLUDE_DEPTH)
+        return;
+
+    char clean_path[MAX_PATH_LEN] = {};
+    ui_normalize_path_text(path, clean_path, MAX_PATH_LEN);
+    if (!clean_path[0] || ui_shader_completion_path_seen(seen, clean_path))
+        return;
+    seen.push_back(clean_path);
+
+    std::string storage;
+    const char* text = nullptr;
+    if (!ui_shader_completion_text_for_path(ed, clean_path, &storage, &text) || !text)
+        return;
+
+    const char* source = ui_shader_path_basename(clean_path);
+    ui_shader_completion_collect_functions_from_text(text, source, items);
+
+    std::vector<UiCodeLine> lines;
+    int max_cols = 0;
+    ui_code_build_lines(text, lines, &max_cols);
+    (void)max_cols;
+    for (int i = 0; i < (int)lines.size(); i++) {
+        char include_name[MAX_PATH_LEN] = {};
+        if (!ui_shader_parse_include_line(lines[i], include_name, MAX_PATH_LEN))
+            continue;
+        char include_path[MAX_PATH_LEN] = {};
+        ui_shader_resolve_include_from_path(ed ? ed->root_path : clean_path, clean_path,
+                                            include_name, include_path, MAX_PATH_LEN);
+        if (include_path[0])
+            ui_shader_completion_collect_file(ed, include_path, depth + 1, seen, items);
+    }
+}
+
+static void ui_shader_autocomplete_ensure_cache(UiShaderSourceEditor* ed) {
+    if (!ed || !ed->completion_cache_dirty)
+        return;
+
+    ed->completion_cache.clear();
+    std::vector<std::string> seen;
+    const char* root = ed->root_path[0] ? ed->root_path : ed->path;
+    ui_shader_completion_collect_file(ed, root, 0, seen, ed->completion_cache);
+    if (ed->path[0] && (!root || _stricmp(root, ed->path) != 0))
+        ui_shader_completion_collect_file(ed, ed->path, 0, seen, ed->completion_cache);
+
+    ed->completion_cache_dirty = false;
+}
+
+static const char* ui_ascii_find_ci(const char* text, const char* needle, int needle_len) {
+    if (!text || !needle || needle_len <= 0)
+        return nullptr;
+    for (const char* p = text; *p; p++) {
+        int i = 0;
+        while (i < needle_len && p[i] &&
+               ui_ascii_lower_char(p[i]) == ui_ascii_lower_char(needle[i]))
+            i++;
+        if (i == needle_len)
+            return p;
+    }
+    return nullptr;
+}
+
+static int ui_shader_autocomplete_match_score(const UiShaderCompletionItem& item,
+                                              const char* prefix, int prefix_len) {
+    if (!prefix || prefix_len <= 0)
+        return -1;
+    const char* word = item.word.c_str();
+    if (ui_ascii_starts_with_ci(word, prefix, prefix_len))
+        return 0;
+
+    const char* hit = ui_ascii_find_ci(word, prefix, prefix_len);
+    if (!hit)
+        return -1;
+    if (hit == word || hit[-1] == '_' || hit[-1] == '.')
+        return 1;
+    return 2;
+}
+
+static int ui_shader_autocomplete_prefix(const UiShaderSourceEditor* ed, int* out_start,
+                                         int* out_end, char* out, int out_sz) {
     if (out_start) *out_start = 0;
+    if (out_end) *out_end = 0;
     if (out && out_sz > 0) out[0] = '\0';
     if (!ed || !ed->text || out_sz <= 0)
         return 0;
@@ -3774,7 +4155,11 @@ static int ui_shader_autocomplete_prefix(const UiShaderSourceEditor* ed, int* ou
     int start = cursor;
     while (start > 0 && ui_ascii_ident_char(ed->text[start - 1]))
         start--;
-    int len = cursor - start;
+    int end = cursor;
+    int text_len = ui_code_text_len(ed);
+    while (end < text_len && ui_ascii_ident_char(ed->text[end]))
+        end++;
+    int len = end - start;
     if (len <= 0 || !ui_ascii_ident_start(ed->text[start]))
         return 0;
     if (len >= out_sz)
@@ -3782,31 +4167,37 @@ static int ui_shader_autocomplete_prefix(const UiShaderSourceEditor* ed, int* ou
     memcpy(out, ed->text + start, (size_t)len);
     out[len] = '\0';
     if (out_start) *out_start = start;
+    if (out_end) *out_end = end;
     return len;
 }
 
-static int ui_shader_autocomplete_count(const char* prefix, int prefix_len) {
-    if (!prefix || prefix_len <= 0)
+static int ui_shader_autocomplete_count(UiShaderSourceEditor* ed, const char* prefix, int prefix_len) {
+    if (!ed || !prefix || prefix_len <= 0)
         return 0;
+    ui_shader_autocomplete_ensure_cache(ed);
     int count = 0;
-    for (int i = 0; i < (int)(sizeof(k_hlsl_completion_words) / sizeof(k_hlsl_completion_words[0])); i++) {
-        const char* w = k_hlsl_completion_words[i];
-        if (ui_ascii_starts_with_ci(w, prefix, prefix_len) && !(strlen(w) == (size_t)prefix_len && strncmp(w, prefix, (size_t)prefix_len) == 0))
+    for (size_t i = 0; i < ed->completion_cache.size(); i++) {
+        if (ui_shader_autocomplete_match_score(ed->completion_cache[i], prefix, prefix_len) >= 0)
             count++;
     }
     return count;
 }
 
-static const char* ui_shader_autocomplete_nth(const char* prefix, int prefix_len, int nth) {
-    if (!prefix || prefix_len <= 0)
+static const UiShaderCompletionItem* ui_shader_autocomplete_nth(UiShaderSourceEditor* ed,
+                                                                const char* prefix,
+                                                                int prefix_len,
+                                                                int nth) {
+    if (!ed || !prefix || prefix_len <= 0)
         return nullptr;
+    ui_shader_autocomplete_ensure_cache(ed);
     int count = 0;
-    for (int i = 0; i < (int)(sizeof(k_hlsl_completion_words) / sizeof(k_hlsl_completion_words[0])); i++) {
-        const char* w = k_hlsl_completion_words[i];
-        if (ui_ascii_starts_with_ci(w, prefix, prefix_len) && !(strlen(w) == (size_t)prefix_len && strncmp(w, prefix, (size_t)prefix_len) == 0)) {
-            if (count == nth)
-                return w;
-            count++;
+    for (int score = 0; score <= 2; score++) {
+        for (size_t i = 0; i < ed->completion_cache.size(); i++) {
+            if (ui_shader_autocomplete_match_score(ed->completion_cache[i], prefix, prefix_len) == score) {
+                if (count == nth)
+                    return &ed->completion_cache[i];
+                count++;
+            }
         }
     }
     return nullptr;
@@ -3818,8 +4209,8 @@ static bool ui_shader_autocomplete_refresh(UiShaderSourceEditor* ed, bool open_w
     char prefix[64] = {};
     int start = 0;
     bool was_open = ed->autocomplete_open;
-    int prefix_len = ui_shader_autocomplete_prefix(ed, &start, prefix, sizeof(prefix));
-    int count = ui_shader_autocomplete_count(prefix, prefix_len);
+    int prefix_len = ui_shader_autocomplete_prefix(ed, &start, nullptr, prefix, sizeof(prefix));
+    int count = ui_shader_autocomplete_count(ed, prefix, prefix_len);
     int min_prefix = was_open ? 1 : 2;
     if (prefix_len < min_prefix || count <= 0 || (!open_when_possible && !ed->autocomplete_open)) {
         ed->autocomplete_open = false;
@@ -3839,21 +4230,22 @@ static bool ui_shader_autocomplete_accept(UiShaderSourceEditor* ed) {
         return false;
     char prefix[64] = {};
     int start = 0;
-    int prefix_len = ui_shader_autocomplete_prefix(ed, &start, prefix, sizeof(prefix));
-    int count = ui_shader_autocomplete_count(prefix, prefix_len);
+    int end = 0;
+    int prefix_len = ui_shader_autocomplete_prefix(ed, &start, &end, prefix, sizeof(prefix));
+    int count = ui_shader_autocomplete_count(ed, prefix, prefix_len);
     if (count <= 0) {
         ed->autocomplete_open = false;
         return false;
     }
     if (ed->autocomplete_index < 0) ed->autocomplete_index = 0;
     if (ed->autocomplete_index >= count) ed->autocomplete_index = count - 1;
-    const char* word = ui_shader_autocomplete_nth(prefix, prefix_len, ed->autocomplete_index);
-    if (!word) {
+    const UiShaderCompletionItem* item = ui_shader_autocomplete_nth(ed, prefix, prefix_len, ed->autocomplete_index);
+    if (!item) {
         ed->autocomplete_open = false;
         return false;
     }
     ed->autocomplete_open = false;
-    return ui_shader_editor_replace_range(ed, start, start + prefix_len, word);
+    return ui_shader_editor_replace_range(ed, start, end, item->word.c_str());
 }
 
 static void ui_shader_autocomplete_draw(UiShaderSourceEditor* ed, ImDrawList* dl,
@@ -3862,8 +4254,8 @@ static void ui_shader_autocomplete_draw(UiShaderSourceEditor* ed, ImDrawList* dl
         return;
     char prefix[64] = {};
     int start = 0;
-    int prefix_len = ui_shader_autocomplete_prefix(ed, &start, prefix, sizeof(prefix));
-    int count = ui_shader_autocomplete_count(prefix, prefix_len);
+    int prefix_len = ui_shader_autocomplete_prefix(ed, &start, nullptr, prefix, sizeof(prefix));
+    int count = ui_shader_autocomplete_count(ed, prefix, prefix_len);
     if (count <= 0) {
         ed->autocomplete_open = false;
         return;
@@ -3876,13 +4268,21 @@ static void ui_shader_autocomplete_draw(UiShaderSourceEditor* ed, ImDrawList* dl
     if (ed->autocomplete_index >= visible)
         first = ed->autocomplete_index - visible + 1;
     float w = ui_px(260.0f);
+    float source_col_w = 0.0f;
     for (int i = 0; i < visible; i++) {
-        const char* word = ui_shader_autocomplete_nth(prefix, prefix_len, first + i);
-        if (word) {
-            float tw = ImGui::CalcTextSize(word).x + ui_px(22.0f);
+        const UiShaderCompletionItem* item = ui_shader_autocomplete_nth(ed, prefix, prefix_len, first + i);
+        if (item) {
+            const char* display = item->signature.empty() ? item->word.c_str() : item->signature.c_str();
+            float sw = item->source.empty() ? 0.0f : ImGui::CalcTextSize(item->source.c_str()).x;
+            if (sw > source_col_w)
+                source_col_w = sw;
+            float tw = ImGui::CalcTextSize(display).x + sw + ui_px(44.0f);
             if (tw > w) w = tw;
         }
     }
+    float max_w = clip.Max.x - clip.Min.x - ui_px(12.0f);
+    if (w > max_w)
+        w = max_w;
     float h = (float)visible * line_h + ui_px(8.0f);
     if (pos.x + w > clip.Max.x - ui_px(4.0f))
         pos.x = clip.Max.x - w - ui_px(4.0f);
@@ -3898,8 +4298,8 @@ static void ui_shader_autocomplete_draw(UiShaderSourceEditor* ed, ImDrawList* dl
     dl->AddRectFilled(min, max, ImGui::GetColorU32(ImVec4(0.075f, 0.070f, 0.075f, 0.98f)), ui_px(5.0f));
     dl->AddRect(min, max, ImGui::GetColorU32(ImVec4(0.38f, 0.32f, 0.28f, 1.0f)), ui_px(5.0f));
     for (int i = 0; i < visible; i++) {
-        const char* word = ui_shader_autocomplete_nth(prefix, prefix_len, first + i);
-        if (!word)
+        const UiShaderCompletionItem* item = ui_shader_autocomplete_nth(ed, prefix, prefix_len, first + i);
+        if (!item)
             continue;
         float y = pos.y + ui_px(4.0f) + (float)i * line_h;
         if (first + i == ed->autocomplete_index) {
@@ -3907,9 +4307,22 @@ static void ui_shader_autocomplete_draw(UiShaderSourceEditor* ed, ImDrawList* dl
                               ImVec2(pos.x + w - ui_px(3.0f), y + line_h),
                               ImGui::GetColorU32(ImVec4(0.34f, 0.18f, 0.10f, 0.95f)), ui_px(3.0f));
         }
+        const char* display = item->signature.empty() ? item->word.c_str() : item->signature.c_str();
+        ImVec4 text_clip(pos.x + ui_px(8.0f), y,
+                         pos.x + w - source_col_w - ui_px(18.0f), y + line_h);
+        if (text_clip.z < text_clip.x + ui_px(40.0f))
+            text_clip.z = text_clip.x + ui_px(40.0f);
         dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
                     ImVec2(pos.x + ui_px(10.0f), y),
-                    ImGui::GetColorU32(ImVec4(0.88f, 0.84f, 0.78f, 1.0f)), word);
+                    ImGui::GetColorU32(ImVec4(0.88f, 0.84f, 0.78f, 1.0f)),
+                    display, nullptr, 0.0f, &text_clip);
+        if (!item->source.empty()) {
+            float sx = pos.x + w - source_col_w - ui_px(10.0f);
+            dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                        ImVec2(sx, y),
+                        ImGui::GetColorU32(ImVec4(0.96f, 0.54f, 0.24f, 1.0f)),
+                        item->source.c_str());
+        }
     }
     if (count > visible) {
         char more[32] = {};
@@ -4197,6 +4610,24 @@ static int ui_shader_editor_cursor_from_mouse(const std::vector<UiCodeLine>& lin
     return ui_code_offset_from_x(lines[line_i], local_x, char_w);
 }
 
+static bool ui_shader_editor_insert_smart_newline(UiShaderSourceEditor* ed,
+                                                  const std::vector<UiCodeLine>& lines) {
+    if (!ed)
+        return false;
+
+    int cursor = ui_code_clamp_offset(ed, ed->cursor);
+    int line_i = ui_code_line_from_offset(lines, cursor);
+    std::string insert = "\n";
+    if (!lines.empty()) {
+        const UiCodeLine& line = lines[line_i];
+        const char* p = line.begin;
+        while (p < line.end && (*p == ' ' || *p == '\t'))
+            p++;
+        insert.append(line.begin, p);
+    }
+    return ui_shader_editor_insert_bytes(ed, insert.c_str(), (int)insert.size());
+}
+
 static bool ui_shader_code_editor_handle_input(UiShaderSourceEditor* ed,
                                                const std::vector<UiCodeLine>& lines) {
     if (!ed || !ed->editor_focused)
@@ -4204,6 +4635,7 @@ static bool ui_shader_code_editor_handle_input(UiShaderSourceEditor* ed,
 
     ImGuiIO& io = ImGui::GetIO();
     bool changed = false;
+    bool cursor_moved = false;
     bool shift = io.KeyShift;
     bool ctrl = io.KeyCtrl;
 
@@ -4216,9 +4648,47 @@ static bool ui_shader_code_editor_handle_input(UiShaderSourceEditor* ed,
         ed->autocomplete_open = false;
         return ui_shader_editor_undo(ed);
     }
-    ed->autocomplete_open = false;
+
+    if (ed->autocomplete_open) {
+        char prefix[64] = {};
+        int prefix_len = ui_shader_autocomplete_prefix(ed, nullptr, nullptr, prefix, sizeof(prefix));
+        int count = ui_shader_autocomplete_count(ed, prefix, prefix_len);
+        if (count <= 0) {
+            ed->autocomplete_open = false;
+        } else {
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+                ed->autocomplete_open = false;
+                return false;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) {
+                ed->autocomplete_index++;
+                if (ed->autocomplete_index >= count)
+                    ed->autocomplete_index = 0;
+                return false;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) {
+                ed->autocomplete_index--;
+                if (ed->autocomplete_index < 0)
+                    ed->autocomplete_index = count - 1;
+                return false;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+                ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false) ||
+                (!shift && ImGui::IsKeyPressed(ImGuiKey_Tab, false))) {
+                return ui_shader_autocomplete_accept(ed);
+            }
+        }
+    }
+
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+        ui_shader_autocomplete_refresh(ed, true);
+        return false;
+    }
+
+    bool autocomplete_was_open = ed->autocomplete_open;
 
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_A)) {
+        ed->autocomplete_open = false;
         ed->select_anchor = 0;
         ed->cursor = ui_code_text_len(ed);
         ed->preferred_col = -1;
@@ -4236,27 +4706,41 @@ static bool ui_shader_code_editor_handle_input(UiShaderSourceEditor* ed,
     }
 
     if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true)) {
+        ed->autocomplete_open = false;
         int next = ctrl ? ui_shader_editor_word_left(ed) : ed->cursor - 1;
         ui_shader_editor_set_cursor(ed, next, shift);
+        cursor_moved = true;
     }
     if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true)) {
+        ed->autocomplete_open = false;
         int next = ctrl ? ui_shader_editor_word_right(ed) : ed->cursor + 1;
         ui_shader_editor_set_cursor(ed, next, shift);
+        cursor_moved = true;
     }
-    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true))
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) {
+        ed->autocomplete_open = false;
         ui_shader_editor_move_vertical(ed, lines, -1, shift);
-    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true))
+        cursor_moved = true;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) {
+        ed->autocomplete_open = false;
         ui_shader_editor_move_vertical(ed, lines, 1, shift);
+        cursor_moved = true;
+    }
 
     if (ImGui::IsKeyPressed(ImGuiKey_Home, true)) {
+        ed->autocomplete_open = false;
         int line_i = ui_code_line_from_offset(lines, ed->cursor);
         ui_shader_editor_set_cursor(ed, lines.empty() ? 0 : lines[line_i].offset, shift);
+        cursor_moved = true;
     }
     if (ImGui::IsKeyPressed(ImGuiKey_End, true)) {
+        ed->autocomplete_open = false;
         int line_i = ui_code_line_from_offset(lines, ed->cursor);
         int end_offset = lines.empty() ? ui_code_text_len(ed) :
             lines[line_i].offset + (int)(lines[line_i].end - lines[line_i].begin);
         ui_shader_editor_set_cursor(ed, end_offset, shift);
+        cursor_moved = true;
     }
 
     if (ImGui::IsKeyPressed(ImGuiKey_Backspace, true)) {
@@ -4272,7 +4756,7 @@ static bool ui_shader_code_editor_handle_input(UiShaderSourceEditor* ed,
             changed |= ui_shader_editor_delete_range(ed, ed->cursor, ed->cursor + 1);
     }
     if (ImGui::IsKeyPressed(ImGuiKey_Enter, true) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, true))
-        changed |= ui_shader_editor_insert_bytes(ed, "\n", 1);
+        changed |= ui_shader_editor_insert_smart_newline(ed, lines);
     if (!shift && ImGui::IsKeyPressed(ImGuiKey_Tab, true))
         changed |= ui_shader_editor_insert_bytes(ed, "\t", 1);
 
@@ -4288,6 +4772,10 @@ static bool ui_shader_code_editor_handle_input(UiShaderSourceEditor* ed,
         }
     }
     io.InputQueueCharacters.resize(0);
+    if (changed && autocomplete_was_open)
+        ui_shader_autocomplete_refresh(ed, true);
+    else if (cursor_moved)
+        ui_shader_autocomplete_refresh(ed, false);
     return changed;
 }
 
@@ -4553,23 +5041,26 @@ static bool ui_shader_code_editor(UiShaderSourceEditor* ed, const Resource* shad
         }
     }
 
+    float cursor_screen_x = origin.x + gutter_w;
+    float cursor_screen_y = origin.y + (float)cursor_line * line_h;
+    if (!lines.empty()) {
+        const UiCodeLine& line = lines[cursor_line];
+        const char* cursor_ptr = line.begin + (ed->cursor - line.offset);
+        if (cursor_ptr < line.begin) cursor_ptr = line.begin;
+        if (cursor_ptr > line.end) cursor_ptr = line.end;
+        cursor_screen_x += ui_code_x_from_ptr(line.begin, cursor_ptr, char_w);
+    }
+
     if (ed->editor_focused) {
         double t = ImGui::GetTime();
         if (fmod(t, 1.2) < 0.8) {
-            float x = origin.x + gutter_w;
-            if (!lines.empty()) {
-                const UiCodeLine& line = lines[cursor_line];
-                const char* cursor_ptr = line.begin + (ed->cursor - line.offset);
-                if (cursor_ptr < line.begin) cursor_ptr = line.begin;
-                if (cursor_ptr > line.end) cursor_ptr = line.end;
-                x += ui_code_x_from_ptr(line.begin, cursor_ptr, char_w);
-            }
-            float y = origin.y + (float)cursor_line * line_h;
-            dl->AddLine(ImVec2(x, y + 1.0f),
-                        ImVec2(x, y + line_h - 1.0f),
+            dl->AddLine(ImVec2(cursor_screen_x, cursor_screen_y + 1.0f),
+                        ImVec2(cursor_screen_x, cursor_screen_y + line_h - 1.0f),
                         ImGui::GetColorU32(ImGuiCol_InputTextCursor), 1.0f);
         }
     }
+    ui_shader_autocomplete_draw(ed, dl, ImVec2(cursor_screen_x, cursor_screen_y + line_h),
+                                line_h, char_w, clip);
 
     dl->PopClipRect();
 
@@ -4603,6 +5094,8 @@ static bool ui_shader_editor_load_file(UiShaderSourceEditor* ed, ResHandle h, co
     ed->autocomplete_open = false;
     ed->autocomplete_index = 0;
     ed->autocomplete_start = 0;
+    ed->completion_cache_dirty = true;
+    ed->completion_cache.clear();
     ed->line_cache.clear();
     ed->line_cache_max_cols = 0;
     ed->line_cache_dirty = true;
@@ -12346,6 +12839,7 @@ static void ui_draw_help_shortcuts_tab() {
         ui_draw_shortcut_row("Ctrl+D", "Compile edited/selected shader");
         ui_draw_shortcut_row("Ctrl+S", "Save shader source or project");
         ui_draw_shortcut_row("Shift+Tab", "Cycle shader editor file");
+        ui_draw_shortcut_row("Ctrl+Space", "Search shader symbols for the current word");
         ui_draw_shortcut_row("Ctrl+L", "Load project");
         ui_draw_shortcut_row("F1", "Toggle this help panel");
         ImGui::EndTable();
