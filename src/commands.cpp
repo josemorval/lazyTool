@@ -1963,9 +1963,9 @@ static void execute_shadow_prepass() {
         g_dx.ctx->RSSetViewports(1, &vp);
 
         SceneCBData shadow_cb = scene_cb_backup;
-        memcpy(shadow_cb.shadow_view_proj,
-               scene_cb_backup.shadow_cascade_view_proj[cascade],
-               sizeof(shadow_cb.shadow_view_proj));
+        memcpy(shadow_cb.shadow_world_to_clip,
+               scene_cb_backup.shadow_cascade_world_to_clip[cascade],
+               sizeof(shadow_cb.shadow_world_to_clip));
         dx_update_scene_cb(shadow_cb);
 
         int child_count = cmd_cached_child_count(INVALID_HANDLE);

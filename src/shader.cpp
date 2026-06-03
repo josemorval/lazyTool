@@ -13,16 +13,18 @@ static const char* s_fallback_vs = R"HLSL(
 cbuffer SceneCB : register(b0) {
     float4x4 WorldToView;
     float4x4 ViewToWorld;
-    float4x4 ViewProj;
-    float4x4 InvViewProj;
-    float4x4 PrevViewProj;
-    float4x4 PrevInvViewProj;
+    float4x4 ViewToClip;
+    float4x4 ClipToView;
+    float4x4 PrevWorldToView;
+    float4x4 PrevViewToWorld;
+    float4x4 PrevViewToClip;
+    float4x4 PrevClipToView;
     float4 TimeVec; float4 CameraParams; float4 LightDir; float4 LightColor;
     float4 LightPos; float4 LightParams; float4 ShadowCascadeSplits; float4 ShadowParams;
-    float4x4 ShadowViewProj;
-    float4x4 PrevShadowViewProj;
+    float4x4 ShadowWorldToClip;
+    float4x4 PrevShadowWorldToClip;
     float4 ShadowCascadeRects[4];
-    float4x4 ShadowCascadeViewProj[4];
+    float4x4 ShadowCascadeWorldToClip[4];
 };
 cbuffer ObjectCB : register(b1) { float4x4 LocalToWorld; };
 struct VSIn  { float3 pos : POSITION; float3 nor : NORMAL; float2 uv : TEXCOORD0; };
@@ -31,7 +33,7 @@ VSOut VSMain(VSIn v) {
     VSOut o;
     float4 wpos = mul(LocalToWorld, float4(v.pos, 1.0));
     o.wpos = wpos.xyz;
-    o.pos  = mul(ViewProj, wpos);
+    o.pos  = mul(ViewToClip, mul(WorldToView, wpos));
     o.nor  = normalize(mul(LocalToWorld, float4(v.nor, 0.0)).xyz); o.uv = v.uv;
     return o;
 }
@@ -41,16 +43,18 @@ static const char* s_fallback_ps = R"HLSL(
 cbuffer SceneCB : register(b0) {
     float4x4 WorldToView;
     float4x4 ViewToWorld;
-    float4x4 ViewProj;
-    float4x4 InvViewProj;
-    float4x4 PrevViewProj;
-    float4x4 PrevInvViewProj;
+    float4x4 ViewToClip;
+    float4x4 ClipToView;
+    float4x4 PrevWorldToView;
+    float4x4 PrevViewToWorld;
+    float4x4 PrevViewToClip;
+    float4x4 PrevClipToView;
     float4 TimeVec; float4 CameraParams; float4 LightDir; float4 LightColor;
     float4 LightPos; float4 LightParams; float4 ShadowCascadeSplits; float4 ShadowParams;
-    float4x4 ShadowViewProj;
-    float4x4 PrevShadowViewProj;
+    float4x4 ShadowWorldToClip;
+    float4x4 PrevShadowWorldToClip;
     float4 ShadowCascadeRects[4];
-    float4x4 ShadowCascadeViewProj[4];
+    float4x4 ShadowCascadeWorldToClip[4];
 };
 cbuffer ObjectCB : register(b1) { float4x4 LocalToWorld; };
 struct PSIn { float4 pos : SV_POSITION; float3 nor : NORMAL; float2 uv : TEXCOORD0; float3 wpos : TEXCOORD1; };

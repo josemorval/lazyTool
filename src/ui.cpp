@@ -418,7 +418,8 @@ static bool ui_begin_shortcut_section(const char* id, const char* title, ImGuiTa
 static void ui_draw_shortcut_row(const char* key, const char* desc);
 static void ui_help_marker(const char* desc);
 static Mat4 ui_mat4_from_raw(const float raw[16]);
-static bool ui_project_world_to_screen(const Mat4& view_proj, ImVec2 rect_min, ImVec2 rect_max,
+static Mat4 ui_scene_world_to_clip_matrix();
+static bool ui_project_world_to_screen(const Mat4& world_to_clip, ImVec2 rect_min, ImVec2 rect_max,
                                        Vec3 world, ImVec2* out_screen);
 static void ui_draw_camera_orientation_gizmo(ImVec2 rect_min, ImVec2 rect_max);
 static void ui_draw_viewport_bounds_debug(ImVec2 rect_min, ImVec2 rect_max);
@@ -5274,10 +5275,12 @@ cbuffer SceneCB : register(b0)
 {
     float4x4 WorldToView;
     float4x4 ViewToWorld;
-    float4x4 ViewProj;
-    float4x4 InvViewProj;
-    float4x4 PrevViewProj;
-    float4x4 PrevInvViewProj;
+    float4x4 ViewToClip;
+    float4x4 ClipToView;
+    float4x4 PrevWorldToView;
+    float4x4 PrevViewToWorld;
+    float4x4 PrevViewToClip;
+    float4x4 PrevClipToView;
     float4 TimeVec;              // x=time seconds, y=delta seconds, z=frame index, w=reserved.
     float4 CameraParams;         // x=0 perspective/1 orthographic, y=ortho height, z/w=near/far.
     float4 LightDir;             // xyz=main light direction, w=intensity.
@@ -5286,16 +5289,16 @@ cbuffer SceneCB : register(b0)
     float4 LightParams;          // x=0 directional/1 spot, y/z=spot inner/outer cos, w=range.
     float4 ShadowCascadeSplits;
     float4 ShadowParams;
-    float4x4 ShadowViewProj;
-    float4x4 PrevShadowViewProj;
+    float4x4 ShadowWorldToClip;
+    float4x4 PrevShadowWorldToClip;
     float4 ShadowCascadeRects[4];
-    float4x4 ShadowCascadeViewProj[4];
+    float4x4 ShadowCascadeWorldToClip[4];
 };
 
 )HLSL";
 
 static const char* k_shader_template_object_cb = R"HLSL(// Per-object transform supplied by draw commands in register(b1).
-// Mesh shaders normally multiply POSITION by LocalToWorld and then ViewProj.
+// Mesh shaders normally multiply POSITION by LocalToWorld, then WorldToView, then ViewToClip.
 cbuffer ObjectCB : register(b1)
 {
     float4x4 LocalToWorld;
@@ -5471,7 +5474,7 @@ VSOut VSMain(VSIn v, uint instance_id : SV_InstanceID)
 {
     VSOut o;
     float4 world_pos = mul(LocalToWorld, float4(v.pos, 1.0));
-    o.pos = mul(ViewProj, world_pos);
+    o.pos = mul(ViewToClip, mul(WorldToView, world_pos));
     o.uv = v.uv;
     return o;
 }
@@ -10471,6 +10474,12 @@ static Mat4 ui_mat4_from_raw(const float raw[16]) {
     return m;
 }
 
+static Mat4 ui_scene_world_to_clip_matrix() {
+    Mat4 world_to_view = ui_mat4_from_raw(g_dx.scene_cb_data.world_to_view);
+    Mat4 view_to_clip = ui_mat4_from_raw(g_dx.scene_cb_data.view_to_clip);
+    return mat4_mul(world_to_view, view_to_clip);
+}
+
 static Vec3 ui_gizmo_axis_dir_from_rotation(const Mat4& rot, int axis) {
     switch (axis) {
     case 0: return v3_norm(v3(rot.m[0], rot.m[1], rot.m[2]));
@@ -10486,7 +10495,7 @@ static void ui_mul_world_point(const Mat4& m, Vec3 p, float* x, float* y, float*
     if (w) *w = p.x * m.m[3] + p.y * m.m[7] + p.z * m.m[11] + m.m[15];
 }
 
-static bool ui_project_world_to_screen(const Mat4& view_proj, ImVec2 rect_min, ImVec2 rect_max,
+static bool ui_project_world_to_screen(const Mat4& world_to_clip, ImVec2 rect_min, ImVec2 rect_max,
                                        Vec3 world, ImVec2* out_screen)
 {
     float clip_x = 0.0f, clip_y = 0.0f, clip_z = 0.0f, clip_w = 0.0f;
@@ -10497,7 +10506,7 @@ static bool ui_project_world_to_screen(const Mat4& view_proj, ImVec2 rect_min, I
     if (!out_screen || w <= 1.0f || h <= 1.0f)
         return false;
 
-    ui_mul_world_point(view_proj, world, &clip_x, &clip_y, &clip_z, &clip_w);
+    ui_mul_world_point(world_to_clip, world, &clip_x, &clip_y, &clip_z, &clip_w);
     if (clip_w <= 0.0001f)
         return false;
 
@@ -10648,7 +10657,7 @@ static void ui_gizmo_rotation_plane_basis(Vec3 axis_world[3], int axis, Vec3* ou
     }
 }
 
-static int ui_project_rotation_ring(const Mat4& view_proj, ImVec2 rect_min, ImVec2 rect_max,
+static int ui_project_rotation_ring(const Mat4& world_to_clip, ImVec2 rect_min, ImVec2 rect_max,
                                     Vec3 origin, Vec3 basis_u, Vec3 basis_v, float radius,
                                     ImVec2* out_pts, int max_pts)
 {
@@ -10663,7 +10672,7 @@ static int ui_project_rotation_ring(const Mat4& view_proj, ImVec2 rect_min, ImVe
             v3_add(origin,
                    v3_add(v3_scale(basis_u, cosf(t) * radius),
                           v3_scale(basis_v, sinf(t) * radius)));
-        if (!ui_project_world_to_screen(view_proj, rect_min, rect_max, world_pt, &out_pts[count]))
+        if (!ui_project_world_to_screen(world_to_clip, rect_min, rect_max, world_pt, &out_pts[count]))
             return 0;
         count++;
     }
@@ -10737,7 +10746,7 @@ static void ui_handle_viewport_gizmo_hotkeys(bool hovered) {
 
 static void ui_draw_viewport_gizmo(ImVec2 rect_min, ImVec2 rect_max, bool hovered) {
     Command* c = ui_selected_gizmo_command();
-    Mat4 view_proj = {};
+    Mat4 world_to_clip = {};
     Mat4 rot = {};
     ImDrawList* dl = ImGui::GetWindowDrawList();
     Vec3 origin_world = {};
@@ -10760,7 +10769,7 @@ static void ui_draw_viewport_gizmo(ImVec2 rect_min, ImVec2 rect_max, bool hovere
     }
 
     origin_world = v3(c->pos[0], c->pos[1], c->pos[2]);
-    view_proj = ui_mat4_from_raw(g_dx.scene_cb_data.view_proj);
+    world_to_clip = ui_scene_world_to_clip_matrix();
     rot = mat4_rotation_quat(quat_from_array(c->rotq));
     axis_world[0] = ui_gizmo_axis_dir_from_rotation(rot, 0);
     axis_world[1] = ui_gizmo_axis_dir_from_rotation(rot, 1);
@@ -10768,14 +10777,14 @@ static void ui_draw_viewport_gizmo(ImVec2 rect_min, ImVec2 rect_max, bool hovere
     axis_world_len = ui_viewport_gizmo_world_axis_len(origin_world, rect_max.y - rect_min.y);
     ring_world_radius = axis_world_len * 0.82f;
 
-    if (!ui_project_world_to_screen(view_proj, rect_min, rect_max, origin_world, &origin_screen)) {
+    if (!ui_project_world_to_screen(world_to_clip, rect_min, rect_max, origin_world, &origin_screen)) {
         ui_cancel_viewport_gizmo_drag();
         return;
     }
 
     for (int axis = 0; axis < 3; axis++) {
         Vec3 axis_tip_world = v3_add(origin_world, v3_scale(axis_world[axis], axis_world_len));
-        if (!ui_project_world_to_screen(view_proj, rect_min, rect_max, axis_tip_world, &axis_end[axis]))
+        if (!ui_project_world_to_screen(world_to_clip, rect_min, rect_max, axis_tip_world, &axis_end[axis]))
             axis_end[axis] = origin_screen;
         axis_screen_len[axis] = ui_imvec2_len(ui_imvec2_sub(axis_end[axis], origin_screen));
         if (s_viewport_gizmo_mode == UI_GIZMO_ROTATE) {
@@ -10783,7 +10792,7 @@ static void ui_draw_viewport_gizmo(ImVec2 rect_min, ImVec2 rect_max, bool hovere
             Vec3 ring_v = {};
             ui_gizmo_rotation_plane_basis(axis_world, axis, &ring_u, &ring_v);
             ring_count[axis] = ui_project_rotation_ring(
-                view_proj, rect_min, rect_max, origin_world, ring_u, ring_v,
+                world_to_clip, rect_min, rect_max, origin_world, ring_u, ring_v,
                 ring_world_radius, ring_pts[axis],
                 (int)(sizeof(ring_pts[axis]) / sizeof(ring_pts[axis][0])));
         }
@@ -10844,11 +10853,11 @@ static void ui_draw_viewport_gizmo(ImVec2 rect_min, ImVec2 rect_max, bool hovere
                 ImVec2 ring_v_screen = origin_screen;
                 ui_gizmo_rotation_plane_basis(axis_world, hovered_axis, &ring_u, &ring_v);
                 ui_project_world_to_screen(
-                    view_proj, rect_min, rect_max,
+                    world_to_clip, rect_min, rect_max,
                     v3_add(origin_world, v3_scale(ring_u, ring_world_radius)),
                     &ring_u_screen);
                 ui_project_world_to_screen(
-                    view_proj, rect_min, rect_max,
+                    world_to_clip, rect_min, rect_max,
                     v3_add(origin_world, v3_scale(ring_v, ring_world_radius)),
                     &ring_v_screen);
                 s_viewport_gizmo_drag.ring_basis_u_screen = ui_imvec2_sub(ring_u_screen, origin_screen);
@@ -11119,7 +11128,7 @@ static void ui_draw_command_bounds_inspector(Command* c, CmdHandle h) {
         ui_draw_bounds_values("World bounds", wmin, wmax);
 }
 
-static void ui_draw_projected_bounds_box(ImDrawList* dl, const Mat4& view_proj,
+static void ui_draw_projected_bounds_box(ImDrawList* dl, const Mat4& world_to_clip,
                                          ImVec2 rect_min, ImVec2 rect_max,
                                          const float bmin[3], const float bmax[3],
                                          ImU32 line_col, ImU32 fill_col)
@@ -11136,7 +11145,7 @@ static void ui_draw_projected_bounds_box(ImDrawList* dl, const Mat4& view_proj,
     ImVec2 pts[8] = {};
     bool ok[8] = {};
     for (int i = 0; i < 8; i++)
-        ok[i] = ui_project_world_to_screen(view_proj, rect_min, rect_max, corners[i], &pts[i]);
+        ok[i] = ui_project_world_to_screen(world_to_clip, rect_min, rect_max, corners[i], &pts[i]);
 
     const int faces[6][4] = {
         {0,1,2,3}, {4,5,6,7}, {0,1,5,4}, {2,3,7,6}, {1,2,6,5}, {0,3,7,4}
@@ -11166,7 +11175,7 @@ static void ui_draw_viewport_bounds_debug(ImVec2 rect_min, ImVec2 rect_max) {
     if (!g_dx.scene_bounds_debug_enabled)
         return;
 
-    Mat4 view_proj = ui_mat4_from_raw(g_dx.scene_cb_data.view_proj);
+    Mat4 world_to_clip = ui_scene_world_to_clip_matrix();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImU32 selected_line = ImGui::GetColorU32(ImVec4(1.0f, 0.68f, 0.24f, 0.95f));
     ImU32 selected_fill = ImGui::GetColorU32(ImVec4(1.0f, 0.55f, 0.18f, 0.055f));
@@ -11185,7 +11194,7 @@ static void ui_draw_viewport_bounds_debug(ImVec2 rect_min, ImVec2 rect_max) {
         if (!cmd_compute_world_bounds(h, bmin, bmax))
             continue;
         bool selected = h == g_sel_cmd;
-        ui_draw_projected_bounds_box(dl, view_proj, rect_min, rect_max, bmin, bmax,
+        ui_draw_projected_bounds_box(dl, world_to_clip, rect_min, rect_max, bmin, bmax,
                                      selected ? selected_line : normal_line,
                                      selected ? selected_fill : normal_fill);
     }
@@ -11197,7 +11206,7 @@ static void ui_draw_viewport_light_debug(ImVec2 rect_min, ImVec2 rect_max) {
     if (!light || !light->light_debug_draw)
         return;
 
-    Mat4 view_proj = ui_mat4_from_raw(g_dx.scene_cb_data.view_proj);
+    Mat4 world_to_clip = ui_scene_world_to_clip_matrix();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImU32 line_col = ImGui::GetColorU32(ImVec4(1.0f, 0.78f, 0.22f, 0.95f));
     ImU32 soft_col = ImGui::GetColorU32(ImVec4(1.0f, 0.58f, 0.18f, 0.58f));
@@ -11217,8 +11226,8 @@ static void ui_draw_viewport_light_debug(ImVec2 rect_min, ImVec2 rect_max) {
 
     ImVec2 pos_s = {};
     ImVec2 tip_s = {};
-    bool pos_ok = ui_project_world_to_screen(view_proj, rect_min, rect_max, pos, &pos_s);
-    bool tip_ok = ui_project_world_to_screen(view_proj, rect_min, rect_max, tip, &tip_s);
+    bool pos_ok = ui_project_world_to_screen(world_to_clip, rect_min, rect_max, pos, &pos_s);
+    bool tip_ok = ui_project_world_to_screen(world_to_clip, rect_min, rect_max, tip, &tip_s);
     if (pos_ok) {
         dl->AddCircleFilled(pos_s, ui_px(4.0f), line_col, 18);
         dl->AddCircle(pos_s, ui_px(7.0f), line_col, 24, ui_px(1.4f));
@@ -11243,7 +11252,7 @@ static void ui_draw_viewport_light_debug(ImVec2 rect_min, ImVec2 rect_max) {
         Vec3 p = v3_add(center,
                         v3_add(v3_scale(right, cosf(a) * radius),
                                v3_scale(up, sinf(a) * radius)));
-        ring_ok[i] = ui_project_world_to_screen(view_proj, rect_min, rect_max, p, &ring[i]);
+        ring_ok[i] = ui_project_world_to_screen(world_to_clip, rect_min, rect_max, p, &ring[i]);
     }
     for (int i = 0; i < segments; i++) {
         int j = (i + 1) % segments;
@@ -12931,9 +12940,12 @@ static void ui_draw_help_common_tab() {
         ui_draw_common_function_row("float3 lt_ray_from_camera_ws(float3 world_pos)", "world_pos: position in world space.", "Direction from the camera through a world point.");
         ui_draw_common_function_row("float4 lt_object_to_world(float3 object_pos)", "object_pos: local/object position.", "Transforms local position with ObjectCB.LocalToWorld.");
         ui_draw_common_function_row("float3 lt_object_normal_to_world(float3 object_normal)", "object_normal: local/object normal.", "Transforms and normalizes a local normal.");
-        ui_draw_common_function_row("float4 lt_world_to_clip(float3 world_pos)", "world_pos: position in world space.", "Projects a world point with SceneCB.ViewProj.");
+        ui_draw_common_function_row("float4 lt_world_to_clip(float3 world_pos)", "world_pos: position in world space.", "Projects a world point using WorldToView, then ViewToClip.");
         ui_draw_common_function_row("float4 lt_world_to_view(float3 world_pos)", "world_pos: position in world space.", "Transforms a world point with SceneCB.WorldToView.");
+        ui_draw_common_function_row("float4 lt_view_to_clip(float3 view_pos)", "view_pos: camera/view-space position.", "Projects a view-space point with SceneCB.ViewToClip.");
+        ui_draw_common_function_row("float4 lt_clip_to_view(float4 clip_pos)", "clip_pos: homogeneous clip position.", "Transforms clip position with SceneCB.ClipToView.");
         ui_draw_common_function_row("float4 lt_view_to_world(float3 view_pos)", "view_pos: camera/view-space position.", "Transforms a view-space point with SceneCB.ViewToWorld.");
+        ui_draw_common_function_row("float4 lt_prev_clip_from_world(float3 world_pos)", "world_pos: current world-space position.", "Projects to previous-frame clip using PrevWorldToView and PrevViewToClip.");
         ui_draw_common_function_row("float3 lt_clip_to_ndc(float4 clip_pos)", "clip_pos: homogeneous clip position.", "Divides xyz by w.");
         ui_draw_common_function_row("float2 lt_ndc_to_uv(float2 ndc)", "ndc: xy in -1..1 clip space.", "Converts NDC to texture UV with D3D y flip.");
         ui_draw_common_function_row("float2 lt_clip_to_uv(float4 clip_pos)", "clip_pos: homogeneous clip position.", "Projects clip space directly to UV.");
@@ -12947,7 +12959,8 @@ static void ui_draw_help_common_tab() {
         ImGui::TableSetupColumn("Use", ImGuiTableColumnFlags_WidthStretch, 1.35f);
         ImGui::TableHeadersRow();
         ui_draw_common_function_row("float4 lt_uv_depth_to_clip(float2 uv, float depth01)", "uv: texture coordinates. depth01: hardware depth.", "Builds D3D clip position for reconstruction.");
-        ui_draw_common_function_row("float3 lt_scene_depth_to_world(float2 uv, float depth01)", "uv: texture coordinates. depth01: sampled scene depth.", "Reconstructs world position using InvViewProj.");
+        ui_draw_common_function_row("float3 lt_scene_depth_to_world(float2 uv, float depth01)", "uv: texture coordinates. depth01: sampled scene depth.", "Reconstructs world position using ClipToView and ViewToWorld.");
+        ui_draw_common_function_row("float3 lt_prev_scene_depth_to_world(float2 uv, float depth01)", "uv: texture coordinates. depth01: sampled scene depth.", "Reconstructs previous-frame world position using PrevClipToView and PrevViewToWorld.");
         ui_draw_common_function_row("float lt_view_depth_from_world(float3 world_pos)", "world_pos: position in world space.", "Signed camera-forward distance.");
         ui_draw_common_function_row("float lt_scene_depth_to_view_depth(float2 uv, float depth01)", "uv/depth01: sampled depth pixel.", "Reconstructs world and returns view depth.");
         ui_draw_common_function_row("float lt_depth01_to_view_depth(float depth01)", "depth01: D3D hardware depth.", "Linear depth using camera near/far; supports perspective and orthographic.");

@@ -34,10 +34,12 @@ cbuffer SceneCB : register(b0)
 {
     float4x4 WorldToView;
     float4x4 ViewToWorld;
-    float4x4 ViewProj;
-    float4x4 InvViewProj;
-    float4x4 PrevViewProj;
-    float4x4 PrevInvViewProj;
+    float4x4 ViewToClip;
+    float4x4 ClipToView;
+    float4x4 PrevWorldToView;
+    float4x4 PrevViewToWorld;
+    float4x4 PrevViewToClip;
+    float4x4 PrevClipToView;
     float4 TimeVec;
     float4 CameraParams;
     float4 LightDir;
@@ -46,10 +48,10 @@ cbuffer SceneCB : register(b0)
     float4 LightParams;
     float4 ShadowCascadeSplits;
     float4 ShadowParams;
-    float4x4 ShadowViewProj;
-    float4x4 PrevShadowViewProj;
+    float4x4 ShadowWorldToClip;
+    float4x4 PrevShadowWorldToClip;
     float4 ShadowCascadeRects[4];
-    float4x4 ShadowCascadeViewProj[4];
+    float4x4 ShadowCascadeWorldToClip[4];
 };
 cbuffer ObjectCB : register(b1)
 {
@@ -69,7 +71,7 @@ struct VSOut {
 VSOut VSMain(VSIn v) {
     VSOut o;
     float4 wpos = mul(LocalToWorld, float4(v.pos, 1.0));
-    o.pos = mul(ShadowViewProj, wpos);
+    o.pos = mul(ShadowWorldToClip, wpos);
     return o;
 }
 )HLSL";
@@ -125,10 +127,12 @@ cbuffer SceneCB : register(b0)
 {
     float4x4 WorldToView;
     float4x4 ViewToWorld;
-    float4x4 ViewProj;
-    float4x4 InvViewProj;
-    float4x4 PrevViewProj;
-    float4x4 PrevInvViewProj;
+    float4x4 ViewToClip;
+    float4x4 ClipToView;
+    float4x4 PrevWorldToView;
+    float4x4 PrevViewToWorld;
+    float4x4 PrevViewToClip;
+    float4x4 PrevClipToView;
     float4 TimeVec;
     float4 CameraParams;
     float4 LightDir;
@@ -137,10 +141,10 @@ cbuffer SceneCB : register(b0)
     float4 LightParams;
     float4 ShadowCascadeSplits;
     float4 ShadowParams;
-    float4x4 ShadowViewProj;
-    float4x4 PrevShadowViewProj;
+    float4x4 ShadowWorldToClip;
+    float4x4 PrevShadowWorldToClip;
     float4 ShadowCascadeRects[4];
-    float4x4 ShadowCascadeViewProj[4];
+    float4x4 ShadowCascadeWorldToClip[4];
 };
 
 struct VSIn {
@@ -156,7 +160,7 @@ struct VSOut {
 
 VSOut VSMain(VSIn v) {
     VSOut o;
-    o.pos = mul(ViewProj, float4(v.pos, 1.0));
+    o.pos = mul(ViewToClip, mul(WorldToView, float4(v.pos, 1.0)));
     o.alpha = v.alpha;
     o.world = v.pos;
     return o;

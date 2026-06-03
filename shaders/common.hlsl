@@ -10,12 +10,14 @@ cbuffer SceneCB : register(b0)
     // Camera transforms.
     float4x4 WorldToView;
     float4x4 ViewToWorld;
-    float4x4 ViewProj;
-    float4x4 InvViewProj;
+    float4x4 ViewToClip;
+    float4x4 ClipToView;
 
-    // Previous-frame camera transforms, useful for velocity/motion vectors.
-    float4x4 PrevViewProj;
-    float4x4 PrevInvViewProj;
+    // Previous-frame camera transforms, useful for reprojection and motion vectors.
+    float4x4 PrevWorldToView;
+    float4x4 PrevViewToWorld;
+    float4x4 PrevViewToClip;
+    float4x4 PrevClipToView;
 
     float4 TimeVec;       // x = time, y = dt, z = frame
     float4 CameraParams;  // x = 0 perspective, 1 orthographic; y = ortho height; z/w = near/far
@@ -30,10 +32,10 @@ cbuffer SceneCB : register(b0)
     // Shadow data. Directional lights can use cascades; spot lights use index 0.
     float4 ShadowCascadeSplits;
     float4 ShadowParams;  // x = cascade count, y = camera near, z = camera far
-    float4x4 ShadowViewProj;
-    float4x4 PrevShadowViewProj;
+    float4x4 ShadowWorldToClip;
+    float4x4 PrevShadowWorldToClip;
     float4 ShadowCascadeRects[LT_MAX_SHADOW_CASCADES];      // reserved cascade UV rects
-    float4x4 ShadowCascadeViewProj[LT_MAX_SHADOW_CASCADES];
+    float4x4 ShadowCascadeWorldToClip[LT_MAX_SHADOW_CASCADES];
 };
 
 // Per-object transform written by draw commands. Procedural draws still receive
@@ -130,10 +132,40 @@ float3 lt_object_normal_to_world(float3 object_normal)
     return lt_safe_normalize(mul(LocalToWorld, float4(object_normal, 0.0)).xyz);
 }
 
+// View position to clip space.
+float4 lt_view_to_clip(float3 view_pos)
+{
+    return mul(ViewToClip, float4(view_pos, 1.0));
+}
+
+// Clip-space position back to camera/view space.
+float4 lt_clip_to_view(float4 clip_pos)
+{
+    return mul(ClipToView, clip_pos);
+}
+
+// Previous-frame view position to clip space.
+float4 lt_prev_view_to_clip(float3 view_pos)
+{
+    return mul(PrevViewToClip, float4(view_pos, 1.0));
+}
+
+// Previous-frame clip-space position back to camera/view space.
+float4 lt_prev_clip_to_view(float4 clip_pos)
+{
+    return mul(PrevClipToView, clip_pos);
+}
+
+// Previous-frame camera/view position back to world space.
+float4 lt_prev_view_to_world(float3 view_pos)
+{
+    return mul(PrevViewToWorld, float4(view_pos, 1.0));
+}
+
 // World position to clip space for SV_POSITION.
 float4 lt_world_to_clip(float3 world_pos)
 {
-    return mul(ViewProj, float4(world_pos, 1.0));
+    return mul(ViewToClip, mul(WorldToView, float4(world_pos, 1.0)));
 }
 
 // World position to camera/view space.
@@ -176,7 +208,14 @@ float4 lt_uv_depth_to_clip(float2 uv, float depth01)
 // Reconstruct world position from screen UV and hardware depth.
 float3 lt_scene_depth_to_world(float2 uv, float depth01)
 {
-    float4 world = mul(InvViewProj, lt_uv_depth_to_clip(uv, depth01));
+    float4 world = mul(ViewToWorld, mul(ClipToView, lt_uv_depth_to_clip(uv, depth01)));
+    return world.xyz / max(abs(world.w), LT_EPS);
+}
+
+// Reconstruct previous-frame world position from screen UV and hardware depth.
+float3 lt_prev_scene_depth_to_world(float2 uv, float depth01)
+{
+    float4 world = mul(PrevViewToWorld, mul(PrevClipToView, lt_uv_depth_to_clip(uv, depth01)));
     return world.xyz / max(abs(world.w), LT_EPS);
 }
 
@@ -197,8 +236,8 @@ float lt_scene_depth_to_view_depth(float2 uv, float depth01)
 // Hardware depth [0, 1] to linear view depth using the active camera mode.
 float lt_depth01_to_view_depth(float depth01)
 {
-    float near_z = max(ShadowParams.y, LT_EPS);
-    float far_z = max(ShadowParams.z, near_z + LT_EPS);
+    float near_z = max(CameraParams.z, LT_EPS);
+    float far_z = max(CameraParams.w, near_z + LT_EPS);
     if (CameraParams.x >= 0.5)
         return lerp(near_z, far_z, saturate(depth01));
     return (near_z * far_z) / max(far_z - depth01 * (far_z - near_z), LT_EPS);
@@ -207,8 +246,8 @@ float lt_depth01_to_view_depth(float depth01)
 // Linear view depth back to hardware depth [0, 1].
 float lt_view_depth_to_depth01(float view_depth)
 {
-    float near_z = max(ShadowParams.y, LT_EPS);
-    float far_z = max(ShadowParams.z, near_z + LT_EPS);
+    float near_z = max(CameraParams.z, LT_EPS);
+    float far_z = max(CameraParams.w, near_z + LT_EPS);
     if (CameraParams.x >= 0.5)
         return saturate((view_depth - near_z) / max(far_z - near_z, LT_EPS));
     return saturate((far_z * (view_depth - near_z)) / max(view_depth * (far_z - near_z), LT_EPS));
@@ -244,10 +283,16 @@ float3 lt_decode_normal_rgb(float4 enc)
     return lt_safe_normalize(enc.xyz * 2.0 - 1.0);
 }
 
+// Previous-frame view space for temporal effects.
+float4 lt_prev_world_to_view(float3 world_pos)
+{
+    return mul(PrevWorldToView, float4(world_pos, 1.0));
+}
+
 // Previous-frame clip space for temporal effects.
 float4 lt_prev_clip_from_world(float3 world_pos)
 {
-    return mul(PrevViewProj, float4(world_pos, 1.0));
+    return mul(PrevViewToClip, lt_prev_world_to_view(world_pos));
 }
 
 // Current-minus-previous UV motion vector for a world-space point.
@@ -284,7 +329,7 @@ int lt_select_shadow_cascade(float3 world_pos)
 // World position to shadow clip space for one cascade.
 float4 lt_shadow_clip(int cascade_index, float3 world_pos)
 {
-    return mul(ShadowCascadeViewProj[cascade_index], float4(world_pos, 1.0));
+    return mul(ShadowCascadeWorldToClip[cascade_index], float4(world_pos, 1.0));
 }
 
 // World position to shadow NDC for one cascade.

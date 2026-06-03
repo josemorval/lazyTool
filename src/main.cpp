@@ -2029,8 +2029,7 @@ static void update_builtins_and_scene_cb() {
     Mat4 proj = camera_projection == CAMERA_PROJECTION_ORTHOGRAPHIC ?
                 mat4_orthographic(ortho_height * aspect, ortho_height, g_camera.near_z, g_camera.far_z) :
                 mat4_perspective(g_camera.fov_y, aspect, g_camera.near_z, g_camera.far_z);
-    Mat4 vp   = mat4_mul(view, proj);
-    Mat4 inv_vp = mat4_inverse(vp);
+    Mat4 clip_to_view = mat4_inverse(proj);
 
     // CPU matrices are stored as row-major row-vector transforms.
     // HLSL shaders use default column-major matrices with mul(M, v).
@@ -2039,14 +2038,18 @@ static void update_builtins_and_scene_cb() {
     SceneCBData cb = {};
     memcpy(cb.world_to_view, view.m, sizeof(view.m));
     memcpy(cb.view_to_world, inv_view.m, sizeof(inv_view.m));
-    memcpy(cb.view_proj, vp.m, sizeof(vp.m));
-    memcpy(cb.inv_view_proj, inv_vp.m, sizeof(inv_vp.m));
+    memcpy(cb.view_to_clip, proj.m, sizeof(proj.m));
+    memcpy(cb.clip_to_view, clip_to_view.m, sizeof(clip_to_view.m));
     if (g_dx.scene_cb_history_valid) {
-        memcpy(cb.prev_view_proj, g_dx.scene_cb_data.view_proj, sizeof(cb.prev_view_proj));
-        memcpy(cb.prev_inv_view_proj, g_dx.scene_cb_data.inv_view_proj, sizeof(cb.prev_inv_view_proj));
+        memcpy(cb.prev_world_to_view, g_dx.scene_cb_data.world_to_view, sizeof(cb.prev_world_to_view));
+        memcpy(cb.prev_view_to_world, g_dx.scene_cb_data.view_to_world, sizeof(cb.prev_view_to_world));
+        memcpy(cb.prev_view_to_clip, g_dx.scene_cb_data.view_to_clip, sizeof(cb.prev_view_to_clip));
+        memcpy(cb.prev_clip_to_view, g_dx.scene_cb_data.clip_to_view, sizeof(cb.prev_clip_to_view));
     } else {
-        memcpy(cb.prev_view_proj, vp.m, sizeof(vp.m));
-        memcpy(cb.prev_inv_view_proj, inv_vp.m, sizeof(inv_vp.m));
+        memcpy(cb.prev_world_to_view, view.m, sizeof(view.m));
+        memcpy(cb.prev_view_to_world, inv_view.m, sizeof(inv_view.m));
+        memcpy(cb.prev_view_to_clip, proj.m, sizeof(proj.m));
+        memcpy(cb.prev_clip_to_view, clip_to_view.m, sizeof(clip_to_view.m));
     }
     cb.time_vec[0] = g_time;
     cb.time_vec[1] = g_dt;
@@ -2119,7 +2122,7 @@ static void update_builtins_and_scene_cb() {
     Mat4 shadow_proj = light_type == LIGHT_TYPE_SPOT ?
         mat4_perspective(spot_outer, g_dx.shadow_height > 0 ? (float)g_dx.shadow_width / g_dx.shadow_height : 1.0f, shadow_near, shadow_far) :
         mat4_orthographic(shadow_w, shadow_h, shadow_near, shadow_far);
-    Mat4 shadow_vp = mat4_mul(shadow_view, shadow_proj);
+    Mat4 shadow_world_to_clip = mat4_mul(shadow_view, shadow_proj);
 
     cb.light_pos[0] = light_pos.x;
     cb.light_pos[1] = light_pos.y;
@@ -2135,7 +2138,7 @@ static void update_builtins_and_scene_cb() {
         cb.shadow_cascade_rects[i][1] = 0.0f;
         cb.shadow_cascade_rects[i][2] = 0.0f;
         cb.shadow_cascade_rects[i][3] = 0.0f;
-        memcpy(cb.shadow_cascade_view_proj[i], shadow_vp.m, sizeof(shadow_vp.m));
+        memcpy(cb.shadow_cascade_world_to_clip[i], shadow_world_to_clip.m, sizeof(shadow_world_to_clip.m));
     }
 
     int cascade_count = light_type == LIGHT_TYPE_SPOT ? 1 : (dl ? dl->shadow_cascade_count : 1);
@@ -2167,29 +2170,29 @@ static void update_builtins_and_scene_cb() {
             float cascade_extent_y = dl ? dl->shadow_cascade_extent[cascade][1] : shadow_h;
             float cascade_near = dl ? dl->shadow_cascade_near[cascade] : shadow_near;
             float cascade_far = dl ? dl->shadow_cascade_far[cascade] : shadow_far;
-            Mat4 cascade_vp = shadow_build_manual_cascade_matrix(
+            Mat4 cascade_world_to_clip = shadow_build_manual_cascade_matrix(
                 shadow_view,
                 cascade_extent_x, cascade_extent_y,
                 cascade_near, cascade_far);
             shadow_array_rect_for_cascade(cb.shadow_cascade_rects[cascade]);
-            memcpy(cb.shadow_cascade_view_proj[cascade], cascade_vp.m, sizeof(cascade_vp.m));
+            memcpy(cb.shadow_cascade_world_to_clip[cascade], cascade_world_to_clip.m, sizeof(cascade_world_to_clip.m));
             cb.shadow_cascade_splits[cascade] = slice_far;
             prev_split = slice_far;
             if (cascade == 0)
-                memcpy(cb.shadow_view_proj, cascade_vp.m, sizeof(cascade_vp.m));
+                memcpy(cb.shadow_world_to_clip, cascade_world_to_clip.m, sizeof(cascade_world_to_clip.m));
         }
         cb.shadow_params[2] = cb.shadow_cascade_splits[cascade_count - 1];
     } else {
         shadow_array_rect_for_cascade(cb.shadow_cascade_rects[0]);
-        memcpy(cb.shadow_view_proj, shadow_vp.m, sizeof(shadow_vp.m));
-        memcpy(cb.shadow_cascade_view_proj[0], shadow_vp.m, sizeof(shadow_vp.m));
+        memcpy(cb.shadow_world_to_clip, shadow_world_to_clip.m, sizeof(shadow_world_to_clip.m));
+        memcpy(cb.shadow_cascade_world_to_clip[0], shadow_world_to_clip.m, sizeof(shadow_world_to_clip.m));
         cb.shadow_cascade_splits[0] = shadow_far;
     }
 
     if (g_dx.scene_cb_history_valid)
-        memcpy(cb.prev_shadow_view_proj, g_dx.scene_cb_data.shadow_view_proj, sizeof(cb.prev_shadow_view_proj));
+        memcpy(cb.prev_shadow_world_to_clip, g_dx.scene_cb_data.shadow_world_to_clip, sizeof(cb.prev_shadow_world_to_clip));
     else
-        memcpy(cb.prev_shadow_view_proj, cb.shadow_view_proj, sizeof(cb.prev_shadow_view_proj));
+        memcpy(cb.prev_shadow_world_to_clip, cb.shadow_world_to_clip, sizeof(cb.prev_shadow_world_to_clip));
 
     dx_update_scene_cb(cb);
 }
