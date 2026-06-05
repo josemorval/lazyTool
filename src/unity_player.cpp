@@ -16,4 +16,5 @@ extern "C" __declspec(dllexport) const char LazyToolPlayerStubMarker[] = "LAZYTO
 #include "embedded_pack.cpp"
 #include "timeline.cpp"
 #include "user_cb.cpp"
+#include "audio.cpp"
 #include "main.cpp"

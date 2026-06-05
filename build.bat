@@ -67,7 +67,7 @@ call :stamp STEP_START "Clean"
 
 set "INCLUDES=/I""%ROOT%\src"" /I""%ROOT%\bin\generated"" /I""%ROOT%\external"" /I""%ROOT%\external\imgui"" /I""%ROOT%\external\imgui\backends"" /I""%ROOT%\external\cgltf"" /I""%ROOT%\external\stb"""
 set "DEFINES=/DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /DLAZYTOOL_UNITY_BUILD"
-set "LIBS=d3d11.lib dxgi.lib d3dcompiler.lib user32.lib gdi32.lib shell32.lib psapi.lib"
+set "LIBS=d3d11.lib dxgi.lib d3dcompiler.lib user32.lib gdi32.lib shell32.lib psapi.lib winmm.lib"
 set "COMMON=/nologo /std:c++17 /EHsc /W3 /MT /DNDEBUG"
 
 if /I "%CONFIG%"=="release" (

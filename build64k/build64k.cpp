@@ -323,6 +323,7 @@ enum ResKind {
     RK_MESH_FILE,
     RK_SHADER_VSPS,
     RK_SHADER_CS,
+    RK_SHADER_AUDIO,
     RK_TEXTURE,
     RK_RT,
     RK_RT3D,
@@ -559,6 +560,12 @@ struct Project {
     bool export_escape_close = true;
     bool export_vsync = false;
     bool export_show_fps_title = false;
+    bool audio_enabled = false;
+    std::string audio_shader;
+    int audio_sample_rate = 48000;
+    float audio_duration_seconds = 60.0f;
+    float audio_master_volume = 0.35f;
+    bool audio_loop = false;
     std::vector<TimelineClipDef> timelines;
 };
 
@@ -609,6 +616,7 @@ static Project parse_lt(const std::string& lt_path) {
     TimelineClipDef* cur_timeline = nullptr;
     TimelineTrackDef* cur_track = nullptr;
     bool saw_export_settings = false;
+    bool saw_audio_settings = false;
     bool saw_timeline_global = false;
     std::istringstream in(text);
     std::string line;
@@ -628,6 +636,20 @@ static Project parse_lt(const std::string& lt_path) {
             p.export_escape_close = toki(t,4,1) != 0;
             p.export_vsync = toki(t,5,0) != 0;
             p.export_show_fps_title = toki(t,6,0) != 0;
+        } else if (tag == "audio_settings") {
+            if (t.size() != 7)
+                die("lt audio_settings must use current format");
+            saw_audio_settings = true;
+            p.audio_enabled = toki(t,1,0) != 0;
+            p.audio_shader = ref_name(t[2]);
+            p.audio_sample_rate = std::max(8000, std::min(192000, toki(t,3,48000)));
+            p.audio_duration_seconds = tokf(t,4,60.0f);
+            if (p.audio_duration_seconds < 1.0f) p.audio_duration_seconds = 1.0f;
+            if (p.audio_duration_seconds > 3600.0f) p.audio_duration_seconds = 3600.0f;
+            p.audio_master_volume = tokf(t,5,0.35f);
+            if (p.audio_master_volume < 0.0f) p.audio_master_volume = 0.0f;
+            if (p.audio_master_volume > 1.0f) p.audio_master_volume = 1.0f;
+            p.audio_loop = toki(t,6,0) != 0;
         } else if (tag == "camera_fps") {
             if (t.size() != 12)
                 die("camera_fps must use the current 11-value format");
@@ -653,6 +675,8 @@ static Project parse_lt(const std::string& lt_path) {
                 r.kind = RK_SHADER_VSPS; r.name = t[2]; r.path = t.size() > 3 ? t[3] : "";
             } else if (kind == "shader_cs") {
                 r.kind = RK_SHADER_CS; r.name = t[2]; r.path = t.size() > 3 ? t[3] : "";
+            } else if (kind == "audio_shader") {
+                r.kind = RK_SHADER_AUDIO; r.name = t[2]; r.path = t.size() > 3 ? t[3] : "";
             } else if (kind == "texture2d") {
                 r.kind = RK_TEXTURE; r.name = t[2]; r.path = t.size() > 3 ? t[3] : "";
             } else if (kind == "gaussian_splat") {
@@ -872,6 +896,8 @@ static Project parse_lt(const std::string& lt_path) {
 
     if (!saw_export_settings)
         die("lt is missing export_settings; save it with the current editor first");
+    if (!saw_audio_settings)
+        die("lt is missing audio_settings; save it with the current editor first");
     if (!saw_timeline_global || p.timelines.empty())
         die("lt is missing current timeline_global/timeline_clip data; save it with the current editor first");
 
@@ -1284,7 +1310,9 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     std::vector<int> buffer_res_indices;
     for (size_t i = 0; i < p.resources.size(); i++) {
         const ResourceDef& r = p.resources[i];
-        if (r.kind == RK_SHADER_VSPS || r.kind == RK_SHADER_CS) {
+        bool selected_audio_shader = p.audio_enabled && r.kind == RK_SHADER_AUDIO && r.name == p.audio_shader;
+        if (r.kind == RK_SHADER_VSPS || r.kind == RK_SHADER_CS ||
+            selected_audio_shader) {
             std::string sp = find_file_for_path(r.path, roots);
             if (sp.empty()) die("cannot find shader '%s' for resource '%s'", r.path.c_str(), r.name.c_str());
             std::string raw_src = expand_hlsl_includes(sp, roots);
@@ -1295,7 +1323,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
             std::string min_src = LT64K_MINIFY_HLSL ? minify_hlsl_for_64k(raw_src) : raw_src;
             shader_res_indices.push_back((int)i);
             shader_names.push_back(r.name);
-            shader_is_cs.push_back(r.kind == RK_SHADER_CS ? 1 : 0);
+            shader_is_cs.push_back((r.kind == RK_SHADER_CS || r.kind == RK_SHADER_AUDIO) ? 1 : 0);
             shader_raw_sizes.push_back(raw_src.size());
             shader_min_sizes.push_back(min_src.size());
             shader_sources.push_back(min_src);
@@ -1492,6 +1520,15 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     std::map<std::string,int> cmd_out_index;
     for (size_t i = 0; i < out_cmds.size(); i++) cmd_out_index[out_cmds[i].name] = (int)i;
 
+    bool uses_audio = p.audio_enabled;
+    if (uses_audio) {
+        int ari = find_res(p, p.audio_shader);
+        if (ari < 0 || p.resources[(size_t)ari].kind != RK_SHADER_AUDIO) {
+            warnf("audio disabled for 64k: audio shader '%s' is not an audio_shader resource", p.audio_shader.c_str());
+            uses_audio = false;
+        }
+    }
+
     bool uses_draw = false;
     bool uses_compute = false;
     bool uses_shadows = false;
@@ -1512,6 +1549,8 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
             if (depth_target_code(c.depth) == -2 && c.clear_depth) uses_depth = true;
         }
     }
+    if (uses_audio)
+        uses_compute = true;
     if (uses_shadows) uses_depth = true;
     bool uses_shaders = uses_draw || uses_compute || uses_shadows;
     bool clear_only = !uses_draw && !uses_compute;
@@ -1536,6 +1575,11 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
                     if (si >= 0) used_shader[(size_t)si] = 1;
                 }
             }
+        }
+        if (uses_audio) {
+            int si = shader_resource_index(p, p.audio_shader, shader_res_indices);
+            if (si >= 0) used_shader[(size_t)si] = 1;
+            else uses_audio = false;
         }
 
         std::vector<int> new_shader_res_indices;
@@ -1570,6 +1614,12 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
         shader_raw_sizes.clear();
         shader_min_sizes.clear();
         builtin_shadow_shader_index = -1;
+    }
+
+    int audio_shader_index = uses_audio ? shader_resource_index(p, p.audio_shader, shader_res_indices) : -1;
+    if (uses_audio && audio_shader_index < 0) {
+        warnf("audio disabled for 64k: audio shader '%s' was not emitted", p.audio_shader.c_str());
+        uses_audio = false;
     }
 
     if (!buffer_res_indices.empty()) {
@@ -1737,6 +1787,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     };
     if (uses_draw) write_feature("draw");
     if (uses_compute) write_feature("compute");
+    if (uses_audio) write_feature("audio");
     if (uses_shadows) write_feature("shadows");
     if (!rt_res_indices.empty()) write_feature("render targets");
     if (!buffer_res_indices.empty()) write_feature("structured buffers");
@@ -1746,6 +1797,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     if (!wrote_feature) fprintf(f, " clear-only command playback");
     fprintf(f, ".\n\n");
     fprintf(f, "#define WIN32_LEAN_AND_MEAN\n#define COBJMACROS\n#include <windows.h>\n#include <stddef.h>\n#include <d3d11.h>\n");
+    if (uses_audio) fprintf(f, "#include <mmsystem.h>\n");
     if (uses_shaders) fprintf(f, "#include <d3dcompiler.h>\n");
     fprintf(f, "\n");
     fprintf(f, "#define LT_WNDCLS \"lt64k_window\"\n#define LT_PI 3.14159265358979323846f\n");
@@ -1779,6 +1831,13 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     fprintf(f, "// authored in the .lt file when scene_scale_divisor == 0.\n");
     fprintf(f, "// -----------------------------------------------------------------------------\n");
     fprintf(f, "#define LT_PROJECT_W %d\n#define LT_PROJECT_H %d\n#define LT_SHADOW_W %d\n#define LT_SHADOW_H %d\n#define LT_SHADOW_LAYERS %d\n#define LT_VSYNC %d\n#define LT_ESC_CLOSE %d\n#define LT_EXIT_AFTER_TIMELINE %d\n#define LT_SHOW_FPS_TITLE %d\n", project_w, project_h, shadow_tex_w, shadow_tex_h, shadow_layers, p.export_vsync ? 1 : 0, p.export_escape_close ? 1 : 0, p.export_exit_after_timeline ? 1 : 0, p.export_show_fps_title ? 1 : 0);
+    if (uses_audio) {
+        fprintf(f, "#define LT_AUDIO_SR %d\n#define LT_AUDIO_CHUNK 2048\n#define LT_AUDIO_Q 2\n#define LT_AUDIO_DUR ", p.audio_sample_rate);
+        emit_float_literal(f, p.audio_duration_seconds);
+        fprintf(f, "\n#define LT_AUDIO_VOL ");
+        emit_float_literal(f, p.audio_master_volume);
+        fprintf(f, "\n#define LT_AUDIO_LOOP %d\n#define LT_AUDIO_SHADER %d\n", p.audio_loop ? 1 : 0, audio_shader_index);
+    }
     fprintf(f, "// Minimal CRT replacements and tiny math types. /NODEFAULTLIB builds need these.\n");
     fprintf(f, "int _fltused=0; typedef unsigned int u32;");
     if (!clear_only) fprintf(f, " typedef struct { float m[16]; } M4;");
@@ -1789,6 +1848,8 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
         fprintf(f, "// Constant buffers shared with the HLSL files. Keep layout in sync with shaders.\n");
         fprintf(f, "typedef struct { float view_proj[16]; float time_vec[4]; float light_dir[4]; float light_color[4]; float cam_pos[4]; float shadow_view_proj[16]; float inv_view_proj[16]; float prev_view_proj[16]; float prev_inv_view_proj[16]; float prev_shadow_view_proj[16]; float cam_dir[4]; float shadow_cascade_splits[4]; float shadow_params[4]; float shadow_cascade_rects[4][4]; float shadow_cascade_view_proj[4][16]; float light_pos[4]; float light_params[4]; float camera_params[4]; } SceneCB;\n");
         fprintf(f, "typedef union { float f[64][4]; int i[64][4]; } UserCB; typedef struct { float world[16]; } ObjectCB;\n");
+        if (uses_audio)
+            fprintf(f, "typedef struct { unsigned int sample_start,sample_count,sample_rate,channels; float time_seconds,duration_seconds,master_volume; unsigned int loop; } AudioCB;\n");
     }
     fprintf(f, "// Global D3D handles and runtime sizes. This player is fullscreen-only, so\n");
     fprintf(f, "// W/H are the monitor/backbuffer size and RW/RH intentionally equal W/H.\n");
@@ -1798,6 +1859,8 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
         fprintf(f, "static ID3D11Device* dev; static ID3D11DeviceContext* ctx; static IDXGISwapChain* swp; static ID3D11RenderTargetView* rtv; static HWND wh; static int W,H;\n");
     } else {
         fprintf(f, "static ID3D11Device* dev; static ID3D11DeviceContext* ctx; static IDXGISwapChain* swp; static ID3D11RenderTargetView* rtv; static ID3D11Texture2D* depth_tex; static ID3D11DepthStencilView* dsv; static ID3D11ShaderResourceView* depth_srv; static ID3D11Texture2D* shadow_tex; static ID3D11DepthStencilView* shadow_dsv[4]; static ID3D11ShaderResourceView* shadow_srv; static ID3D11SamplerState* smp_lin; static ID3D11SamplerState* smp_cmp; static ID3D11DepthStencilState* ds[4]; static ID3D11RasterizerState* rs[2]; static ID3D11BlendState* bs[4]; static ID3D11Buffer* scene_cb; static ID3D11Buffer* object_cb; static ID3D11Buffer* user_cb; static ID3D11Buffer* prim_vb[6]; static HWND wh; static int W,H,RW,RH;\n");
+        if (uses_audio)
+            fprintf(f, "static HWAVEOUT awo; static WAVEHDR awh[LT_AUDIO_Q]; static char awb[LT_AUDIO_Q][LT_AUDIO_CHUNK*4]; static ID3D11Buffer* audio_cb; static ID3D11Buffer* audio_out; static ID3D11Buffer* audio_stage; static ID3D11UnorderedAccessView* audio_uav; static unsigned int audio_sample; static int audio_started;\n");
         if (uses_compute)
             fprintf(f, "typedef struct { const char* src; unsigned int len; int cs_kind; ID3D11VertexShader* vs; ID3D11PixelShader* ps; ID3D11ComputeShader* cs; ID3D11InputLayout* il; } Sh;\n");
         else
@@ -2240,6 +2303,12 @@ static void init_states(){ D3D11_SAMPLER_DESC sp; zmem(&sp,sizeof(sp)); sp.Filte
 static void cb_make(ID3D11Buffer** b, unsigned int sz){ D3D11_BUFFER_DESC d; zmem(&d,sizeof(d)); d.ByteWidth=(sz+15)&~15; d.Usage=D3D11_USAGE_DYNAMIC; d.BindFlags=D3D11_BIND_CONSTANT_BUFFER; d.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE; ID3D11Device_CreateBuffer(dev,&d,0,b); }
 static void cb_up(ID3D11Buffer* b, void* data, unsigned int sz){ D3D11_MAPPED_SUBRESOURCE m; if(SUCCEEDED(ID3D11DeviceContext_Map(ctx,(ID3D11Resource*)b,0,D3D11_MAP_WRITE_DISCARD,0,&m))){ cpy(m.pData,data,sz); ID3D11DeviceContext_Unmap(ctx,(ID3D11Resource*)b,0); } }
 )LT64K", f);
+    if (uses_audio) {
+        fputs(R"LT64K(static void init_audio(){ WAVEFORMATEX wf; D3D11_BUFFER_DESC bd; D3D11_UNORDERED_ACCESS_VIEW_DESC uv; zmem(&wf,sizeof(wf)); wf.wFormatTag=WAVE_FORMAT_PCM; wf.nChannels=2; wf.nSamplesPerSec=LT_AUDIO_SR; wf.wBitsPerSample=16; wf.nBlockAlign=4; wf.nAvgBytesPerSec=LT_AUDIO_SR*4; if(waveOutOpen(&awo,WAVE_MAPPER,&wf,0,0,CALLBACK_NULL)!=MMSYSERR_NOERROR)return; for(int i=0;i<LT_AUDIO_Q;i++){ zmem(&awh[i],sizeof(WAVEHDR)); awh[i].lpData=awb[i]; awh[i].dwBufferLength=LT_AUDIO_CHUNK*4; waveOutPrepareHeader(awo,&awh[i],sizeof(WAVEHDR)); } cb_make(&audio_cb,sizeof(AudioCB)); zmem(&bd,sizeof(bd)); bd.ByteWidth=LT_AUDIO_CHUNK*4; bd.Usage=D3D11_USAGE_DEFAULT; bd.BindFlags=D3D11_BIND_UNORDERED_ACCESS; bd.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_STRUCTURED; bd.StructureByteStride=4; if(SUCCEEDED(ID3D11Device_CreateBuffer(dev,&bd,0,&audio_out))){ zmem(&uv,sizeof(uv)); uv.Format=DXGI_FORMAT_UNKNOWN; uv.ViewDimension=D3D11_UAV_DIMENSION_BUFFER; uv.Buffer.NumElements=LT_AUDIO_CHUNK; ID3D11Device_CreateUnorderedAccessView(dev,(ID3D11Resource*)audio_out,&uv,&audio_uav); } bd.Usage=D3D11_USAGE_STAGING; bd.BindFlags=0; bd.CPUAccessFlags=D3D11_CPU_ACCESS_READ; ID3D11Device_CreateBuffer(dev,&bd,0,&audio_stage); }
+static int audio_gen(char* dst){ unsigned int total=(unsigned int)(LT_AUDIO_DUR*(float)LT_AUDIO_SR+0.5f); if(total<1)total=1; zmem(dst,LT_AUDIO_CHUNK*4); if(!audio_cb||!audio_uav||!audio_stage||!audio_out||LT_AUDIO_SHADER<0||LT_AUDIO_SHADER>=SHN||!sh[LT_AUDIO_SHADER].cs)return 0; if(LT_AUDIO_LOOP&&audio_sample>=total)audio_sample%=total; if(!LT_AUDIO_LOOP&&audio_sample>=total)return 0; unsigned int n=LT_AUDIO_CHUNK; if(!LT_AUDIO_LOOP&&audio_sample+n>total)n=total-audio_sample; AudioCB ac; UserCB uc; D3D11_MAPPED_SUBRESOURCE m; ID3D11ShaderResourceView* ns[8]; ID3D11UnorderedAccessView* nu[8]; zmem(&ac,sizeof(ac)); ac.sample_start=audio_sample; ac.sample_count=n; ac.sample_rate=LT_AUDIO_SR; ac.channels=2; ac.time_seconds=(float)audio_sample/(float)LT_AUDIO_SR; ac.duration_seconds=LT_AUDIO_DUR; ac.master_volume=LT_AUDIO_VOL; ac.loop=LT_AUDIO_LOOP; fill_user_base(&uc); cb_up(user_cb,&uc,sizeof(uc)); cb_up(audio_cb,&ac,sizeof(ac)); zmem(ns,sizeof(ns)); zmem(nu,sizeof(nu)); ID3D11DeviceContext_CSSetShaderResources(ctx,0,8,ns); ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx,0,8,nu,0); ID3D11DeviceContext_CSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_CSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_CSSetConstantBuffers(ctx,3,1,&audio_cb); ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx,0,1,&audio_uav,0); ID3D11DeviceContext_CSSetShader(ctx,sh[LT_AUDIO_SHADER].cs,0,0); ID3D11DeviceContext_Dispatch(ctx,(n+255)/256,1,1); ID3D11DeviceContext_CSSetShader(ctx,0,0,0); ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx,0,8,nu,0); ID3D11DeviceContext_CopyResource(ctx,(ID3D11Resource*)audio_stage,(ID3D11Resource*)audio_out); if(SUCCEEDED(ID3D11DeviceContext_Map(ctx,(ID3D11Resource*)audio_stage,0,D3D11_MAP_READ,0,&m))){ cpy(dst,m.pData,n*4); ID3D11DeviceContext_Unmap(ctx,(ID3D11Resource*)audio_stage,0); } audio_sample+=n; if(LT_AUDIO_LOOP&&audio_sample>=total)audio_sample%=total; return n; }
+static void audio_tick(float sec){ (void)sec; if(!awo)return; if(!audio_started){ audio_sample=0; audio_started=1; } for(int i=0;i<LT_AUDIO_Q;i++){ if((awh[i].dwFlags&WHDR_INQUEUE)&&!(awh[i].dwFlags&WHDR_DONE))continue; if(audio_gen(awb[i]))waveOutWrite(awo,&awh[i],sizeof(WAVEHDR)); } }
+)LT64K", f);
+    }
     if (uses_structured_buffers)
         fputs("static ID3D11ShaderResourceView* srvof(int s){ if(s>=1000&&s<1000+SBN)return sb_srv[s-1000]; if(s>=0&&s<RTN)return rt_srv[s]; if(s==-2)return depth_srv; if(s==-3)return shadow_srv; return 0; }\n", f);
     else
@@ -2278,7 +2347,13 @@ static void fps_title(void){}
 #endif
 )LT64K", f);
     if (uses_compute) {
-        fputs(R"LT64K(static void dispatch_dims(Cmd* c,unsigned int* x,unsigned int* y,unsigned int* z){ unsigned int sx=(unsigned int)(c->tx>0?c->tx:1),sy=(unsigned int)(c->ty>0?c->ty:1),sz=(unsigned int)(c->tz>0?c->tz:1),dx=sx,dy=sy,dz=sz; int s=c->dispatch_src; if(s>=1000&&s<1000+SBN){ dx=(unsigned int)sbd[s-1000].count; dy=1; dz=1; } else if(s>=0&&s<RTN){ dx=(unsigned int)rtw(s); dy=(unsigned int)rth(s); dz=1; } if(s!=-1){ dx=(dx+sx-1)/sx; dy=(dy+sy-1)/sy; dz=(dz+sz-1)/sz; } if(dx<1)dx=1;if(dy<1)dy=1;if(dz<1)dz=1; *x=dx;*y=dy;*z=dz; }
+        if (uses_structured_buffers)
+            fputs(R"LT64K(static void dispatch_dims(Cmd* c,unsigned int* x,unsigned int* y,unsigned int* z){ unsigned int sx=(unsigned int)(c->tx>0?c->tx:1),sy=(unsigned int)(c->ty>0?c->ty:1),sz=(unsigned int)(c->tz>0?c->tz:1),dx=sx,dy=sy,dz=sz; int s=c->dispatch_src; if(s>=1000&&s<1000+SBN){ dx=(unsigned int)sbd[s-1000].count; dy=1; dz=1; } else if(s>=0&&s<RTN){ dx=(unsigned int)rtw(s); dy=(unsigned int)rth(s); dz=1; } if(s!=-1){ dx=(dx+sx-1)/sx; dy=(dy+sy-1)/sy; dz=(dz+sz-1)/sz; } if(dx<1)dx=1;if(dy<1)dy=1;if(dz<1)dz=1; *x=dx;*y=dy;*z=dz; }
+)LT64K", f);
+        else
+            fputs(R"LT64K(static void dispatch_dims(Cmd* c,unsigned int* x,unsigned int* y,unsigned int* z){ unsigned int sx=(unsigned int)(c->tx>0?c->tx:1),sy=(unsigned int)(c->ty>0?c->ty:1),sz=(unsigned int)(c->tz>0?c->tz:1),dx=sx,dy=sy,dz=sz; int s=c->dispatch_src; if(s>=0&&s<RTN){ dx=(unsigned int)rtw(s); dy=(unsigned int)rth(s); dz=1; } if(s!=-1){ dx=(dx+sx-1)/sx; dy=(dy+sy-1)/sy; dz=(dz+sz-1)/sz; } if(dx<1)dx=1;if(dy<1)dy=1;if(dz<1)dz=1; *x=dx;*y=dy;*z=dz; }
+)LT64K", f);
+        fputs(R"LT64K(
 static void run_compute(Cmd* c){ if(c->shader<0||c->shader>=SHN||!sh[c->shader].cs)return; UserCB uc; fill_user_cmd(&uc,c); cb_up(user_cb,&uc,sizeof(uc)); ID3D11DeviceContext_CSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_CSSetConstantBuffers(ctx,2,1,&user_cb); for(int t=0;t<c->sc;t++){ ID3D11ShaderResourceView* sv=srvof(c->srv[t]); ID3D11DeviceContext_CSSetShaderResources(ctx,c->ssl[t],1,&sv); } for(int t=0;t<c->uc;t++){ ID3D11UnorderedAccessView* uv=uavof(c->uav[t]); ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx,c->usl[t],1,&uv,0); } unsigned int x,y,z; dispatch_dims(c,&x,&y,&z); ID3D11DeviceContext_CSSetShader(ctx,sh[c->shader].cs,0,0); ID3D11DeviceContext_Dispatch(ctx,x,y,z); ID3D11DeviceContext_CSSetShader(ctx,0,0,0); }
 )LT64K", f);
     } else {
@@ -2289,7 +2364,7 @@ static int reset_compute_done=0; static float prev_render_sec=0;
 static void render(float sec){ float dt=sec-prev_render_sec; if(dt<0)dt=0; if(dt>0.10f)dt=0.10f; prev_render_sec=sec; cpy(cam,cam0,sizeof(cam));cpy(dl,dl0,sizeof(dl));
 )LT64K", f);
     if (uses_timeline) fputs(" timeline(sec);", f);
-    fputs(R"LT64K( float clr[4]={0,0,0,1},bf[4]={0,0,0,0}; SceneCB sc; ObjectCB oc; M4 vp,ivp; zmem(&sc,sizeof(sc)); viewproj(&vp,sec); invm(&vp,&ivp); cpy(sc.view_proj,vp.m,64); cpy(sc.prev_view_proj,vp.m,64); cpy(sc.inv_view_proj,ivp.m,64); cpy(sc.prev_inv_view_proj,ivp.m,64); shadowvp(&sc); sc.time_vec[0]=sec; sc.time_vec[1]=dt; sc.time_vec[2]=sec*60.0f; sc.cam_pos[0]=cam[0];sc.cam_pos[1]=cam[1];sc.cam_pos[2]=cam[2]; float cp=cs(cam[4]); sc.cam_dir[0]=sn(cam[3])*cp;sc.cam_dir[1]=sn(cam[4]);sc.cam_dir[2]=cs(cam[3])*cp; sc.camera_params[0]=cam[9]>=0.5f?1.0f:0.0f;sc.camera_params[1]=cam[10];sc.camera_params[2]=cam[6];sc.camera_params[3]=cam[7]; float ldx=dl[3]-dl[0],ldy=dl[4]-dl[1],ldz=dl[5]-dl[2],li=rsq(ldx*ldx+ldy*ldy+ldz*ldz); sc.light_dir[0]=ldx*li;sc.light_dir[1]=ldy*li;sc.light_dir[2]=ldz*li;sc.light_dir[3]=dl[9]; sc.light_color[0]=dl[6];sc.light_color[1]=dl[7];sc.light_color[2]=dl[8]; shadowpass(&sc); cb_up(scene_cb,&sc,sizeof(sc)); ID3D11DeviceContext_ClearRenderTargetView(ctx,rtv,clr); if(dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,1,0); for(int i=0;i<CMDN;i++){ Cmd* c=cmd+i; if(!c->enabled)continue; set_target(c); if(c->type==1){ ID3D11RenderTargetView* rv=rtvof(c->rt); float cc[4],dc; clear_vals(c,cc,&dc); if(c->ccen&&rv)ID3D11DeviceContext_ClearRenderTargetView(ctx,rv,cc); if(c->cden&&c->dep==-2&&dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,dc,0); } else if(c->type==3){ if(!c->reset||!reset_compute_done)run_compute(c); } else if(c->type==2 && c->shader>=0&&c->shader<SHN&&sh[c->shader].vs&&sh[c->shader].ps){ UserCB uc; M4 w; world(c,&w); cpy(oc.world,w.m,64); fill_user_cmd(&uc,c); cb_up(object_cb,&oc,sizeof(oc)); cb_up(user_cb,&uc,sizeof(uc)); ID3D11DeviceContext_OMSetDepthStencilState(ctx,ds[(c->dt?1:0)|(c->dw?2:0)],0); ID3D11DeviceContext_RSSetState(ctx,rs[c->cb?1:0]); ID3D11DeviceContext_OMSetBlendState(ctx,bs[(c->ab?1:0)|(c->cw?2:0)],bf,0xffffffff); ID3D11DeviceContext_VSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetSamplers(ctx,0,1,&smp_lin); ID3D11DeviceContext_PSSetSamplers(ctx,1,1,&smp_cmp); for(int t=0;t<c->tc;t++){ ID3D11ShaderResourceView* sv=srvof(c->tex[t]); ID3D11DeviceContext_PSSetShaderResources(ctx,c->tsl[t],1,&sv); } if(c->srecv){ ID3D11ShaderResourceView* sv=shadow_srv; ID3D11DeviceContext_PSSetShaderResources(ctx,7,1,&sv); } for(int t=0;t<c->sc;t++){ ID3D11ShaderResourceView* sv=srvof(c->srv[t]); ID3D11DeviceContext_VSSetShaderResources(ctx,c->ssl[t],1,&sv); ID3D11DeviceContext_PSSetShaderResources(ctx,c->ssl[t],1,&sv); } if(c->mk>0&&c->mk<6&&prim_vb[c->mk]){ unsigned int st=32,off=0; ID3D11DeviceContext_IASetInputLayout(ctx,sh[c->shader].il); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,1,&prim_vb[c->mk],&st,&off); } else { ID3D11DeviceContext_IASetInputLayout(ctx,0); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,0,0,0,0); } ID3D11DeviceContext_IASetIndexBuffer(ctx,0,DXGI_FORMAT_R32_UINT,0); ID3D11DeviceContext_IASetPrimitiveTopology(ctx,c->topology?D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST:D3D11_PRIMITIVE_TOPOLOGY_POINTLIST); ID3D11DeviceContext_VSSetShader(ctx,sh[c->shader].vs,0,0); ID3D11DeviceContext_PSSetShader(ctx,sh[c->shader].ps,0,0); ID3D11DeviceContext_DrawInstanced(ctx,c->vc,c->ic,0,0); } } reset_compute_done=1; IDXGISwapChain_Present(swp,LT_VSYNC?1:0,0); fps_title(); }
+    std::string render_body = R"LT64K( float clr[4]={0,0,0,1},bf[4]={0,0,0,0}; SceneCB sc; ObjectCB oc; M4 vp,ivp; zmem(&sc,sizeof(sc)); viewproj(&vp,sec); invm(&vp,&ivp); cpy(sc.view_proj,vp.m,64); cpy(sc.prev_view_proj,vp.m,64); cpy(sc.inv_view_proj,ivp.m,64); cpy(sc.prev_inv_view_proj,ivp.m,64); shadowvp(&sc); sc.time_vec[0]=sec; sc.time_vec[1]=dt; sc.time_vec[2]=sec*60.0f; sc.cam_pos[0]=cam[0];sc.cam_pos[1]=cam[1];sc.cam_pos[2]=cam[2]; float cp=cs(cam[4]); sc.cam_dir[0]=sn(cam[3])*cp;sc.cam_dir[1]=sn(cam[4]);sc.cam_dir[2]=cs(cam[3])*cp; sc.camera_params[0]=cam[9]>=0.5f?1.0f:0.0f;sc.camera_params[1]=cam[10];sc.camera_params[2]=cam[6];sc.camera_params[3]=cam[7]; float ldx=dl[3]-dl[0],ldy=dl[4]-dl[1],ldz=dl[5]-dl[2],li=rsq(ldx*ldx+ldy*ldy+ldz*ldz); sc.light_dir[0]=ldx*li;sc.light_dir[1]=ldy*li;sc.light_dir[2]=ldz*li;sc.light_dir[3]=dl[9]; sc.light_color[0]=dl[6];sc.light_color[1]=dl[7];sc.light_color[2]=dl[8]; shadowpass(&sc); cb_up(scene_cb,&sc,sizeof(sc)); audio_tick(sec); ID3D11DeviceContext_ClearRenderTargetView(ctx,rtv,clr); if(dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,1,0); for(int i=0;i<CMDN;i++){ Cmd* c=cmd+i; if(!c->enabled)continue; set_target(c); if(c->type==1){ ID3D11RenderTargetView* rv=rtvof(c->rt); float cc[4],dc; clear_vals(c,cc,&dc); if(c->ccen&&rv)ID3D11DeviceContext_ClearRenderTargetView(ctx,rv,cc); if(c->cden&&c->dep==-2&&dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,dc,0); } else if(c->type==3){ if(!c->reset||!reset_compute_done)run_compute(c); } else if(c->type==2 && c->shader>=0&&c->shader<SHN&&sh[c->shader].vs&&sh[c->shader].ps){ UserCB uc; M4 w; world(c,&w); cpy(oc.world,w.m,64); fill_user_cmd(&uc,c); cb_up(object_cb,&oc,sizeof(oc)); cb_up(user_cb,&uc,sizeof(uc)); ID3D11DeviceContext_OMSetDepthStencilState(ctx,ds[(c->dt?1:0)|(c->dw?2:0)],0); ID3D11DeviceContext_RSSetState(ctx,rs[c->cb?1:0]); ID3D11DeviceContext_OMSetBlendState(ctx,bs[(c->ab?1:0)|(c->cw?2:0)],bf,0xffffffff); ID3D11DeviceContext_VSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetSamplers(ctx,0,1,&smp_lin); ID3D11DeviceContext_PSSetSamplers(ctx,1,1,&smp_cmp); for(int t=0;t<c->tc;t++){ ID3D11ShaderResourceView* sv=srvof(c->tex[t]); ID3D11DeviceContext_PSSetShaderResources(ctx,c->tsl[t],1,&sv); } if(c->srecv){ ID3D11ShaderResourceView* sv=shadow_srv; ID3D11DeviceContext_PSSetShaderResources(ctx,7,1,&sv); } for(int t=0;t<c->sc;t++){ ID3D11ShaderResourceView* sv=srvof(c->srv[t]); ID3D11DeviceContext_VSSetShaderResources(ctx,c->ssl[t],1,&sv); ID3D11DeviceContext_PSSetShaderResources(ctx,c->ssl[t],1,&sv); } if(c->mk>0&&c->mk<6&&prim_vb[c->mk]){ unsigned int st=32,off=0; ID3D11DeviceContext_IASetInputLayout(ctx,sh[c->shader].il); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,1,&prim_vb[c->mk],&st,&off); } else { ID3D11DeviceContext_IASetInputLayout(ctx,0); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,0,0,0,0); } ID3D11DeviceContext_IASetIndexBuffer(ctx,0,DXGI_FORMAT_R32_UINT,0); ID3D11DeviceContext_IASetPrimitiveTopology(ctx,c->topology?D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST:D3D11_PRIMITIVE_TOPOLOGY_POINTLIST); ID3D11DeviceContext_VSSetShader(ctx,sh[c->shader].vs,0,0); ID3D11DeviceContext_PSSetShader(ctx,sh[c->shader].ps,0,0); ID3D11DeviceContext_DrawInstanced(ctx,c->vc,c->ic,0,0); } } reset_compute_done=1; IDXGISwapChain_Present(swp,LT_VSYNC?1:0,0); fps_title(); }
 static LRESULT CALLBACK wp(HWND h,UINT m,WPARAM w,LPARAM l){
     if(LT_ESC_CLOSE&&m==WM_KEYDOWN&&w==VK_ESCAPE)PostQuitMessage(0);
     if(m==WM_CLOSE||m==WM_DESTROY){PostQuitMessage(0);return 0;}
@@ -2303,8 +2378,13 @@ static LRESULT CALLBACK wp(HWND h,UINT m,WPARAM w,LPARAM l){
 static float qpcdt(LARGE_INTEGER* now,LARGE_INTEGER* prev,LARGE_INTEGER* freq){ unsigned int dt=(unsigned int)now->LowPart-(unsigned int)prev->LowPart; unsigned int fq=(unsigned int)freq->LowPart? (unsigned int)freq->LowPart:1; float s=(float)dt/(float)fq; if(s>0.10f)s=0.10f; return s; }
 void WINAPI WinMainCRTStartup(void){ WNDCLASSA wc; zmem(&wc,sizeof(wc)); wc.lpfnWndProc=wp; wc.hInstance=GetModuleHandleA(0); wc.hCursor=LoadCursorA(0,(LPCSTR)32512); wc.lpszClassName=LT_WNDCLS; RegisterClassA(&wc); // FPS-in-title builds use a maximized overlapped window so the title bar is visible.
 // Otherwise the tiny player uses borderless desktop fullscreen.
-W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); DWORD st=LT_SHOW_FPS_TITLE?WS_OVERLAPPEDWINDOW:(WS_POPUP|WS_VISIBLE); DWORD ex=LT_SHOW_FPS_TITLE?0:WS_EX_TOPMOST; HWND hw=CreateWindowExA(ex,LT_WNDCLS,"lt64k",st,0,0,W,H,0,0,wc.hInstance,0); wh=hw; if(LT_SHOW_FPS_TITLE){ShowWindow(hw,SW_SHOWMAXIMIZED); RECT rc; GetClientRect(hw,&rc); W=rc.right-rc.left; H=rc.bottom-rc.top;}else{SetWindowPos(hw,HWND_TOPMOST,0,0,W,H,SWP_SHOWWINDOW); while(ShowCursor(FALSE)>=0);} RW=W; RH=H; DXGI_SWAP_CHAIN_DESC sd; zmem(&sd,sizeof(sd)); sd.BufferCount=1; sd.BufferDesc.Width=W; sd.BufferDesc.Height=H; sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow=hw; sd.SampleDesc.Count=1; sd.Windowed=TRUE; if(FAILED(D3D11CreateDeviceAndSwapChain(0,D3D_DRIVER_TYPE_HARDWARE,0,0,0,0,D3D11_SDK_VERSION,&sd,&swp,&dev,0,&ctx)))ExitProcess(1); ID3D11Texture2D* bb=0; IDXGISwapChain_GetBuffer(swp,0,&IID_ID3D11Texture2D,(void**)&bb); ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)bb,0,&rtv); ID3D11Texture2D_Release(bb); init_depth_shadow(); init_rts(); init_sbs(); init_states(); cb_make(&scene_cb,sizeof(SceneCB)); cb_make(&object_cb,sizeof(ObjectCB)); cb_make(&user_cb,sizeof(UserCB)); init_shaders(); init_prims(); LARGE_INTEGER fq,t0,tn; QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0); float sec=0; MSG msg; for(;;){ while(PeekMessageA(&msg,0,0,0,PM_REMOVE)){ if(msg.message==WM_QUIT)ExitProcess(0); TranslateMessage(&msg); DispatchMessageA(&msg);} QueryPerformanceCounter(&tn); sec+=qpcdt(&tn,&t0,&fq); t0=tn; render(sec);
-)LT64K", f);
+W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); DWORD st=LT_SHOW_FPS_TITLE?WS_OVERLAPPEDWINDOW:(WS_POPUP|WS_VISIBLE); DWORD ex=LT_SHOW_FPS_TITLE?0:WS_EX_TOPMOST; HWND hw=CreateWindowExA(ex,LT_WNDCLS,"lt64k",st,0,0,W,H,0,0,wc.hInstance,0); wh=hw; if(LT_SHOW_FPS_TITLE){ShowWindow(hw,SW_SHOWMAXIMIZED); RECT rc; GetClientRect(hw,&rc); W=rc.right-rc.left; H=rc.bottom-rc.top;}else{SetWindowPos(hw,HWND_TOPMOST,0,0,W,H,SWP_SHOWWINDOW); while(ShowCursor(FALSE)>=0);} RW=W; RH=H; DXGI_SWAP_CHAIN_DESC sd; zmem(&sd,sizeof(sd)); sd.BufferCount=1; sd.BufferDesc.Width=W; sd.BufferDesc.Height=H; sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow=hw; sd.SampleDesc.Count=1; sd.Windowed=TRUE; if(FAILED(D3D11CreateDeviceAndSwapChain(0,D3D_DRIVER_TYPE_HARDWARE,0,0,0,0,D3D11_SDK_VERSION,&sd,&swp,&dev,0,&ctx)))ExitProcess(1); ID3D11Texture2D* bb=0; IDXGISwapChain_GetBuffer(swp,0,&IID_ID3D11Texture2D,(void**)&bb); ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)bb,0,&rtv); ID3D11Texture2D_Release(bb); init_depth_shadow(); init_rts(); init_sbs(); init_states(); cb_make(&scene_cb,sizeof(SceneCB)); cb_make(&object_cb,sizeof(ObjectCB)); cb_make(&user_cb,sizeof(UserCB)); init_shaders(); init_audio(); init_prims(); LARGE_INTEGER fq,t0,tn; QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0); float sec=0; MSG msg; for(;;){ while(PeekMessageA(&msg,0,0,0,PM_REMOVE)){ if(msg.message==WM_QUIT)ExitProcess(0); TranslateMessage(&msg); DispatchMessageA(&msg);} QueryPerformanceCounter(&tn); sec+=qpcdt(&tn,&t0,&fq); t0=tn; render(sec);
+)LT64K";
+    if (!uses_audio) {
+        replace_all_inplace(render_body, " audio_tick(sec);", "");
+        replace_all_inplace(render_body, " init_audio();", "");
+    }
+    fputs(render_body.c_str(), f);
     if (uses_timeline) fputs(" if(LT_EXIT_AFTER_TIMELINE&&TL_ON){float tt=tltotal(); if(tt>0&&sec>=tt)PostQuitMessage(0);}", f);
     fputs(R"LT64K( } }
 )LT64K", f);

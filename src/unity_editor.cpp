@@ -25,6 +25,7 @@
 #include "embedded_pack.cpp"
 #include "timeline.cpp"
 #include "user_cb.cpp"
+#include "audio.cpp"
 #include "ui.cpp"
 #include "main.cpp"
 

@@ -10,6 +10,7 @@
 #include "shader.h"
 #include "embedded_pack.h"
 #include "timeline.h"
+#include "audio.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "imgui_impl_dx11.h"
@@ -1208,6 +1209,10 @@ static bool ui_recompile_shader_resource(ResHandle h, Resource* r, const char* p
     // Request a redraw and allow matching compute/indirect dispatch commands
     // marked "Only On Reset" to run once without advancing scene time/frame.
     cmd_request_shader_recompute(h);
+    if (r->audio_shader) {
+        audio_request_reset(0.0f);
+        app_request_scene_restart();
+    }
     app_request_scene_render();
     return ok;
 }
@@ -1638,6 +1643,7 @@ static const char* ui_resource_display_type(const Resource& r) {
     case RES_BUILTIN_SHADOW_MAP:  return "DepthTexture2D";
     case RES_BUILTIN_LIGHT:    return "Light";
     case RES_SHADER:
+        if (r.audio_shader) return "Audio Shader";
         return r.shader_kind == SHADER_PROGRAM_CS ? "Compute Shader" : "Vertex/Pixel Shader";
     default:                      return res_type_str(r.type);
     }
@@ -1670,18 +1676,36 @@ static float ui_labeled_item_compact_width(const char* label, float max_w, float
     float right_margin = ui_current_vertical_scroll_margin(10.0f);
     float label_reserve = label_size.x > 0.0f ? label_size.x + style.ItemInnerSpacing.x : 0.0f;
     float avail = ImGui::GetContentRegionAvail().x;
-    float width = avail - label_reserve - right_margin;
+    float hard_max = avail - label_reserve - right_margin;
+    if (hard_max < ui_px(1.0f))
+        hard_max = ui_px(1.0f);
+
+    float width = hard_max;
     if (width > ui_px(max_w))
         width = ui_px(max_w);
-    if (width < ui_px(min_w))
+    if (width < ui_px(min_w) && hard_max >= ui_px(min_w))
         width = ui_px(min_w);
-
-    float hard_max = avail - label_reserve - right_margin;
-    if (width > hard_max && hard_max > ui_px(64.0f))
+    if (width > hard_max)
         width = hard_max;
-    if (width < ui_px(64.0f))
-        width = ui_px(64.0f);
     return width;
+}
+
+static float ui_button_width(const char* label) {
+    ImGuiStyle& style = ImGui::GetStyle();
+    return ImGui::CalcTextSize(label, nullptr, true).x + style.FramePadding.x * 2.0f;
+}
+
+static float ui_checkbox_width(const char* label) {
+    ImGuiStyle& style = ImGui::GetStyle();
+    return ImGui::GetFrameHeight() + style.ItemInnerSpacing.x + ImGui::CalcTextSize(label, nullptr, true).x;
+}
+
+static bool ui_same_line_if_fits(float next_item_w, float spacing = -1.0f) {
+    ImGuiStyle& style = ImGui::GetStyle();
+    if (spacing < 0.0f)
+        spacing = style.ItemInnerSpacing.x;
+    float avail = ImGui::GetContentRegionAvail().x - ui_current_vertical_scroll_margin(4.0f);
+    return avail >= next_item_w + spacing;
 }
 
 static void res_combo(const char* label, ResHandle* h, ResType filter, bool allow_invalid = true,
@@ -1721,6 +1745,8 @@ static void res_combo_depth_target(const char* label, ResHandle* h) {
 
 static bool ui_shader_matches_program_kind(const Resource& r, ShaderProgramKind kind) {
     if (r.type != RES_SHADER)
+        return false;
+    if (r.audio_shader)
         return false;
     return r.shader_kind == kind;
 }
@@ -1779,6 +1805,7 @@ static void res_combo_dispatch_source(const char* label, ResHandle* h) {
         *h = normalized;
     Resource* cur = res_get(*h);
     const char* prev = cur ? ui_resource_display_name(*cur) : "(none)";
+    ImGui::SetNextItemWidth(ui_labeled_item_compact_width(label));
     if (ImGui::BeginCombo(label, prev)) {
         if (ImGui::Selectable("(none)", *h == INVALID_HANDLE))
             *h = INVALID_HANDLE;
@@ -2834,10 +2861,17 @@ static void ui_hint_text_disabled_wrapped(const char* fmt, ...) {
 static void ui_hint_text_disabled(const char* fmt, ...) {
     if (!s_show_interface_hints)
         return;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    float wrap_pos = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - ui_current_vertical_scroll_margin(10.0f);
+    if (wrap_pos < ImGui::GetCursorPosX() + ui_px(48.0f))
+        wrap_pos = ImGui::GetCursorPosX() + ui_px(48.0f);
+    ImGui::PushTextWrapPos(wrap_pos);
     va_list args;
     va_start(args, fmt);
-    ImGui::TextDisabledV(fmt, args);
+    ImGui::TextV(fmt, args);
     va_end(args);
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
 }
 
 static void ui_inspector_note_preview(const char* note, ImVec2 size) {
@@ -5930,7 +5964,6 @@ static bool ui_tinted_transform_row(const char* label, float* v, float speed,
 
 static void ui_key_value(const char* key, const char* value) {
     ui_inspector_text_disabled_wrapped("%s", key);
-    ImGui::SameLine(120.0f);
     ImGui::TextWrapped("%s", value ? value : "-");
 }
 
@@ -5964,24 +5997,22 @@ static void ui_command_shader_params(Command* c, Resource* shader) {
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.080f, 0.077f, 0.081f, 1.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(ui_margin_px(8.0f), ui_margin_px(7.0f)));
-        ImGui::BeginChild("##param_card", ImVec2(0.0f, 108.0f), true);
+        ImGui::BeginChild("##param_card", ImVec2(0.0f, 138.0f), true);
 
         ImGui::Checkbox("##enabled", &p.enabled);
-        ImGui::SameLine();
-        ImGui::TextUnformatted(p.name);
-        ImGui::SameLine();
+        if (ui_same_line_if_fits(ImGui::CalcTextSize(p.name).x))
+            ImGui::SameLine();
+        ImGui::TextWrapped("%s", p.name);
         ui_inspector_text_disabled_wrapped("%s", res_type_str(p.type));
 
         if (!p.enabled)
             ImGui::BeginDisabled();
 
         ui_inspector_text_disabled_wrapped("Source");
-        ImGui::SameLine(96.0f);
         ImGui::SetNextItemWidth(-1.0f);
         ui_command_param_source_combo(&p);
 
         ui_inspector_text_disabled_wrapped("Value");
-        ImGui::SameLine(96.0f);
         UserCBSourceKind source_kind = p.source_kind;
         if (source_kind == USER_CB_SOURCE_NONE && p.source != INVALID_HANDLE)
             source_kind = USER_CB_SOURCE_RESOURCE;
@@ -7170,6 +7201,13 @@ static void ui_panel_resources(bool embedded = false) {
                 g_sel_res = res_create_compute_shader(uname, "", "CSMain");
                 g_sel_cmd = INVALID_HANDLE;
             }
+            if (ImGui::MenuItem("Audio Shader")) {
+                res_make_unique_name("audio_0", uname, MAX_NAME);
+                g_sel_res = res_create_audio_shader(uname, "shaders/audio_song.hlsl", "CSMain");
+                g_audio_settings.shader = g_sel_res;
+                g_sel_cmd = INVALID_HANDLE;
+                audio_request_reset(app_scene_time());
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Load Texture... (set path in Inspector)")) {
                 res_make_unique_name("tex_0", uname, MAX_NAME);
@@ -7369,11 +7407,16 @@ static void ui_panel_resources(bool embedded = false) {
 
     static int s_res_filter = 0;
     ui_filter_button("all", 0, &s_res_filter);
-    ImGui::SameLine(); ui_filter_button("mesh", 1, &s_res_filter);
-    ImGui::SameLine(); ui_filter_button("shader", 2, &s_res_filter);
-    ImGui::SameLine(); ui_filter_button("tex", 3, &s_res_filter);
-    ImGui::SameLine(); ui_filter_button("buf", 4, &s_res_filter);
-    ImGui::SameLine(); ui_filter_button("var", 5, &s_res_filter);
+    if (ui_same_line_if_fits(ui_button_width("mesh"))) ImGui::SameLine();
+    ui_filter_button("mesh", 1, &s_res_filter);
+    if (ui_same_line_if_fits(ui_button_width("shader"))) ImGui::SameLine();
+    ui_filter_button("shader", 2, &s_res_filter);
+    if (ui_same_line_if_fits(ui_button_width("tex"))) ImGui::SameLine();
+    ui_filter_button("tex", 3, &s_res_filter);
+    if (ui_same_line_if_fits(ui_button_width("buf"))) ImGui::SameLine();
+    ui_filter_button("buf", 4, &s_res_filter);
+    if (ui_same_line_if_fits(ui_button_width("var"))) ImGui::SameLine();
+    ui_filter_button("var", 5, &s_res_filter);
     ImGui::Separator();
 
     if (ImGui::BeginTabBar("##resource_scope_tabs")) {
@@ -8577,6 +8620,7 @@ static bool ui_compute_shader_combo(const char* label, ResHandle* h) {
     cur = res_get(*h);
     const char* prev = cur ? cur->name : "(none)";
     bool changed = false;
+    ImGui::SetNextItemWidth(ui_labeled_item_compact_width(label));
     if (ImGui::BeginCombo(label, prev)) {
         if (ImGui::Selectable("(none)", *h == INVALID_HANDLE)) {
             *h = INVALID_HANDLE;
@@ -8585,6 +8629,37 @@ static bool ui_compute_shader_combo(const char* label, ResHandle* h) {
         for (int i = 0; i < MAX_RESOURCES; i++) {
             Resource& r = g_resources[i];
             if (!r.active || !ui_shader_matches_program_kind(r, SHADER_PROGRAM_CS)) continue;
+            ResHandle rh = (ResHandle)(i + 1);
+            bool sel = *h == rh;
+            ImGui::PushID(i);
+            if (ImGui::Selectable(r.name, sel)) {
+                *h = rh;
+                changed = true;
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndCombo();
+    }
+    return changed;
+}
+
+static bool ui_audio_shader_combo(const char* label, ResHandle* h) {
+    Resource* cur = res_get(*h);
+    if (!cur || cur->type != RES_SHADER || !cur->audio_shader)
+        *h = INVALID_HANDLE;
+    cur = res_get(*h);
+    const char* prev = cur ? cur->name : "(none)";
+    bool changed = false;
+    ImGui::SetNextItemWidth(ui_labeled_item_compact_width(label));
+    if (ImGui::BeginCombo(label, prev)) {
+        if (ImGui::Selectable("(none)", *h == INVALID_HANDLE)) {
+            *h = INVALID_HANDLE;
+            changed = true;
+        }
+        for (int i = 0; i < MAX_RESOURCES; i++) {
+            Resource& r = g_resources[i];
+            if (!r.active || r.type != RES_SHADER || !r.audio_shader)
+                continue;
             ResHandle rh = (ResHandle)(i + 1);
             bool sel = *h == rh;
             ImGui::PushID(i);
@@ -8762,7 +8837,8 @@ static void ui_command_compute_resource_bindings(Command* c, const char* id_suff
         ImGui::PushID(srv_id_base + s);
         char lbl[64]; snprintf(lbl, sizeof(lbl), "t%d srv##%s", (int)c->srv_slots[s], id_suffix);
         res_combo(lbl, &c->srv_handles[s], RES_NONE);
-        ImGui::SameLine();
+        if (ui_same_line_if_fits(ui_px(48.0f) + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize("slot").x))
+            ImGui::SameLine();
         ImGui::SetNextItemWidth(48.f);
         ImGui::InputScalar("slot##cs_srv_slot", ImGuiDataType_U32, &c->srv_slots[s]);
         ImGui::PopID();
@@ -8770,7 +8846,11 @@ static void ui_command_compute_resource_bindings(Command* c, const char* id_suff
     char add_srv[64]; snprintf(add_srv, sizeof(add_srv), "+##cs_srv_%s", id_suffix);
     char rem_srv[64]; snprintf(rem_srv, sizeof(rem_srv), "-##cs_srv_%s", id_suffix);
     if (c->srv_count < MAX_SRV_SLOTS && ImGui::SmallButton(add_srv)) c->srv_count++;
-    if (c->srv_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton(rem_srv)) c->srv_count--; }
+    if (c->srv_count > 0) {
+        if (ui_same_line_if_fits(ui_button_width(rem_srv)))
+            ImGui::SameLine();
+        if (ImGui::SmallButton(rem_srv)) c->srv_count--;
+    }
 
     ImGui::Spacing();
     ImGui::Text("UAV Slots u# (%d / %d):", c->uav_count, MAX_UAV_SLOTS);
@@ -8778,7 +8858,8 @@ static void ui_command_compute_resource_bindings(Command* c, const char* id_suff
         ImGui::PushID(uav_id_base + u);
         char lbl[64]; snprintf(lbl, sizeof(lbl), "u%d uav##%s", (int)c->uav_slots[u], id_suffix);
         res_combo(lbl, &c->uav_handles[u], RES_NONE);
-        ImGui::SameLine();
+        if (ui_same_line_if_fits(ui_px(48.0f) + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize("slot").x))
+            ImGui::SameLine();
         ImGui::SetNextItemWidth(48.f);
         ImGui::InputScalar("slot##cs_uav_slot", ImGuiDataType_U32, &c->uav_slots[u]);
         ImGui::PopID();
@@ -8786,7 +8867,11 @@ static void ui_command_compute_resource_bindings(Command* c, const char* id_suff
     char add_uav[64]; snprintf(add_uav, sizeof(add_uav), "+##cs_uav_%s", id_suffix);
     char rem_uav[64]; snprintf(rem_uav, sizeof(rem_uav), "-##cs_uav_%s", id_suffix);
     if (c->uav_count < MAX_UAV_SLOTS && ImGui::SmallButton(add_uav)) c->uav_count++;
-    if (c->uav_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton(rem_uav)) c->uav_count--; }
+    if (c->uav_count > 0) {
+        if (ui_same_line_if_fits(ui_button_width(rem_uav)))
+            ImGui::SameLine();
+        if (ImGui::SmallButton(rem_uav)) c->uav_count--;
+    }
 }
 
 static void ui_inspector_command(Command* c) {
@@ -8968,15 +9053,18 @@ static void ui_inspector_command(Command* c) {
 
         if (ui_inspector_section("RENDER STATE")) {
             ImGui::Checkbox("Color Write", &c->color_write);
-            ImGui::SameLine(170.0f);
+            if (ui_same_line_if_fits(ui_checkbox_width("Alpha Blend")))
+                ImGui::SameLine();
             ImGui::Checkbox("Alpha Blend", &c->alpha_blend);
             ImGui::Checkbox("Depth Test", &c->depth_test);
-            ImGui::SameLine(170.0f);
+            if (ui_same_line_if_fits(ui_checkbox_width("Backface Cull")))
+                ImGui::SameLine();
             ImGui::Checkbox("Backface Cull", &c->cull_back);
             if (!c->depth_test) ImGui::BeginDisabled();
             ImGui::Checkbox("Depth Write", &c->depth_write);
             if (!c->depth_test) ImGui::EndDisabled();
-            ImGui::SameLine(170.0f);
+            if (ui_same_line_if_fits(ui_checkbox_width("Shadow Caster")))
+                ImGui::SameLine();
             ImGui::Checkbox("Shadow Caster", &c->shadow_cast);
             ImGui::Checkbox("Shadow Receiver", &c->shadow_receive);
             if (c->shadow_cast)
@@ -8997,13 +9085,18 @@ static void ui_inspector_command(Command* c) {
                 ImGui::PushID(100 + s);
                 char lbl[32]; snprintf(lbl, sizeof(lbl), "t%d srv", (int)c->srv_slots[s]);
                 res_combo(lbl, &c->srv_handles[s], RES_NONE);
-                ImGui::SameLine();
+                if (ui_same_line_if_fits(ui_px(48.0f)))
+                    ImGui::SameLine();
                 ImGui::SetNextItemWidth(48.f);
                 ImGui::InputScalar("##sslot", ImGuiDataType_U32, &c->srv_slots[s]);
                 ImGui::PopID();
             }
             if (c->srv_count < MAX_SRV_SLOTS && ImGui::SmallButton("+##s")) c->srv_count++;
-            if (c->srv_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##s")) c->srv_count--; }
+            if (c->srv_count > 0) {
+                if (ui_same_line_if_fits(ui_button_width("-##s")))
+                    ImGui::SameLine();
+                if (ImGui::SmallButton("-##s")) c->srv_count--;
+            }
         }
 
         if (ui_inspector_section("PIXEL UAV OUTPUTS")) {
@@ -9016,13 +9109,18 @@ static void ui_inspector_command(Command* c) {
                 ImGui::PushID(700 + u);
                 char lbl[32]; snprintf(lbl, sizeof(lbl), "u%d uav", (int)c->uav_slots[u]);
                 res_combo(lbl, &c->uav_handles[u], RES_NONE);
-                ImGui::SameLine();
+                if (ui_same_line_if_fits(ui_px(48.0f)))
+                    ImGui::SameLine();
                 ImGui::SetNextItemWidth(48.f);
                 ImGui::InputScalar("##puavslot", ImGuiDataType_U32, &c->uav_slots[u]);
                 ImGui::PopID();
             }
             if (c->uav_count < MAX_UAV_SLOTS && ImGui::SmallButton("+##pu")) c->uav_count++;
-            if (c->uav_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##pu")) c->uav_count--; }
+            if (c->uav_count > 0) {
+                if (ui_same_line_if_fits(ui_button_width("-##pu")))
+                    ImGui::SameLine();
+                if (ImGui::SmallButton("-##pu")) c->uav_count--;
+            }
         }
         break;
     }
@@ -9083,15 +9181,18 @@ static void ui_inspector_command(Command* c) {
 
         if (ui_inspector_section("RENDER STATE")) {
             ImGui::Checkbox("Color Write", &c->color_write);
-            ImGui::SameLine(170.0f);
+            if (ui_same_line_if_fits(ui_checkbox_width("Alpha Blend")))
+                ImGui::SameLine();
             ImGui::Checkbox("Alpha Blend", &c->alpha_blend);
             ImGui::Checkbox("Depth Test", &c->depth_test);
-            ImGui::SameLine(170.0f);
+            if (ui_same_line_if_fits(ui_checkbox_width("Backface Cull")))
+                ImGui::SameLine();
             ImGui::Checkbox("Backface Cull", &c->cull_back);
             if (!c->depth_test) ImGui::BeginDisabled();
             ImGui::Checkbox("Depth Write", &c->depth_write);
             if (!c->depth_test) ImGui::EndDisabled();
-            ImGui::SameLine(170.0f);
+            if (ui_same_line_if_fits(ui_checkbox_width("Shadow Caster")))
+                ImGui::SameLine();
             ImGui::Checkbox("Shadow Caster", &c->shadow_cast);
             ImGui::Checkbox("Shadow Receiver", &c->shadow_receive);
             if (c->shadow_cast)
@@ -9112,13 +9213,18 @@ static void ui_inspector_command(Command* c) {
                 ImGui::PushID(1000 + s);
                 char lbl[32]; snprintf(lbl, sizeof(lbl), "t%d srv", (int)c->srv_slots[s]);
                 res_combo(lbl, &c->srv_handles[s], RES_NONE);
-                ImGui::SameLine();
+                if (ui_same_line_if_fits(ui_px(48.0f)))
+                    ImGui::SameLine();
                 ImGui::SetNextItemWidth(48.f);
                 ImGui::InputScalar("##idsslot", ImGuiDataType_U32, &c->srv_slots[s]);
                 ImGui::PopID();
             }
             if (c->srv_count < MAX_SRV_SLOTS && ImGui::SmallButton("+##id_s")) c->srv_count++;
-            if (c->srv_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##id_s")) c->srv_count--; }
+            if (c->srv_count > 0) {
+                if (ui_same_line_if_fits(ui_button_width("-##id_s")))
+                    ImGui::SameLine();
+                if (ImGui::SmallButton("-##id_s")) c->srv_count--;
+            }
         }
 
         if (ui_inspector_section("PIXEL UAV OUTPUTS")) {
@@ -9131,13 +9237,18 @@ static void ui_inspector_command(Command* c) {
                 ImGui::PushID(1100 + u);
                 char lbl[32]; snprintf(lbl, sizeof(lbl), "u%d uav", (int)c->uav_slots[u]);
                 res_combo(lbl, &c->uav_handles[u], RES_NONE);
-                ImGui::SameLine();
+                if (ui_same_line_if_fits(ui_px(48.0f)))
+                    ImGui::SameLine();
                 ImGui::SetNextItemWidth(48.f);
                 ImGui::InputScalar("##idpuavslot", ImGuiDataType_U32, &c->uav_slots[u]);
                 ImGui::PopID();
             }
             if (c->uav_count < MAX_UAV_SLOTS && ImGui::SmallButton("+##id_u")) c->uav_count++;
-            if (c->uav_count > 0) { ImGui::SameLine(); if (ImGui::SmallButton("-##id_u")) c->uav_count--; }
+            if (c->uav_count > 0) {
+                if (ui_same_line_if_fits(ui_button_width("-##id_u")))
+                    ImGui::SameLine();
+                if (ImGui::SmallButton("-##id_u")) c->uav_count--;
+            }
         }
 
         if (ui_inspector_section("INDIRECT BUFFER")) {
@@ -9941,17 +10052,20 @@ static void ui_panel_user_cb() {
                 user_changed |= ui_user_cb_value_editor(e.type, e.ival, e.fval);
             if (user_changed)
                 timeline_capture_if_tracked(TIMELINE_TRACK_USER_VAR, e.name, e.type);
-            ImGui::SameLine();
+            if (ui_same_line_if_fits(ui_button_width("^")))
+                ImGui::SameLine();
             if (ImGui::SmallButton("^") && i > 0) {
                 s_ucb_name_editing = -1;
                 user_cb_move(i, i - 1);
             }
-            ImGui::SameLine();
+            if (ui_same_line_if_fits(ui_button_width("v")))
+                ImGui::SameLine();
             if (ImGui::SmallButton("v") && i < g_user_cb_count - 1) {
                 s_ucb_name_editing = -1;
                 user_cb_move(i, i + 1);
             }
-            ImGui::SameLine();
+            if (ui_same_line_if_fits(ui_button_width("x")))
+                ImGui::SameLine();
             if (ImGui::SmallButton("x")) {
                 s_ucb_name_editing = -1;
                 user_cb_remove(i);
@@ -9971,7 +10085,7 @@ static void ui_panel_user_cb() {
         RES_FLOAT, RES_FLOAT2, RES_FLOAT3, RES_FLOAT4, RES_INT, RES_INT2, RES_INT3
     };
 
-    ImGui::SetNextItemWidth(110.f);
+    ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Type##ucb_create_type", 110.0f, 70.0f));
     if (ImGui::BeginCombo("Type##ucb_create_type", res_type_str(s_create_type))) {
         for (int i = 0; i < (int)(sizeof(create_types) / sizeof(create_types[0])); i++) {
             ResType type = create_types[i];
@@ -9981,10 +10095,16 @@ static void ui_panel_user_cb() {
         }
         ImGui::EndCombo();
     }
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(150.f);
+    {
+        ImGuiStyle& style = ImGui::GetStyle();
+        float name_row_w = ui_px(150.0f) + style.ItemInnerSpacing.x + ImGui::CalcTextSize("Name").x;
+        if (ui_same_line_if_fits(name_row_w))
+            ImGui::SameLine();
+    }
+    ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Name##ucb_create_name", 150.0f, 80.0f));
     ImGui::InputText("Name##ucb_create_name", s_create_name, MAX_NAME);
-    ImGui::SameLine();
+    if (ui_same_line_if_fits(ui_button_width("Create Var")))
+        ImGui::SameLine();
     if (ImGui::Button("Create Var")) {
         const char* name = s_create_name[0] ? s_create_name : user_cb_default_base_name(s_create_type);
         if (user_cb_add_var(name, s_create_type))
@@ -9993,9 +10113,14 @@ static void ui_panel_user_cb() {
 
     ImGui::Spacing();
     static ResHandle s_add = INVALID_HANDLE;
+    bool add_link_inline = false;
     {
         Resource* cur = res_get(s_add);
-        ImGui::SetNextItemWidth(-60.f);
+        ImGuiStyle& style = ImGui::GetStyle();
+        float add_button_w = ui_button_width("Add Link");
+        float add_combo_w = ImGui::GetContentRegionAvail().x - add_button_w - style.ItemInnerSpacing.x - ui_current_vertical_scroll_margin(4.0f);
+        add_link_inline = add_combo_w >= ui_px(80.0f);
+        ImGui::SetNextItemWidth(add_link_inline ? add_combo_w : -1.0f);
         if (ImGui::BeginCombo("##ucb_add", cur ? ui_resource_display_name(*cur) : "(select resource)")) {
             for (int i = 0; i < MAX_RESOURCES; i++) {
                 Resource& r = g_resources[i];
@@ -10009,7 +10134,8 @@ static void ui_panel_user_cb() {
             ImGui::EndCombo();
         }
     }
-    ImGui::SameLine();
+    if (add_link_inline)
+        ImGui::SameLine();
     if (ImGui::Button("Add Link") && s_add != INVALID_HANDLE) {
         user_cb_add_from_resource(s_add);
         s_add = INVALID_HANDLE;
@@ -10020,13 +10146,13 @@ static void ui_panel_user_cb() {
     ImGui::Separator();
     ImGui::TextDisabled("HLSL snippet");
     if (ImGui::BeginChild("ucb_hlsl", {0, 140}, true)) {
-        ImGui::TextDisabled("cbuffer UserCB : register(b2)");
-        ImGui::TextDisabled("{");
+        ui_inspector_text_disabled_wrapped("cbuffer UserCB : register(b2)");
+        ui_inspector_text_disabled_wrapped("{");
         for (int i = 0; i < g_user_cb_count; i++) {
             UserCBEntry& e = g_user_cb_entries[i];
-            ImGui::TextDisabled("    %-8s %-24s: packoffset(c%d);", user_cb_hlsl_type(e.type), e.name, i);
+            ui_inspector_text_disabled_wrapped("    %-8s %-24s: packoffset(c%d);", user_cb_hlsl_type(e.type), e.name, i);
         }
-        ImGui::TextDisabled("};");
+        ui_inspector_text_disabled_wrapped("};");
     }
     ImGui::EndChild();
 
@@ -10046,11 +10172,13 @@ static void ui_panel_general(bool embedded = false) {
 
     if (ui_inspector_section("INTERFACE")) {
         float ui_scale = ui_global_scale();
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Global Scale", 220.0f, 80.0f));
         if (ImGui::SliderFloat("Global Scale", &ui_scale, k_ui_scale_min, k_ui_scale_max, "%.2fx")) {
             ui_set_global_scale(ui_scale);
             settings_dirty = true;
         }
-        ImGui::SameLine();
+        if (ui_same_line_if_fits(ui_button_width("Reset##ui_scale")))
+            ImGui::SameLine();
         if (ImGui::Button("Reset##ui_scale")) {
             ui_set_global_scale(k_ui_scale_default);
             settings_dirty = true;
@@ -10071,6 +10199,7 @@ static void ui_panel_general(bool embedded = false) {
         ui_hint_text_disabled("Controls whether per-resource and per-command notes appear in the Inspector.");
 
         int rt_preview_columns = ui_render_target_preview_columns();
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("RT Preview Columns", 180.0f, 80.0f));
         if (ImGui::SliderInt("RT Preview Columns", &rt_preview_columns, 1, 8)) {
             ui_set_render_target_preview_columns(rt_preview_columns);
             settings_dirty = true;
@@ -10079,6 +10208,7 @@ static void ui_panel_general(bool embedded = false) {
 
     if (ui_inspector_section("SHADER EDITOR")) {
         float font_size = ui_code_font_size();
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Code Font Size", 180.0f, 80.0f));
         if (ImGui::SliderFloat("Code Font Size", &font_size, 10.0f, 28.0f, "%.0f px")) {
             ui_set_code_font_size(font_size);
             settings_dirty = true;
@@ -10088,21 +10218,58 @@ static void ui_panel_general(bool embedded = false) {
 
     if (ui_inspector_section("APPLICATION")) {
         settings_dirty |= ImGui::Checkbox("VSync", &g_dx.vsync);
-        ImGui::SameLine();
         ui_hint_text_disabled("%s", g_dx.vsync ? "Present interval 1" :
             (g_dx.present_allow_tearing ? "Present immediate + tearing" : "Present immediate"));
 
         float frame_cap = app_editor_frame_cap_fps();
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Editor Frame Cap", 220.0f, 80.0f));
         if (ImGui::SliderFloat("Editor Frame Cap", &frame_cap, 0.0f, 1000.0f, frame_cap <= 0.0f ? "uncapped" : "%.0f fps")) {
             app_set_editor_frame_cap_fps(frame_cap);
             settings_dirty = true;
         }
-        ImGui::SameLine();
+        if (ui_same_line_if_fits(ui_button_width("Uncap##editor_frame_cap")))
+            ImGui::SameLine();
         if (ImGui::Button("Uncap##editor_frame_cap")) {
             app_set_editor_frame_cap_fps(0.0f);
             settings_dirty = true;
         }
         ui_hint_text_disabled("Editor-only throttle. It is ignored when VSync is enabled and does not affect exported players.");
+    }
+
+    if (ui_inspector_section("AUDIO")) {
+        if (ImGui::Checkbox("Enable Audio##audio_enabled", &g_audio_settings.enabled))
+            audio_request_reset(app_scene_time());
+
+        if (ui_audio_shader_combo("Audio Shader##audio_shader", &g_audio_settings.shader))
+            audio_request_reset(app_scene_time());
+
+        bool reset_audio = false;
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Sample Rate##audio_sample_rate", 180.0f, 80.0f));
+        reset_audio |= ImGui::InputInt("Sample Rate##audio_sample_rate", &g_audio_settings.sample_rate);
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Song Duration##audio_duration", 180.0f, 80.0f));
+        reset_audio |= ImGui::InputFloat("Song Duration##audio_duration", &g_audio_settings.duration_seconds, 1.0f, 10.0f, "%.2f s");
+        if (reset_audio)
+            audio_request_reset(app_scene_time());
+
+        if (ImGui::Checkbox("Loop Audio##audio_loop", &g_audio_settings.loop))
+            audio_request_reset(app_scene_time());
+
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Master Volume##audio_master_volume", 180.0f, 80.0f));
+        ImGui::SliderFloat("Master Volume##audio_master_volume", &g_audio_settings.master_volume, 0.0f, 1.0f, "%.2f");
+
+        if (ImGui::Button("Reset Clock##audio_reset_clock"))
+            audio_request_reset(app_scene_time());
+        if (ui_same_line_if_fits(ui_button_width("Stop##audio_stop")))
+            ImGui::SameLine();
+        if (ImGui::Button("Stop##audio_stop")) {
+            g_audio_settings.enabled = false;
+            audio_stop();
+        }
+
+        ui_inspector_text_disabled_wrapped("Status: %s", audio_status());
+        ui_inspector_text_disabled_wrapped("Playback latency: %.1f ms", audio_latency_seconds() * 1000.0f);
+        ui_inspector_text_disabled_wrapped("Sample cursor: %llu", audio_sample_cursor());
+        ui_hint_text_disabled("Audio shader ABI: include shaders/audio_common.hlsl, write packed stereo int16 samples to AudioOut u0, use AudioCB b3.");
     }
 
     if (ui_inspector_section("EXPORTER / STANDALONE")) {
@@ -10113,13 +10280,10 @@ static void ui_panel_general(bool embedded = false) {
         // headers. Hidden ## suffixes avoid accidental ID collisions while keeping
         // the visible labels readable.
         ImGui::Checkbox("Camera/Light Controls##export_camera_light_controls", &g_export_settings.camera_light_controls_enabled);
-        ImGui::SameLine();
         ui_hint_text_disabled("off by default for demo playback");
         ImGui::Checkbox("Autoplay Timeline##export_timeline_autoplay", &g_export_settings.timeline_autoplay);
-        ImGui::SameLine();
         ui_hint_text_disabled("starts the sequence from frame 0 in the player");
         ImGui::Checkbox("Exit After Timeline##export_exit_after_timeline", &g_export_settings.exit_after_timeline);
-        ImGui::SameLine();
         ui_hint_text_disabled("overrides timeline loop in player/export");
         ImGui::Checkbox("Esc Closes Player##export_escape_closes_player", &g_export_settings.escape_closes_player);
         ImGui::Checkbox("VSync In Export##export_vsync", &g_export_settings.vsync);
@@ -10133,7 +10297,8 @@ static void ui_panel_general(bool embedded = false) {
             g_export_settings.vsync = false;
             g_export_settings.show_fps_title = false;
         }
-        ImGui::SameLine();
+        if (ui_same_line_if_fits(ui_button_width("Interactive Preset")))
+            ImGui::SameLine();
         if (ImGui::Button("Interactive Preset")) {
             g_export_settings.camera_light_controls_enabled = true;
             g_export_settings.timeline_autoplay = true;
@@ -10142,7 +10307,8 @@ static void ui_panel_general(bool embedded = false) {
             g_export_settings.vsync = false;
             g_export_settings.show_fps_title = true;
         }
-        ImGui::SameLine();
+        if (ui_same_line_if_fits(ui_button_width("Reset##export_settings")))
+            ImGui::SameLine();
         if (ImGui::Button("Reset##export_settings")) {
             g_export_settings = project_default_export_settings();
         }
@@ -10160,14 +10326,17 @@ static void ui_panel_general(bool embedded = false) {
             app_request_scene_render();
         }
         ui_hint_text_disabled("Grid level opacity");
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Fine##grid_level_alpha", 180.0f, 80.0f));
         if (ImGui::SliderFloat("Fine##grid_level_alpha", &g_dx.scene_grid_level_alpha[0], 0.0f, 1.0f, "%.2f")) {
             settings_dirty = true;
             app_request_scene_render();
         }
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Medium##grid_level_alpha", 180.0f, 80.0f));
         if (ImGui::SliderFloat("Medium##grid_level_alpha", &g_dx.scene_grid_level_alpha[1], 0.0f, 1.0f, "%.2f")) {
             settings_dirty = true;
             app_request_scene_render();
         }
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Coarse##grid_level_alpha", 180.0f, 80.0f));
         if (ImGui::SliderFloat("Coarse##grid_level_alpha", &g_dx.scene_grid_level_alpha[2], 0.0f, 1.0f, "%.2f")) {
             settings_dirty = true;
             app_request_scene_render();
@@ -10177,10 +10346,12 @@ static void ui_panel_general(bool embedded = false) {
             app_request_scene_render();
         }
         if (g_dx.scene_grid_distance_fade) {
+            ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Grid Fade Start", 180.0f, 80.0f));
             if (ImGui::DragFloat("Grid Fade Start", &g_dx.scene_grid_fade_start, 1.0f, 0.0f, 10000.0f, "%.0f")) {
                 settings_dirty = true;
                 app_request_scene_render();
             }
+            ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Grid Fade End", 180.0f, 80.0f));
             if (ImGui::DragFloat("Grid Fade End", &g_dx.scene_grid_fade_end, 1.0f, 1.0f, 10000.0f, "%.0f")) {
                 settings_dirty = true;
                 app_request_scene_render();
@@ -10191,6 +10362,7 @@ static void ui_panel_general(bool embedded = false) {
         settings_dirty |= ImGui::Checkbox("Show Camera Orientation Gizmo", &g_dx.scene_orientation_gizmo_enabled);
         if (g_dx.scene_orientation_gizmo_enabled) {
             ImGui::Indent(ui_margin_px(8.0f));
+            ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Gizmo Size##scene_orientation_gizmo_size", 180.0f, 80.0f));
             if (ImGui::SliderFloat("Gizmo Size##scene_orientation_gizmo_size", &g_dx.scene_orientation_gizmo_size_px, 72.0f, 180.0f, "%.0f px")) {
                 settings_dirty = true;
                 g_dx.scene_orientation_gizmo_size_px = clampf(g_dx.scene_orientation_gizmo_size_px, 72.0f, 180.0f);
@@ -10210,38 +10382,38 @@ static void ui_panel_general(bool embedded = false) {
     }
 
     if (ui_inspector_section("DIAGNOSTICS")) {
-        ImGui::Text("DX11 Adapter: %s", g_dx.adapter_name[0] ? g_dx.adapter_name : "unknown");
-        ImGui::TextDisabled("vendor=0x%04X device=0x%04X dedicated=%llu MB",
+        ImGui::TextWrapped("DX11 Adapter: %s", g_dx.adapter_name[0] ? g_dx.adapter_name : "unknown");
+        ui_inspector_text_disabled_wrapped("vendor=0x%04X device=0x%04X dedicated=%llu MB",
             g_dx.adapter_vendor_id,
             g_dx.adapter_device_id,
             g_dx.adapter_dedicated_vram_mb);
-        ImGui::TextDisabled("High-performance GPU hints are exported; on hybrid laptops the final desktop composition may still show iGPU activity.");
+        ui_inspector_text_disabled_wrapped("High-performance GPU hints are exported; on hybrid laptops the final desktop composition may still show iGPU activity.");
         ImGui::Separator();
 
 #if LAZYTOOL_ENABLE_D3D11_VALIDATION
         settings_dirty |= ImGui::Checkbox("D3D11 Runtime Validation", &g_dx.d3d11_validation);
         if (g_dx.d3d11_validation_active) {
-            ImGui::TextDisabled("Debug layer active in this session. Adds overhead.");
+            ui_inspector_text_disabled_wrapped("Debug layer active in this session. Adds overhead.");
         } else if (g_dx.d3d11_validation) {
             if (!g_dx.d3d11_validation_supported)
-                ImGui::TextDisabled("Requested, but the D3D11 debug layer is unavailable on this system.");
+                ui_inspector_text_disabled_wrapped("Requested, but the D3D11 debug layer is unavailable on this system.");
             else
-                ImGui::TextDisabled("Takes effect on next launch.");
+                ui_inspector_text_disabled_wrapped("Takes effect on next launch.");
         } else {
-            ImGui::TextDisabled("Disabled. Enable and restart to capture D3D11 runtime warnings.");
+            ui_inspector_text_disabled_wrapped("Disabled. Enable and restart to capture D3D11 runtime warnings.");
         }
 #else
         g_dx.d3d11_validation = false;
         g_dx.d3d11_validation_active = false;
-        ImGui::TextDisabled("D3D11 validation is compiled out for this build profile.");
+        ui_inspector_text_disabled_wrapped("D3D11 validation is compiled out for this build profile.");
 #endif
 
 #if LAZYTOOL_ENABLE_SHADER_BINDING_WARNINGS
         settings_dirty |= ImGui::Checkbox("Shader Binding Warnings##runtime_shader_binding_warnings", &g_dx.shader_validation_warnings);
-        ImGui::TextDisabled("Editor/runtime diagnostic only. Export defaults are controlled in Exporter / Standalone.");
+        ui_inspector_text_disabled_wrapped("Editor/runtime diagnostic only. Export defaults are controlled in Exporter / Standalone.");
 #else
         g_dx.shader_validation_warnings = false;
-        ImGui::TextDisabled("Shader binding warnings are compiled out for this build profile.");
+        ui_inspector_text_disabled_wrapped("Shader binding warnings are compiled out for this build profile.");
 #endif
 
 #if LAZYTOOL_ENABLE_D3D11_VALIDATION
@@ -10274,7 +10446,7 @@ static void ui_panel_general(bool embedded = false) {
             ImGui::Text("Other CPU: %.3f ms", app_cpu_other_ms());
             ui_help_marker("Everything in the measured frame not attributed to scene, ImGui build, ImGui render, or Present. Ideally small; includes message handling and loop overhead.");
             ImGuiIO& profiler_io = ImGui::GetIO();
-            ImGui::Text("ImGui output: %d verts, %d indices, %d draw cmds, %d lists, %d windows",
+            ImGui::TextWrapped("ImGui output: %d verts, %d indices, %d draw cmds, %d lists, %d windows",
                 profiler_io.MetricsRenderVertices,
                 profiler_io.MetricsRenderIndices,
                 app_imgui_draw_command_count(),
@@ -10349,6 +10521,7 @@ static void ui_panel_general(bool embedded = false) {
         settings_dirty |= ImGui::Checkbox("Enabled", &g_camera_controls.enabled);
         const char* camera_modes[] = { "Horizon Locked", "Free Camera" };
         int camera_mode = g_camera_controls.mode == CAMERA_MODE_FREE ? 1 : 0;
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Mode", 180.0f, 80.0f));
         if (ImGui::Combo("Mode", &camera_mode, camera_modes, 2)) {
             g_camera_controls.mode = camera_mode == 1 ? CAMERA_MODE_FREE : CAMERA_MODE_HORIZON_LOCKED;
             if (g_camera_controls.mode == CAMERA_MODE_HORIZON_LOCKED) {
@@ -10359,33 +10532,48 @@ static void ui_panel_general(bool embedded = false) {
             app_request_scene_render();
         }
         settings_dirty |= ImGui::Checkbox("Mouse Look", &g_camera_controls.mouse_look);
-        ImGui::SameLine();
+        if (ui_same_line_if_fits(ui_checkbox_width("Invert Y")))
+            ImGui::SameLine();
         settings_dirty |= ImGui::Checkbox("Invert Y", &g_camera_controls.invert_y);
 
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Move Speed", 180.0f, 80.0f));
         settings_dirty |= ImGui::DragFloat("Move Speed", &g_camera_controls.move_speed, 0.01f, 0.001f, 100.0f);
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Fast Mult", 180.0f, 80.0f));
         settings_dirty |= ImGui::DragFloat("Fast Mult", &g_camera_controls.fast_mult, 0.05f, 1.0f, 20.0f);
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Slow Mult", 180.0f, 80.0f));
         settings_dirty |= ImGui::DragFloat("Slow Mult", &g_camera_controls.slow_mult, 0.01f, 0.01f, 1.0f);
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Mouse Sensitivity", 180.0f, 80.0f));
         settings_dirty |= ImGui::DragFloat("Mouse Sensitivity", &g_camera_controls.mouse_sensitivity, 0.0001f, 0.0001f, 0.05f, "%.4f");
 
         ImGui::Separator();
         bool camera_changed = false;
         bool camera_rotation_changed = false;
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Position", 220.0f, 80.0f));
         camera_changed |= ImGui::DragFloat3("Position", g_camera.position, 0.01f);
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Yaw", 180.0f, 80.0f));
         camera_rotation_changed |= ImGui::DragFloat("Yaw", &g_camera.yaw, 0.01f);
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Pitch", 180.0f, 80.0f));
         camera_rotation_changed |= ImGui::DragFloat("Pitch", &g_camera.pitch, 0.01f);
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Roll", 180.0f, 80.0f));
         camera_rotation_changed |= ImGui::DragFloat("Roll", &g_camera.roll, 0.01f);
         camera_changed |= camera_rotation_changed;
         const char* projection_types[] = { "Perspective", "Orthographic" };
         int projection_type = g_camera.projection_type == CAMERA_PROJECTION_ORTHOGRAPHIC ? 1 : 0;
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Projection", 180.0f, 80.0f));
         if (ImGui::Combo("Projection", &projection_type, projection_types, 2)) {
             g_camera.projection_type = projection_type == 1 ? CAMERA_PROJECTION_ORTHOGRAPHIC : CAMERA_PROJECTION_PERSPECTIVE;
             camera_changed = true;
         }
-        if (g_camera.projection_type == CAMERA_PROJECTION_ORTHOGRAPHIC)
+        if (g_camera.projection_type == CAMERA_PROJECTION_ORTHOGRAPHIC) {
+            ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Ortho Height", 180.0f, 80.0f));
             camera_changed |= ImGui::DragFloat("Ortho Height", &g_camera.ortho_height, 0.01f, 0.001f, 10000.0f);
-        else
+        } else {
+            ImGui::SetNextItemWidth(ui_labeled_item_compact_width("FOV", 180.0f, 80.0f));
             camera_changed |= ImGui::DragFloat("FOV", &g_camera.fov_y, 0.01f, 0.10f, 2.80f);
+        }
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Near Plane", 180.0f, 80.0f));
         camera_changed |= ImGui::DragFloat("Near Plane", &g_camera.near_z, 0.001f, 0.0001f, 100.0f);
+        ImGui::SetNextItemWidth(ui_labeled_item_compact_width("Far Plane", 180.0f, 80.0f));
         camera_changed |= ImGui::DragFloat("Far Plane", &g_camera.far_z, 0.05f, 0.001f, 10000.0f);
 
         if (camera_rotation_changed)
@@ -14633,9 +14821,8 @@ static void ui_draw_render_graph_window() {
         return;
     }
     ImGui::Spacing();
-    ImGui::TextDisabled("Commands are shown in execution order. Mouse wheel zooms, right-drag pans, double middle-click resets.");
-    ImGui::SameLine();
-    ImGui::TextDisabled("Zoom %.0f%%", s_render_graph_zoom * 100.0f);
+    ui_inspector_text_disabled_wrapped("Commands are shown in execution order. Mouse wheel zooms, right-drag pans, double middle-click resets.");
+    ui_inspector_text_disabled_wrapped("Zoom %.0f%%", s_render_graph_zoom * 100.0f);
     ImGui::Spacing();
 
     if (graph.cmd_count == 0) {

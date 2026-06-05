@@ -1,5 +1,6 @@
 lazyTool_project 1
 export_settings 0 1 0 0 0 0
+audio_settings 0 - 48000 60 0.35 0
 
 commands
 command clear clear_scene 1

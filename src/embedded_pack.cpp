@@ -496,6 +496,58 @@ static bool append_cstr(unsigned char** out, size_t* out_len, size_t* out_cap, c
     return append_bytes(out, out_len, out_cap, s, s ? strlen(s) : 0);
 }
 
+static void project_ref_base_name(const char* token, char* out, int out_sz) {
+    if (!out || out_sz <= 0)
+        return;
+    out[0] = '\0';
+    if (!token || strcmp(token, "-") == 0)
+        return;
+    strncpy(out, token, out_sz - 1);
+    out[out_sz - 1] = '\0';
+    char* type_sep = strrchr(out, '|');
+    if (type_sep)
+        *type_sep = '\0';
+}
+
+static void scan_project_audio_settings(const void* data, size_t size,
+                                        bool* out_enabled, char* out_shader, int out_shader_sz) {
+    if (out_enabled)
+        *out_enabled = false;
+    if (out_shader && out_shader_sz > 0)
+        out_shader[0] = '\0';
+    if (!data || size == 0)
+        return;
+
+    const char* cursor = (const char*)data;
+    const char* end = cursor + size;
+    while (cursor < end) {
+        char line[1024] = {};
+        int n = 0;
+        while (cursor < end && *cursor != '\n' && *cursor != '\r') {
+            if (n < (int)sizeof(line) - 1)
+                line[n++] = *cursor;
+            cursor++;
+        }
+        while (cursor < end && (*cursor == '\n' || *cursor == '\r'))
+            cursor++;
+        line[n] = '\0';
+        trim_line(line);
+
+        char tmp[1024] = {};
+        strncpy(tmp, line, sizeof(tmp) - 1);
+        char* tag = strtok(tmp, " \t");
+        if (!tag || strcmp(tag, "audio_settings") != 0)
+            continue;
+        char* enabled = strtok(nullptr, " \t");
+        char* shader = strtok(nullptr, " \t");
+        if (out_enabled)
+            *out_enabled = enabled && atoi(enabled) != 0;
+        if (out_shader)
+            project_ref_base_name(shader, out_shader, out_shader_sz);
+        return;
+    }
+}
+
 static bool project_line_is_known_default(const char* line) {
     if (!line || !line[0])
         return true;
@@ -561,6 +613,9 @@ static bool minify_project_text(const void* data, size_t size, void** out_data, 
     unsigned char* out = nullptr;
     size_t out_len = 0;
     size_t out_cap = 0;
+    bool audio_enabled = false;
+    char audio_shader[MAX_NAME] = {};
+    scan_project_audio_settings(data, size, &audio_enabled, audio_shader, MAX_NAME);
 
     const char* cursor = (const char*)data;
     const char* end = cursor + size;
@@ -576,6 +631,30 @@ static bool minify_project_text(const void* data, size_t size, void** out_data, 
             cursor++;
         line[n] = '\0';
         trim_line(line);
+        char audio_tmp[1024] = {};
+        strncpy(audio_tmp, line, sizeof(audio_tmp) - 1);
+        char* audio_tag = strtok(audio_tmp, " \t");
+        if (audio_tag && strcmp(audio_tag, "resource") == 0) {
+            char* kind = strtok(nullptr, " \t");
+            char* name = strtok(nullptr, " \t");
+            if (kind && strcmp(kind, "audio_shader") == 0 &&
+                (!audio_enabled || !name || strcmp(name, audio_shader) != 0))
+                continue;
+        } else if (!audio_enabled && audio_tag && strcmp(audio_tag, "audio_settings") == 0) {
+            char* enabled = strtok(nullptr, " \t");
+            char* shader = strtok(nullptr, " \t");
+            char* sample_rate = strtok(nullptr, " \t");
+            char* duration = strtok(nullptr, " \t");
+            char* volume = strtok(nullptr, " \t");
+            char* loop = strtok(nullptr, " \t");
+            (void)enabled;
+            (void)shader;
+            snprintf(line, sizeof(line), "audio_settings 0 - %s %s %s %s",
+                     sample_rate ? sample_rate : "48000",
+                     duration ? duration : "60",
+                     volume ? volume : "0.35",
+                     loop ? loop : "0");
+        }
         // Keep timeline blocks even if the global runtime toggle is off.
         // They contain the animation curves/keyframes and are required by the
         // current runtime loader. The player will still respect timeline_global
@@ -828,6 +907,10 @@ static bool collect_project_refs(ExportList* list, const char* project_path, cha
         return false;
     }
 
+    bool audio_enabled = false;
+    char audio_shader[MAX_NAME] = {};
+    scan_project_audio_settings(bytes, size, &audio_enabled, audio_shader, MAX_NAME);
+
     char* text = (char*)bytes;
     char* line = text;
     while (line && *line) {
@@ -845,7 +928,8 @@ static bool collect_project_refs(ExportList* list, const char* project_path, cha
             char* kind = strtok(nullptr, " \t");
             char* name = strtok(nullptr, " \t");
             char* path = strtok(nullptr, " \t");
-            (void)name;
+            bool selected_audio_shader = audio_enabled && kind && name &&
+                strcmp(kind, "audio_shader") == 0 && strcmp(name, audio_shader) == 0;
             bool file_resource =
                 kind &&
                 (strcmp(kind, "mesh_gltf") == 0 ||
@@ -853,10 +937,12 @@ static bool collect_project_refs(ExportList* list, const char* project_path, cha
                  strcmp(kind, "gaussian_splat") == 0 ||
                  strcmp(kind, "nanovdb") == 0 ||
                  strcmp(kind, "shader_vsps") == 0 ||
-                 strcmp(kind, "shader_cs") == 0);
+                 strcmp(kind, "shader_cs") == 0 ||
+                 selected_audio_shader);
             if (file_resource && path && strcmp(path, "-") != 0) {
                 export_add_file(list, path, path);
-                if (strcmp(kind, "shader_vsps") == 0 || strcmp(kind, "shader_cs") == 0)
+                if (strcmp(kind, "shader_vsps") == 0 || strcmp(kind, "shader_cs") == 0 ||
+                    strcmp(kind, "audio_shader") == 0)
                     collect_shader_includes(list, path, 0);
                 if (strcmp(kind, "mesh_gltf") == 0)
                     collect_gltf_refs(list, path);

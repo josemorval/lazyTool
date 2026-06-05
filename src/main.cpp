@@ -20,6 +20,7 @@
 #include "app_settings.h"
 #include "embedded_pack.h"
 #include "timeline.h"
+#include "audio.h"
 #include "resource.h"
 
 // Hint hybrid-GPU laptops to start the editor/player on the high-performance GPU.
@@ -1075,6 +1076,7 @@ static void app_rewind_scene_runtime_state() {
     g_dt = 0.0f;
     g_frame = 0;
     g_scene_reset_execution_pending = true;
+    audio_request_reset(0.0f);
     dx_invalidate_scene_history();
 }
 
@@ -1130,6 +1132,7 @@ void app_set_scene_time(float seconds) {
     g_time = seconds;
     g_dt = 0.0f;
     g_frame = (uint64_t)floorf(seconds * 60.0f + 0.5f);
+    audio_request_reset(seconds);
     dx_invalidate_scene_history();
     app_request_scene_render();
 }
@@ -2406,6 +2409,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     res_init();
     cmd_init();
     user_cb_init();
+    audio_init();
 
     if (startup_project[0]) {
         if (!project_load_text(startup_project))
@@ -2572,6 +2576,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             g_scene_render_requested = false;
         scene_will_render = !g_scene_paused || force_scene_render;
 
+        if (!scene_will_render)
+            audio_update(g_time, false);
+
         if (scene_will_render) {
             LARGE_INTEGER scene_cpu_begin = {};
             if (profile_cpu)
@@ -2581,6 +2588,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             update_default_example_commands();
             // User cbuffer: pack editor defaults before any draw/dispatch.
             user_cb_update();
+            audio_update(g_time, !g_scene_paused);
 
             cmd_profile_begin_frame_capture();
 
@@ -2668,6 +2676,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 #ifndef LAZYTOOL_PLAYER_ONLY
     app_settings_save();
 #endif
+    audio_shutdown();
     user_cb_shutdown();
 #ifndef LAZYTOOL_PLAYER_ONLY
     if (!g_player_mode)

@@ -240,6 +240,7 @@ struct Resource {
     // recompilation. It stays valid even when a path is missing and the
     // runtime shader pointer contains only a fallback object.
     ShaderProgramKind shader_kind;
+    bool audio_shader;
     bool compiled_ok;
     bool using_fallback;
     char compile_err[512];
@@ -437,6 +438,17 @@ struct ExportSettings {
     bool escape_closes_player;
     bool vsync;
     bool show_fps_title;
+};
+
+// Project-owned audio playback settings. Audio shaders compile as compute
+// programs, but are flagged as their own asset kind by Resource::audio_shader.
+struct AudioSettings {
+    bool      enabled;
+    ResHandle shader;
+    int       sample_rate;
+    float     duration_seconds;
+    float     master_volume;
+    bool      loop;
 };
 
 // ?? math ??????????????????????????????????????????????????????????????????

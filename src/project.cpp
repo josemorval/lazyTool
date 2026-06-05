@@ -7,6 +7,7 @@
 #include "user_cb.h"
 #include "embedded_pack.h"
 #include "timeline.h"
+#include "audio.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -625,6 +626,7 @@ static void project_clear_user_data() {
     timeline_reset();
     user_cb_clear();
     project_reset_export_settings();
+    audio_reset_settings();
 
     for (int i = 0; i < MAX_COMMANDS; i++) {
         if (g_commands[i].active)
@@ -806,7 +808,9 @@ bool project_save_text(const char* path) {
             // as the program kind the user created.
             bool is_compute = r.shader_kind == SHADER_PROGRAM_CS ||
                               (r.shader_kind == SHADER_PROGRAM_UNKNOWN && r.cs != nullptr);
-            fprintf(f, "resource %s %s %s\n", is_compute ? "shader_cs" : "shader_vsps",
+            const char* shader_kind = r.audio_shader ? "audio_shader" :
+                                      (is_compute ? "shader_cs" : "shader_vsps");
+            fprintf(f, "resource %s %s %s\n", shader_kind,
                 r.name, project_path_token(r.path, path_ref, MAX_PATH_LEN));
         } else if (r.type == RES_TEXTURE2D) {
             char path_ref[MAX_PATH_LEN] = {};
@@ -835,6 +839,16 @@ bool project_save_text(const char* path) {
                 fprintf(f, "mesh_part_disabled %s %d\n", r.name, pi);
         }
     }
+
+    char audio_shader_ref[MAX_PATH_LEN] = {};
+    res_ref(g_audio_settings.shader, audio_shader_ref, MAX_PATH_LEN);
+    fprintf(f, "\naudio_settings %s %s %d %.9g %.9g %s\n",
+        bool_str(g_audio_settings.enabled),
+        audio_shader_ref,
+        g_audio_settings.sample_rate,
+        g_audio_settings.duration_seconds,
+        g_audio_settings.master_volume,
+        bool_str(g_audio_settings.loop));
 
     fprintf(f, "\nuser_cb\n");
     for (int i = 0; i < g_user_cb_count; i++) {
@@ -1059,6 +1073,7 @@ bool project_load_text(const char* path) {
     LARGE_INTEGER t_validate_begin = t_read_end;
     {
         bool has_export_settings = false;
+        bool has_audio_settings = false;
         bool has_timeline_global = false;
         bool has_timeline_clip = false;
         char scan_line[4096] = {};
@@ -1071,10 +1086,11 @@ bool project_load_text(const char* path) {
             if (!tag || tag[0] == '#')
                 continue;
             if (strcmp(tag, "export_settings") == 0) has_export_settings = true;
+            else if (strcmp(tag, "audio_settings") == 0) has_audio_settings = true;
             else if (strcmp(tag, "timeline_global") == 0) has_timeline_global = true;
             else if (strcmp(tag, "timeline_clip") == 0) has_timeline_clip = true;
         }
-        if (!has_export_settings || !has_timeline_global || !has_timeline_clip) {
+        if (!has_export_settings || !has_audio_settings || !has_timeline_global || !has_timeline_clip) {
             lt_free_file(project_bytes);
             log_error("Project load failed: project is not saved in the current .lt format.");
             return false;
@@ -1111,6 +1127,7 @@ bool project_load_text(const char* path) {
     bool timeline_global_enabled = false;
     bool timeline_clip_enabled_load[MAX_TIMELINES] = {};
     bool saw_export_settings = false;
+    bool saw_audio_settings = false;
     bool saw_timeline_global = false;
     const char* cursor = (const char*)project_bytes;
     const char* end = cursor + project_size;
@@ -1140,6 +1157,28 @@ bool project_load_text(const char* path) {
                 g_export_settings.show_fps_title = atoi(show_fps_title) != 0;
             } else
                 return fail_current_project_load("export_settings must be: export_settings camera_light_controls timeline_autoplay exit_after_timeline esc_close vsync show_fps_title");
+        } else if (strcmp(tag, "audio_settings") == 0) {
+            char* enabled = strtok(nullptr, " \t\r\n");
+            char* shader_ref = strtok(nullptr, " \t\r\n");
+            char* sample_rate = strtok(nullptr, " \t\r\n");
+            char* duration_seconds = strtok(nullptr, " \t\r\n");
+            char* master_volume = strtok(nullptr, " \t\r\n");
+            char* loop = strtok(nullptr, " \t\r\n");
+            char* extra = strtok(nullptr, " \t\r\n");
+            if (!enabled || !shader_ref || !sample_rate || !duration_seconds ||
+                !master_volume || !loop || extra)
+                return fail_current_project_load("audio_settings must be: audio_settings enabled shader sample_rate duration_seconds master_volume loop");
+            saw_audio_settings = true;
+            g_audio_settings.enabled = atoi(enabled) != 0;
+            g_audio_settings.shader = res_by_ref(shader_ref, res_lookup_types(RES_SHADER));
+            Resource* audio_shader = res_get(g_audio_settings.shader);
+            if (!audio_shader || !audio_shader->audio_shader)
+                g_audio_settings.shader = INVALID_HANDLE;
+            g_audio_settings.sample_rate = atoi(sample_rate);
+            g_audio_settings.duration_seconds = (float)atof(duration_seconds);
+            g_audio_settings.master_volume = clampf((float)atof(master_volume), 0.0f, 1.0f);
+            g_audio_settings.loop = atoi(loop) != 0;
+            audio_request_reset(0.0f);
         } else if (strcmp(tag, "timeline") == 0) {
             timeline_reset();
             timeline_load_track = -1;
@@ -1388,6 +1427,9 @@ bool project_load_text(const char* path) {
             } else if (strcmp(kind, "shader_cs") == 0) {
                 char* p = strtok(nullptr, " \t\r\n");
                 res_create_compute_shader(name, p && strcmp(p, "-") != 0 ? p : "", "CSMain");
+            } else if (strcmp(kind, "audio_shader") == 0) {
+                char* p = strtok(nullptr, " \t\r\n");
+                res_create_audio_shader(name, p && strcmp(p, "-") != 0 ? p : "", "CSMain");
             } else if (strcmp(kind, "texture2d") == 0) {
                 char* p = strtok(nullptr, " \t\r\n");
                 if (p && strcmp(p, "-") != 0) res_load_texture(name, p);
@@ -1624,6 +1666,12 @@ bool project_load_text(const char* path) {
         log_set_info_suppressed(previous_info_log_suppressed);
         lt_free_file(project_bytes);
         log_error("Project load failed: missing or invalid export_settings block.");
+        return false;
+    }
+    if (!saw_audio_settings) {
+        log_set_info_suppressed(previous_info_log_suppressed);
+        lt_free_file(project_bytes);
+        log_error("Project load failed: missing or invalid audio_settings block.");
         return false;
     }
     if (!saw_timeline_global || timeline_clip_count <= 0) {

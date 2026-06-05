@@ -59,6 +59,7 @@ bool      res_recreate_structured_buffer(ResHandle h, int elem_size, int elem_co
 ResHandle res_create_shader(const char* name, const char* path,
                              const char* vs_entry, const char* ps_entry);
 ResHandle res_create_compute_shader(const char* name, const char* path, const char* cs_entry);
+ResHandle res_create_audio_shader(const char* name, const char* path, const char* cs_entry);
 ResHandle res_load_texture(const char* name, const char* path);
 bool      res_reload_texture(Resource* r, const char* path);
 ResHandle res_load_mesh(const char* name, const char* path);

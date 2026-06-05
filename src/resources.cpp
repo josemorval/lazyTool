@@ -1338,6 +1338,15 @@ ResHandle res_create_compute_shader(const char* name, const char* path, const ch
     return handle;
 }
 
+ResHandle res_create_audio_shader(const char* name, const char* path, const char* cs_entry) {
+    ResHandle handle = res_alloc(name, RES_SHADER);
+    if (handle == INVALID_HANDLE) return INVALID_HANDLE;
+    Resource* r = res_get(handle);
+    r->audio_shader = true;
+    shader_compile_cs(r, path, cs_entry ? cs_entry : "CSMain");
+    return handle;
+}
+
 static bool res_upload_texture_2d(Resource* r, const char* source_label,
                                   const void* pixels, int w, int h,
                                   DXGI_FORMAT fmt, UINT row_pitch)
