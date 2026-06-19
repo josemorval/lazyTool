@@ -62,13 +62,13 @@ VSOut VSMain(VSIn v)
 float3 main_light_dir_ws(float3 world_pos)
 {
     if (LightParams.x >= 0.5)
-        return lt_safe_normalize(LightPos.xyz - world_pos);
-    return lt_safe_normalize(-LightDir.xyz);
+        return normalize(LightPos.xyz - world_pos);
+    return normalize(-LightDir.xyz);
 }
 
 float4 PSMain(VSOut i) : SV_Target
 {
-    float3 n = lt_safe_normalize(i.normal_ws);
+    float3 n = normalize(i.normal_ws);
     float3 l = main_light_dir_ws(i.world_pos);
     float ndl = saturate(dot(n, l));
 
@@ -141,7 +141,7 @@ float3 scene_normal(float3 p)
 {
     float e = 0.002;
     float2 h = float2(e, 0.0);
-    return lt_safe_normalize(float3(
+    return normalize(float3(
         scene_sdf(p + h.xyy).x - scene_sdf(p - h.xyy).x,
         scene_sdf(p + h.yxy).x - scene_sdf(p - h.yxy).x,
         scene_sdf(p + h.yyx).x - scene_sdf(p - h.yyx).x));
@@ -191,7 +191,7 @@ float3 ray_dir_from_uv(float2 uv)
     float4 far_clip = lt_uv_depth_to_clip(uv, 1.0);
     float4 far_world = mul(InvViewProj, far_clip);
     far_world.xyz /= max(abs(far_world.w), LT_EPS);
-    return lt_safe_normalize(far_world.xyz - lt_camera_position_ws());
+    return normalize(far_world.xyz - lt_camera_position_ws());
 }
 
 float3 material_color(float3 p, float mat_id)
@@ -217,8 +217,8 @@ float4 PSMain(VSOut i) : SV_Target
     float3 p = ro + rd * t;
     float3 n = scene_normal(p);
     float3 l = LightParams.x >= 0.5
-        ? lt_safe_normalize(LightPos.xyz - p)
-        : lt_safe_normalize(-LightDir.xyz);
+        ? normalize(LightPos.xyz - p)
+        : normalize(-LightDir.xyz);
 
     float ndl = saturate(dot(n, l));
     float shadow = soft_shadow(p + n * 0.015, l, 40.0);
@@ -379,14 +379,9 @@ struct GBufferOut
     float4 emissive_ao  : SV_Target2;
 };
 
-float3 safe_normalize(float3 v)
-{
-    return v * rsqrt(max(dot(v, v), 1e-8));
-}
-
 float3 encode_normal(float3 n)
 {
-    return safe_normalize(n) * 0.5 + 0.5;
+    return normalize(n) * 0.5 + 0.5;
 }
 
 VSOut VSMain(VSIn v)
@@ -395,7 +390,7 @@ VSOut VSMain(VSIn v)
     float4 world = mul(LocalToWorld, float4(v.pos, 1.0));
     o.pos = mul(ViewProj, world);
     o.world_pos = world.xyz;
-    o.normal_ws = safe_normalize(mul(LocalToWorld, float4(v.nor, 0.0)).xyz);
+    o.normal_ws = normalize(mul(LocalToWorld, float4(v.nor, 0.0)).xyz);
     o.uv = v.uv;
     return o;
 }
@@ -454,14 +449,9 @@ Texture2D<float4> GBufferEmissiveAO  : register(t2);
 Texture2D<float>  SceneDepth         : register(t3);
 RWTexture2D<float4> OutputColor      : register(u0);
 
-float3 safe_normalize(float3 v)
-{
-    return v * rsqrt(max(dot(v, v), 1e-8));
-}
-
 float3 decode_normal(float3 enc)
 {
-    return safe_normalize(enc * 2.0 - 1.0);
+    return normalize(enc * 2.0 - 1.0);
 }
 
 float4 uv_depth_to_clip(float2 uv, float depth01)
@@ -505,7 +495,7 @@ float geometry_smith(float3 n, float3 v, float3 l, float roughness)
 float3 pbr_direct(float3 albedo, float metallic, float roughness,
                   float3 n, float3 v, float3 l, float3 radiance)
 {
-    float3 h = safe_normalize(v + l);
+    float3 h = normalize(v + l);
     float ndl = saturate(dot(n, l));
     float ndv = saturate(dot(n, v));
     float hdv = saturate(dot(h, v));
@@ -543,13 +533,13 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     float ao = saturate(ea.a);
 
     float3 world_pos = scene_depth_to_world(uv, depth01);
-    float3 v = safe_normalize(mul(ViewToWorld, float4(0.0, 0.0, 0.0, 1.0)).xyz - world_pos);
-    float3 l = LightParams.x >= 0.5 ? safe_normalize(LightPos.xyz - world_pos)
-                                    : safe_normalize(-LightDir.xyz);
+    float3 v = normalize(mul(ViewToWorld, float4(0.0, 0.0, 0.0, 1.0)).xyz - world_pos);
+    float3 l = LightParams.x >= 0.5 ? normalize(LightPos.xyz - world_pos)
+                                    : normalize(-LightDir.xyz);
 
     float attenuation = 1.0;
     if (LightParams.x >= 0.5) {
-        float cone = dot(safe_normalize(world_pos - LightPos.xyz), safe_normalize(LightDir.xyz));
+        float cone = dot(normalize(world_pos - LightPos.xyz), normalize(LightDir.xyz));
         attenuation = saturate((cone - LightParams.z) / max(LightParams.y - LightParams.z, 1e-5));
     }
 
@@ -695,11 +685,6 @@ struct VSOut
     float4 col : COLOR0;
 };
 
-float3 safe_normalize(float3 v)
-{
-    return v * rsqrt(max(dot(v, v), 1e-8));
-}
-
 float2 quad_corner(uint vertex_in_quad)
 {
     float2 corners[6] = {
@@ -717,9 +702,9 @@ VSOut VSMain(uint vertex_id : SV_VertexID)
     Particle p = Particles[particle_id];
     float2 q = quad_corner(vertex_in_quad);
 
-    float3 forward = safe_normalize(mul(ViewToWorld, float4(0.0, 0.0, -1.0, 0.0)).xyz);
-    float3 right = safe_normalize(cross(float3(0, 1, 0), forward));
-    float3 up = safe_normalize(cross(forward, right));
+    float3 forward = normalize(mul(ViewToWorld, float4(0.0, 0.0, -1.0, 0.0)).xyz);
+    float3 right = normalize(cross(float3(0, 1, 0), forward));
+    float3 up = normalize(cross(forward, right));
     float3 world_pos = p.pos + (right * q.x + up * q.y) * p.size;
 
     VSOut o;

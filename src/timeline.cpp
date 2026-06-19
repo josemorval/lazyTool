@@ -16,6 +16,7 @@ struct TimelineState {
     int length_frames;
     int current_frame;
     float sample_frame;
+    TimelineCameraFeelSettings camera_feel;
     int track_count;
     TimelineTrack tracks[MAX_TIMELINE_TRACKS];
 };
@@ -27,6 +28,7 @@ static int   s_timeline_playback_index = 0; // timeline currently sampled by seq
 static bool  s_timeline_setting_scene_time = false;
 static bool  s_timeline_enabled = false; // global runtime enable.
 static bool  s_timeline_loop = false;    // global sequence loop.
+static bool  s_timeline_recording = false; // editor auto-key capture.
 
 TimelineTrack* g_timeline_tracks = nullptr;
 int            g_timeline_track_count = 0;
@@ -42,6 +44,10 @@ static float timeline_wrap_angle(float a) {
 
 static float timeline_lerp(float a, float b, float t) {
     return a + (b - a) * t;
+}
+
+static int timeline_clampi(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
 }
 
 static float timeline_lerp_angle(float a, float b, float t) {
@@ -69,6 +75,116 @@ static float timeline_ease_t(int mode, float t) {
         return 1.0f - 2.0f * u * u;
     }
     return t;
+}
+
+void timeline_camera_feel_apply_preset(TimelineCameraFeelSettings* settings, int preset) {
+    if (!settings)
+        return;
+
+    bool enabled = settings->enabled;
+    int seed = settings->seed;
+    if (seed == 0)
+        seed = 1337;
+    memset(settings, 0, sizeof(*settings));
+    settings->enabled = enabled;
+    settings->preset = timeline_clampi(preset, 0, TIMELINE_CAMERA_FEEL_PRESET_COUNT - 1);
+    settings->seed = seed;
+    settings->fade_in_frames = 12;
+    settings->fade_out_frames = 12;
+
+    switch (settings->preset) {
+    case TIMELINE_CAMERA_FEEL_OPERATOR:
+        settings->amount = 0.65f;
+        settings->frequency = 1.00f;
+        settings->roughness = 0.45f;
+        settings->position_amount = 0.035f;
+        settings->rotation_amount = 0.0070f;
+        settings->roll_amount = 0.0030f;
+        settings->micro_amount = 0.12f;
+        settings->breathing_amount = 0.0035f;
+        break;
+    case TIMELINE_CAMERA_FEEL_HANDHELD:
+        settings->amount = 0.85f;
+        settings->frequency = 1.25f;
+        settings->roughness = 0.68f;
+        settings->position_amount = 0.075f;
+        settings->rotation_amount = 0.0140f;
+        settings->roll_amount = 0.0070f;
+        settings->micro_amount = 0.30f;
+        settings->breathing_amount = 0.0060f;
+        break;
+    case TIMELINE_CAMERA_FEEL_DOCUMENTARY:
+        settings->amount = 0.75f;
+        settings->frequency = 1.40f;
+        settings->roughness = 0.58f;
+        settings->position_amount = 0.055f;
+        settings->rotation_amount = 0.0100f;
+        settings->roll_amount = 0.0090f;
+        settings->micro_amount = 0.25f;
+        settings->breathing_amount = 0.0045f;
+        break;
+    case TIMELINE_CAMERA_FEEL_AGGRESSIVE:
+        settings->amount = 1.20f;
+        settings->frequency = 2.40f;
+        settings->roughness = 0.85f;
+        settings->position_amount = 0.180f;
+        settings->rotation_amount = 0.0350f;
+        settings->roll_amount = 0.0280f;
+        settings->micro_amount = 0.65f;
+        settings->breathing_amount = 0.0120f;
+        settings->fade_in_frames = 8;
+        settings->fade_out_frames = 8;
+        break;
+    case TIMELINE_CAMERA_FEEL_SUBTLE:
+    default:
+        settings->amount = 0.45f;
+        settings->frequency = 0.85f;
+        settings->roughness = 0.28f;
+        settings->position_amount = 0.015f;
+        settings->rotation_amount = 0.0040f;
+        settings->roll_amount = 0.0015f;
+        settings->micro_amount = 0.05f;
+        settings->breathing_amount = 0.0015f;
+        break;
+    }
+}
+
+void timeline_camera_feel_defaults(TimelineCameraFeelSettings* out) {
+    if (!out)
+        return;
+    memset(out, 0, sizeof(*out));
+    out->seed = 1337;
+    timeline_camera_feel_apply_preset(out, TIMELINE_CAMERA_FEEL_SUBTLE);
+    out->enabled = false;
+}
+
+static void timeline_sanitize_camera_feel_settings(TimelineCameraFeelSettings* settings) {
+    if (!settings)
+        return;
+    settings->preset = timeline_clampi(settings->preset, 0, TIMELINE_CAMERA_FEEL_PRESET_COUNT - 1);
+    if (settings->seed == 0)
+        settings->seed = 1337;
+    settings->amount = clampf(settings->amount, 0.0f, 4.0f);
+    settings->frequency = clampf(settings->frequency, 0.01f, 24.0f);
+    settings->roughness = clampf(settings->roughness, 0.0f, 1.0f);
+    settings->position_amount = clampf(settings->position_amount, 0.0f, 50.0f);
+    settings->rotation_amount = clampf(settings->rotation_amount, 0.0f, 1.0f);
+    settings->roll_amount = clampf(settings->roll_amount, 0.0f, 1.0f);
+    settings->micro_amount = clampf(settings->micro_amount, 0.0f, 4.0f);
+    settings->breathing_amount = clampf(settings->breathing_amount, 0.0f, 0.50f);
+    settings->fade_in_frames = timeline_clampi(settings->fade_in_frames, 0, MAX_TIMELINE_FRAMES);
+    settings->fade_out_frames = timeline_clampi(settings->fade_out_frames, 0, MAX_TIMELINE_FRAMES);
+}
+
+const char* timeline_camera_feel_preset_name(int preset) {
+    switch (preset) {
+    case TIMELINE_CAMERA_FEEL_OPERATOR:    return "Operator";
+    case TIMELINE_CAMERA_FEEL_HANDHELD:    return "Handheld";
+    case TIMELINE_CAMERA_FEEL_DOCUMENTARY: return "Documentary";
+    case TIMELINE_CAMERA_FEEL_AGGRESSIVE:  return "Aggressive";
+    case TIMELINE_CAMERA_FEEL_SUBTLE:
+    default:                               return "Subtle";
+    }
 }
 
 static float timeline_cubic_hermite(float p0, float p1, float p2, float p3,
@@ -132,6 +248,7 @@ static void timeline_init_state(TimelineState& tl, int index, const char* name) 
     tl.length_frames = 240;
     tl.current_frame = 0;
     tl.sample_frame = 0.0f;
+    timeline_camera_feel_defaults(&tl.camera_feel);
     tl.track_count = 0;
     if (name && name[0]) {
         strncpy(tl.name, name, MAX_NAME - 1);
@@ -293,7 +410,16 @@ void timeline_reset() {
     s_timeline_setting_scene_time = false;
     s_timeline_enabled = false;
     s_timeline_loop = false;
+    s_timeline_recording = false;
     timeline_sync_public_tracks();
+}
+
+bool timeline_recording() {
+    return s_timeline_recording;
+}
+
+void timeline_set_recording(bool recording) {
+    s_timeline_recording = recording;
 }
 
 int timeline_count() {
@@ -457,6 +583,26 @@ bool timeline_current_has_keys() {
             return true;
     }
     return false;
+}
+
+bool timeline_get_camera_feel_settings(int index, TimelineCameraFeelSettings* out) {
+    if (!out)
+        return false;
+    TimelineState* tl = timeline_state_at(index);
+    if (!tl)
+        return false;
+    *out = tl->camera_feel;
+    timeline_sanitize_camera_feel_settings(out);
+    return true;
+}
+
+void timeline_set_camera_feel_settings(int index, const TimelineCameraFeelSettings* settings) {
+    TimelineState* tl = timeline_state_at(index);
+    if (!tl || !settings)
+        return;
+    tl->camera_feel = *settings;
+    timeline_sanitize_camera_feel_settings(&tl->camera_feel);
+    app_request_scene_render();
 }
 
 int timeline_fps() {
@@ -957,6 +1103,8 @@ bool timeline_capture_key(int track_index, int frame) {
 
 bool timeline_capture_if_tracked(TimelineTrackKind kind, const char* target, ResType value_type) {
     app_request_scene_render();
+    if (!s_timeline_recording)
+        return false;
     int track_index = timeline_find_track(kind, target ? target : "", value_type);
     if (track_index < 0)
         return false;
@@ -1038,9 +1186,9 @@ static void timeline_sample_command_transform(const TimelineKey& k0, const Timel
         out->fval[i] = timeline_sample_float_component(k0, a, b, k3, i, t, mode, false);
 }
 
-static void timeline_sample_camera(const TimelineKey& k0, const TimelineKey& a,
-                                   const TimelineKey& b, const TimelineKey& k3,
-                                   float t, int mode, TimelineKey* out) {
+static void timeline_sample_camera_key(const TimelineKey& k0, const TimelineKey& a,
+                                       const TimelineKey& b, const TimelineKey& k3,
+                                       float t, int mode, TimelineKey* out) {
     if (!out)
         return;
 
@@ -1056,11 +1204,25 @@ static void timeline_sample_camera(const TimelineKey& k0, const TimelineKey& a,
     out->fval[10] = timeline_sample_float_component(k0, a, b, k3, 10, t, mode, false);
 }
 
-static void timeline_sample_key(const TimelineState& tl, const TimelineTrack& track, TimelineKey* out) {
+static void timeline_sample_light_key(const TimelineKey& k0, const TimelineKey& a,
+                                      const TimelineKey& b, const TimelineKey& k3,
+                                      float t, int mode, TimelineKey* out) {
+    if (!out)
+        return;
+
+    TimelineTrack light_track = {};
+    light_track.kind = TIMELINE_TRACK_LIGHT;
+    int n = timeline_track_value_count(light_track);
+    for (int i = 0; i < n; i++)
+        out->fval[i] = timeline_sample_float_component(k0, a, b, k3, i, t, mode, false);
+    out->fval[10] = t < 0.5f ? a.fval[10] : b.fval[10];
+}
+
+static void timeline_sample_key_at(const TimelineState& tl, const TimelineTrack& track,
+                                   float sample_frame, TimelineKey* out) {
     if (!out || track.key_count <= 0)
         return;
 
-    float sample_frame = tl.sample_frame;
     if (sample_frame < 0.0f) sample_frame = 0.0f;
     float max_sample_frame = (float)(tl.length_frames - 1);
     if (sample_frame > max_sample_frame) sample_frame = max_sample_frame;
@@ -1105,7 +1267,11 @@ static void timeline_sample_key(const TimelineState& tl, const TimelineTrack& tr
         return;
     }
     if (track.kind == TIMELINE_TRACK_CAMERA) {
-        timeline_sample_camera(k0, a, b, k3, t, mode, out);
+        timeline_sample_camera_key(k0, a, b, k3, t, mode, out);
+        return;
+    }
+    if (track.kind == TIMELINE_TRACK_LIGHT) {
+        timeline_sample_light_key(k0, a, b, k3, t, mode, out);
         return;
     }
     if (track.kind == TIMELINE_TRACK_USER_VAR &&
@@ -1116,6 +1282,10 @@ static void timeline_sample_key(const TimelineState& tl, const TimelineTrack& tr
     int n = timeline_track_value_count(track);
     for (int i = 0; i < n; i++)
         out->fval[i] = timeline_sample_float_component(k0, a, b, k3, i, t, mode, false);
+}
+
+static void timeline_sample_key(const TimelineState& tl, const TimelineTrack& track, TimelineKey* out) {
+    timeline_sample_key_at(tl, track, tl.sample_frame, out);
 }
 
 static void timeline_apply_user_var_to_source(UserCBEntry& e, const TimelineKey& key) {
@@ -1229,7 +1399,119 @@ static void timeline_apply_command_enabled(const TimelineTrack& track, const Tim
         c->enabled = key.ival[0] != 0;
 }
 
-static void timeline_apply_camera(const TimelineKey& key) {
+static uint32_t timeline_camera_feel_hash(uint32_t x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+static float timeline_camera_feel_hash_float(int x, int seed) {
+    uint32_t h = timeline_camera_feel_hash((uint32_t)x ^ timeline_camera_feel_hash((uint32_t)seed));
+    return ((float)(h & 0x00ffffffu) / 8388607.5f) - 1.0f;
+}
+
+static float timeline_camera_feel_smooth(float t) {
+    t = clampf(t, 0.0f, 1.0f);
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+static float timeline_camera_feel_value_noise(float x, int seed) {
+    int ix = (int)floorf(x);
+    float t = x - (float)ix;
+    float a = timeline_camera_feel_hash_float(ix, seed);
+    float b = timeline_camera_feel_hash_float(ix + 1, seed);
+    return timeline_lerp(a, b, timeline_camera_feel_smooth(t));
+}
+
+static float timeline_camera_feel_fbm(float x, int seed, float roughness) {
+    roughness = clampf(roughness, 0.0f, 1.0f);
+    float sum = timeline_camera_feel_value_noise(x, seed);
+    float norm = 1.0f;
+    float amp = 0.5f * roughness;
+    float freq = 2.13f;
+    for (int i = 0; i < 3; i++) {
+        sum += timeline_camera_feel_value_noise(x * freq + 19.37f * (float)(i + 1), seed + 41 + i * 17) * amp;
+        norm += amp;
+        amp *= 0.5f * roughness;
+        freq *= 2.07f;
+    }
+    return norm > 0.0f ? sum / norm : sum;
+}
+
+static float timeline_camera_feel_fade(const TimelineState& tl) {
+    const TimelineCameraFeelSettings& s = tl.camera_feel;
+    float fade = 1.0f;
+    if (s.fade_in_frames > 0)
+        fade = fminf(fade, clampf(tl.sample_frame / (float)s.fade_in_frames, 0.0f, 1.0f));
+    if (s.fade_out_frames > 0) {
+        float last = (float)(tl.length_frames - 1);
+        fade = fminf(fade, clampf((last - tl.sample_frame) / (float)s.fade_out_frames, 0.0f, 1.0f));
+    }
+    return timeline_camera_feel_smooth(fade);
+}
+
+static void timeline_apply_camera_feel(const TimelineState& tl, TimelineKey* key) {
+    if (!key || !tl.camera_feel.enabled || tl.fps <= 0)
+        return;
+
+    TimelineCameraFeelSettings s = tl.camera_feel;
+    timeline_sanitize_camera_feel_settings(&s);
+    float fade = timeline_camera_feel_fade(tl);
+    float strength = s.amount * fade;
+    if (strength <= 0.000001f)
+        return;
+
+    float t = tl.sample_frame / (float)tl.fps;
+    float f = s.frequency;
+    int seed = s.seed;
+
+    float drift_yaw = timeline_camera_feel_fbm(t * f * 0.29f + 3.1f, seed + 11, s.roughness);
+    float drift_pitch = timeline_camera_feel_fbm(t * f * 0.37f + 7.3f, seed + 17, s.roughness);
+    float drift_roll = timeline_camera_feel_fbm(t * f * 0.31f + 2.4f, seed + 23, s.roughness);
+    float operator_yaw = timeline_camera_feel_fbm(t * f * 1.10f + 5.8f, seed + 29, s.roughness);
+    float operator_pitch = timeline_camera_feel_fbm(t * f * 1.28f + 9.4f, seed + 31, s.roughness);
+    float operator_roll = timeline_camera_feel_fbm(t * f * 0.92f + 4.2f, seed + 37, s.roughness);
+    float micro_yaw = timeline_camera_feel_value_noise(t * f * 5.70f + 1.7f, seed + 43);
+    float micro_pitch = timeline_camera_feel_value_noise(t * f * 6.20f + 8.9f, seed + 47);
+    float micro_roll = timeline_camera_feel_value_noise(t * f * 5.10f + 6.2f, seed + 53);
+
+    key->fval[3] = timeline_wrap_angle(key->fval[3] +
+        (drift_yaw * 0.72f + operator_yaw * 0.28f + micro_yaw * s.micro_amount * 0.10f) *
+        s.rotation_amount * strength);
+    key->fval[4] +=
+        (drift_pitch * 0.62f + operator_pitch * 0.38f + micro_pitch * s.micro_amount * 0.12f) *
+        s.rotation_amount * 0.78f * strength;
+    key->fval[8] = timeline_wrap_angle(key->fval[8] +
+        (drift_roll * 0.52f + operator_roll * 0.48f + micro_roll * s.micro_amount * 0.20f) *
+        s.roll_amount * strength);
+
+    Camera basis = {};
+    for (int i = 0; i < 3; i++)
+        basis.position[i] = key->fval[i];
+    camera_set_euler(&basis, key->fval[3], key->fval[4], key->fval[8]);
+
+    Vec3 right = camera_right(basis);
+    Vec3 up = camera_up(basis);
+    float pos_right = timeline_camera_feel_fbm(t * f * 0.55f + 11.4f, seed + 59, s.roughness);
+    float pos_up = timeline_camera_feel_fbm(t * f * 0.73f + 14.1f, seed + 61, s.roughness);
+    float pos_operator_right = timeline_camera_feel_fbm(t * f * 1.34f + 20.3f, seed + 67, s.roughness);
+    float pos_operator_up = timeline_camera_feel_fbm(t * f * 1.18f + 17.7f, seed + 71, s.roughness);
+    float pos_scale = s.position_amount * strength;
+    Vec3 offset = v3_add(v3_scale(right, (pos_right * 0.78f + pos_operator_right * 0.22f) * pos_scale),
+                         v3_scale(up, (pos_up * 0.65f + pos_operator_up * 0.35f) * pos_scale));
+    key->fval[0] += offset.x;
+    key->fval[1] += offset.y;
+    key->fval[2] += offset.z;
+
+    float breath = timeline_camera_feel_fbm(t * f * 0.18f + 25.6f, seed + 79, s.roughness);
+    key->fval[5] = clampf(key->fval[5] + breath * s.breathing_amount * strength, 0.10f, 2.80f);
+}
+
+static void timeline_apply_camera(const TimelineState& tl, TimelineKey key) {
+    timeline_apply_camera_feel(tl, &key);
     for (int i = 0; i < 3; i++) g_camera.position[i] = key.fval[i];
     camera_set_euler(&g_camera,
                      timeline_wrap_angle(key.fval[3]),
@@ -1259,13 +1541,101 @@ static void timeline_apply_light(const TimelineKey& key) {
     dl->spot_softness = clampf(key.fval[12], 0.0f, 0.95f);
 }
 
-void timeline_apply_current() {
+static void timeline_camera_state_from_key(const TimelineKey& key, TimelineCameraState* out) {
+    if (!out)
+        return;
+    memset(out, 0, sizeof(*out));
+    for (int i = 0; i < 3; i++)
+        out->position[i] = key.fval[i];
+    out->yaw = timeline_wrap_angle(key.fval[3]);
+    out->pitch = key.fval[4];
+    out->roll = timeline_wrap_angle(key.fval[8]);
+    out->projection_type = key.fval[9] >= 0.5f ? CAMERA_PROJECTION_ORTHOGRAPHIC : CAMERA_PROJECTION_PERSPECTIVE;
+    out->fov_y = clampf(key.fval[5], 0.10f, 2.80f);
+    out->near_z = key.fval[6] < 0.0001f ? 0.0001f : key.fval[6];
+    out->far_z = key.fval[7] > out->near_z + 0.001f ? key.fval[7] : out->near_z + 0.001f;
+    out->ortho_height = key.fval[10] > 0.001f ? key.fval[10] : 0.001f;
+}
+
+static void timeline_light_state_from_key(const TimelineKey& key, TimelineLightState* out) {
+    if (!out)
+        return;
+    memset(out, 0, sizeof(*out));
+    for (int i = 0; i < 3; i++)
+        out->position[i] = key.fval[i];
+    for (int i = 0; i < 3; i++)
+        out->target[i] = key.fval[3 + i];
+    for (int i = 0; i < 3; i++)
+        out->color[i] = key.fval[6 + i];
+    out->intensity = key.fval[9];
+    out->light_type = key.fval[10] >= 0.5f ? LIGHT_TYPE_SPOT : LIGHT_TYPE_DIRECTIONAL;
+    out->spot_angle = clampf(key.fval[11] > 0.001f ? key.fval[11] : 0.78539816339f, 0.05f, 3.0f);
+    out->spot_softness = clampf(key.fval[12], 0.0f, 0.95f);
+}
+
+bool timeline_sample_camera_state(int frame, TimelineCameraState* out) {
+    if (!out)
+        return false;
+    TimelineState& tl = timeline_current_state();
+    int track_index = timeline_find_track_in(tl, TIMELINE_TRACK_CAMERA, "camera", RES_NONE);
+    if (track_index < 0)
+        return false;
+    TimelineTrack& track = tl.tracks[track_index];
+    if (!track.active || !track.enabled || track.key_count <= 0)
+        return false;
+    TimelineKey sampled = {};
+    timeline_sample_key_at(tl, track, (float)timeline_clamp_frame_for(tl, frame), &sampled);
+    timeline_camera_state_from_key(sampled, out);
+    return true;
+}
+
+bool timeline_sample_light_state(int frame, TimelineLightState* out) {
+    if (!out)
+        return false;
+    TimelineState& tl = timeline_current_state();
+    int track_index = timeline_find_track_in(tl, TIMELINE_TRACK_LIGHT, "light", RES_NONE);
+    if (track_index < 0)
+        return false;
+    TimelineTrack& track = tl.tracks[track_index];
+    if (!track.active || !track.enabled || track.key_count <= 0)
+        return false;
+    TimelineKey sampled = {};
+    timeline_sample_key_at(tl, track, (float)timeline_clamp_frame_for(tl, frame), &sampled);
+    timeline_light_state_from_key(sampled, out);
+    return true;
+}
+
+static bool timeline_track_drives_camera(const TimelineTrack& track) {
+    if (track.kind == TIMELINE_TRACK_CAMERA)
+        return true;
+    if (track.kind != TIMELINE_TRACK_USER_VAR)
+        return false;
+    UserCBSourceKind source_kind = timeline_user_var_source_kind(track);
+    return source_kind == USER_CB_SOURCE_CAMERA_POSITION ||
+           source_kind == USER_CB_SOURCE_CAMERA_ROTATION;
+}
+
+static bool timeline_track_drives_light(const TimelineTrack& track) {
+    if (track.kind == TIMELINE_TRACK_LIGHT)
+        return true;
+    if (track.kind != TIMELINE_TRACK_USER_VAR)
+        return false;
+    UserCBSourceKind source_kind = timeline_user_var_source_kind(track);
+    return source_kind == USER_CB_SOURCE_LIGHT_POSITION ||
+           source_kind == USER_CB_SOURCE_LIGHT_TARGET;
+}
+
+void timeline_apply_current_filtered(bool apply_camera, bool apply_light) {
     TimelineState& tl = timeline_playback_state();
     if (!tl.enabled)
         return;
     for (int i = 0; i < tl.track_count; i++) {
         TimelineTrack& track = tl.tracks[i];
         if (!track.active || !track.enabled || track.key_count <= 0)
+            continue;
+        if (!apply_camera && timeline_track_drives_camera(track))
+            continue;
+        if (!apply_light && timeline_track_drives_light(track))
             continue;
 
         TimelineKey sampled = {};
@@ -1274,11 +1644,15 @@ void timeline_apply_current() {
         case TIMELINE_TRACK_USER_VAR:          timeline_apply_user_var(track, sampled); break;
         case TIMELINE_TRACK_COMMAND_TRANSFORM: timeline_apply_command_transform(track, sampled); break;
         case TIMELINE_TRACK_COMMAND_ENABLED:   timeline_apply_command_enabled(track, sampled); break;
-        case TIMELINE_TRACK_CAMERA:            timeline_apply_camera(sampled); break;
+        case TIMELINE_TRACK_CAMERA:            timeline_apply_camera(tl, sampled); break;
         case TIMELINE_TRACK_LIGHT:          timeline_apply_light(sampled); break;
         default: break;
         }
     }
+}
+
+void timeline_apply_current() {
+    timeline_apply_current_filtered(true, true);
 }
 
 static void timeline_write_tracks(FILE* f, const TimelineState& tl) {
@@ -1332,6 +1706,22 @@ void timeline_write_project(FILE* f) {
                 tl.name[0] ? tl.name : "Timeline",
                 tl.fps, tl.length_frames, tl.current_frame,
                 tl.enabled ? 1 : 0);
+        TimelineCameraFeelSettings feel = tl.camera_feel;
+        timeline_sanitize_camera_feel_settings(&feel);
+        fprintf(f, "timeline_camera_feel %d %d %d %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %d %d\n",
+                feel.enabled ? 1 : 0,
+                feel.preset,
+                feel.seed,
+                feel.amount,
+                feel.frequency,
+                feel.roughness,
+                feel.position_amount,
+                feel.rotation_amount,
+                feel.roll_amount,
+                feel.micro_amount,
+                feel.breathing_amount,
+                feel.fade_in_frames,
+                feel.fade_out_frames);
         timeline_write_tracks(f, tl);
         fprintf(f, "end_timeline_clip\n");
     }

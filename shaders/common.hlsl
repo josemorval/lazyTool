@@ -53,7 +53,7 @@ Texture2DArray ShadowMap : register(t7);
 SamplerComparisonState ShadowSampler : register(s1);
 #endif
 
-// General constants. LT_EPS is intentionally conservative for divide guards.
+// General constants.
 static const float LT_PI      = 3.14159265359;
 static const float LT_TWO_PI  = 6.28318530718;
 static const float LT_HALF_PI = 1.57079632679;
@@ -63,17 +63,6 @@ static const float LT_EPS     = 1e-5;
 float lt_square(float x) { return x * x; }
 float2 lt_square(float2 x) { return x * x; }
 float3 lt_square(float3 x) { return x * x; }
-
-// Normalize with a floor on length squared, avoiding NaNs for zero vectors.
-float2 lt_safe_normalize(float2 v)
-{
-    return v * rsqrt(max(dot(v, v), 1e-8));
-}
-
-float3 lt_safe_normalize(float3 v)
-{
-    return v * rsqrt(max(dot(v, v), 1e-8));
-}
 
 // Rec.709 luminance weights for linear RGB values.
 float lt_luminance(float3 c)
@@ -104,19 +93,19 @@ float3 lt_camera_position_ws()
 // Camera forward in world space. lazyTool/D3D view space looks down -Z.
 float3 lt_camera_forward_ws()
 {
-    return lt_safe_normalize(mul(ViewToWorld, float4(0.0, 0.0, -1.0, 0.0)).xyz);
+    return normalize(mul(ViewToWorld, float4(0.0, 0.0, -1.0, 0.0)).xyz);
 }
 
 // Unit vector from a world-space point back to the camera position.
 float3 lt_vector_to_camera_ws(float3 world_pos)
 {
-    return lt_safe_normalize(lt_camera_position_ws() - world_pos);
+    return normalize(lt_camera_position_ws() - world_pos);
 }
 
 // Unit ray direction from the camera through a world-space point.
 float3 lt_ray_from_camera_ws(float3 world_pos)
 {
-    return lt_safe_normalize(world_pos - lt_camera_position_ws());
+    return normalize(world_pos - lt_camera_position_ws());
 }
 
 // Object/local position to world homogeneous position.
@@ -129,7 +118,7 @@ float4 lt_object_to_world(float3 object_pos)
 // scale that would require an inverse-transpose normal matrix.
 float3 lt_object_normal_to_world(float3 object_normal)
 {
-    return lt_safe_normalize(mul(LocalToWorld, float4(object_normal, 0.0)).xyz);
+    return normalize(mul(LocalToWorld, float4(object_normal, 0.0)).xyz);
 }
 
 // View position to clip space.
@@ -280,7 +269,7 @@ float2 lt_viewport_uv_to_ndc(float2 uv)
 // Decode a normal stored in RGB as [0, 1] to normalized [-1, 1].
 float3 lt_decode_normal_rgb(float4 enc)
 {
-    return lt_safe_normalize(enc.xyz * 2.0 - 1.0);
+    return normalize(enc.xyz * 2.0 - 1.0);
 }
 
 // Previous-frame view space for temporal effects.

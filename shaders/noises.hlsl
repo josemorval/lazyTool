@@ -260,9 +260,8 @@ float lt_interleaved_gradient_noise(float2 pixel, uint frame)
 // true blue-noise spectrum procedurally.
 float2 lt_blue_noise_uv(float2 pixel, float2 texture_size, uint frame)
 {
-    float2 safe_size = max(texture_size, float2(1.0, 1.0));
-    float2 frame_offset = lt_hash22(uint2(frame, frame ^ 0x68BC21EBu)) * safe_size;
-    return frac((pixel + frame_offset + 0.5) / safe_size);
+    float2 frame_offset = lt_hash22(uint2(frame, frame ^ 0x68BC21EBu)) * texture_size;
+    return frac((pixel + frame_offset + 0.5) / texture_size);
 }
 
 float lt_sample_blue_noise(Texture2D<float> blue_noise,

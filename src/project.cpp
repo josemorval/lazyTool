@@ -1237,6 +1237,45 @@ bool project_load_text(const char* path) {
                 timeline_clip_count++;
             }
             timeline_load_track = -1;
+        } else if (strcmp(tag, "timeline_camera_feel") == 0) {
+            char* enabled = strtok(nullptr, " \t\r\n");
+            char* preset = strtok(nullptr, " \t\r\n");
+            char* seed = strtok(nullptr, " \t\r\n");
+            char* amount = strtok(nullptr, " \t\r\n");
+            char* frequency = strtok(nullptr, " \t\r\n");
+            char* roughness = strtok(nullptr, " \t\r\n");
+            char* position_amount = strtok(nullptr, " \t\r\n");
+            char* rotation_amount = strtok(nullptr, " \t\r\n");
+            char* roll_amount = strtok(nullptr, " \t\r\n");
+            char* micro_amount = strtok(nullptr, " \t\r\n");
+            char* breathing_amount = strtok(nullptr, " \t\r\n");
+            char* fade_in = strtok(nullptr, " \t\r\n");
+            char* fade_out = strtok(nullptr, " \t\r\n");
+            char* extra = strtok(nullptr, " \t\r\n");
+            if (!enabled || !preset || !seed || !amount || !frequency || !roughness ||
+                !position_amount || !rotation_amount || !roll_amount || !micro_amount ||
+                !breathing_amount || !fade_in || !fade_out || extra)
+                return fail_current_project_load("timeline_camera_feel must be: timeline_camera_feel enabled preset seed amount frequency roughness position rotation roll micro breathing fade_in fade_out");
+            if (timeline_current_clip < 0)
+                return fail_current_project_load("timeline_camera_feel appears outside a timeline_clip");
+
+            TimelineCameraFeelSettings settings = {};
+            timeline_camera_feel_defaults(&settings);
+            settings.enabled = atoi(enabled) != 0;
+            settings.preset = atoi(preset);
+            settings.seed = atoi(seed);
+            settings.amount = (float)atof(amount);
+            settings.frequency = (float)atof(frequency);
+            settings.roughness = (float)atof(roughness);
+            settings.position_amount = (float)atof(position_amount);
+            settings.rotation_amount = (float)atof(rotation_amount);
+            settings.roll_amount = (float)atof(roll_amount);
+            settings.micro_amount = (float)atof(micro_amount);
+            settings.breathing_amount = (float)atof(breathing_amount);
+            settings.fade_in_frames = atoi(fade_in);
+            settings.fade_out_frames = atoi(fade_out);
+            timeline_set_camera_feel_settings(timeline_current_clip, &settings);
+            timeline_load_track = -1;
         } else if (strcmp(tag, "timeline_track") == 0) {
             char* kind = strtok(nullptr, " \t\r\n");
             char* target = strtok(nullptr, " \t\r\n");

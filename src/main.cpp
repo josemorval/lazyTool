@@ -2555,8 +2555,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             timeline_update(g_time);
             if (timeline_was_running)
                 timeline_sync_editor_to_playback();
-            if (app_timeline_has_keys())
-                timeline_apply_current();
+            if (app_timeline_has_keys()) {
+                bool apply_camera_light_tracks = g_player_mode || g_editor_preview_no_ui || timeline_recording();
+                timeline_apply_current_filtered(apply_camera_light_tracks, apply_camera_light_tracks);
+            }
         }
         Camera camera_before_controls = g_camera;
         light_orbit_active = update_light_orbit();

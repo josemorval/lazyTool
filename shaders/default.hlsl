@@ -23,15 +23,15 @@ VSOut VSMain(VSIn v) {
 }
 
 float4 PSMain(VSOut i) : SV_Target {
-    float3 n = lt_safe_normalize(i.nor);
-    float3 ld = LightParams.x >= 0.5 ? lt_safe_normalize(LightPos.xyz - i.wpos) : lt_safe_normalize(-LightDir.xyz);
+    float3 n = normalize(i.nor);
+    float3 ld = LightParams.x >= 0.5 ? normalize(LightPos.xyz - i.wpos) : normalize(-LightDir.xyz);
     float ndl = saturate(dot(n, ld));
     float shadow = lt_sample_shadow_pcf3x3(i.wpos, n, ld);
 
     float3 base = 0.30 + 0.70 * (0.5 + 0.5 * n);
     float attenuation = 1.0;
     if (LightParams.x >= 0.5) {
-        float cone = dot(lt_safe_normalize(i.wpos - LightPos.xyz), lt_safe_normalize(LightDir.xyz));
+        float cone = dot(normalize(i.wpos - LightPos.xyz), normalize(LightDir.xyz));
         attenuation = saturate((cone - LightParams.z) / max(LightParams.y - LightParams.z, LT_EPS));
     }
     float3 sun = LightColor.xyz * LightDir.w * ndl * shadow * attenuation;

@@ -324,6 +324,7 @@ static ImVec2 s_render_graph_pan = ImVec2(0.0f, 0.0f);
 static bool s_timeline_keyboard_focus = false;
 static int s_timeline_visible_first_frame = 0;
 static bool s_timeline_ensure_current_visible = false;
+static bool s_timeline_debug_paths = true;
 static bool s_scene_surface_resize_armed = true;
 static int s_scene_surface_host_w = 0;
 static int s_scene_surface_host_h = 0;
@@ -425,6 +426,7 @@ static bool ui_project_world_to_screen(const Mat4& world_to_clip, ImVec2 rect_mi
 static void ui_draw_camera_orientation_gizmo(ImVec2 rect_min, ImVec2 rect_max);
 static void ui_draw_viewport_bounds_debug(ImVec2 rect_min, ImVec2 rect_max);
 static void ui_draw_viewport_light_debug(ImVec2 rect_min, ImVec2 rect_max);
+static void ui_draw_viewport_timeline_paths(ImVec2 rect_min, ImVec2 rect_max);
 static void ui_draw_viewport_camera_overlay(ImVec2 rect_min, ImVec2 rect_max);
 static bool ui_viewport_toolbar_hit_test(ImVec2 rect_min, ImVec2 rect_max);
 static void ui_draw_icon_shape(UiIconKind icon, ImVec2 min, ImVec2 max, ImU32 col);
@@ -3764,6 +3766,37 @@ static int ui_shader_editor_word_right(const UiShaderSourceEditor* ed) {
     return p;
 }
 
+static bool ui_shader_editor_select_word_at(UiShaderSourceEditor* ed, int cursor) {
+    if (!ed || !ed->text)
+        return false;
+
+    int len = ui_code_text_len(ed);
+    int p = ui_code_clamp_offset(ed, cursor);
+    if (p >= len && p > 0)
+        p--;
+    else if (p < len && !ui_ascii_ident_char(ed->text[p]) &&
+             p > 0 && ui_ascii_ident_char(ed->text[p - 1]))
+        p--;
+
+    if (p < 0 || p >= len || !ui_ascii_ident_char(ed->text[p]))
+        return false;
+
+    int a = p;
+    while (a > 0 && ui_ascii_ident_char(ed->text[a - 1]))
+        a--;
+    int b = p + 1;
+    while (b < len && ui_ascii_ident_char(ed->text[b]))
+        b++;
+
+    if (a >= b)
+        return false;
+    ed->select_anchor = a;
+    ed->cursor = b;
+    ed->preferred_col = -1;
+    ed->cursor_follow = true;
+    return true;
+}
+
 static char ui_ascii_lower_char(char c) {
     if (c >= 'A' && c <= 'Z')
         return (char)(c - 'A' + 'a');
@@ -4848,12 +4881,17 @@ static bool ui_shader_code_editor(UiShaderSourceEditor* ed, const Resource* shad
     bool content_hovered = hovered && window->InnerRect.Contains(io.MousePos);
     if (content_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         ed->editor_focused = true;
-        ed->dragging_selection = true;
         ImGui::SetActiveID(editor_id, window);
         ImGui::SetFocusID(editor_id, window);
         ImGui::FocusWindow(window);
         int cursor = ui_shader_editor_cursor_from_mouse(lines, origin, gutter_w, line_h, char_w, io.MousePos);
-        ui_shader_editor_set_cursor(ed, cursor, io.KeyShift);
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+            ui_shader_editor_select_word_at(ed, cursor)) {
+            ed->dragging_selection = false;
+        } else {
+            ed->dragging_selection = true;
+            ui_shader_editor_set_cursor(ed, cursor, io.KeyShift);
+        }
     } else if (ed->editor_focused && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !content_hovered) {
         ed->editor_focused = false;
         ed->dragging_selection = false;
@@ -5302,41 +5340,7 @@ static bool ui_shader_editor_open_compile_error_file(UiShaderSourceEditor* ed, c
     return opened;
 }
 
-static const char* k_shader_template_common_scene_cb = R"HLSL(// Built-in scene constants supplied by the editor in register(b0).
-// These names and order match the CPU SceneCB layout. You can delete unused
-// fields from your shader; D3D reflection only keeps constants that are read.
-cbuffer SceneCB : register(b0)
-{
-    float4x4 WorldToView;
-    float4x4 ViewToWorld;
-    float4x4 ViewToClip;
-    float4x4 ClipToView;
-    float4x4 PrevWorldToView;
-    float4x4 PrevViewToWorld;
-    float4x4 PrevViewToClip;
-    float4x4 PrevClipToView;
-    float4 TimeVec;              // x=time seconds, y=delta seconds, z=frame index, w=reserved.
-    float4 CameraParams;         // x=0 perspective/1 orthographic, y=ortho height, z/w=near/far.
-    float4 LightDir;             // xyz=main light direction, w=intensity.
-    float4 LightColor;           // rgb=color, a=reserved.
-    float4 LightPos;             // xyz=main light position.
-    float4 LightParams;          // x=0 directional/1 spot, y/z=spot inner/outer cos, w=range.
-    float4 ShadowCascadeSplits;
-    float4 ShadowParams;
-    float4x4 ShadowWorldToClip;
-    float4x4 PrevShadowWorldToClip;
-    float4 ShadowCascadeRects[4];
-    float4x4 ShadowCascadeWorldToClip[4];
-};
-
-)HLSL";
-
-static const char* k_shader_template_object_cb = R"HLSL(// Per-object transform supplied by draw commands in register(b1).
-// Mesh shaders normally multiply POSITION by LocalToWorld, then WorldToView, then ViewToClip.
-cbuffer ObjectCB : register(b1)
-{
-    float4x4 LocalToWorld;
-};
+static const char* k_shader_template_common_include_fmt = R"HLSL(#include "%s"
 
 )HLSL";
 
@@ -5355,8 +5359,7 @@ float4 ResolveUserColor()
 
 )HLSL";
 
-static const char* k_shader_template_compute_uv = R"HLSL(
-// Compute template: write normalized UV coordinates into a RWTexture2D.
+static const char* k_shader_template_compute_uv = R"HLSL(// Compute template: write normalized UV coordinates into a RWTexture2D.
 //
 // Editor setup:
 //   1. Create or select a RenderTexture2D with UAV enabled.
@@ -5366,8 +5369,7 @@ static const char* k_shader_template_compute_uv = R"HLSL(
 //      (for example scene_color.size or your_render_target.size).
 //
 // The shader is intentionally simple: each 8x8 group writes one pixel per
-// thread. TargetSize keeps the border safe when the texture size is not a
-// multiple of 8.
+// thread. TargetSize clips threads outside the target bounds.
 cbuffer UserCB : register(b2)
 {
     int2 TargetSize;             // Usually sourced from a RenderTexture2D size.
@@ -5381,67 +5383,25 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     if (id.x >= (uint)TargetSize.x || id.y >= (uint)TargetSize.y)
         return;
 
-    float2 target_size = float2((float)TargetSize.x, (float)TargetSize.y);
-    float2 safe_size = max(target_size, float2(1.0, 1.0));
-    float2 uv = (float2(id.xy) + 0.5) / safe_size;
+    float2 uv = (float2(id.xy) + 0.5) / float2(TargetSize);
     Output[id.xy] = float4(uv, 0.0, 1.0);
 }
 )HLSL";
 
-static const char* k_shader_template_compute_indirect_args = R"HLSL(
-// Compute template: fill an indirect argument buffer.
+static const char* k_shader_template_compute_dispatch_indirect_args = R"HLSL(// Compute template: DispatchIndirect argument buffer.
 //
 // Editor setup:
 //   1. Create a StructuredBuffer with UAV enabled and Indirect Args enabled.
 //      A stride of 4 bytes is enough because the buffer stores uint DWORDs.
 //   2. Bind that buffer to UAV slot u0 on a Dispatch command.
 //   3. Dispatch this shader with 1,1,1 groups.
-//   4. Use the same buffer as the Indirect Buffer of an Indirect Draw or
-//      Indirect Dispatch command.
-//
-// Mode selects how the first DWORDs are written:
-//   Mode = 0: DispatchIndirect      -> x, y, z group counts.
-//   Mode = 1: DrawInstancedIndirect -> vertex count, instance count,
-//                                      start vertex, start instance.
-//   Mode = 2: DrawIndexedInstancedIndirect -> index count, instance count,
-//                                             start index, base vertex,
-//                                             start instance.
-//
-// The editor reads the argument layout according to the command that consumes
-// the buffer, so unused DWORDs are harmless. Keep Byte Offset on both commands
-// aligned to 4 bytes.
-//
-// Instancing notes:
-//   - For DrawInstancedIndirect, InstanceCount is the number of instances the
-//     draw shader will receive through SV_InstanceID.
-//   - InstanceCount can be hardcoded here, driven from a StructuredBuffer count,
-//     or driven from a Gaussian Splat count through Shader Parameters.
-//   - For procedural quad instances, set DrawVertexOrIndexCount to 6 and use
-//     InstanceCount to choose how many quads to draw.
+//   4. Use the same buffer as the Indirect Buffer of an Indirect Dispatch command.
 cbuffer UserCB : register(b2)
 {
-    int  Mode;
-    int3 DispatchGroups;
-
-    int  DrawVertexOrIndexCount;
-    int  InstanceCount;
-    int  StartVertexOrIndex;
-    int  BaseVertex;
-
-    int  StartInstance;
+    uint3 DispatchGroups;
 };
 
 RWStructuredBuffer<uint> IndirectArgs : register(u0);
-
-uint positive_or_one(int v)
-{
-    return (v > 0) ? (uint)v : 1u;
-}
-
-uint positive_or_zero(int v)
-{
-    return (v > 0) ? (uint)v : 0u;
-}
 
 [numthreads(1, 1, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)
@@ -5449,27 +5409,82 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     if (id.x != 0 || id.y != 0 || id.z != 0)
         return;
 
-    if (Mode == 0)
-    {
-        IndirectArgs[0] = positive_or_one(DispatchGroups.x);
-        IndirectArgs[1] = positive_or_one(DispatchGroups.y);
-        IndirectArgs[2] = positive_or_one(DispatchGroups.z);
+    IndirectArgs[0] = DispatchGroups.x;
+    IndirectArgs[1] = DispatchGroups.y;
+    IndirectArgs[2] = DispatchGroups.z;
+}
+)HLSL";
+
+static const char* k_shader_template_compute_draw_instanced_indirect_args = R"HLSL(// Compute template: DrawInstancedIndirect argument buffer.
+//
+// Editor setup:
+//   1. Create a StructuredBuffer with UAV enabled and Indirect Args enabled.
+//      A stride of 4 bytes is enough because the buffer stores uint DWORDs.
+//   2. Bind that buffer to UAV slot u0 on a Dispatch command.
+//   3. Dispatch this shader with 1,1,1 groups.
+//   4. Use the same buffer as the Indirect Buffer of an Indirect Draw command.
+//   5. Set the Indirect Draw source to Procedural or use a mesh without an index buffer.
+//
+// D3D11 DrawInstancedIndirect DWORD layout:
+//   VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation.
+cbuffer UserCB : register(b2)
+{
+    uint VertexCountPerInstance;
+    uint InstanceCount;
+    uint StartVertexLocation;
+    uint StartInstanceLocation;
+};
+
+RWStructuredBuffer<uint> IndirectArgs : register(u0);
+
+[numthreads(1, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x != 0 || id.y != 0 || id.z != 0)
         return;
-    }
 
-    IndirectArgs[0] = positive_or_one(DrawVertexOrIndexCount);
-    IndirectArgs[1] = positive_or_one(InstanceCount);
-    IndirectArgs[2] = positive_or_zero(StartVertexOrIndex);
+    IndirectArgs[0] = VertexCountPerInstance;
+    IndirectArgs[1] = InstanceCount;
+    IndirectArgs[2] = StartVertexLocation;
+    IndirectArgs[3] = StartInstanceLocation;
+}
+)HLSL";
 
-    if (Mode == 2)
-    {
-        IndirectArgs[3] = (uint)BaseVertex;
-        IndirectArgs[4] = positive_or_zero(StartInstance);
-    }
-    else
-    {
-        IndirectArgs[3] = positive_or_zero(StartInstance);
-    }
+static const char* k_shader_template_compute_draw_indexed_indirect_args = R"HLSL(// Compute template: DrawIndexedInstancedIndirect argument buffer.
+//
+// Editor setup:
+//   1. Create a StructuredBuffer with UAV enabled and Indirect Args enabled.
+//      A stride of 4 bytes is enough because the buffer stores uint DWORDs.
+//   2. Bind that buffer to UAV slot u0 on a Dispatch command.
+//   3. Dispatch this shader with 1,1,1 groups.
+//   4. Use the same buffer as the Indirect Buffer of an Indirect Draw command.
+//   5. Assign a mesh with an index buffer to the Indirect Draw command.
+//
+// D3D11 DrawIndexedInstancedIndirect DWORD layout:
+//   IndexCountPerInstance, InstanceCount, StartIndexLocation,
+//   BaseVertexLocation, StartInstanceLocation.
+cbuffer UserCB : register(b2)
+{
+    uint IndexCountPerInstance;
+    uint InstanceCount;
+    uint StartIndexLocation;
+    int  BaseVertexLocation;
+    uint StartInstanceLocation;
+};
+
+RWStructuredBuffer<uint> IndirectArgs : register(u0);
+
+[numthreads(1, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x != 0 || id.y != 0 || id.z != 0)
+        return;
+
+    IndirectArgs[0] = IndexCountPerInstance;
+    IndirectArgs[1] = InstanceCount;
+    IndirectArgs[2] = StartIndexLocation;
+    IndirectArgs[3] = (uint)BaseVertexLocation;
+    IndirectArgs[4] = StartInstanceLocation;
 }
 )HLSL";
 
@@ -5570,30 +5585,81 @@ float4 PSMain(VSOut i) : SV_Target
 }
 )HLSL";
 
-static void ui_build_shader_template(bool compute_shader, int template_kind, char* out, int out_sz) {
+static void ui_shader_template_common_include_path(const char* shader_path, char* out, int out_sz) {
     if (!out || out_sz <= 0)
         return;
     out[0] = '\0';
 
-    // Templates are generated as complete, readable files. Built-in cbuffers
-    // are emitted only when the sample actually uses them, which keeps shader
-    // reflection focused on the resources the command needs to bind.
-    if (compute_shader) {
-        snprintf(out, out_sz, "%s%s",
-            k_shader_template_common_scene_cb,
-            template_kind == 1 ? k_shader_template_compute_indirect_args
-                               : k_shader_template_compute_uv);
-    } else if (template_kind == 1) {
-        snprintf(out, out_sz, "%s%s",
-            k_shader_template_vsps_color_cb,
-            k_shader_template_vsps_procedural_quad);
-    } else {
-        snprintf(out, out_sz, "%s%s%s%s",
-            k_shader_template_common_scene_cb,
-            k_shader_template_object_cb,
-            k_shader_template_vsps_color_cb,
-            k_shader_template_vsps_mesh_uv);
+    char clean_path[MAX_PATH_LEN] = {};
+    ui_normalize_path_text(shader_path ? shader_path : "", clean_path, MAX_PATH_LEN);
+    char dir[MAX_PATH_LEN] = {};
+    ui_path_parent_dir(clean_path, dir, MAX_PATH_LEN);
+    if (!dir[0]) {
+        strncpy(out, "shaders/common.hlsl", out_sz - 1);
+        out[out_sz - 1] = '\0';
+        return;
     }
+
+    if (_stricmp(dir, "shaders") == 0) {
+        strncpy(out, "common.hlsl", out_sz - 1);
+        out[out_sz - 1] = '\0';
+        return;
+    }
+
+    if (_strnicmp(dir, "shaders/", 8) == 0) {
+        int depth = 1;
+        for (const char* p = dir + 8; *p; p++)
+            if (*p == '/')
+                depth++;
+        for (int i = 0; i < depth; i++)
+            strncat(out, "../", (size_t)(out_sz - 1 - (int)strlen(out)));
+        strncat(out, "common.hlsl", (size_t)(out_sz - 1 - (int)strlen(out)));
+        out[out_sz - 1] = '\0';
+        return;
+    }
+
+    int depth = 1;
+    for (const char* p = dir; *p; p++)
+        if (*p == '/')
+            depth++;
+    for (int i = 0; i < depth; i++)
+        strncat(out, "../", (size_t)(out_sz - 1 - (int)strlen(out)));
+    strncat(out, "shaders/common.hlsl", (size_t)(out_sz - 1 - (int)strlen(out)));
+    out[out_sz - 1] = '\0';
+}
+
+static void ui_build_shader_template(bool compute_shader, int template_kind,
+                                     const char* target_path, char* out, int out_sz) {
+    if (!out || out_sz <= 0)
+        return;
+    out[0] = '\0';
+
+    const char* body = nullptr;
+    if (compute_shader) {
+        switch (template_kind) {
+        case 1: body = k_shader_template_compute_dispatch_indirect_args; break;
+        case 2: body = k_shader_template_compute_draw_instanced_indirect_args; break;
+        case 3: body = k_shader_template_compute_draw_indexed_indirect_args; break;
+        default: body = k_shader_template_compute_uv; break;
+        }
+    } else if (template_kind == 1) {
+        body = k_shader_template_vsps_procedural_quad;
+    } else {
+        body = k_shader_template_vsps_mesh_uv;
+    }
+
+    if (!body)
+        return;
+    char common_include[MAX_PATH_LEN] = {};
+    ui_shader_template_common_include_path(target_path, common_include, MAX_PATH_LEN);
+    if (!common_include[0])
+        strncpy(common_include, "common.hlsl", MAX_PATH_LEN - 1);
+    char common_block[MAX_PATH_LEN + 64] = {};
+    snprintf(common_block, sizeof(common_block), k_shader_template_common_include_fmt, common_include);
+    snprintf(out, out_sz, "%s%s%s",
+             common_block,
+             compute_shader ? "" : k_shader_template_vsps_color_cb,
+             body);
     out[out_sz - 1] = '\0';
 }
 
@@ -5611,7 +5677,7 @@ static bool ui_create_shader_template_file(ResHandle h, Resource* r, const char*
     }
 
     char source[32768] = {};
-    ui_build_shader_template(compute_shader, template_kind, source, sizeof(source));
+    ui_build_shader_template(compute_shader, template_kind, path, source, sizeof(source));
     if (!source[0])
         return false;
 
@@ -5649,8 +5715,12 @@ static void ui_shader_template_buttons(ResHandle h, Resource* r, const char* pat
     if (compute_shader) {
         if (ImGui::Button("Create Compute: UVs to UAV", ImVec2(-1.0f, 0.0f)))
             ui_create_shader_template_file(h, r, clean_path, true, 0);
-        if (ImGui::Button("Create Compute: Indirect Args", ImVec2(-1.0f, 0.0f)))
+        if (ImGui::Button("Create Compute: DispatchIndirect Args", ImVec2(-1.0f, 0.0f)))
             ui_create_shader_template_file(h, r, clean_path, true, 1);
+        if (ImGui::Button("Create Compute: DrawInstancedIndirect Args", ImVec2(-1.0f, 0.0f)))
+            ui_create_shader_template_file(h, r, clean_path, true, 2);
+        if (ImGui::Button("Create Compute: DrawIndexedIndirect Args", ImVec2(-1.0f, 0.0f)))
+            ui_create_shader_template_file(h, r, clean_path, true, 3);
     } else {
         if (ImGui::Button("Create VS/PS: Mesh UV Color", ImVec2(-1.0f, 0.0f)))
             ui_create_shader_template_file(h, r, clean_path, false, 0);
@@ -6712,6 +6782,17 @@ fail:
     return INVALID_HANDLE;
 }
 
+static void ui_draw_command_warning_marker(ImDrawList* dl, ImVec2 center) {
+    if (!dl)
+        return;
+    ImU32 fill = ImGui::GetColorU32(ImVec4(0.96f, 0.70f, 0.28f, 1.0f));
+    ImU32 text = ImGui::GetColorU32(ImVec4(0.16f, 0.10f, 0.04f, 1.0f));
+    dl->AddCircleFilled(center, 6.0f, fill, 16);
+    ImVec2 ts = ImGui::CalcTextSize("!");
+    dl->AddText(ImVec2(center.x - ts.x * 0.5f, center.y - ts.y * 0.5f),
+                text, "!");
+}
+
 static bool ui_command_row(int index, Command& c, int depth = 0) {
     CmdHandle h = (CmdHandle)(index + 1);
     bool selected = (g_sel_cmd == h);
@@ -6773,25 +6854,34 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
     float cy = (min.y + max.y) * 0.5f;
     float row_x = min.x + indent;
     if (container) {
-        ImU32 arrow_col = ImGui::GetColorU32(c.enabled ?
-            ImVec4(0.72f, 0.74f, 0.78f, 1.0f) : ImVec4(0.42f, 0.43f, 0.45f, 1.0f));
         ImVec2 center = ImVec2(row_x + 13.0f, cy);
-        if (c.repeat_expanded) {
-            dl->AddTriangleFilled(ImVec2(center.x - 4.5f, center.y - 2.5f),
-                                  ImVec2(center.x + 4.5f, center.y - 2.5f),
-                                  ImVec2(center.x,        center.y + 3.5f),
-                                  arrow_col);
+        if (warning) {
+            ui_draw_command_warning_marker(dl, center);
         } else {
-            dl->AddTriangleFilled(ImVec2(center.x - 2.5f, center.y - 4.5f),
-                                  ImVec2(center.x - 2.5f, center.y + 4.5f),
-                                  ImVec2(center.x + 3.5f, center.y),
-                                  arrow_col);
+            ImU32 arrow_col = ImGui::GetColorU32(c.enabled ?
+                ImVec4(0.72f, 0.74f, 0.78f, 1.0f) : ImVec4(0.42f, 0.43f, 0.45f, 1.0f));
+            if (c.repeat_expanded) {
+                dl->AddTriangleFilled(ImVec2(center.x - 4.5f, center.y - 2.5f),
+                                      ImVec2(center.x + 4.5f, center.y - 2.5f),
+                                      ImVec2(center.x,        center.y + 3.5f),
+                                      arrow_col);
+            } else {
+                dl->AddTriangleFilled(ImVec2(center.x - 2.5f, center.y - 4.5f),
+                                      ImVec2(center.x - 2.5f, center.y + 4.5f),
+                                      ImVec2(center.x + 3.5f, center.y),
+                                      arrow_col);
+            }
         }
     }
     ImVec4 dot = !c.enabled ? ImVec4(0.35f, 0.36f, 0.38f, 1.0f) :
         (warning ? ImVec4(0.96f, 0.70f, 0.28f, 1.0f) : ImVec4(0.38f, 0.76f, 0.52f, 1.0f));
-    if (c.type != CMD_REPEAT && c.type != CMD_GROUP)
-        dl->AddCircleFilled(ImVec2(row_x + 13.0f, cy), 4.0f, ImGui::GetColorU32(dot), 12);
+    if (c.type != CMD_REPEAT && c.type != CMD_GROUP) {
+        ImVec2 status_center(row_x + 13.0f, cy);
+        if (warning)
+            ui_draw_command_warning_marker(dl, status_center);
+        else
+            dl->AddCircleFilled(status_center, 4.0f, ImGui::GetColorU32(dot), 12);
+    }
 
     const char* type = cmd_type_str(c.type);
     char type_buf[32] = {};
@@ -6805,7 +6895,7 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
     float badge_w = badge_ts.x + 12.0f;
     float badge_h = badge_ts.y + 6.0f;
     float text_y = floorf(cy - ImGui::GetTextLineHeight() * 0.5f);
-    float right_x = max.x - (warning ? 24.0f : 6.0f);
+    float right_x = max.x - 6.0f;
     bool show_type_badge = !container;
     char profile_buf[32] = {};
     if (g_profiler_enabled) {
@@ -6851,9 +6941,6 @@ static bool ui_command_row(int index, Command& c, int depth = 0) {
     dl->PushClipRect(name_pos, ImVec2(clip_right, max.y), true);
     dl->AddText(name_pos, name_col, display_name);
     dl->PopClipRect();
-
-    if (warning)
-        dl->AddText(ImVec2(max.x - 18.0f, text_y), ImGui::GetColorU32(ImVec4(1.0f, 0.78f, 0.28f, 1.0f)), "!");
 
     bool moved = false;
     if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoDisableHover)) {
@@ -11457,6 +11544,222 @@ static void ui_draw_viewport_light_debug(ImVec2 rect_min, ImVec2 rect_max) {
         dl->AddTriangleFilled(ring[0], ring[18], ring[27], fill_col);
 }
 
+static Camera ui_camera_from_timeline_state(const TimelineCameraState& state) {
+    Camera c = {};
+    for (int i = 0; i < 3; i++)
+        c.position[i] = state.position[i];
+    c.projection_type = state.projection_type;
+    c.fov_y = state.fov_y;
+    c.ortho_height = state.ortho_height;
+    c.near_z = state.near_z;
+    c.far_z = state.far_z;
+    camera_set_euler(&c, state.yaw, state.pitch, state.roll);
+    return c;
+}
+
+static void ui_draw_timeline_camera_marker(ImDrawList* dl, const Mat4& world_to_clip,
+                                           ImVec2 rect_min, ImVec2 rect_max,
+                                           const TimelineCameraState& state,
+                                           ImU32 col, float thickness) {
+    if (!dl)
+        return;
+
+    Camera c = ui_camera_from_timeline_state(state);
+    Vec3 pos = v3(c.position[0], c.position[1], c.position[2]);
+    Vec3 forward = camera_forward(c);
+    Vec3 right = camera_right(c);
+    Vec3 up = camera_up(c);
+    float scale = ui_viewport_gizmo_world_axis_len(pos, rect_max.y - rect_min.y) * 0.55f;
+    if (scale < 0.05f)
+        scale = 0.05f;
+    float aspect = 1.35f;
+    float half_h = scale * 0.34f;
+    float half_w = half_h * aspect;
+    Vec3 center = v3_add(pos, v3_scale(forward, scale));
+    Vec3 corners[4] = {
+        v3_add(center, v3_add(v3_scale(right, -half_w), v3_scale(up,  half_h))),
+        v3_add(center, v3_add(v3_scale(right,  half_w), v3_scale(up,  half_h))),
+        v3_add(center, v3_add(v3_scale(right,  half_w), v3_scale(up, -half_h))),
+        v3_add(center, v3_add(v3_scale(right, -half_w), v3_scale(up, -half_h)))
+    };
+
+    ImVec2 p = {};
+    ImVec2 cs[4] = {};
+    bool p_ok = ui_project_world_to_screen(world_to_clip, rect_min, rect_max, pos, &p);
+    bool c_ok[4] = {};
+    for (int i = 0; i < 4; i++)
+        c_ok[i] = ui_project_world_to_screen(world_to_clip, rect_min, rect_max, corners[i], &cs[i]);
+
+    if (p_ok) {
+        dl->AddCircleFilled(p, ui_px(3.4f), col, 16);
+        dl->AddCircle(p, ui_px(5.6f), col, 18, ui_px(1.0f));
+    }
+    for (int i = 0; i < 4; i++) {
+        int j = (i + 1) & 3;
+        if (c_ok[i] && c_ok[j])
+            dl->AddLine(cs[i], cs[j], col, thickness);
+        if (p_ok && c_ok[i])
+            dl->AddLine(p, cs[i], col, thickness * 0.82f);
+    }
+    ImVec2 center_s = {};
+    if (p_ok && ui_project_world_to_screen(world_to_clip, rect_min, rect_max, center, &center_s))
+        ui_draw_translate_axis(dl, p, center_s, col, thickness);
+}
+
+static void ui_draw_timeline_light_marker(ImDrawList* dl, const Mat4& world_to_clip,
+                                          ImVec2 rect_min, ImVec2 rect_max,
+                                          const TimelineLightState& state,
+                                          ImU32 col, float thickness) {
+    if (!dl)
+        return;
+
+    Vec3 pos = v3(state.position[0], state.position[1], state.position[2]);
+    Vec3 target = v3(state.target[0], state.target[1], state.target[2]);
+    Vec3 dir = v3_norm(v3_sub(target, pos));
+    if (v3_dot(dir, dir) < 0.0001f)
+        dir = v3(0.0f, -1.0f, 0.0f);
+    float scale = ui_viewport_gizmo_world_axis_len(pos, rect_max.y - rect_min.y) * 0.80f;
+    if (scale < 0.05f)
+        scale = 0.05f;
+    Vec3 tip = v3_add(pos, v3_scale(dir, scale));
+
+    ImVec2 p = {};
+    ImVec2 t = {};
+    bool p_ok = ui_project_world_to_screen(world_to_clip, rect_min, rect_max, pos, &p);
+    bool t_ok = ui_project_world_to_screen(world_to_clip, rect_min, rect_max, tip, &t);
+    if (p_ok) {
+        dl->AddCircleFilled(p, ui_px(3.8f), col, 16);
+        dl->AddCircle(p, ui_px(6.0f), col, 18, ui_px(1.0f));
+    }
+    if (p_ok && t_ok)
+        ui_draw_translate_axis(dl, p, t, col, thickness);
+
+    if (state.light_type != LIGHT_TYPE_SPOT)
+        return;
+
+    Vec3 up_seed = fabsf(v3_dot(dir, v3(0.0f, 1.0f, 0.0f))) > 0.92f ? v3(0.0f, 0.0f, 1.0f) : v3(0.0f, 1.0f, 0.0f);
+    Vec3 right = v3_norm(v3_cross(up_seed, dir));
+    Vec3 up = v3_norm(v3_cross(dir, right));
+    float radius = tanf(clampf(state.spot_angle, 0.05f, 3.0f) * 0.5f) * scale;
+    const int segments = 14;
+    ImVec2 ring[segments] = {};
+    bool ok[segments] = {};
+    for (int i = 0; i < segments; i++) {
+        float a = 6.28318530718f * (float)i / (float)segments;
+        Vec3 rp = v3_add(tip,
+                         v3_add(v3_scale(right, cosf(a) * radius),
+                                v3_scale(up, sinf(a) * radius)));
+        ok[i] = ui_project_world_to_screen(world_to_clip, rect_min, rect_max, rp, &ring[i]);
+    }
+    for (int i = 0; i < segments; i++) {
+        int j = (i + 1) % segments;
+        if (ok[i] && ok[j])
+            dl->AddLine(ring[i], ring[j], col, thickness * 0.78f);
+    }
+    for (int i = 0; i < segments; i += 4) {
+        if (p_ok && ok[i])
+            dl->AddLine(p, ring[i], col, thickness * 0.65f);
+    }
+}
+
+static void ui_draw_timeline_camera_path(ImDrawList* dl, const Mat4& world_to_clip,
+                                         ImVec2 rect_min, ImVec2 rect_max) {
+    int track_index = timeline_find_track(TIMELINE_TRACK_CAMERA, "camera", RES_NONE);
+    if (track_index < 0 || track_index >= g_timeline_track_count)
+        return;
+    TimelineTrack& track = g_timeline_tracks[track_index];
+    if (!track.active || !track.enabled || track.key_count <= 0)
+        return;
+
+    ImU32 path_col = ImGui::GetColorU32(ImVec4(0.50f, 0.72f, 1.0f, 0.82f));
+    ImU32 key_col = ImGui::GetColorU32(ImVec4(0.64f, 0.82f, 1.0f, 0.90f));
+    ImU32 current_col = ImGui::GetColorU32(ImVec4(0.88f, 0.96f, 1.0f, 1.0f));
+    int length = timeline_length_frames();
+    int step = length > 160 ? (length + 159) / 160 : 1;
+    ImVec2 prev = {};
+    bool prev_ok = false;
+    for (int f = 0; f < length; f += step) {
+        TimelineCameraState state = {};
+        if (!timeline_sample_camera_state(f, &state))
+            continue;
+        ImVec2 p = {};
+        bool ok = ui_project_world_to_screen(world_to_clip, rect_min, rect_max,
+                                             v3(state.position[0], state.position[1], state.position[2]), &p);
+        if (ok && prev_ok)
+            dl->AddLine(prev, p, path_col, ui_px(1.8f));
+        prev = p;
+        prev_ok = ok;
+        if (f == length - 1)
+            break;
+        if (f + step >= length && f != length - 1)
+            f = length - 1 - step;
+    }
+
+    for (int i = 0; i < track.key_count; i++) {
+        TimelineCameraState state = {};
+        if (timeline_sample_camera_state(track.keys[i].frame, &state))
+            ui_draw_timeline_camera_marker(dl, world_to_clip, rect_min, rect_max, state, key_col, ui_px(1.15f));
+    }
+    TimelineCameraState current = {};
+    if (timeline_sample_camera_state(timeline_current_frame(), &current))
+        ui_draw_timeline_camera_marker(dl, world_to_clip, rect_min, rect_max, current, current_col, ui_px(1.65f));
+}
+
+static void ui_draw_timeline_light_path(ImDrawList* dl, const Mat4& world_to_clip,
+                                        ImVec2 rect_min, ImVec2 rect_max) {
+    int track_index = timeline_find_track(TIMELINE_TRACK_LIGHT, "light", RES_NONE);
+    if (track_index < 0 || track_index >= g_timeline_track_count)
+        return;
+    TimelineTrack& track = g_timeline_tracks[track_index];
+    if (!track.active || !track.enabled || track.key_count <= 0)
+        return;
+
+    ImU32 path_col = ImGui::GetColorU32(ImVec4(1.0f, 0.64f, 0.24f, 0.82f));
+    ImU32 key_col = ImGui::GetColorU32(ImVec4(1.0f, 0.72f, 0.34f, 0.90f));
+    ImU32 current_col = ImGui::GetColorU32(ImVec4(1.0f, 0.88f, 0.58f, 1.0f));
+    int length = timeline_length_frames();
+    int step = length > 160 ? (length + 159) / 160 : 1;
+    ImVec2 prev = {};
+    bool prev_ok = false;
+    for (int f = 0; f < length; f += step) {
+        TimelineLightState state = {};
+        if (!timeline_sample_light_state(f, &state))
+            continue;
+        ImVec2 p = {};
+        bool ok = ui_project_world_to_screen(world_to_clip, rect_min, rect_max,
+                                             v3(state.position[0], state.position[1], state.position[2]), &p);
+        if (ok && prev_ok)
+            dl->AddLine(prev, p, path_col, ui_px(1.8f));
+        prev = p;
+        prev_ok = ok;
+        if (f == length - 1)
+            break;
+        if (f + step >= length && f != length - 1)
+            f = length - 1 - step;
+    }
+
+    for (int i = 0; i < track.key_count; i++) {
+        TimelineLightState state = {};
+        if (timeline_sample_light_state(track.keys[i].frame, &state))
+            ui_draw_timeline_light_marker(dl, world_to_clip, rect_min, rect_max, state, key_col, ui_px(1.15f));
+    }
+    TimelineLightState current = {};
+    if (timeline_sample_light_state(timeline_current_frame(), &current))
+        ui_draw_timeline_light_marker(dl, world_to_clip, rect_min, rect_max, current, current_col, ui_px(1.65f));
+}
+
+static void ui_draw_viewport_timeline_paths(ImVec2 rect_min, ImVec2 rect_max) {
+    if (!s_timeline_debug_paths)
+        return;
+    if (rect_max.x <= rect_min.x + 1.0f || rect_max.y <= rect_min.y + 1.0f)
+        return;
+
+    Mat4 world_to_clip = ui_scene_world_to_clip_matrix();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ui_draw_timeline_camera_path(dl, world_to_clip, rect_min, rect_max);
+    ui_draw_timeline_light_path(dl, world_to_clip, rect_min, rect_max);
+}
+
 static float ui_viewport_overlay_text_button_width(const char* label) {
     float pad_x = ui_px(8.0f);
     float min_h = ui_px(22.0f);
@@ -11792,6 +12095,7 @@ static void ui_panel_scene(bool embedded = false) {
     if (g_dx.scene_srv && image_max.x > image_min.x && image_max.y > image_min.y) {
         ui_draw_viewport_bounds_debug(image_min, image_max);
         ui_draw_viewport_light_debug(image_min, image_max);
+        ui_draw_viewport_timeline_paths(image_min, image_max);
         ui_draw_viewport_gizmo(image_min, image_max, viewport_hovered);
         if (g_dx.scene_orientation_gizmo_enabled)
             ui_draw_camera_orientation_gizmo(image_min, image_max);
@@ -13189,7 +13493,6 @@ static void ui_draw_help_common_tab() {
         ImGui::TableSetupColumn("Use", ImGuiTableColumnFlags_WidthStretch, 1.35f);
         ImGui::TableHeadersRow();
         ui_draw_common_function_row("float/float2/float3 lt_square(x)", "x: scalar/vector.", "Returns x*x.");
-        ui_draw_common_function_row("float2/float3 lt_safe_normalize(v)", "v: vector.", "Normalize with a small length guard.");
         ui_draw_common_function_row("float lt_luminance(float3 c)", "c: linear RGB color.", "Rec.709 luminance.");
         ui_draw_common_function_row("float3 lt_aces_fitted(float3 color)", "color: HDR linear RGB.", "Simple fitted ACES tone map.");
         ui_draw_common_function_row("float3 lt_decode_normal_rgb(float4 enc)", "enc: normal encoded in 0..1 RGB.", "Decodes to normalized -1..1 normal.");
@@ -13590,6 +13893,181 @@ static bool ui_timeline_track_enable_checkbox(const char* id, bool* value, float
     return changed;
 }
 
+static bool ui_timeline_edit_camera_key(TimelineKey& key) {
+    bool changed = false;
+    ImGui::SetNextItemWidth(ui_px(220.0f));
+    changed |= ImGui::DragFloat3("Position", key.fval, 0.01f);
+
+    float rotation[3] = { key.fval[3], key.fval[4], key.fval[8] };
+    ImGui::SetNextItemWidth(ui_px(220.0f));
+    if (ImGui::DragFloat3("Rotation", rotation, 0.01f)) {
+        key.fval[3] = rotation[0];
+        key.fval[4] = rotation[1];
+        key.fval[8] = rotation[2];
+        changed = true;
+    }
+
+    const char* projection_types[] = { "Perspective", "Orthographic" };
+    int projection_type = key.fval[9] >= 0.5f ? 1 : 0;
+    ImGui::SetNextItemWidth(ui_px(180.0f));
+    if (ImGui::Combo("Projection", &projection_type, projection_types, 2)) {
+        key.fval[9] = projection_type == 1 ? 1.0f : 0.0f;
+        changed = true;
+    }
+
+    ImGui::SetNextItemWidth(ui_px(180.0f));
+    changed |= ImGui::DragFloat("FOV", &key.fval[5], 0.01f, 0.10f, 2.80f);
+    ImGui::SetNextItemWidth(ui_px(180.0f));
+    changed |= ImGui::DragFloat("Ortho Height", &key.fval[10], 0.01f, 0.001f, 10000.0f);
+    ImGui::SetNextItemWidth(ui_px(180.0f));
+    changed |= ImGui::DragFloat("Near Plane", &key.fval[6], 0.001f, 0.0001f, 100.0f);
+    ImGui::SetNextItemWidth(ui_px(180.0f));
+    changed |= ImGui::DragFloat("Far Plane", &key.fval[7], 0.05f, 0.001f, 10000.0f);
+
+    key.fval[5] = clampf(key.fval[5], 0.10f, 2.80f);
+    if (key.fval[10] < 0.001f) key.fval[10] = 0.001f;
+    if (key.fval[6] < 0.0001f) key.fval[6] = 0.0001f;
+    if (key.fval[7] <= key.fval[6] + 0.001f)
+        key.fval[7] = key.fval[6] + 0.001f;
+    return changed;
+}
+
+static bool ui_timeline_edit_light_key(TimelineKey& key) {
+    bool changed = false;
+    const char* light_types[] = { "Directional", "Spot" };
+    int light_type = key.fval[10] >= 0.5f ? 1 : 0;
+    ImGui::SetNextItemWidth(ui_px(180.0f));
+    if (ImGui::Combo("Light Type", &light_type, light_types, 2)) {
+        key.fval[10] = light_type == 1 ? 1.0f : 0.0f;
+        changed = true;
+    }
+
+    ImGui::SetNextItemWidth(ui_px(220.0f));
+    changed |= ImGui::DragFloat3("Position", key.fval, 0.01f);
+    ImGui::SetNextItemWidth(ui_px(220.0f));
+    changed |= ImGui::DragFloat3("Target", &key.fval[3], 0.01f);
+    ImGui::SetNextItemWidth(ui_px(220.0f));
+    changed |= ImGui::ColorEdit3("Color", &key.fval[6]);
+    ImGui::SetNextItemWidth(ui_px(180.0f));
+    changed |= ImGui::DragFloat("Intensity", &key.fval[9], 0.01f, 0.0f, 10.0f);
+    ImGui::SetNextItemWidth(ui_px(180.0f));
+    changed |= ImGui::DragFloat("Spot Angle", &key.fval[11], 0.01f, 0.05f, 3.0f);
+    ImGui::SetNextItemWidth(ui_px(180.0f));
+    changed |= ImGui::DragFloat("Spot Softness", &key.fval[12], 0.01f, 0.0f, 0.95f);
+
+    key.fval[9] = clampf(key.fval[9], 0.0f, 10.0f);
+    key.fval[11] = clampf(key.fval[11] > 0.001f ? key.fval[11] : 0.78539816339f, 0.05f, 3.0f);
+    key.fval[12] = clampf(key.fval[12], 0.0f, 0.95f);
+    return changed;
+}
+
+static bool ui_timeline_edit_key_values(const TimelineTrack& track, TimelineKey& key) {
+    if (track.kind != TIMELINE_TRACK_CAMERA && track.kind != TIMELINE_TRACK_LIGHT)
+        return false;
+
+    bool changed = false;
+    if (ImGui::BeginMenu("Key Values")) {
+        if (track.kind == TIMELINE_TRACK_CAMERA)
+            changed = ui_timeline_edit_camera_key(key);
+        else if (track.kind == TIMELINE_TRACK_LIGHT)
+            changed = ui_timeline_edit_light_key(key);
+        ImGui::EndMenu();
+    }
+    if (changed)
+        app_request_scene_render();
+    return changed;
+}
+
+static void ui_timeline_camera_feel_button() {
+    TimelineCameraFeelSettings feel = {};
+    int current_timeline = timeline_current_index();
+    if (!timeline_get_camera_feel_settings(current_timeline, &feel))
+        return;
+
+    if (feel.enabled) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.22f, 0.25f, 0.15f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.34f, 0.19f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.40f, 0.43f, 0.24f, 1.0f));
+    }
+    if (ImGui::Button("Feel##timeline_camera_feel", ImVec2(ui_px(48.0f), 0.0f)))
+        ImGui::OpenPopup("##timeline_camera_feel_popup");
+    if (feel.enabled)
+        ImGui::PopStyleColor(3);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(feel.enabled ? "Camera Feel is enabled for this timeline" : "Camera Feel is disabled for this timeline");
+
+    ImGui::SetNextWindowSizeConstraints(ImVec2(ui_px(300.0f), 0.0f), ImVec2(ui_px(360.0f), ui_px(520.0f)));
+    if (!ImGui::BeginPopup("##timeline_camera_feel_popup"))
+        return;
+
+    bool changed = false;
+    changed |= ImGui::Checkbox("Enabled##camera_feel_enabled", &feel.enabled);
+
+    const char* preset_names[TIMELINE_CAMERA_FEEL_PRESET_COUNT] = {};
+    for (int i = 0; i < TIMELINE_CAMERA_FEEL_PRESET_COUNT; i++)
+        preset_names[i] = timeline_camera_feel_preset_name(i);
+    int preset = feel.preset;
+    ImGui::SetNextItemWidth(ui_px(180.0f));
+    if (ImGui::Combo("Preset##camera_feel_preset", &preset, preset_names, TIMELINE_CAMERA_FEEL_PRESET_COUNT)) {
+        bool was_enabled = feel.enabled;
+        int seed = feel.seed;
+        timeline_camera_feel_apply_preset(&feel, preset);
+        feel.enabled = was_enabled;
+        feel.seed = seed;
+        changed = true;
+    }
+
+    ImGui::SetNextItemWidth(ui_px(120.0f));
+    changed |= ImGui::InputInt("Seed##camera_feel_seed", &feel.seed, 1, 100);
+    ImGui::Separator();
+
+    ImGui::SetNextItemWidth(ui_px(220.0f));
+    changed |= ImGui::SliderFloat("Amount##camera_feel_amount", &feel.amount, 0.0f, 3.0f, "%.2f");
+    ImGui::SetNextItemWidth(ui_px(220.0f));
+    changed |= ImGui::SliderFloat("Frequency##camera_feel_frequency", &feel.frequency, 0.05f, 12.0f, "%.2f");
+    ImGui::SetNextItemWidth(ui_px(220.0f));
+    changed |= ImGui::SliderFloat("Roughness##camera_feel_roughness", &feel.roughness, 0.0f, 1.0f, "%.2f");
+    ImGui::Separator();
+
+    ImGui::SetNextItemWidth(ui_px(220.0f));
+    changed |= ImGui::DragFloat("Position##camera_feel_position", &feel.position_amount, 0.005f, 0.0f, 5.0f, "%.3f");
+    ImGui::SetNextItemWidth(ui_px(220.0f));
+    changed |= ImGui::DragFloat("Rotation##camera_feel_rotation", &feel.rotation_amount, 0.0005f, 0.0f, 0.35f, "%.4f");
+    ImGui::SetNextItemWidth(ui_px(220.0f));
+    changed |= ImGui::DragFloat("Roll##camera_feel_roll", &feel.roll_amount, 0.0005f, 0.0f, 0.35f, "%.4f");
+    ImGui::SetNextItemWidth(ui_px(220.0f));
+    changed |= ImGui::SliderFloat("Micro##camera_feel_micro", &feel.micro_amount, 0.0f, 3.0f, "%.2f");
+    ImGui::SetNextItemWidth(ui_px(220.0f));
+    changed |= ImGui::DragFloat("Breathing##camera_feel_breathing", &feel.breathing_amount, 0.0005f, 0.0f, 0.20f, "%.4f");
+    ImGui::Separator();
+
+    ImGui::SetNextItemWidth(ui_px(110.0f));
+    changed |= ImGui::InputInt("Fade In##camera_feel_fade_in", &feel.fade_in_frames, 1, 8);
+    ImGui::SetNextItemWidth(ui_px(110.0f));
+    changed |= ImGui::InputInt("Fade Out##camera_feel_fade_out", &feel.fade_out_frames, 1, 8);
+
+    if (ImGui::Button("Reset##camera_feel_reset")) {
+        bool was_enabled = feel.enabled;
+        int seed = feel.seed;
+        timeline_camera_feel_apply_preset(&feel, feel.preset);
+        feel.enabled = was_enabled;
+        feel.seed = seed;
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Random Seed##camera_feel_random_seed")) {
+        feel.seed = (int)(app_scene_frame() * 1664525u + 1013904223u);
+        if (feel.seed == 0)
+            feel.seed = 1337;
+        changed = true;
+    }
+
+    if (changed)
+        timeline_set_camera_feel_settings(current_timeline, &feel);
+
+    ImGui::EndPopup();
+}
+
 static void ui_timeline_draw_slot(int track_index, int frame, ImVec2 slot_size) {
     TimelineTrack& track = g_timeline_tracks[track_index];
     int key_index = timeline_find_key_index(track, frame);
@@ -13655,6 +14133,7 @@ static void ui_timeline_draw_slot(int track_index, int frame, ImVec2 slot_size) 
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Cubic tangent scale. 0 is flat, 1 is automatic, higher values overshoot more.");
             }
+            ui_timeline_edit_key_values(track, *key);
         }
         if (has_key && ImGui::MenuItem("Delete Key"))
             timeline_delete_key(track_index, frame);
@@ -13819,8 +14298,9 @@ static void ui_draw_timeline_window() {
     }
 
     char detail[160] = {};
-    snprintf(detail, sizeof(detail), "%s  timeline %d / %d  frame %d / %d  %.2fs",
+    snprintf(detail, sizeof(detail), "%s%s  timeline %d / %d  frame %d / %d  %.2fs",
              timeline_enabled() ? "active" : "disabled",
+             timeline_recording() ? "  rec" : "",
              timeline_current_index() + 1, timeline_count(),
              timeline_current_frame(), timeline_length_frames() - 1, app_scene_time());
     if (s_panel_tone_count < (int)(sizeof(s_panel_tone_stack) / sizeof(s_panel_tone_stack[0])))
@@ -13939,6 +14419,26 @@ static void ui_draw_timeline_window() {
     }
     if (track_enabled)
         ImGui::PopStyleColor(3);
+    ImGui::SameLine(0.0f, ui_margin_px(12.0f));
+
+    bool recording = timeline_recording();
+    if (recording) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.08f, 0.06f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.58f, 0.12f, 0.08f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.72f, 0.18f, 0.10f, 1.0f));
+    }
+    if (ImGui::Button(recording ? "Rec" : "No Rec", ImVec2(ui_px(58.0f), 0.0f)))
+        timeline_set_recording(!recording);
+    if (recording)
+        ImGui::PopStyleColor(3);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(recording ? "Automatic key capture is on" : "Automatic key capture is off");
+    ImGui::SameLine(0.0f, ui_margin_px(12.0f));
+    ImGui::Checkbox("Paths##timeline_debug_paths", &s_timeline_debug_paths);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(s_timeline_debug_paths ? "Timeline camera/light paths are visible" : "Timeline camera/light paths are hidden");
+    ImGui::SameLine(0.0f, ui_margin_px(12.0f));
+    ui_timeline_camera_feel_button();
     ImGui::SameLine(0.0f, ui_margin_px(12.0f));
 
     int current_timeline = timeline_current_index();
@@ -15410,8 +15910,9 @@ static void ui_top_bar() {
     if (ui_icon_button("##help_button", UI_ICON_HELP, ImVec2(ui_px(28.0f), 0.0f), "Help"))
         s_help_popup_open = !s_help_popup_open;
     ImGui::SameLine(0.0f, ui_margin_px(8.0f));
-    ui_align_text_row(row_y);
-    ImGui::TextDisabled("workspace");
+    ui_align_frame_row(row_y);
+    ui_inline_small_text("##workspace_label", "workspace",
+                         ImVec4(0.56f, 0.54f, 0.53f, 1.0f), row_h, 0.82f);
     ImGui::SameLine(0.0f, ui_margin_px(8.0f));
     ui_align_frame_row(row_y);
     ui_inline_badge("##project_name_badge", project_current_name() ? project_current_name() : "untitled",

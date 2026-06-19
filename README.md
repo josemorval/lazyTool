@@ -93,10 +93,10 @@ For the common case, include `shaders/common.hlsl`, enable **Shadow Receiver** o
 
 float4 PSMain(VSOut i) : SV_Target
 {
-    float3 n = lt_safe_normalize(i.normal_ws);
+    float3 n = normalize(i.normal_ws);
     float3 light_dir = LightParams.x >= 0.5
-        ? lt_safe_normalize(LightPos.xyz - i.world_pos)
-        : lt_safe_normalize(-LightDir.xyz);
+        ? normalize(LightPos.xyz - i.world_pos)
+        : normalize(-LightDir.xyz);
 
     float ndl = saturate(dot(n, light_dir));
     float shadow = lt_sample_shadow_pcf3x3(i.world_pos, n, light_dir);
