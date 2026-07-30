@@ -46,6 +46,7 @@ typedef enum {
     RES_GAUSSIAN_SPLAT,
     RES_NANOVDB,
     RES_MESH,
+    RES_SKINNED_MESH,
     RES_SHADER,
     RES_BUILTIN_TIME,
     RES_BUILTIN_SCENE_COLOR,
@@ -65,6 +66,7 @@ typedef enum {
     CMD_INDIRECT_DRAW,
     CMD_INDIRECT_DISPATCH,
     CMD_REPEAT,
+    CMD_SWAP,
     CMD_COUNT
 } CmdType;
 
@@ -191,6 +193,11 @@ struct Resource {
     bool     active;
     bool     is_builtin;
     bool     is_generated;
+    // GPU ownership is independent from logical identity. Runtime-managed
+    // built-ins such as scene_color/depth own their backing here, while proxy
+    // built-ins such as shadow_map currently reference backing owned by g_dx.
+    bool     owns_gpu_backing;
+    bool     runtime_managed;
 
     int      ival[4];
     float    fval[4];
@@ -204,6 +211,11 @@ struct Resource {
     ID3D11Buffer*               buf;
     ID3D11Buffer*               vb;
     ID3D11Buffer*               ib;
+    // RES_SKINNED_MESH keeps its immutable rig in buf/srv so generic compute
+    // commands can bind the resource directly. Vertex influences are an
+    // internal draw-time SRV because they are part of the mesh geometry.
+    ID3D11Buffer*               skin_influence_buf;
+    ID3D11ShaderResourceView*   skin_influence_srv;
     ID3D11VertexShader*         vs;
     ID3D11PixelShader*          ps;
     ID3D11ComputeShader*        cs;
@@ -340,6 +352,11 @@ struct Command {
 
     ResHandle indirect_buf;
     uint32_t  indirect_offset;
+
+    // Low-level ping-pong operation. Only GPU backing objects/views move;
+    // resource identity and descriptors stay fixed.
+    ResHandle swap_a;
+    ResHandle swap_b;
 
     CommandParam params[MAX_COMMAND_PARAMS];
     int          param_count;

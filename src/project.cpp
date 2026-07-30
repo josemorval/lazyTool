@@ -141,6 +141,7 @@ static const char* res_type_token(ResType t) {
     case RES_GAUSSIAN_SPLAT:      return "gaussian_splat";
     case RES_NANOVDB:             return "nanovdb";
     case RES_MESH:                return "mesh";
+    case RES_SKINNED_MESH:        return "skinned_mesh";
     case RES_SHADER:              return "shader";
     case RES_BUILTIN_TIME:        return "builtin_time";
     case RES_BUILTIN_SCENE_COLOR: return "builtin_scene_color";
@@ -167,6 +168,7 @@ static ResType res_type_from_token(const char* name) {
     if (strcmp(name, "gaussian_splat") == 0) return RES_GAUSSIAN_SPLAT;
     if (strcmp(name, "nanovdb") == 0) return RES_NANOVDB;
     if (strcmp(name, "mesh") == 0) return RES_MESH;
+    if (strcmp(name, "skinned_mesh") == 0) return RES_SKINNED_MESH;
     if (strcmp(name, "shader") == 0) return RES_SHADER;
     if (strcmp(name, "builtin_time") == 0) return RES_BUILTIN_TIME;
     if (strcmp(name, "builtin_scene_color") == 0) return RES_BUILTIN_SCENE_COLOR;
@@ -605,6 +607,7 @@ static CmdType cmd_type_from_name(const char* name) {
     if (strcmp(name, "indirect_draw") == 0) return CMD_INDIRECT_DRAW;
     if (strcmp(name, "indirect_dispatch") == 0) return CMD_INDIRECT_DISPATCH;
     if (strcmp(name, "repeat") == 0) return CMD_REPEAT;
+    if (strcmp(name, "swap") == 0) return CMD_SWAP;
     return CMD_DRAW_MESH;
 }
 
@@ -618,6 +621,7 @@ static const char* cmd_type_name(CmdType type) {
     case CMD_INDIRECT_DRAW:     return "indirect_draw";
     case CMD_INDIRECT_DISPATCH: return "indirect_dispatch";
     case CMD_REPEAT:            return "repeat";
+    case CMD_SWAP:              return "swap";
     default:                    return "none";
     }
 }
@@ -801,6 +805,10 @@ bool project_save_text(const char* path) {
             } else {
                 fprintf(f, "resource mesh_primitive %s %s\n", r.name, mesh_prim_name(r.mesh_primitive_type));
             }
+        } else if (r.type == RES_SKINNED_MESH) {
+            char path_ref[MAX_PATH_LEN] = {};
+            fprintf(f, "resource skinned_gltf %s %s\n",
+                    r.name, project_path_token(r.path, path_ref, MAX_PATH_LEN));
         } else if (r.type == RES_SHADER) {
             char path_ref[MAX_PATH_LEN] = {};
             // The serialized shader kind is the editor intent, not the current
@@ -832,7 +840,8 @@ bool project_save_text(const char* path) {
 
     for (int i = 0; i < MAX_RESOURCES; i++) {
         Resource& r = g_resources[i];
-        if (!r.active || r.type != RES_MESH || r.is_builtin || r.is_generated)
+        if (!r.active || (r.type != RES_MESH && r.type != RES_SKINNED_MESH) ||
+            r.is_builtin || r.is_generated)
             continue;
         for (int pi = 0; pi < r.mesh_part_count; pi++) {
             if (!r.mesh_parts[pi].enabled)
@@ -935,6 +944,13 @@ bool project_save_text(const char* path) {
         res_ref(c.indirect_buf, indirect_ref, MAX_PATH_LEN);
         fprintf(f, "  indirect_args %s %u\n", indirect_ref, c.indirect_offset);
         fprintf(f, "  repeat %d %s\n", c.repeat_count, bool_str(c.repeat_expanded));
+        if (c.type == CMD_SWAP) {
+            char swap_a_ref[MAX_PATH_LEN] = {};
+            char swap_b_ref[MAX_PATH_LEN] = {};
+            res_ref(c.swap_a, swap_a_ref, MAX_PATH_LEN);
+            res_ref(c.swap_b, swap_b_ref, MAX_PATH_LEN);
+            fprintf(f, "  swap %s %s\n", swap_a_ref, swap_b_ref);
+        }
         Command* parent_cmd = cmd_get(c.parent);
         fprintf(f, "  parent %s\n", parent_cmd ? parent_cmd->name : "-");
 
@@ -1460,6 +1476,9 @@ bool project_load_text(const char* path) {
             } else if (strcmp(kind, "mesh_gltf") == 0) {
                 char* p = strtok(nullptr, " \t\r\n");
                 res_load_mesh(name, p ? p : "");
+            } else if (strcmp(kind, "skinned_gltf") == 0) {
+                char* p = strtok(nullptr, " \t\r\n");
+                res_load_skinned_mesh(name, p ? p : "");
             } else if (strcmp(kind, "shader_vsps") == 0) {
                 char* p = strtok(nullptr, " \t\r\n");
                 res_create_shader(name, p && strcmp(p, "-") != 0 ? p : "", "VSMain", "PSMain");
@@ -1482,7 +1501,7 @@ bool project_load_text(const char* path) {
         } else if (strcmp(tag, "mesh_part_disabled") == 0) {
             char* mesh_ref = strtok(nullptr, " \t\r\n");
             char* part_tok = strtok(nullptr, " \t\r\n");
-            ResHandle mesh_h = res_by_ref(mesh_ref, res_lookup_types(RES_MESH));
+            ResHandle mesh_h = res_by_ref(mesh_ref, res_lookup_types(RES_MESH, RES_SKINNED_MESH));
             Resource* mesh = res_get(mesh_h);
             int part_index = part_tok ? atoi(part_tok) : -1;
             if (mesh && part_index >= 0 && part_index < mesh->mesh_part_count)
@@ -1560,7 +1579,8 @@ bool project_load_text(const char* path) {
                 parse_handles(line, cur->mrt_handles, &cur->mrt_count, MAX_DRAW_RENDER_TARGETS - 1,
                     res_lookup_types(RES_RENDER_TEXTURE2D, RES_RENDER_TEXTURE3D, RES_BUILTIN_SCENE_COLOR));
             } else if (strcmp(tag, "mesh_shader") == 0) {
-                cur->mesh = res_by_ref(strtok(nullptr, " \t\r\n"), res_lookup_types(RES_MESH));
+                cur->mesh = res_by_ref(strtok(nullptr, " \t\r\n"),
+                                       res_lookup_types(RES_MESH, RES_SKINNED_MESH));
                 cur->shader = res_by_ref(strtok(nullptr, " \t\r\n"), res_lookup_types(RES_SHADER));
             } else if (strcmp(tag, "draw_source") == 0) {
                 cur->draw_source = (int)draw_source_from_name(strtok(nullptr, " \t\r\n"));
@@ -1631,6 +1651,12 @@ bool project_load_text(const char* path) {
                 cur->repeat_count = count ? atoi(count) : 1;
                 if (cur->repeat_count < 1) cur->repeat_count = 1;
                 cur->repeat_expanded = expanded ? atoi(expanded) != 0 : true;
+            } else if (strcmp(tag, "swap") == 0) {
+                // Keep the serialized handles even when a project is temporarily
+                // incompatible; the command validator provides the precise reason.
+                ResourceLookup swap_lookup = res_lookup_types();
+                cur->swap_a = res_by_ref(strtok(nullptr, " \t\r\n"), swap_lookup);
+                cur->swap_b = res_by_ref(strtok(nullptr, " \t\r\n"), swap_lookup);
             } else if (strcmp(tag, "parent") == 0) {
                 char* parent_name = strtok(nullptr, " \t\r\n");
                 if (parent_name && strcmp(parent_name, "-") != 0 && cur_h != INVALID_HANDLE &&

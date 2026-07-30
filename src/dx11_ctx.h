@@ -25,19 +25,7 @@ struct DX11Ctx {
     unsigned long long       adapter_dedicated_vram_mb;
     bool                     adapter_force_high_performance;
 
-    ID3D11Texture2D*            scene_tex;
-    ID3D11RenderTargetView*     scene_rtv;
-    ID3D11ShaderResourceView*   scene_srv;
-    ID3D11UnorderedAccessView*  scene_uav;
-
-    ID3D11Texture2D*            depth_tex;
-    ID3D11DepthStencilView*     depth_dsv;
-    ID3D11ShaderResourceView*   depth_srv;
-
-    ID3D11Texture2D*            shadow_tex;
-    ID3D11DepthStencilView*     shadow_dsv;
     ID3D11DepthStencilView*     shadow_slice_dsv[MAX_SHADOW_CASCADES];
-    ID3D11ShaderResourceView*   shadow_srv;
     ID3D11ShaderResourceView*   shadow_preview_srv;
     int                         shadow_width, shadow_height, shadow_layers;
     ID3D11VertexShader*         shadow_vs;

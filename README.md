@@ -15,6 +15,7 @@ It does not try to hide the technical side. The goal is that you can open the to
 
 - View a live scene in the viewport.
 - Create visual resources and internal GPU buffers.
+- Import glTF skinned meshes and simulate their bone palettes with compute shaders.
 - Chain render commands in an ordered frame pipeline.
 - Clear targets, draw, run compute work, and organize commands into groups.
 - Edit parameters from panels without rebuilding the whole application.
@@ -56,6 +57,11 @@ You do not need to understand the entire engine to start. A good first approach 
 
 The `.lt` file is plain text. That makes scenes easier to review, version, and understand.
 
+The repository includes `projects/skinned_tree_gpu.lt`, a compact example that
+imports a four-joint glTF trunk, initializes two generic bone buffers, simulates
+one bone per compute thread using the previous-frame parent transform, swaps the
+buffers, and skins the draw and its shadow on the GPU.
+
 ## Resources
 
 Resources are the pieces used by the scene. They can be simple values, textures, internal targets, buffers, meshes, or built-in data such as scene color, depth, time, and shadow maps.
@@ -66,7 +72,7 @@ Keeping resources visible makes it easier to answer simple questions: what exist
 
 Commands are the steps of the frame. They run in order and form the main pipeline.
 
-Some commands clear a texture, some draw, some run compute work, and some group or repeat other steps. This makes the frame easier to inspect: if something goes wrong, you can usually find the exact step that produced it.
+Some commands clear a texture, some draw, some run compute work, and some group or repeat other steps. `Swap` exchanges the GPU backing of two compatible render targets, scene color/depth targets, or structured buffers in O(1), which is useful for ping-pong pipelines without copying data. This makes the frame easier to inspect: if something goes wrong, you can usually find the exact step that produced it.
 
 ## Timeline
 

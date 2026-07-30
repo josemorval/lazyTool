@@ -53,6 +53,7 @@ static void cmd_clear_shader_recompute_requests();
 #define GPU_PROFILE_MAX_EVENTS 512
 #endif
 static const UINT k_shadow_map_ps_slot = 7;
+static const UINT k_skin_influences_vs_slot = 5;
 
 uint64_t cmd_revision() {
     return s_cmd_revision;
@@ -215,6 +216,7 @@ const char* cmd_type_str(CmdType t) {
     case CMD_INDIRECT_DRAW:     return "IndirectDraw";
     case CMD_INDIRECT_DISPATCH: return "IndirectDispatch";
     case CMD_REPEAT:            return "Repeat";
+    case CMD_SWAP:              return "Swap";
     default:                    return "?";
     }
 }
@@ -663,6 +665,8 @@ CmdHandle cmd_alloc(const char* name, CmdType type) {
             g_commands[i].thread_z         = 1;
             g_commands[i].compute_on_reset = false;
             g_commands[i].dispatch_size_source = INVALID_HANDLE;
+            g_commands[i].swap_a           = INVALID_HANDLE;
+            g_commands[i].swap_b           = INVALID_HANDLE;
             for (int r = 0; r < MAX_DRAW_RENDER_TARGETS - 1; r++) g_commands[i].mrt_handles[r] = INVALID_HANDLE;
             for (int t = 0; t < MAX_TEX_SLOTS; t++) g_commands[i].tex_handles[t] = INVALID_HANDLE;
             for (int s = 0; s < MAX_SRV_SLOTS; s++) g_commands[i].srv_handles[s] = INVALID_HANDLE;
@@ -806,11 +810,11 @@ CmdHandle cmd_move(CmdHandle moving, CmdHandle target, bool after_target) {
 }
 
 static ID3D11RenderTargetView* get_rtv(ResHandle h) {
-    if (h == INVALID_HANDLE) return g_dx.scene_rtv;
+    Resource* scene = res_get(g_builtin_scene_color);
+    if (h == INVALID_HANDLE) return scene ? scene->rtv : nullptr;
     Resource* r = res_get(h);
-    if (!r) return g_dx.scene_rtv;
-    if (r->type == RES_BUILTIN_SCENE_COLOR) return g_dx.scene_rtv;
-    return r->rtv ? r->rtv : g_dx.scene_rtv;
+    if (!r) return scene ? scene->rtv : nullptr;
+    return r->rtv ? r->rtv : (scene ? scene->rtv : nullptr);
 }
 
 static ID3D11RenderTargetView* get_optional_rtv(ResHandle h) {
@@ -819,33 +823,27 @@ static ID3D11RenderTargetView* get_optional_rtv(ResHandle h) {
     Resource* r = res_get(h);
     if (!r)
         return nullptr;
-    if (r->type == RES_BUILTIN_SCENE_COLOR)
-        return g_dx.scene_rtv;
     return r->rtv;
 }
 
 static ID3D11ShaderResourceView* get_resource_srv(Resource* r) {
     if (!r)
         return nullptr;
-    if (r->type == RES_BUILTIN_SCENE_COLOR) return g_dx.scene_srv;
-    if (r->type == RES_BUILTIN_SCENE_DEPTH) return g_dx.depth_srv;
-    if (r->type == RES_BUILTIN_SHADOW_MAP)  return g_dx.shadow_srv;
     return r->srv;
 }
 
 static ID3D11UnorderedAccessView* get_resource_uav(Resource* r) {
     if (!r)
         return nullptr;
-    if (r->type == RES_BUILTIN_SCENE_COLOR) return g_dx.scene_uav;
     return r->uav;
 }
 
 static ID3D11DepthStencilView* get_dsv(ResHandle h) {
-    if (h == INVALID_HANDLE) return g_dx.depth_dsv;
+    Resource* depth = res_get(g_builtin_scene_depth);
+    if (h == INVALID_HANDLE) return depth ? depth->dsv : nullptr;
     Resource* r = res_get(h);
-    if (!r) return g_dx.depth_dsv;
-    if (r->type == RES_BUILTIN_SCENE_DEPTH) return g_dx.depth_dsv;
-    return r->dsv ? r->dsv : g_dx.depth_dsv;
+    if (!r) return depth ? depth->dsv : nullptr;
+    return r->dsv ? r->dsv : (depth ? depth->dsv : nullptr);
 }
 
 static Resource* get_output_size_resource(ResHandle h) {
@@ -1505,6 +1503,24 @@ static int resolve_draw_instance_count(const Command& c) {
     return inst;
 }
 
+static bool is_skinned_mesh(const Resource* mesh) {
+    return mesh && mesh->type == RES_SKINNED_MESH;
+}
+
+static void bind_skinned_mesh_influences(const Resource* mesh) {
+    if (!is_skinned_mesh(mesh))
+        return;
+    ID3D11ShaderResourceView* srv = mesh->skin_influence_srv;
+    bind_srv_range(SrvBindStage::VS, k_skin_influences_vs_slot, 1, &srv);
+}
+
+static void clear_skinned_mesh_influences(const Resource* mesh) {
+    if (!is_skinned_mesh(mesh))
+        return;
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    bind_srv_range(SrvBindStage::VS, k_skin_influences_vs_slot, 1, &null_srv);
+}
+
 static void draw_command_geometry(const Command& c, Resource* mesh, const MeshPart* part) {
     int inst = resolve_draw_instance_count(c);
     if (command_uses_procedural_draw(c)) {
@@ -1591,13 +1607,21 @@ static bool is_valid_indirect_dispatch_call(const Command& c, const Resource* in
 }
 
 static bool draw_command_has_ps_srv_binding(const Command& c, const Resource* mesh, uint32_t slot) {
-    if (slot == k_shadow_map_ps_slot && c.shadow_receive && g_dx.shadow_srv)
+    Resource* shadow = res_get(g_builtin_shadow_map);
+    if (slot == k_shadow_map_ps_slot && c.shadow_receive && shadow && shadow->srv)
         return true;
     if (command_has_bound_srv(c.srv_handles, c.srv_slots, c.srv_count, slot))
         return true;
     if (mesh_has_material_srv_binding(mesh, slot))
         return true;
     return false;
+}
+
+static bool draw_command_has_vs_srv_binding(const Command& c, const Resource* mesh, uint32_t slot) {
+    if (is_skinned_mesh(mesh) && slot == k_skin_influences_vs_slot &&
+        mesh->skin_influence_srv)
+        return true;
+    return command_has_bound_srv(c.srv_handles, c.srv_slots, c.srv_count, slot);
 }
 
 static void validate_draw_command(Command& c, const Resource* mesh, const Resource* shader,
@@ -1623,11 +1647,12 @@ static void validate_draw_command(Command& c, const Resource* mesh, const Resour
     }
     if (procedural && !indirect && c.vertex_count <= 0)
         validation_issue_append(issues, sizeof(issues), "procedural draw has vertex_count <= 0");
-    if (procedural && c.shadow_cast) {
+    if ((procedural || is_skinned_mesh(mesh)) && c.shadow_cast) {
         Resource* shadow_shader = res_get(c.shadow_shader);
         if (!shadow_shader || !shadow_shader->vs)
             validation_issue_append(issues, sizeof(issues),
-                "procedural shadow caster needs shadow_shader with a valid VS");
+                "%s shadow caster needs shadow_shader with a valid VS",
+                procedural ? "procedural" : "skinned");
     }
     if (indirect && !procedural && mesh && mesh->mesh_material_count > 0 &&
         mesh_enabled_part_count(mesh) != 1) {
@@ -1648,7 +1673,7 @@ static void validate_draw_command(Command& c, const Resource* mesh, const Resour
 
                 if (bind.kind == SHADER_BIND_SRV) {
                     if ((bind.stage_mask & SHADER_STAGE_VERTEX) &&
-                        !command_has_bound_srv(c.srv_handles, c.srv_slots, c.srv_count, slot)) {
+                        !draw_command_has_vs_srv_binding(c, mesh, slot)) {
                         validation_issue_append(issues, sizeof(issues), "missing VS t%u '%s'", slot, bind.name);
                     }
                     if ((bind.stage_mask & SHADER_STAGE_PIXEL) &&
@@ -1881,6 +1906,8 @@ static void execute_shadow_prepass_command(CmdHandle h) {
     ID3D11VertexShader* shadow_vs = g_dx.shadow_vs;
     ID3D11InputLayout* shadow_il = g_dx.shadow_il;
     Resource* shadow_shader = res_get(c.shadow_shader);
+    if (is_skinned_mesh(mesh) && (!shadow_shader || !shadow_shader->vs || !shadow_shader->il))
+        return;
     if (shadow_shader && shadow_shader->vs && (procedural || shadow_shader->il)) {
         shadow_vs = shadow_shader->vs;
         shadow_il = shadow_shader->il;
@@ -1895,6 +1922,7 @@ static void execute_shadow_prepass_command(CmdHandle h) {
     set_cached_input_layout(procedural ? nullptr : shadow_il);
     bind_command_geometry(c, mesh);
     bind_srv_slot_list(SrvBindStage::VS, c.srv_handles, c.srv_slots, c.srv_count);
+    bind_skinned_mesh_influences(mesh);
 
     if (c.type == CMD_INDIRECT_DRAW) {
         const MeshPart* draw_part = procedural ? nullptr : indirect_draw_part_context(mesh);
@@ -1912,6 +1940,7 @@ static void execute_shadow_prepass_command(CmdHandle h) {
         }
 
         clear_srv_slot_list(SrvBindStage::VS, c.srv_slots, c.srv_count);
+        clear_skinned_mesh_influences(mesh);
         return;
     }
 
@@ -1930,15 +1959,17 @@ static void execute_shadow_prepass_command(CmdHandle h) {
     }
 
     clear_srv_slot_list(SrvBindStage::VS, c.srv_slots, c.srv_count);
+    clear_skinned_mesh_influences(mesh);
 }
 
 static void execute_shadow_prepass() {
-    if (!g_dx.shadow_dsv || !g_dx.shadow_vs || !g_dx.shadow_il)
+    Resource* shadow = res_get(g_builtin_shadow_map);
+    if (!shadow || !shadow->dsv || !g_dx.shadow_vs || !g_dx.shadow_il)
         return;
 
     ID3D11ShaderResourceView* null_srv = nullptr;
     bind_srv_range(SrvBindStage::PS, 1, 1, &null_srv);
-    g_dx.ctx->ClearDepthStencilView(g_dx.shadow_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+    g_dx.ctx->ClearDepthStencilView(shadow->dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
     set_cached_depth_state(g_dx.dss_default, 0);
     float bf[4] = {};
     set_cached_blend_state(g_dx.bs_opaque, bf, 0xFFFFFFFF);
@@ -1950,7 +1981,7 @@ static void execute_shadow_prepass() {
     if (cascade_count > MAX_SHADOW_CASCADES) cascade_count = MAX_SHADOW_CASCADES;
 
     for (int cascade = 0; cascade < cascade_count; cascade++) {
-        ID3D11DepthStencilView* layer_dsv = g_dx.shadow_slice_dsv[cascade] ? g_dx.shadow_slice_dsv[cascade] : g_dx.shadow_dsv;
+        ID3D11DepthStencilView* layer_dsv = g_dx.shadow_slice_dsv[cascade] ? g_dx.shadow_slice_dsv[cascade] : shadow->dsv;
         g_dx.ctx->OMSetRenderTargets(0, nullptr, layer_dsv);
 
         D3D11_VIEWPORT vp = {};
@@ -2218,6 +2249,7 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         bind_command_geometry(c, mesh);
 
         bind_srv_slot_list(SrvBindStage::VS, c.srv_handles, c.srv_slots, c.srv_count);
+        bind_skinned_mesh_influences(mesh);
 
         int part_count = procedural ? 1 : (mesh->mesh_part_count > 0 ? mesh->mesh_part_count : 1);
         for (int pi = 0; pi < part_count; pi++) {
@@ -2232,7 +2264,8 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
             bind_mesh_material_textures(mesh, part);
             bind_srv_slot_list(SrvBindStage::PS, c.srv_handles, c.srv_slots, c.srv_count);
             if (c.shadow_receive) {
-                ID3D11ShaderResourceView* srv = g_dx.shadow_srv;
+                Resource* shadow = res_get(g_builtin_shadow_map);
+                ID3D11ShaderResourceView* srv = shadow ? shadow->srv : nullptr;
                 bind_srv_range(SrvBindStage::PS, k_shadow_map_ps_slot, 1, &srv);
             }
 
@@ -2242,6 +2275,7 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         ID3D11ShaderResourceView* null_ps_srvs[MAX_TEX_SLOTS] = {};
         bind_srv_range(SrvBindStage::PS, 0, MAX_TEX_SLOTS, null_ps_srvs);
         clear_srv_slot_list(SrvBindStage::VS, c.srv_slots, c.srv_count);
+        clear_skinned_mesh_influences(mesh);
         clear_srv_slot_list(SrvBindStage::PS, c.srv_slots, c.srv_count);
         clear_draw_uavs(uav_start_slot, om_uav_count);
         break;
@@ -2296,6 +2330,7 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         bind_command_geometry(c, mesh);
 
         bind_srv_slot_list(SrvBindStage::VS, c.srv_handles, c.srv_slots, c.srv_count);
+        bind_skinned_mesh_influences(mesh);
 
         apply_draw_state(c, material);
         update_object_cb_for_command(c, draw_part);
@@ -2303,7 +2338,8 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         bind_mesh_material_textures(mesh, draw_part);
         bind_srv_slot_list(SrvBindStage::PS, c.srv_handles, c.srv_slots, c.srv_count);
         if (c.shadow_receive) {
-            ID3D11ShaderResourceView* srv = g_dx.shadow_srv;
+            Resource* shadow = res_get(g_builtin_shadow_map);
+            ID3D11ShaderResourceView* srv = shadow ? shadow->srv : nullptr;
             bind_srv_range(SrvBindStage::PS, k_shadow_map_ps_slot, 1, &srv);
         }
 
@@ -2322,6 +2358,7 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
         ID3D11ShaderResourceView* null_ps_srvs[MAX_TEX_SLOTS] = {};
         bind_srv_range(SrvBindStage::PS, 0, MAX_TEX_SLOTS, null_ps_srvs);
         clear_srv_slot_list(SrvBindStage::VS, c.srv_slots, c.srv_count);
+        clear_skinned_mesh_influences(mesh);
         clear_srv_slot_list(SrvBindStage::PS, c.srv_slots, c.srv_count);
         clear_draw_uavs(uav_start_slot, om_uav_count);
         break;
@@ -2334,6 +2371,11 @@ static void execute_command_handle(CmdHandle h, bool& shadow_prepass_done) {
 
     case CMD_REPEAT: {
         execute_repeat_command(h, c, shadow_prepass_done);
+        break;
+    }
+
+    case CMD_SWAP: {
+        res_swap_backing(c.swap_a, c.swap_b);
         break;
     }
 

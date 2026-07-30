@@ -52,6 +52,23 @@ static void res_store_path(char* dst, int dst_sz, const char* path) {
 
 struct Vertex { float pos[3]; float nor[3]; float uv[2]; };
 
+// Public GPU ABI for skinned mesh shaders. Keep these layouts in sync with
+// shaders/skinning.hlsl. Matrices use glTF/HLSL column-major storage and are
+// consumed with mul(M, v).
+struct SkinInfluenceGPU {
+    uint32_t joints[4];
+    float    weights[4];
+};
+
+struct SkinRigBoneGPU {
+    float    rest_local[16];
+    float    rest_global[16];
+    float    inverse_bind[16];
+    uint32_t parent;
+    uint32_t joint_index;
+    uint32_t padding[2];
+};
+
 struct GltfPrimitiveRange {
     cgltf_primitive* prim;
     int              start_index;
@@ -68,6 +85,12 @@ struct IndexArray {
     uint32_t* items;
     int       count;
     int       capacity;
+};
+
+struct SkinInfluenceArray {
+    SkinInfluenceGPU* items;
+    int               count;
+    int               capacity;
 };
 
 struct PrimitiveRangeArray {
@@ -128,6 +151,12 @@ static bool res_index_array_reserve(IndexArray* arr, int needed) {
     return res_grow_pod_array((void**)&arr->items, &arr->capacity, needed, sizeof(uint32_t));
 }
 
+static bool res_skin_influence_array_reserve(SkinInfluenceArray* arr, int needed) {
+    if (!arr)
+        return false;
+    return res_grow_pod_array((void**)&arr->items, &arr->capacity, needed, sizeof(SkinInfluenceGPU));
+}
+
 static bool res_primitive_range_array_reserve(PrimitiveRangeArray* arr, int needed) {
     if (!arr)
         return false;
@@ -144,6 +173,15 @@ static void res_vertex_array_free(VertexArray* arr) {
 }
 
 static void res_index_array_free(IndexArray* arr) {
+    if (!arr)
+        return;
+    free(arr->items);
+    arr->items = nullptr;
+    arr->count = 0;
+    arr->capacity = 0;
+}
+
+static void res_skin_influence_array_free(SkinInfluenceArray* arr) {
     if (!arr)
         return;
     free(arr->items);
@@ -425,6 +463,108 @@ static bool res_upload_mesh(Resource* r, const Vertex* verts, int vert_count,
     return true;
 }
 
+static bool res_upload_skinned_mesh(Resource* r,
+                                    const Vertex* verts, int vert_count,
+                                    const uint32_t* indices, int idx_count,
+                                    const SkinInfluenceGPU* influences,
+                                    const SkinRigBoneGPU* rig, int joint_count)
+{
+    if (!r || !g_dx.dev || !verts || vert_count <= 0 || !influences ||
+        !rig || joint_count <= 0)
+        return false;
+
+    res_release_gpu(r);
+    r->type = RES_SKINNED_MESH;
+    r->vert_count = vert_count;
+    r->idx_count = idx_count;
+    r->vert_stride = sizeof(Vertex);
+    r->elem_size = sizeof(SkinRigBoneGPU);
+    r->elem_count = joint_count;
+    r->has_srv = true;
+    r->has_uav = false;
+    res_set_default_mesh_layout(r);
+    res_compute_mesh_bounds_from_parts(r, verts, vert_count, indices, idx_count);
+
+    D3D11_BUFFER_DESC vbd = {};
+    vbd.ByteWidth = (UINT)(sizeof(Vertex) * (size_t)vert_count);
+    vbd.Usage = D3D11_USAGE_IMMUTABLE;
+    vbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA vsd = { verts, 0, 0 };
+    HRESULT hr = g_dx.dev->CreateBuffer(&vbd, &vsd, &r->vb);
+    if (FAILED(hr) || !r->vb) {
+        log_error("Skinned mesh vertex buffer create failed: %s", r->name);
+        res_release_gpu(r);
+        return false;
+    }
+
+    if (indices && idx_count > 0) {
+        D3D11_BUFFER_DESC ibd = {};
+        ibd.ByteWidth = (UINT)(sizeof(uint32_t) * (size_t)idx_count);
+        ibd.Usage = D3D11_USAGE_IMMUTABLE;
+        ibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA isd = { indices, 0, 0 };
+        hr = g_dx.dev->CreateBuffer(&ibd, &isd, &r->ib);
+        if (FAILED(hr) || !r->ib) {
+            log_error("Skinned mesh index buffer create failed: %s", r->name);
+            res_release_gpu(r);
+            return false;
+        }
+    }
+
+    D3D11_BUFFER_DESC influence_bd = {};
+    influence_bd.ByteWidth = (UINT)(sizeof(SkinInfluenceGPU) * (size_t)vert_count);
+    influence_bd.Usage = D3D11_USAGE_IMMUTABLE;
+    influence_bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    influence_bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    influence_bd.StructureByteStride = sizeof(SkinInfluenceGPU);
+    D3D11_SUBRESOURCE_DATA influence_sd = { influences, 0, 0 };
+    hr = g_dx.dev->CreateBuffer(&influence_bd, &influence_sd, &r->skin_influence_buf);
+    if (FAILED(hr) || !r->skin_influence_buf) {
+        log_error("Skinned mesh influence buffer create failed: %s", r->name);
+        res_release_gpu(r);
+        return false;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC influence_srv_desc = {};
+    influence_srv_desc.Format = DXGI_FORMAT_UNKNOWN;
+    influence_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+    influence_srv_desc.Buffer.NumElements = (UINT)vert_count;
+    hr = g_dx.dev->CreateShaderResourceView(r->skin_influence_buf, &influence_srv_desc,
+                                             &r->skin_influence_srv);
+    if (FAILED(hr) || !r->skin_influence_srv) {
+        log_error("Skinned mesh influence SRV create failed: %s", r->name);
+        res_release_gpu(r);
+        return false;
+    }
+
+    D3D11_BUFFER_DESC rig_bd = {};
+    rig_bd.ByteWidth = (UINT)(sizeof(SkinRigBoneGPU) * (size_t)joint_count);
+    rig_bd.Usage = D3D11_USAGE_IMMUTABLE;
+    rig_bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    rig_bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    rig_bd.StructureByteStride = sizeof(SkinRigBoneGPU);
+    D3D11_SUBRESOURCE_DATA rig_sd = { rig, 0, 0 };
+    hr = g_dx.dev->CreateBuffer(&rig_bd, &rig_sd, &r->buf);
+    if (FAILED(hr) || !r->buf) {
+        log_error("Skinned mesh rig buffer create failed: %s", r->name);
+        res_release_gpu(r);
+        return false;
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC rig_srv_desc = {};
+    rig_srv_desc.Format = DXGI_FORMAT_UNKNOWN;
+    rig_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+    rig_srv_desc.Buffer.NumElements = (UINT)joint_count;
+    hr = g_dx.dev->CreateShaderResourceView(r->buf, &rig_srv_desc, &r->srv);
+    if (FAILED(hr) || !r->srv) {
+        log_error("Skinned mesh rig SRV create failed: %s", r->name);
+        res_release_gpu(r);
+        return false;
+    }
+
+    return true;
+}
+
 static bool res_make_cube_mesh(Resource* r) {
     Vertex verts[24] = {};
     uint32_t idx[36] = {};
@@ -562,6 +702,7 @@ const char* res_type_str(ResType t) {
     case RES_GAUSSIAN_SPLAT:      return "GaussianSplat";
     case RES_NANOVDB:             return "NanoVDB";
     case RES_MESH:                return "Mesh";
+    case RES_SKINNED_MESH:        return "SkinnedMesh";
     case RES_SHADER:              return "Shader";
     case RES_BUILTIN_TIME:        return "[time]";
     case RES_BUILTIN_SCENE_COLOR: return "[scene_color]";
@@ -622,6 +763,12 @@ uint64_t res_estimate_gpu_bytes(const Resource& r) {
         return (uint64_t)(r.vert_stride > 0 ? r.vert_stride : 0) *
                (uint64_t)(r.vert_count > 0 ? r.vert_count : 0) +
                (uint64_t)(r.idx_count > 0 ? r.idx_count : 0) * sizeof(uint32_t);
+    case RES_SKINNED_MESH:
+        return (uint64_t)(r.vert_stride > 0 ? r.vert_stride : 0) *
+                   (uint64_t)(r.vert_count > 0 ? r.vert_count : 0) +
+               (uint64_t)(r.idx_count > 0 ? r.idx_count : 0) * sizeof(uint32_t) +
+               (uint64_t)r.vert_count * sizeof(SkinInfluenceGPU) +
+               (uint64_t)(r.elem_count > 0 ? r.elem_count : 0) * sizeof(SkinRigBoneGPU);
     default:
         return 0;
     }
@@ -645,19 +792,26 @@ void res_init() {
 
     g_builtin_time = res_alloc("time", RES_BUILTIN_TIME);
     g_resources[g_builtin_time - 1].is_builtin = true;
+    g_resources[g_builtin_time - 1].owns_gpu_backing = false;
+    g_resources[g_builtin_time - 1].runtime_managed = true;
 
     g_builtin_scene_color = res_alloc("scene_color", RES_BUILTIN_SCENE_COLOR);
     g_resources[g_builtin_scene_color - 1].is_builtin = true;
+    g_resources[g_builtin_scene_color - 1].runtime_managed = true;
 
     g_builtin_scene_depth = res_alloc("scene_depth", RES_BUILTIN_SCENE_DEPTH);
     g_resources[g_builtin_scene_depth - 1].is_builtin = true;
+    g_resources[g_builtin_scene_depth - 1].runtime_managed = true;
 
     g_builtin_shadow_map = res_alloc("shadow_map", RES_BUILTIN_SHADOW_MAP);
     g_resources[g_builtin_shadow_map - 1].is_builtin = true;
+    g_resources[g_builtin_shadow_map - 1].runtime_managed = true;
 
     g_builtin_light = res_alloc("light", RES_BUILTIN_LIGHT);
     Resource* dl       = res_get(g_builtin_light);
     dl->is_builtin = true;
+    dl->owns_gpu_backing = false;
+    dl->runtime_managed = true;
     project_apply_default_light(dl);
 
     res_sync_size_resource(g_builtin_scene_color);
@@ -672,7 +826,8 @@ void res_shutdown() {
     res_finish_async_loads(true);
 #endif
     for (int i = 0; i < MAX_RESOURCES; i++)
-        if (g_resources[i].active && !g_resources[i].is_builtin) res_release_gpu(&g_resources[i]);
+        if (g_resources[i].active && g_resources[i].owns_gpu_backing)
+            res_release_gpu(&g_resources[i]);
 }
 
 ResHandle res_alloc(const char* name, ResType type) {
@@ -682,6 +837,7 @@ ResHandle res_alloc(const char* name, ResType type) {
             strncpy(g_resources[i].name, name, MAX_NAME - 1);
             g_resources[i].type   = type;
             g_resources[i].active = true;
+            g_resources[i].owns_gpu_backing = true;
             g_resources[i].generated_from = INVALID_HANDLE;
             g_resources[i].size_handle = INVALID_HANDLE;
             g_resources[i].mesh_primitive_type = -1;
@@ -767,6 +923,7 @@ static bool res_has_size_variable(const Resource& r) {
     case RES_STRUCTURED_BUFFER:
     case RES_GAUSSIAN_SPLAT:
     case RES_NANOVDB:
+    case RES_SKINNED_MESH:
     case RES_BUILTIN_SCENE_COLOR:
     case RES_BUILTIN_SCENE_DEPTH:
     case RES_BUILTIN_SHADOW_MAP:
@@ -779,13 +936,15 @@ static bool res_has_size_variable(const Resource& r) {
 static ResType res_size_type_for(const Resource& r) {
     if (r.type == RES_RENDER_TEXTURE3D)
         return RES_INT3;
-    if (r.type == RES_STRUCTURED_BUFFER || r.type == RES_GAUSSIAN_SPLAT || r.type == RES_NANOVDB)
+    if (r.type == RES_STRUCTURED_BUFFER || r.type == RES_GAUSSIAN_SPLAT ||
+        r.type == RES_NANOVDB || r.type == RES_SKINNED_MESH)
         return RES_INT;
     return RES_INT2;
 }
 
 static void res_size_name_for(const Resource& r, char* out, int out_sz) {
-    if (r.type == RES_STRUCTURED_BUFFER || r.type == RES_GAUSSIAN_SPLAT || r.type == RES_NANOVDB)
+    if (r.type == RES_STRUCTURED_BUFFER || r.type == RES_GAUSSIAN_SPLAT ||
+        r.type == RES_NANOVDB || r.type == RES_SKINNED_MESH)
         snprintf(out, out_sz, "%s.count", r.name);
     else
         snprintf(out, out_sz, "%s.size", r.name);
@@ -831,7 +990,8 @@ void res_sync_size_resource(ResHandle h) {
     strncpy(size_res->name, size_name, MAX_NAME - 1);
     size_res->name[MAX_NAME - 1] = '\0';
     size_res->type = size_type;
-    if (r->type == RES_STRUCTURED_BUFFER || r->type == RES_GAUSSIAN_SPLAT || r->type == RES_NANOVDB) {
+    if (r->type == RES_STRUCTURED_BUFFER || r->type == RES_GAUSSIAN_SPLAT ||
+        r->type == RES_NANOVDB || r->type == RES_SKINNED_MESH) {
         size_res->ival[0] = r->elem_count > 0 ? r->elem_count : 1;
         size_res->ival[1] = 1;
         size_res->ival[2] = 1;
@@ -856,6 +1016,8 @@ ResHandle res_find_by_name(const char* name) {
 }
 
 void res_release_gpu(Resource* r) {
+    if (r->skin_influence_srv) { r->skin_influence_srv->Release(); r->skin_influence_srv = nullptr; }
+    if (r->skin_influence_buf) { r->skin_influence_buf->Release(); r->skin_influence_buf = nullptr; }
     if (r->srv) { r->srv->Release(); r->srv = nullptr; }
     if (r->rtv) { r->rtv->Release(); r->rtv = nullptr; }
     if (r->uav) { r->uav->Release(); r->uav = nullptr; }
@@ -866,6 +1028,159 @@ void res_release_gpu(Resource* r) {
     if (r->vb)  { r->vb->Release();  r->vb  = nullptr; }
     if (r->ib)  { r->ib->Release();  r->ib  = nullptr; }
     shader_release(r);
+}
+
+static void res_set_swap_reason(char* reason, int reason_sz, const char* text) {
+    if (!reason || reason_sz <= 0)
+        return;
+    snprintf(reason, reason_sz, "%s", text ? text : "");
+}
+
+static bool res_is_swap_texture2d(const Resource* r) {
+    if (!r) return false;
+    return r->type == RES_RENDER_TEXTURE2D ||
+           r->type == RES_BUILTIN_SCENE_COLOR ||
+           r->type == RES_BUILTIN_SCENE_DEPTH;
+}
+
+static bool res_is_supported_swap_builtin(const Resource* r) {
+    return r && (r->type == RES_BUILTIN_SCENE_COLOR ||
+                 r->type == RES_BUILTIN_SCENE_DEPTH);
+}
+
+bool res_can_swap_backing(ResHandle a_h, ResHandle b_h, char* reason, int reason_sz) {
+    res_set_swap_reason(reason, reason_sz, "");
+    if (a_h == INVALID_HANDLE || b_h == INVALID_HANDLE) {
+        res_set_swap_reason(reason, reason_sz, "Select both resources.");
+        return false;
+    }
+    if (a_h == b_h) {
+        res_set_swap_reason(reason, reason_sz, "The two resources must be different.");
+        return false;
+    }
+
+    Resource* a = res_get(a_h);
+    Resource* b = res_get(b_h);
+    if (!a || !b) {
+        res_set_swap_reason(reason, reason_sz, "A resource no longer exists.");
+        return false;
+    }
+    if ((a->is_builtin && !res_is_supported_swap_builtin(a)) ||
+        (b->is_builtin && !res_is_supported_swap_builtin(b))) {
+        res_set_swap_reason(reason, reason_sz, "This built-in has no swappable backing.");
+        return false;
+    }
+
+    bool a_tex2d = res_is_swap_texture2d(a);
+    bool b_tex2d = res_is_swap_texture2d(b);
+    if (a_tex2d != b_tex2d || (!a_tex2d && a->type != b->type)) {
+        res_set_swap_reason(reason, reason_sz, "Resource types do not match.");
+        return false;
+    }
+
+    if (a_tex2d) {
+        if (a->width != b->width || a->height != b->height ||
+            a->tex_fmt != b->tex_fmt ||
+            a->has_rtv != b->has_rtv || a->has_srv != b->has_srv ||
+            a->has_uav != b->has_uav || a->has_dsv != b->has_dsv ||
+            a->scene_scale_divisor != b->scene_scale_divisor) {
+            res_set_swap_reason(reason, reason_sz, "Render-target descriptors do not match.");
+            return false;
+        }
+        if (!a->tex || !b->tex) {
+            res_set_swap_reason(reason, reason_sz, "A render target has no GPU backing.");
+            return false;
+        }
+        return true;
+    }
+
+    switch (a->type) {
+    case RES_RENDER_TEXTURE3D:
+        if (a->width != b->width || a->height != b->height || a->depth != b->depth ||
+            a->tex_fmt != b->tex_fmt ||
+            a->has_rtv != b->has_rtv || a->has_srv != b->has_srv ||
+            a->has_uav != b->has_uav) {
+            res_set_swap_reason(reason, reason_sz, "3D render-target descriptors do not match.");
+            return false;
+        }
+        if (!a->tex3d || !b->tex3d) {
+            res_set_swap_reason(reason, reason_sz, "A 3D render target has no GPU backing.");
+            return false;
+        }
+        return true;
+
+    case RES_STRUCTURED_BUFFER:
+        if (a->elem_size != b->elem_size || a->elem_count != b->elem_count ||
+            a->has_srv != b->has_srv || a->has_uav != b->has_uav ||
+            a->indirect_args != b->indirect_args) {
+            res_set_swap_reason(reason, reason_sz, "Structured-buffer descriptors do not match.");
+            return false;
+        }
+        if (!a->buf || !b->buf) {
+            res_set_swap_reason(reason, reason_sz, "A structured buffer has no GPU backing.");
+            return false;
+        }
+        return true;
+
+    default:
+        res_set_swap_reason(reason, reason_sz, "Swap supports render targets and structured buffers.");
+        return false;
+    }
+}
+
+template <typename T>
+static void res_swap_ptr(T*& a, T*& b) {
+    T* tmp = a;
+    a = b;
+    b = tmp;
+}
+
+bool res_swap_backing(ResHandle a_h, ResHandle b_h) {
+    if (!res_can_swap_backing(a_h, b_h))
+        return false;
+
+    Resource* a = res_get(a_h);
+    Resource* b = res_get(b_h);
+
+    // D3D11 keeps references to bound views. Clear all stages used by lazyTool
+    // before the logical identities start pointing at the opposite backing.
+    if (g_dx.ctx) {
+        ID3D11ShaderResourceView* null_srvs[16] = {};
+        ID3D11UnorderedAccessView* null_uavs[8] = {};
+        g_dx.ctx->OMSetRenderTargetsAndUnorderedAccessViews(
+            0, nullptr, nullptr, 0, 8, null_uavs, nullptr);
+        g_dx.ctx->VSSetShaderResources(0, 16, null_srvs);
+        g_dx.ctx->PSSetShaderResources(0, 16, null_srvs);
+        g_dx.ctx->CSSetShaderResources(0, 16, null_srvs);
+        g_dx.ctx->CSSetUnorderedAccessViews(0, 8, null_uavs, nullptr);
+    }
+
+    if (res_is_swap_texture2d(a)) {
+        res_swap_ptr(a->tex, b->tex);
+        res_swap_ptr(a->srv, b->srv);
+        res_swap_ptr(a->rtv, b->rtv);
+        res_swap_ptr(a->uav, b->uav);
+        res_swap_ptr(a->dsv, b->dsv);
+        return true;
+    }
+
+    switch (a->type) {
+    case RES_RENDER_TEXTURE3D:
+        res_swap_ptr(a->tex3d, b->tex3d);
+        res_swap_ptr(a->srv, b->srv);
+        res_swap_ptr(a->rtv, b->rtv);
+        res_swap_ptr(a->uav, b->uav);
+        return true;
+
+    case RES_STRUCTURED_BUFFER:
+        res_swap_ptr(a->buf, b->buf);
+        res_swap_ptr(a->srv, b->srv);
+        res_swap_ptr(a->uav, b->uav);
+        return true;
+
+    default:
+        return false;
+    }
 }
 
 static bool res_is_depth_format(DXGI_FORMAT fmt) {
@@ -2035,6 +2350,389 @@ static void res_cgltf_file_release(const cgltf_memory_options*,
                                    cgltf_size)
 {
     lt_free_file(data);
+}
+
+static int res_gltf_skin_joint_index(const cgltf_skin* skin, const cgltf_node* node) {
+    if (!skin || !node)
+        return -1;
+    for (cgltf_size i = 0; i < skin->joints_count; i++)
+        if (skin->joints[i] == node)
+            return (int)i;
+    return -1;
+}
+
+// A skin joint can have ordinary glTF nodes between it and the closest parent
+// joint. Compose those local transforms so the runtime rig remains a compact
+// joint-only hierarchy.
+static void res_gltf_joint_effective_local(const cgltf_skin* skin, const cgltf_node* joint,
+                                           int* out_parent, float out_local[16])
+{
+    const cgltf_node* chain[128] = {};
+    int chain_count = 0;
+    const cgltf_node* cursor = joint;
+    int parent = -1;
+
+    while (cursor && chain_count < (int)(sizeof(chain) / sizeof(chain[0]))) {
+        int joint_index = cursor != joint ? res_gltf_skin_joint_index(skin, cursor) : -1;
+        if (joint_index >= 0) {
+            parent = joint_index;
+            break;
+        }
+        chain[chain_count++] = cursor;
+        cursor = cursor->parent;
+    }
+
+    if (out_parent)
+        *out_parent = parent;
+    res_mesh_identity(out_local);
+
+    // cgltf matrices and our structured-buffer ABI are column-major:
+    // composed = ancestorLocal * ... * childLocal.
+    for (int ci = chain_count - 1; ci >= 0; ci--) {
+        float local[16] = {};
+        float composed[16] = {};
+        cgltf_node_transform_local(chain[ci], local);
+        for (int col = 0; col < 4; col++) {
+            for (int row = 0; row < 4; row++) {
+                float sum = 0.0f;
+                for (int k = 0; k < 4; k++)
+                    sum += out_local[k * 4 + row] * local[col * 4 + k];
+                composed[col * 4 + row] = sum;
+            }
+        }
+        memcpy(out_local, composed, sizeof(composed));
+    }
+}
+
+static bool res_build_gltf_skin_rig(const cgltf_skin* skin, SkinRigBoneGPU** out_rig,
+                                    int* out_joint_count, char* err, int err_sz)
+{
+    if (!skin || !out_rig || !out_joint_count || skin->joints_count == 0) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "skin has no joints");
+        return false;
+    }
+    if (skin->joints_count > INT_MAX) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "skin has too many joints");
+        return false;
+    }
+    if (skin->inverse_bind_matrices &&
+        skin->inverse_bind_matrices->count < skin->joints_count) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "inverseBindMatrices count is smaller than joints count");
+        return false;
+    }
+
+    int joint_count = (int)skin->joints_count;
+    SkinRigBoneGPU* rig = (SkinRigBoneGPU*)calloc((size_t)joint_count, sizeof(SkinRigBoneGPU));
+    if (!rig) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "out of memory allocating rig");
+        return false;
+    }
+
+    for (int ji = 0; ji < joint_count; ji++) {
+        cgltf_node* joint = skin->joints[ji];
+        if (!joint) {
+            free(rig);
+            if (err && err_sz > 0) snprintf(err, err_sz, "skin joint %d is null", ji);
+            return false;
+        }
+
+        int parent = -1;
+        res_gltf_joint_effective_local(skin, joint, &parent, rig[ji].rest_local);
+        cgltf_node_transform_world(joint, rig[ji].rest_global);
+        res_mesh_identity(rig[ji].inverse_bind);
+        if (skin->inverse_bind_matrices) {
+            if (!cgltf_accessor_read_float(skin->inverse_bind_matrices, (cgltf_size)ji,
+                                           rig[ji].inverse_bind, 16)) {
+                free(rig);
+                if (err && err_sz > 0) snprintf(err, err_sz, "failed reading inverse bind matrix %d", ji);
+                return false;
+            }
+        }
+        rig[ji].parent = parent >= 0 ? (uint32_t)parent : UINT32_MAX;
+        rig[ji].joint_index = (uint32_t)ji;
+    }
+
+    *out_rig = rig;
+    *out_joint_count = joint_count;
+    return true;
+}
+
+static bool res_extract_gltf_skinned_primitive(VertexArray* verts,
+                                               IndexArray* indices,
+                                               SkinInfluenceArray* influences,
+                                               cgltf_primitive* prim,
+                                               int joint_count,
+                                               int* out_start_index,
+                                               int* out_index_count,
+                                               char* err,
+                                               int err_sz)
+{
+    if (!verts || !indices || !influences || !prim || joint_count <= 0 ||
+        !out_start_index || !out_index_count) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "invalid skinned primitive");
+        return false;
+    }
+    if (prim->type != cgltf_primitive_type_triangles) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "only triangle primitives are supported");
+        return false;
+    }
+
+    cgltf_accessor* pos_acc = nullptr;
+    cgltf_accessor* nor_acc = nullptr;
+    cgltf_accessor* uv_acc = nullptr;
+    cgltf_accessor* joints_acc = nullptr;
+    cgltf_accessor* weights_acc = nullptr;
+    for (cgltf_size ai = 0; ai < prim->attributes_count; ai++) {
+        cgltf_attribute* attr = &prim->attributes[ai];
+        if (attr->type == cgltf_attribute_type_position) pos_acc = attr->data;
+        else if (attr->type == cgltf_attribute_type_normal) nor_acc = attr->data;
+        else if (attr->type == cgltf_attribute_type_texcoord && attr->index == 0) uv_acc = attr->data;
+        else if (attr->type == cgltf_attribute_type_joints && attr->index == 0) joints_acc = attr->data;
+        else if (attr->type == cgltf_attribute_type_weights && attr->index == 0) weights_acc = attr->data;
+    }
+
+    if (!pos_acc || !joints_acc || !weights_acc || pos_acc->count == 0) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "POSITION, JOINTS_0 and WEIGHTS_0 are required");
+        return false;
+    }
+    if (joints_acc->count != pos_acc->count || weights_acc->count != pos_acc->count ||
+        (nor_acc && nor_acc->count != pos_acc->count) ||
+        (uv_acc && uv_acc->count != pos_acc->count)) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "skinned vertex attribute counts do not match");
+        return false;
+    }
+    if (pos_acc->count > INT_MAX) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "primitive has too many vertices");
+        return false;
+    }
+
+    int vert_count = (int)pos_acc->count;
+    int old_vert_count = verts->count;
+    if (!res_vertex_array_reserve(verts, old_vert_count + vert_count) ||
+        !res_skin_influence_array_reserve(influences, old_vert_count + vert_count)) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "out of memory growing skinned vertex arrays");
+        return false;
+    }
+
+    for (int i = 0; i < vert_count; i++) {
+        float p[3] = {};
+        float n[3] = {0.0f, 1.0f, 0.0f};
+        float uv[2] = {};
+        float weights[4] = {};
+        cgltf_uint joints[4] = {};
+        if (!cgltf_accessor_read_float(pos_acc, (cgltf_size)i, p, 3) ||
+            !cgltf_accessor_read_uint(joints_acc, (cgltf_size)i, joints, 4) ||
+            !cgltf_accessor_read_float(weights_acc, (cgltf_size)i, weights, 4)) {
+            if (err && err_sz > 0) snprintf(err, err_sz, "failed reading skinned vertex %d", i);
+            return false;
+        }
+        if (nor_acc) cgltf_accessor_read_float(nor_acc, (cgltf_size)i, n, 3);
+        if (uv_acc) cgltf_accessor_read_float(uv_acc, (cgltf_size)i, uv, 2);
+
+        Vertex* v = &verts->items[old_vert_count + i];
+        memcpy(v->pos, p, sizeof(p));
+        memcpy(v->nor, n, sizeof(n));
+        memcpy(v->uv, uv, sizeof(uv));
+
+        SkinInfluenceGPU* influence = &influences->items[old_vert_count + i];
+        float weight_sum = 0.0f;
+        for (int wi = 0; wi < 4; wi++) {
+            if (joints[wi] >= (cgltf_uint)joint_count) {
+                if (err && err_sz > 0)
+                    snprintf(err, err_sz, "vertex %d references joint %u outside skin", i, (unsigned)joints[wi]);
+                return false;
+            }
+            influence->joints[wi] = (uint32_t)joints[wi];
+            influence->weights[wi] = weights[wi] > 0.0f ? weights[wi] : 0.0f;
+            weight_sum += influence->weights[wi];
+        }
+        if (weight_sum <= 1e-8f) {
+            influence->joints[0] = 0;
+            influence->weights[0] = 1.0f;
+            influence->weights[1] = influence->weights[2] = influence->weights[3] = 0.0f;
+        } else {
+            float inv_sum = 1.0f / weight_sum;
+            for (int wi = 0; wi < 4; wi++)
+                influence->weights[wi] *= inv_sum;
+        }
+    }
+    verts->count += vert_count;
+    influences->count += vert_count;
+
+    uint32_t base_vertex = (uint32_t)old_vert_count;
+    int start_index = indices->count;
+    int append_count = prim->indices ? (int)prim->indices->count : vert_count;
+    if (!res_index_array_reserve(indices, indices->count + append_count)) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "out of memory growing skinned index array");
+        return false;
+    }
+    if (prim->indices) {
+        for (cgltf_size ii = 0; ii < prim->indices->count; ii++) {
+            cgltf_size local_index = cgltf_accessor_read_index(prim->indices, ii);
+            if (local_index >= pos_acc->count) {
+                if (err && err_sz > 0) snprintf(err, err_sz, "primitive index is outside vertex range");
+                return false;
+            }
+            indices->items[indices->count++] = base_vertex + (uint32_t)local_index;
+        }
+    } else {
+        for (int i = 0; i < vert_count; i++)
+            indices->items[indices->count++] = base_vertex + (uint32_t)i;
+    }
+
+    *out_start_index = start_index;
+    *out_index_count = indices->count - start_index;
+    return true;
+}
+
+static ResHandle res_skinned_mesh_fail(ResHandle handle, const char* msg) {
+    Resource* r = res_get(handle);
+    if (!r)
+        return INVALID_HANDLE;
+    res_release_gpu(r);
+    r->type = RES_SKINNED_MESH;
+    r->compiled_ok = false;
+    r->using_fallback = false;
+    snprintf(r->compile_err, sizeof(r->compile_err), "%s", msg ? msg : "Skinned mesh load failed");
+    log_warn("SkinnedMesh: %s", r->compile_err);
+    return handle;
+}
+
+ResHandle res_load_skinned_mesh(const char* name, const char* path) {
+    ResHandle handle = res_alloc(name, RES_SKINNED_MESH);
+    if (handle == INVALID_HANDLE)
+        return INVALID_HANDLE;
+    Resource* r = res_get(handle);
+    res_store_path(r->path, MAX_PATH_LEN, path);
+    r->compiled_ok = false;
+    r->using_fallback = false;
+    r->compile_err[0] = '\0';
+
+    cgltf_options opts = {};
+    opts.file.read = res_cgltf_file_read;
+    opts.file.release = res_cgltf_file_release;
+    cgltf_data* data = nullptr;
+    if (cgltf_parse_file(&opts, path, &data) != cgltf_result_success) {
+        char msg[512] = {};
+        snprintf(msg, sizeof(msg), "cgltf: failed to parse '%s'", path);
+        if (data) cgltf_free(data);
+        return res_skinned_mesh_fail(handle, msg);
+    }
+    if (cgltf_load_buffers(&opts, data, path) != cgltf_result_success) {
+        char msg[512] = {};
+        snprintf(msg, sizeof(msg), "cgltf: failed to load buffers for '%s'", path);
+        cgltf_free(data);
+        return res_skinned_mesh_fail(handle, msg);
+    }
+
+    cgltf_node* skin_node = nullptr;
+    int skinned_node_count = 0;
+    for (cgltf_size ni = 0; ni < data->nodes_count; ni++) {
+        cgltf_node* node = &data->nodes[ni];
+        if (node->mesh && node->skin) {
+            if (!skin_node) skin_node = node;
+            skinned_node_count++;
+        }
+    }
+    if (!skin_node || !skin_node->skin || !skin_node->mesh) {
+        cgltf_free(data);
+        return res_skinned_mesh_fail(handle, "cgltf: no node with both mesh and skin");
+    }
+    if (skinned_node_count > 1) {
+        log_warn("SkinnedMesh %s contains %d skinned nodes; importing only '%s'",
+                 name, skinned_node_count,
+                 skin_node->name && skin_node->name[0] ? skin_node->name : "first node");
+    }
+
+    SkinRigBoneGPU* rig = nullptr;
+    int joint_count = 0;
+    char err[512] = {};
+    if (!res_build_gltf_skin_rig(skin_node->skin, &rig, &joint_count, err, sizeof(err))) {
+        cgltf_free(data);
+        return res_skinned_mesh_fail(handle, err);
+    }
+
+    MeshMaterial imported_materials[MAX_MESH_MATERIALS] = {};
+    MeshPart imported_parts[MAX_MESH_PARTS] = {};
+    for (int i = 0; i < MAX_MESH_MATERIALS; i++) res_init_mesh_material(&imported_materials[i]);
+    for (int i = 0; i < MAX_MESH_PARTS; i++) res_init_mesh_part(&imported_parts[i]);
+    int imported_material_count = res_load_gltf_materials(handle, name, path, data, imported_materials);
+    int imported_part_count = 0;
+
+    VertexArray verts = {};
+    IndexArray indices = {};
+    SkinInfluenceArray influences = {};
+    float identity[16] = {};
+    res_mesh_identity(identity);
+
+    for (cgltf_size pi = 0; pi < skin_node->mesh->primitives_count; pi++) {
+        if (imported_part_count >= MAX_MESH_PARTS) {
+            log_warn("SkinnedMesh parts truncated for %s: max %d", name, MAX_MESH_PARTS);
+            break;
+        }
+        int start_index = 0;
+        int index_count = 0;
+        err[0] = '\0';
+        cgltf_primitive* prim = &skin_node->mesh->primitives[pi];
+        if (!res_extract_gltf_skinned_primitive(&verts, &indices, &influences, prim,
+                                                joint_count, &start_index, &index_count,
+                                                err, sizeof(err))) {
+            log_warn("SkinnedMesh primitive skipped in %s: %s", name, err);
+            continue;
+        }
+        char part_name[MAX_NAME] = {};
+        const char* base_name = skin_node->name && skin_node->name[0] ? skin_node->name :
+                                (skin_node->mesh->name && skin_node->mesh->name[0] ? skin_node->mesh->name : name);
+        snprintf(part_name, sizeof(part_name), "%s.%u", base_name, (unsigned)pi);
+        GltfMeshBuildContext material_ctx = {};
+        material_ctx.data = data;
+        material_ctx.imported_material_count = imported_material_count;
+        int material_index = res_gltf_resolve_material_index(&material_ctx, prim->material);
+        res_push_mesh_part(imported_parts, &imported_part_count, part_name,
+                           start_index, index_count, material_index, identity);
+    }
+
+    if (verts.count == 0 || indices.count == 0 || influences.count != verts.count ||
+        imported_part_count == 0) {
+        free(rig);
+        cgltf_free(data);
+        res_vertex_array_free(&verts);
+        res_index_array_free(&indices);
+        res_skin_influence_array_free(&influences);
+        return res_skinned_mesh_fail(handle, "cgltf: no supported skinned triangle primitives");
+    }
+
+    bool uploaded = res_upload_skinned_mesh(r, verts.items, verts.count,
+                                            indices.items, indices.count,
+                                            influences.items, rig, joint_count);
+    free(rig);
+    if (!uploaded) {
+        cgltf_free(data);
+        res_vertex_array_free(&verts);
+        res_index_array_free(&indices);
+        res_skin_influence_array_free(&influences);
+        return res_skinned_mesh_fail(handle, "Skinned mesh GPU upload failed");
+    }
+
+    res_reset_mesh_asset(r);
+    r->mesh_material_count = imported_material_count;
+    r->mesh_part_count = imported_part_count;
+    memcpy(r->mesh_materials, imported_materials, sizeof(imported_materials));
+    memcpy(r->mesh_parts, imported_parts, sizeof(imported_parts));
+    res_compute_mesh_bounds_from_parts(r, verts.items, verts.count, indices.items, indices.count);
+    r->mesh_primitive_type = -1;
+    r->compiled_ok = true;
+    r->using_fallback = false;
+    r->compile_err[0] = '\0';
+    res_sync_size_resource(handle);
+
+    cgltf_free(data);
+    res_vertex_array_free(&verts);
+    res_index_array_free(&indices);
+    res_skin_influence_array_free(&influences);
+    log_info("SkinnedMesh loaded: %s (%d verts, %d idx, %d joints, %d parts)",
+             name, r->vert_count, r->idx_count, r->elem_count, r->mesh_part_count);
+    return handle;
 }
 
 ResHandle res_load_mesh(const char* name, const char* path) {

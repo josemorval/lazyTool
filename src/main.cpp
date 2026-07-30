@@ -521,7 +521,9 @@ static bool selected_or_default_focus_bounds(float out_min[3], float out_max[3])
     }
 
     Resource* selected_res = res_get(g_sel_res);
-    if (selected_res && selected_res->type == RES_MESH && selected_res->mesh_bounds_valid) {
+    if (selected_res &&
+        (selected_res->type == RES_MESH || selected_res->type == RES_SKINNED_MESH) &&
+        selected_res->mesh_bounds_valid) {
         memcpy(out_min, selected_res->mesh_bounds_min, sizeof(float) * 3);
         memcpy(out_max, selected_res->mesh_bounds_max, sizeof(float) * 3);
         return true;
@@ -1986,39 +1988,16 @@ static void update_builtins_and_scene_cb() {
     if (bt) bt->fval[0] = g_time;
 
     Resource* sc = res_get(g_builtin_scene_color);
-    if (sc) {
-        sc->srv = g_dx.scene_srv;
-        sc->uav = g_dx.scene_uav;
-        sc->width = g_dx.scene_width;
-        sc->height = g_dx.scene_height;
-        sc->tex_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
-        sc->has_srv = true;
-        sc->has_uav = true;
+    if (sc)
         res_sync_size_resource(g_builtin_scene_color);
-    }
 
     Resource* sd = res_get(g_builtin_scene_depth);
-    if (sd) {
-        sd->srv = g_dx.depth_srv;
-        sd->width = g_dx.scene_width;
-        sd->height = g_dx.scene_height;
-        sd->tex_fmt = DXGI_FORMAT_R24G8_TYPELESS;
-        sd->has_srv = true;
+    if (sd)
         res_sync_size_resource(g_builtin_scene_depth);
-    }
 
     Resource* sm = res_get(g_builtin_shadow_map);
-    if (sm) {
-        sm->srv = g_dx.shadow_srv;
-        sm->dsv = g_dx.shadow_dsv;
-        sm->width = g_dx.shadow_width;
-        sm->height = g_dx.shadow_height;
-        sm->depth = g_dx.shadow_layers;
-        sm->tex_fmt = DXGI_FORMAT_R24G8_TYPELESS;
-        sm->has_srv = true;
-        sm->has_dsv = true;
+    if (sm)
         res_sync_size_resource(g_builtin_shadow_map);
-    }
 
     Vec3  eye    = camera_eye(g_camera);
     Vec3  at     = v3_add(eye, camera_forward(g_camera));
@@ -2397,7 +2376,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     }
 #endif
 
+    // Runtime-managed built-ins must exist before D3D creates their backing.
+    res_init();
     if (!dx_init(hwnd, 1600, 900)) {
+        res_shutdown();
         MessageBoxA(nullptr, "DX11 init failed.\nMake sure you have a DX11-capable GPU.", "lazyTool", MB_OK | MB_ICONERROR);
         return 1;
     }
@@ -2406,7 +2388,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     if (!g_player_mode)
         ui_init();
 #endif
-    res_init();
     cmd_init();
     user_cb_init();
     audio_init();

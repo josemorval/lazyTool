@@ -933,6 +933,7 @@ static bool collect_project_refs(ExportList* list, const char* project_path, cha
             bool file_resource =
                 kind &&
                 (strcmp(kind, "mesh_gltf") == 0 ||
+                 strcmp(kind, "skinned_gltf") == 0 ||
                  strcmp(kind, "texture2d") == 0 ||
                  strcmp(kind, "gaussian_splat") == 0 ||
                  strcmp(kind, "nanovdb") == 0 ||
@@ -944,7 +945,7 @@ static bool collect_project_refs(ExportList* list, const char* project_path, cha
                 if (strcmp(kind, "shader_vsps") == 0 || strcmp(kind, "shader_cs") == 0 ||
                     strcmp(kind, "audio_shader") == 0)
                     collect_shader_includes(list, path, 0);
-                if (strcmp(kind, "mesh_gltf") == 0)
+                if (strcmp(kind, "mesh_gltf") == 0 || strcmp(kind, "skinned_gltf") == 0)
                     collect_gltf_refs(list, path);
             }
         }

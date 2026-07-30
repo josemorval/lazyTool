@@ -42,6 +42,7 @@ Use this exporter for procedural projects built from:
 - shader-only procedural draws using `SV_VertexID`;
 - built-in primitive meshes;
 - internal render targets;
+- O(1) swap commands between matching internal render targets, scene color/depth built-ins, or structured buffers;
 - scene color, scene depth, and shadow map built-ins;
 - clear and draw commands;
 - render target/depth bindings;
@@ -59,7 +60,7 @@ The exporter can inline shader includes and minify project/shader text where use
 The tiny player intentionally skips features that require a larger runtime or external asset pack:
 
 - external texture/HDR files;
-- glTF/GLB meshes;
+- glTF/GLB static or skinned meshes;
 - Gaussian splat PLY assets;
 - arbitrary external SRV resources;
 - general compute/UAV/indirect GPU pipelines.

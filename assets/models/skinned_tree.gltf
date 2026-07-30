@@ -1,0 +1,209 @@
+{
+  "asset": {
+    "version": "2.0",
+    "generator": "lazyTool skinned tree example"
+  },
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [
+        0,
+        1
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "name": "TreeMesh",
+      "mesh": 0,
+      "skin": 0
+    },
+    {
+      "name": "Root",
+      "children": [
+        2
+      ]
+    },
+    {
+      "name": "Trunk_01",
+      "translation": [
+        0,
+        1.3333333333333333,
+        0
+      ],
+      "children": [
+        3
+      ]
+    },
+    {
+      "name": "Trunk_02",
+      "translation": [
+        0,
+        1.3333333333333333,
+        0
+      ],
+      "children": [
+        4
+      ]
+    },
+    {
+      "name": "Trunk_03",
+      "translation": [
+        0,
+        1.3333333333333333,
+        0
+      ]
+    }
+  ],
+  "skins": [
+    {
+      "name": "TreeRig",
+      "inverseBindMatrices": 6,
+      "skeleton": 1,
+      "joints": [
+        1,
+        2,
+        3,
+        4
+      ]
+    }
+  ],
+  "meshes": [
+    {
+      "name": "TreeTrunk",
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 0,
+            "NORMAL": 1,
+            "TEXCOORD_0": 2,
+            "JOINTS_0": 3,
+            "WEIGHTS_0": 4
+          },
+          "indices": 5,
+          "material": 0,
+          "mode": 4
+        }
+      ]
+    }
+  ],
+  "materials": [
+    {
+      "name": "Bark",
+      "doubleSided": true,
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          0.22,
+          0.07,
+          0.018,
+          1
+        ],
+        "metallicFactor": 0,
+        "roughnessFactor": 0.92
+      }
+    }
+  ],
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "count": 20,
+      "type": "VEC3",
+      "min": [
+        -0.34,
+        0,
+        -0.34
+      ],
+      "max": [
+        0.34,
+        4,
+        0.34
+      ]
+    },
+    {
+      "bufferView": 1,
+      "componentType": 5126,
+      "count": 20,
+      "type": "VEC3"
+    },
+    {
+      "bufferView": 2,
+      "componentType": 5126,
+      "count": 20,
+      "type": "VEC2"
+    },
+    {
+      "bufferView": 3,
+      "componentType": 5121,
+      "count": 20,
+      "type": "VEC4"
+    },
+    {
+      "bufferView": 4,
+      "componentType": 5126,
+      "count": 20,
+      "type": "VEC4"
+    },
+    {
+      "bufferView": 5,
+      "componentType": 5123,
+      "count": 48,
+      "type": "SCALAR"
+    },
+    {
+      "bufferView": 6,
+      "componentType": 5126,
+      "count": 4,
+      "type": "MAT4"
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 240,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 240,
+      "byteLength": 240,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 480,
+      "byteLength": 160,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 640,
+      "byteLength": 80,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 720,
+      "byteLength": 320,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 1040,
+      "byteLength": 96,
+      "target": 34963
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 1136,
+      "byteLength": 256
+    }
+  ],
+  "buffers": [
+    {
+      "byteLength": 1392,
+      "uri": "data:application/octet-stream;base64,exSuvgAAAAAAAAAAexSuPgAAAAAAAAAA16OQvgAAgD8AAAAA16OQPgAAgD8AAAAAZmZmvgAAAEAAAAAAZmZmPgAAAEAAAAAAH4UrvgAAQEAAAAAAH4UrPgAAQEAAAAAArkfhvQAAgEAAAAAArkfhPQAAgEAAAAAAAAAAAAAAAAB7FK6+AAAAAAAAAAB7FK4+AAAAAAAAgD/Xo5C+AAAAAAAAgD/Xo5A+AAAAAAAAAEBmZma+AAAAAAAAAEBmZmY+AAAAAAAAQEAfhSu+AAAAAAAAQEAfhSs+AAAAAAAAgECuR+G9AAAAAAAAgECuR+E9AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA+AACAPwAAgD4AAAAAAAAAPwAAgD8AAAA/AAAAAAAAQD8AAIA/AABAPwAAAAAAAIA/AACAPwAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD4AAIA/AACAPgAAAAAAAAA/AACAPwAAAD8AAAAAAABAPwAAgD8AAEA/AAAAAAAAgD8AAIA/AACAPwABAAAAAQAAAAEAAAABAAABAgAAAQIAAAIDAAACAwAAAwMAAAMDAAAAAQAAAAEAAAABAAAAAQAAAQIAAAECAAACAwAAAgMAAAMDAAADAwAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA+AABAPwAAAAAAAAAAAACAPgAAQD8AAAAAAAAAAAAAAD8AAAA/AAAAAAAAAAAAAAA/AAAAPwAAAAAAAAAAAABAPwAAgD4AAAAAAAAAAAAAQD8AAIA+AAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAACAPgAAQD8AAAAAAAAAAAAAgD4AAEA/AAAAAAAAAAAAAAA/AAAAPwAAAAAAAAAAAAAAPwAAAD8AAAAAAAAAAAAAQD8AAIA+AAAAAAAAAAAAAEA/AACAPgAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAAIAAQABAAIAAwACAAQAAwADAAQABQAEAAYABQAFAAYABwAGAAgABwAHAAgACQAKAAwACwALAAwADQAMAA4ADQANAA4ADwAOABAADwAPABAAEQAQABIAEQARABIAEwAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAgAAAAAAAAIA/AACAPwAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAKuqqr8AAAAAAACAPwAAgD8AAAAAAAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAACrqirAAAAAAAAAgD8AAIA/AAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAACAwAAAAAAAAIA/"
+    }
+  ]
+}

@@ -17,7 +17,7 @@
 //   - command parameters, user constant buffer values, timeline tracks and shadows.
 //
 // Explicitly not packed:
-//   - mesh_gltf / mesh files with a path.
+//   - mesh_gltf / skinned_gltf / mesh files with a path.
 //   - texture2d files with a path.
 //   - arbitrary external binary buffers.
 //   - indirect compute/draw pipelines and OM UAV draw bindings.
@@ -347,7 +347,8 @@ enum CmdType {
     CT_DRAW_INSTANCED,
     CT_DISPATCH,
     CT_GROUP,
-    CT_REPEAT
+    CT_REPEAT,
+    CT_SWAP
 };
 
 // Timeline tracks are flattened into compact per-component arrays.
@@ -411,6 +412,7 @@ static CmdType parse_cmd_type(const std::string& s) {
     if (s == "dispatch") return CT_DISPATCH;
     if (s == "group") return CT_GROUP;
     if (s == "repeat") return CT_REPEAT;
+    if (s == "swap") return CT_SWAP;
     return CT_NONE;
 }
 
@@ -514,6 +516,8 @@ struct CommandDef {
     bool compute_on_reset = false;
     std::string dispatch_from;
     int repeat_count = 1;
+    std::string swap_a;
+    std::string swap_b;
     std::vector<SlotRef> textures;
     std::vector<SlotRef> srvs;
     std::vector<SlotRef> uavs;
@@ -671,6 +675,8 @@ static Project parse_lt(const std::string& lt_path) {
                 r.kind = RK_MESH_PRIMITIVE; r.name = t[2]; r.primitive = t.size() > 3 ? t[3] : "";
             } else if (kind == "mesh_gltf") {
                 r.kind = RK_MESH_FILE; r.name = t[2]; r.path = t.size() > 3 ? t[3] : "";
+            } else if (kind == "skinned_gltf") {
+                r.kind = RK_MESH_FILE; r.name = t[2]; r.path = t.size() > 3 ? t[3] : "";
             } else if (kind == "shader_vsps") {
                 r.kind = RK_SHADER_VSPS; r.name = t[2]; r.path = t.size() > 3 ? t[3] : "";
             } else if (kind == "shader_cs") {
@@ -788,6 +794,9 @@ static Project parse_lt(const std::string& lt_path) {
                 cur->dispatch_from = ref_name(t[1]);
             } else if (tag == "repeat" && t.size() >= 2) {
                 cur->repeat_count = std::max(1, toki(t,1,1));
+            } else if (tag == "swap" && t.size() >= 3) {
+                cur->swap_a = ref_name(t[1]);
+                cur->swap_b = ref_name(t[2]);
             } else if (tag == "parent" && t.size() >= 2) {
                 cur->parent = (t[1] == "-") ? std::string() : t[1];
             } else if (tag == "textures" && t.size() > 1) {
@@ -949,9 +958,11 @@ static int depth_target_code(const std::string& name) {
 //   >= 0 : index into the generated render-target arrays
 //   -2   : builtin scene depth
 //   -3   : builtin shadow map
+//   -4   : builtin scene color (off-screen only when the project needs it)
 //   -1   : unsupported / unbound
 static int texture_source_code(const Project& p, const std::string& name, const std::vector<int>& rt_res_indices) {
     if (name.empty() || name == "-") return -1;
+    if (builtin_scene_color(name)) return -4;
     if (builtin_scene_depth(name)) return -2;
     if (builtin_shadow_map(name)) return -3;
     return rt_resource_index(p, name, rt_res_indices);
@@ -969,6 +980,66 @@ static int dispatch_source_code(const Project& p, const std::string& name, const
     int bi = buffer_resource_index(p, name, buffer_res_indices);
     if (bi >= 0) return 1000 + bi;
     return rt_resource_index(p, name, rt_res_indices);
+}
+
+static int swap_source_code(const Project& p, const std::string& name,
+                            const std::vector<int>& rt_res_indices,
+                            const std::vector<int>& buffer_res_indices) {
+    if (builtin_scene_color(name)) return -4;
+    if (builtin_scene_depth(name)) return -2;
+    int ri = rt_resource_index(p, name, rt_res_indices);
+    if (ri >= 0) return ri;
+    int bi = buffer_resource_index(p, name, buffer_res_indices);
+    return bi >= 0 ? 1000 + bi : -1;
+}
+
+static bool swap_resources_compatible(const Project& p, const std::string& a_name,
+                                      const std::string& b_name) {
+    if (a_name.empty() || b_name.empty() || a_name == b_name)
+        return false;
+    bool a_scene_color = builtin_scene_color(a_name);
+    bool b_scene_color = builtin_scene_color(b_name);
+    bool a_scene_depth = builtin_scene_depth(a_name);
+    bool b_scene_depth = builtin_scene_depth(b_name);
+    if ((a_scene_color || a_scene_depth) && (b_scene_color || b_scene_depth))
+        return false;
+
+    const std::string& resource_name =
+        (a_scene_color || a_scene_depth) ? b_name : a_name;
+    int builtin_kind = a_scene_color || b_scene_color ? 1 :
+                       (a_scene_depth || b_scene_depth ? 2 : 0);
+    if (builtin_kind != 0) {
+        int ri = find_res(p, resource_name);
+        if (ri < 0) return false;
+        const ResourceDef& r = p.resources[(size_t)ri];
+        if (r.kind != RK_RT || r.ival[7] != 1)
+            return false;
+        if (builtin_kind == 1)
+            return r.ival[2] == 28 && r.ival[3] == 1 && r.ival[4] == 1 &&
+                   r.ival[5] == 1 && r.ival[6] == 0;
+        return r.ival[2] == 44 && r.ival[3] == 0 && r.ival[4] == 1 &&
+               r.ival[5] == 0 && r.ival[6] == 1;
+    }
+
+    int ai = find_res(p, a_name);
+    int bi = find_res(p, b_name);
+    if (ai < 0 || bi < 0)
+        return false;
+    const ResourceDef& a = p.resources[(size_t)ai];
+    const ResourceDef& b = p.resources[(size_t)bi];
+    if (a.kind != b.kind)
+        return false;
+    if (a.kind == RK_RT) {
+        for (int i = 0; i < 8; i++)
+            if (a.ival[i] != b.ival[i]) return false;
+        return true;
+    }
+    if (a.kind == RK_BUFFER) {
+        for (int i = 0; i < 5; i++)
+            if (a.ival[i] != b.ival[i]) return false;
+        return true;
+    }
+    return false;
 }
 
 static bool user_var_has_timeline_track(const Project& p, const std::string& user_name, ValType type) {
@@ -1428,6 +1499,17 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
 
     auto export_one = [&](CommandDef c) -> bool {
         if (c.type == CT_CLEAR) { out_cmds.push_back(c); return true; }
+        if (c.type == CT_SWAP) {
+            int a = swap_source_code(p, c.swap_a, rt_res_indices, buffer_res_indices);
+            int b = swap_source_code(p, c.swap_b, rt_res_indices, buffer_res_indices);
+            if (a == -1 || b == -1 || !swap_resources_compatible(p, c.swap_a, c.swap_b)) {
+                warnf("skipping swap '%s': operands must be distinct matching 2D render targets, scene built-ins, or structured buffers",
+                      c.name.c_str());
+                return false;
+            }
+            out_cmds.push_back(c);
+            return true;
+        }
         if (c.type == CT_DISPATCH) {
             int sh = shader_resource_index(p, c.shader, shader_res_indices);
             if (sh < 0 || !shader_is_cs[(size_t)sh]) { warnf("skipping compute '%s': compute shader not found/supported", c.name.c_str()); return false; }
@@ -1536,8 +1618,18 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     bool uses_primitives = false;
     bool uses_structured_buffers = false;
     bool uses_rt_uavs = false;
+    bool uses_rt_dsvs = false;
+    bool uses_swap = false;
+    bool uses_scene_color_surface = false;
+    bool uses_scene_depth_swap = false;
     for (size_t i = 0; i < out_cmds.size(); i++) {
         const CommandDef& c = out_cmds[i];
+        for (size_t k = 0; k < c.textures.size(); k++)
+            if (builtin_scene_color(c.textures[k].name)) uses_scene_color_surface = true;
+        for (size_t k = 0; k < c.srvs.size(); k++)
+            if (builtin_scene_color(c.srvs[k].name)) uses_scene_color_surface = true;
+        for (size_t k = 0; k < c.uavs.size(); k++)
+            if (builtin_scene_color(c.uavs[k].name)) uses_scene_color_surface = true;
         if (c.type == CT_DRAW || c.type == CT_DRAW_INSTANCED) {
             uses_draw = true;
             if (c.mesh_kind > 0) uses_primitives = true;
@@ -1547,13 +1639,21 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
             uses_compute = true;
         } else if (c.type == CT_CLEAR) {
             if (depth_target_code(c.depth) == -2 && c.clear_depth) uses_depth = true;
+        } else if (c.type == CT_SWAP) {
+            uses_swap = true;
+            if (builtin_scene_color(c.swap_a) || builtin_scene_color(c.swap_b))
+                uses_scene_color_surface = true;
+            if (builtin_scene_depth(c.swap_a) || builtin_scene_depth(c.swap_b)) {
+                uses_scene_depth_swap = true;
+                uses_depth = true;
+            }
         }
     }
     if (uses_audio)
         uses_compute = true;
     if (uses_shadows) uses_depth = true;
     bool uses_shaders = uses_draw || uses_compute || uses_shadows;
-    bool clear_only = !uses_draw && !uses_compute;
+    bool clear_only = !uses_draw && !uses_compute && !uses_swap;
 
     // Specialize embedded resources to the exported command list.  A 64k build
     // should not carry unused shaders or buffers just because they exist in the
@@ -1633,6 +1733,8 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
             for (size_t k = 0; k < c.srvs.size(); k++) mark_buffer_ref(c.srvs[k].name);
             for (size_t k = 0; k < c.uavs.size(); k++) mark_buffer_ref(c.uavs[k].name);
             mark_buffer_ref(c.dispatch_from);
+            mark_buffer_ref(c.swap_a);
+            mark_buffer_ref(c.swap_b);
         }
         std::vector<int> new_buffer_res_indices;
         for (size_t i = 0; i < buffer_res_indices.size(); i++)
@@ -1642,7 +1744,8 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     uses_structured_buffers = !buffer_res_indices.empty();
     for (size_t i = 0; i < rt_res_indices.size(); i++) {
         const ResourceDef& r = p.resources[(size_t)rt_res_indices[i]];
-        if (r.ival[5]) { uses_rt_uavs = true; break; }
+        if (r.ival[5]) uses_rt_uavs = true;
+        if (r.ival[6]) uses_rt_dsvs = true;
     }
 
     std::vector<int> cmd_clear_color_user(out_cmds.size(), -1);
@@ -1791,6 +1894,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     if (uses_shadows) write_feature("shadows");
     if (!rt_res_indices.empty()) write_feature("render targets");
     if (!buffer_res_indices.empty()) write_feature("structured buffers");
+    if (uses_swap) write_feature("resource swap");
     if (!flat_params.empty()) write_feature("parameters");
     if (!p.user_vars.empty()) write_feature("user variables");
     if (uses_timeline) write_feature("timeline animation");
@@ -1798,7 +1902,7 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
     fprintf(f, ".\n\n");
     fprintf(f, "#define WIN32_LEAN_AND_MEAN\n#define COBJMACROS\n#include <windows.h>\n#include <stddef.h>\n#include <d3d11.h>\n");
     if (uses_audio) fprintf(f, "#include <mmsystem.h>\n");
-    if (uses_shaders) fprintf(f, "#include <d3dcompiler.h>\n");
+    if (!clear_only) fprintf(f, "#include <d3dcompiler.h>\n");
     fprintf(f, "\n");
     fprintf(f, "#define LT_WNDCLS \"lt64k_window\"\n#define LT_PI 3.14159265358979323846f\n");
     int shadow_tex_w = (int)(p.light[10] > 16.0f ? p.light[10] : 16.0f);
@@ -1859,6 +1963,8 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
         fprintf(f, "static ID3D11Device* dev; static ID3D11DeviceContext* ctx; static IDXGISwapChain* swp; static ID3D11RenderTargetView* rtv; static HWND wh; static int W,H;\n");
     } else {
         fprintf(f, "static ID3D11Device* dev; static ID3D11DeviceContext* ctx; static IDXGISwapChain* swp; static ID3D11RenderTargetView* rtv; static ID3D11Texture2D* depth_tex; static ID3D11DepthStencilView* dsv; static ID3D11ShaderResourceView* depth_srv; static ID3D11Texture2D* shadow_tex; static ID3D11DepthStencilView* shadow_dsv[4]; static ID3D11ShaderResourceView* shadow_srv; static ID3D11SamplerState* smp_lin; static ID3D11SamplerState* smp_cmp; static ID3D11DepthStencilState* ds[4]; static ID3D11RasterizerState* rs[2]; static ID3D11BlendState* bs[4]; static ID3D11Buffer* scene_cb; static ID3D11Buffer* object_cb; static ID3D11Buffer* user_cb; static ID3D11Buffer* prim_vb[6]; static HWND wh; static int W,H,RW,RH;\n");
+        if (uses_scene_color_surface)
+            fprintf(f, "static ID3D11Texture2D* scene_tex; static ID3D11RenderTargetView* scene_rtv; static ID3D11ShaderResourceView* scene_srv; static ID3D11UnorderedAccessView* scene_uav;\n");
         if (uses_audio)
             fprintf(f, "static HWAVEOUT awo; static WAVEHDR awh[LT_AUDIO_Q]; static char awb[LT_AUDIO_Q][LT_AUDIO_CHUNK*4]; static ID3D11Buffer* audio_cb; static ID3D11Buffer* audio_out; static ID3D11Buffer* audio_stage; static ID3D11UnorderedAccessView* audio_uav; static unsigned int audio_sample; static int audio_started;\n");
         if (uses_compute)
@@ -1901,6 +2007,8 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
         fprintf(f, "static ID3D11Texture2D* rt_tex[%u]; static ID3D11RenderTargetView* rt_rtv[%u]; static ID3D11ShaderResourceView* rt_srv[%u];\n", (unsigned)(rt_res_indices.empty() ? 1 : rt_res_indices.size()), (unsigned)(rt_res_indices.empty() ? 1 : rt_res_indices.size()), (unsigned)(rt_res_indices.empty() ? 1 : rt_res_indices.size()));
         if (uses_rt_uavs)
             fprintf(f, "static ID3D11UnorderedAccessView* rt_uav[%u];\n", (unsigned)(rt_res_indices.empty() ? 1 : rt_res_indices.size()));
+        if (uses_rt_dsvs)
+            fprintf(f, "static ID3D11DepthStencilView* rt_dsv[%u];\n", (unsigned)(rt_res_indices.empty() ? 1 : rt_res_indices.size()));
 
         if (uses_structured_buffers) {
             fprintf(f, "// Structured buffers used by compute shaders and procedural draw SRVs.\n");
@@ -1916,9 +2024,9 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
 
     fprintf(f, "// Flattened render commands. Resource names are gone here; everything is a\n");
     fprintf(f, "// small integer code so the runtime can be straightforward and deterministic.\n");
-    fprintf(f, "typedef struct { int type,enabled,shader,shs,topology,mk,vc,ic,ccen,cden,ccs,dcs,rt,dep,dt,dw,ab,cb,cw,scast,srecv,pst,pc,tc,sc,uc,dispatch_src,tx,ty,tz,reset; int tex[8],tsl[8],srv[8],ssl[8],uav[8],usl[8]; float cc[4],dc,pos[3],q[4],scl[3]; } Cmd;\n");
+    fprintf(f, "typedef struct { int type,enabled,shader,shs,topology,mk,vc,ic,ccen,cden,ccs,dcs,rt,dep,dt,dw,ab,cb,cw,scast,srecv,pst,pc,tc,sc,uc,dispatch_src,tx,ty,tz,reset,sa,sb; int tex[8],tsl[8],srv[8],ssl[8],uav[8],usl[8]; float cc[4],dc,pos[3],q[4],scl[3]; } Cmd;\n");
     fprintf(f, "static Cmd cmd[%u] = {\n", (unsigned)(out_cmds.empty() ? 1 : out_cmds.size()));
-    if (out_cmds.empty()) fprintf(f, " {0,0,-1,-1,1,0,0,0,0,0,-1,-1,-1,-1,0,0,0,0,1,0,0,0,0,0,0,0,-1,1,1,1,0,{-1,-1,-1,-1,-1,-1,-1,-1},{0,0,0,0,0,0,0,0},{-1,-1,-1,-1,-1,-1,-1,-1},{0,0,0,0,0,0,0,0},{-1,-1,-1,-1,-1,-1,-1,-1},{0,0,0,0,0,0,0,0},{0.0f,0.0f,0.0f,1.0f},1.0f,{0.0f,0.0f,0.0f},{0.0f,0.0f,0.0f,1.0f},{1.0f,1.0f,1.0f}},\n");
+    if (out_cmds.empty()) fprintf(f, " {0,0,-1,-1,1,0,0,0,0,0,-1,-1,-1,-1,0,0,0,0,1,0,0,0,0,0,0,0,-1,1,1,1,0,-1,-1,{-1,-1,-1,-1,-1,-1,-1,-1},{0,0,0,0,0,0,0,0},{-1,-1,-1,-1,-1,-1,-1,-1},{0,0,0,0,0,0,0,0},{-1,-1,-1,-1,-1,-1,-1,-1},{0,0,0,0,0,0,0,0},{0.0f,0.0f,0.0f,1.0f},1.0f,{0.0f,0.0f,0.0f},{0.0f,0.0f,0.0f,1.0f},{1.0f,1.0f,1.0f}},\n");
     for (size_t i = 0; i < out_cmds.size(); i++) {
         const CommandDef& c = out_cmds[i];
         int shidx = shader_resource_index(p, c.shader, shader_res_indices);
@@ -1933,10 +2041,13 @@ static void emit_generated_c(const Project& p, const std::string& lt_path, const
         for (int k = 0; k < texc; k++) { tex_src[k] = texture_source_code(p, c.textures[(size_t)k].name, rt_res_indices); tex_slot[k] = c.textures[(size_t)k].slot; }
         for (int k = 0; k < srvc; k++) { srv_src[k] = srv_source_code(p, c.srvs[(size_t)k].name, rt_res_indices, buffer_res_indices); srv_slot[k] = c.srvs[(size_t)k].slot; }
         for (int k = 0; k < uavc; k++) { uav_src[k] = srv_source_code(p, c.uavs[(size_t)k].name, rt_res_indices, buffer_res_indices); uav_slot[k] = c.uavs[(size_t)k].slot; }
-        int ctype = c.type == CT_CLEAR ? 1 : (c.type == CT_DISPATCH ? 3 : 2);
+        int ctype = c.type == CT_CLEAR ? 1 : (c.type == CT_DISPATCH ? 3 : (c.type == CT_SWAP ? 4 : 2));
         fprintf(f, " {%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,",
             ctype, c.enabled?1:0, shidx, shadow_shidx, c.topology, c.mesh_kind, c.vertex_count, c.instance_count, c.clear_color_enabled?1:0, c.clear_depth?1:0,
             cmd_clear_color_user[i], cmd_clear_depth_user[i], rtcode, depcode, c.depth_test?1:0, c.depth_write?1:0, c.alpha_blend?1:0, c.cull_back?1:0, c.color_write?1:0, c.shadow_cast?1:0, c.shadow_receive?1:0, cmd_param_start[i], cmd_param_count[i], texc, srvc, uavc, dispatch_source_code(p, c.dispatch_from, rt_res_indices, buffer_res_indices), std::max(1, c.thread_x), std::max(1, c.thread_y), std::max(1, c.thread_z), c.compute_on_reset?1:0);
+        fprintf(f, "%d,%d,",
+                swap_source_code(p, c.swap_a, rt_res_indices, buffer_res_indices),
+                swap_source_code(p, c.swap_b, rt_res_indices, buffer_res_indices));
         fprintf(f, "{"); emit_int_array(f, tex_src, 8); fprintf(f, "},{"); emit_int_array(f, tex_slot, 8); fprintf(f, "},{"); emit_int_array(f, srv_src, 8); fprintf(f, "},{"); emit_int_array(f, srv_slot, 8); fprintf(f, "},{");
         emit_int_array(f, uav_src, 8); fprintf(f, "},{"); emit_int_array(f, uav_slot, 8); fprintf(f, "},{");
         emit_float_array(f, c.clear_color, 4); fprintf(f, "},"); emit_float_literal(f, c.depth_clear); fprintf(f, ",{");
@@ -2282,13 +2393,17 @@ static DXGI_FORMAT srvfmt(DXGI_FORMAT f){ if(f==DXGI_FORMAT_D24_UNORM_S8_UINT||f
 // Allocate internal render textures requested by the project. They replace file
 // textures in the 64k path and support post-processing chains.
 )LT64K", f);
-    if (uses_rt_uavs) {
-        fputs(R"LT64K(static void init_rts(){ for(int i=0;i<RTN;i++){ D3D11_TEXTURE2D_DESC d; zmem(&d,sizeof(d)); d.Width=rtw(i); d.Height=rth(i); d.MipLevels=1; d.ArraySize=1; d.Format=sfmt((DXGI_FORMAT)rtd[i].fmt); d.SampleDesc.Count=1; d.BindFlags=(rtd[i].rtv?D3D11_BIND_RENDER_TARGET:0)|(rtd[i].srv?D3D11_BIND_SHADER_RESOURCE:0)|(rtd[i].uav?D3D11_BIND_UNORDERED_ACCESS:0); if(!d.BindFlags)d.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE; if(SUCCEEDED(ID3D11Device_CreateTexture2D(dev,&d,0,&rt_tex[i]))){ if(rtd[i].rtv)ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)rt_tex[i],0,&rt_rtv[i]); if(rtd[i].srv){ D3D11_SHADER_RESOURCE_VIEW_DESC sv; zmem(&sv,sizeof(sv)); sv.Format=srvfmt((DXGI_FORMAT)rtd[i].fmt); sv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels=1; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)rt_tex[i],&sv,&rt_srv[i]); } if(rtd[i].uav)ID3D11Device_CreateUnorderedAccessView(dev,(ID3D11Resource*)rt_tex[i],0,&rt_uav[i]); } } }
-)LT64K", f);
-    } else {
-        fputs(R"LT64K(static void init_rts(){ for(int i=0;i<RTN;i++){ D3D11_TEXTURE2D_DESC d; zmem(&d,sizeof(d)); d.Width=rtw(i); d.Height=rth(i); d.MipLevels=1; d.ArraySize=1; d.Format=sfmt((DXGI_FORMAT)rtd[i].fmt); d.SampleDesc.Count=1; d.BindFlags=(rtd[i].rtv?D3D11_BIND_RENDER_TARGET:0)|(rtd[i].srv?D3D11_BIND_SHADER_RESOURCE:0); if(!d.BindFlags)d.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE; if(SUCCEEDED(ID3D11Device_CreateTexture2D(dev,&d,0,&rt_tex[i]))){ if(rtd[i].rtv)ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)rt_tex[i],0,&rt_rtv[i]); if(rtd[i].srv){ D3D11_SHADER_RESOURCE_VIEW_DESC sv; zmem(&sv,sizeof(sv)); sv.Format=srvfmt((DXGI_FORMAT)rtd[i].fmt); sv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels=1; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)rt_tex[i],&sv,&rt_srv[i]); } } } }
-)LT64K", f);
-    }
+    fputs("static void init_rts(){ for(int i=0;i<RTN;i++){ D3D11_TEXTURE2D_DESC d; zmem(&d,sizeof(d)); d.Width=rtw(i); d.Height=rth(i); d.MipLevels=1; d.ArraySize=1; d.Format=sfmt((DXGI_FORMAT)rtd[i].fmt); d.SampleDesc.Count=1; d.BindFlags=(rtd[i].rtv?D3D11_BIND_RENDER_TARGET:0)|(rtd[i].srv?D3D11_BIND_SHADER_RESOURCE:0)", f);
+    if (uses_rt_uavs)
+        fputs("|(rtd[i].uav?D3D11_BIND_UNORDERED_ACCESS:0)", f);
+    if (uses_rt_dsvs)
+        fputs("|(rtd[i].dsv?D3D11_BIND_DEPTH_STENCIL:0)", f);
+    fputs("; if(!d.BindFlags)d.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE; if(SUCCEEDED(ID3D11Device_CreateTexture2D(dev,&d,0,&rt_tex[i]))){ if(rtd[i].rtv)ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)rt_tex[i],0,&rt_rtv[i]); if(rtd[i].srv){ D3D11_SHADER_RESOURCE_VIEW_DESC sv; zmem(&sv,sizeof(sv)); sv.Format=srvfmt((DXGI_FORMAT)rtd[i].fmt); sv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels=1; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)rt_tex[i],&sv,&rt_srv[i]); }", f);
+    if (uses_rt_uavs)
+        fputs(" if(rtd[i].uav)ID3D11Device_CreateUnorderedAccessView(dev,(ID3D11Resource*)rt_tex[i],0,&rt_uav[i]);", f);
+    if (uses_rt_dsvs)
+        fputs(" if(rtd[i].dsv){ D3D11_DEPTH_STENCIL_VIEW_DESC dv; zmem(&dv,sizeof(dv)); dv.Format=((DXGI_FORMAT)rtd[i].fmt==DXGI_FORMAT_D32_FLOAT||(DXGI_FORMAT)rtd[i].fmt==DXGI_FORMAT_R32_TYPELESS)?DXGI_FORMAT_D32_FLOAT:DXGI_FORMAT_D24_UNORM_S8_UINT; dv.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2D; ID3D11Device_CreateDepthStencilView(dev,(ID3D11Resource*)rt_tex[i],&dv,&rt_dsv[i]); }", f);
+    fputs(" } } }\n", f);
     if (uses_structured_buffers) {
         fputs(R"LT64K(static void init_sbs(){ for(int i=0;i<SBN;i++){ D3D11_BUFFER_DESC bd; zmem(&bd,sizeof(bd)); bd.ByteWidth=(unsigned int)(sbd[i].stride*sbd[i].count); bd.Usage=D3D11_USAGE_DEFAULT; bd.BindFlags=(sbd[i].srv?D3D11_BIND_SHADER_RESOURCE:0)|(sbd[i].uav?D3D11_BIND_UNORDERED_ACCESS:0); bd.MiscFlags=sbd[i].indirect?D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS:D3D11_RESOURCE_MISC_BUFFER_STRUCTURED; bd.StructureByteStride=sbd[i].indirect?0:(unsigned int)sbd[i].stride; if(SUCCEEDED(ID3D11Device_CreateBuffer(dev,&bd,0,&sb_buf[i]))){ if(sbd[i].srv){ D3D11_SHADER_RESOURCE_VIEW_DESC sv; zmem(&sv,sizeof(sv)); sv.Format=sbd[i].indirect?DXGI_FORMAT_R32_UINT:DXGI_FORMAT_UNKNOWN; sv.ViewDimension=D3D11_SRV_DIMENSION_BUFFER; sv.Buffer.NumElements=sbd[i].indirect?(unsigned int)(bd.ByteWidth/4):(unsigned int)sbd[i].count; ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)sb_buf[i],&sv,&sb_srv[i]); } if(sbd[i].uav){ D3D11_UNORDERED_ACCESS_VIEW_DESC uv; zmem(&uv,sizeof(uv)); uv.Format=sbd[i].indirect?DXGI_FORMAT_R32_UINT:DXGI_FORMAT_UNKNOWN; uv.ViewDimension=D3D11_UAV_DIMENSION_BUFFER; uv.Buffer.NumElements=sbd[i].indirect?(unsigned int)(bd.ByteWidth/4):(unsigned int)sbd[i].count; ID3D11Device_CreateUnorderedAccessView(dev,(ID3D11Resource*)sb_buf[i],&uv,&sb_uav[i]); } } } }
 )LT64K", f);
@@ -2303,28 +2418,37 @@ static void init_states(){ D3D11_SAMPLER_DESC sp; zmem(&sp,sizeof(sp)); sp.Filte
 static void cb_make(ID3D11Buffer** b, unsigned int sz){ D3D11_BUFFER_DESC d; zmem(&d,sizeof(d)); d.ByteWidth=(sz+15)&~15; d.Usage=D3D11_USAGE_DYNAMIC; d.BindFlags=D3D11_BIND_CONSTANT_BUFFER; d.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE; ID3D11Device_CreateBuffer(dev,&d,0,b); }
 static void cb_up(ID3D11Buffer* b, void* data, unsigned int sz){ D3D11_MAPPED_SUBRESOURCE m; if(SUCCEEDED(ID3D11DeviceContext_Map(ctx,(ID3D11Resource*)b,0,D3D11_MAP_WRITE_DISCARD,0,&m))){ cpy(m.pData,data,sz); ID3D11DeviceContext_Unmap(ctx,(ID3D11Resource*)b,0); } }
 )LT64K", f);
+    if (uses_scene_color_surface) {
+        fputs("static void init_scene_color(){ D3D11_TEXTURE2D_DESC d; zmem(&d,sizeof(d)); d.Width=RW;d.Height=RH;d.MipLevels=1;d.ArraySize=1;d.Format=DXGI_FORMAT_R8G8B8A8_UNORM;d.SampleDesc.Count=1;d.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS; if(SUCCEEDED(ID3D11Device_CreateTexture2D(dev,&d,0,&scene_tex))){ ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)scene_tex,0,&scene_rtv); ID3D11Device_CreateShaderResourceView(dev,(ID3D11Resource*)scene_tex,0,&scene_srv); ID3D11Device_CreateUnorderedAccessView(dev,(ID3D11Resource*)scene_tex,0,&scene_uav); } }\n", f);
+        fputs("static void present_scene(){ ID3D11ShaderResourceView* ns[16]; ID3D11UnorderedAccessView* nu[8]; ID3D11Texture2D* b=0; zmem(ns,sizeof(ns));zmem(nu,sizeof(nu)); ID3D11DeviceContext_OMSetRenderTargets(ctx,0,0,0); ID3D11DeviceContext_VSSetShaderResources(ctx,0,16,ns); ID3D11DeviceContext_PSSetShaderResources(ctx,0,16,ns); ID3D11DeviceContext_CSSetShaderResources(ctx,0,16,ns); ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx,0,8,nu,0); if(scene_tex&&SUCCEEDED(IDXGISwapChain_GetBuffer(swp,0,&IID_ID3D11Texture2D,(void**)&b))&&b){ ID3D11DeviceContext_CopyResource(ctx,(ID3D11Resource*)b,(ID3D11Resource*)scene_tex); ID3D11Texture2D_Release(b); } }\n", f);
+    }
     if (uses_audio) {
         fputs(R"LT64K(static void init_audio(){ WAVEFORMATEX wf; D3D11_BUFFER_DESC bd; D3D11_UNORDERED_ACCESS_VIEW_DESC uv; zmem(&wf,sizeof(wf)); wf.wFormatTag=WAVE_FORMAT_PCM; wf.nChannels=2; wf.nSamplesPerSec=LT_AUDIO_SR; wf.wBitsPerSample=16; wf.nBlockAlign=4; wf.nAvgBytesPerSec=LT_AUDIO_SR*4; if(waveOutOpen(&awo,WAVE_MAPPER,&wf,0,0,CALLBACK_NULL)!=MMSYSERR_NOERROR)return; for(int i=0;i<LT_AUDIO_Q;i++){ zmem(&awh[i],sizeof(WAVEHDR)); awh[i].lpData=awb[i]; awh[i].dwBufferLength=LT_AUDIO_CHUNK*4; waveOutPrepareHeader(awo,&awh[i],sizeof(WAVEHDR)); } cb_make(&audio_cb,sizeof(AudioCB)); zmem(&bd,sizeof(bd)); bd.ByteWidth=LT_AUDIO_CHUNK*4; bd.Usage=D3D11_USAGE_DEFAULT; bd.BindFlags=D3D11_BIND_UNORDERED_ACCESS; bd.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_STRUCTURED; bd.StructureByteStride=4; if(SUCCEEDED(ID3D11Device_CreateBuffer(dev,&bd,0,&audio_out))){ zmem(&uv,sizeof(uv)); uv.Format=DXGI_FORMAT_UNKNOWN; uv.ViewDimension=D3D11_UAV_DIMENSION_BUFFER; uv.Buffer.NumElements=LT_AUDIO_CHUNK; ID3D11Device_CreateUnorderedAccessView(dev,(ID3D11Resource*)audio_out,&uv,&audio_uav); } bd.Usage=D3D11_USAGE_STAGING; bd.BindFlags=0; bd.CPUAccessFlags=D3D11_CPU_ACCESS_READ; ID3D11Device_CreateBuffer(dev,&bd,0,&audio_stage); }
 static int audio_gen(char* dst){ unsigned int total=(unsigned int)(LT_AUDIO_DUR*(float)LT_AUDIO_SR+0.5f); if(total<1)total=1; zmem(dst,LT_AUDIO_CHUNK*4); if(!audio_cb||!audio_uav||!audio_stage||!audio_out||LT_AUDIO_SHADER<0||LT_AUDIO_SHADER>=SHN||!sh[LT_AUDIO_SHADER].cs)return 0; if(LT_AUDIO_LOOP&&audio_sample>=total)audio_sample%=total; if(!LT_AUDIO_LOOP&&audio_sample>=total)return 0; unsigned int n=LT_AUDIO_CHUNK; if(!LT_AUDIO_LOOP&&audio_sample+n>total)n=total-audio_sample; AudioCB ac; UserCB uc; D3D11_MAPPED_SUBRESOURCE m; ID3D11ShaderResourceView* ns[8]; ID3D11UnorderedAccessView* nu[8]; zmem(&ac,sizeof(ac)); ac.sample_start=audio_sample; ac.sample_count=n; ac.sample_rate=LT_AUDIO_SR; ac.channels=2; ac.time_seconds=(float)audio_sample/(float)LT_AUDIO_SR; ac.duration_seconds=LT_AUDIO_DUR; ac.master_volume=LT_AUDIO_VOL; ac.loop=LT_AUDIO_LOOP; fill_user_base(&uc); cb_up(user_cb,&uc,sizeof(uc)); cb_up(audio_cb,&ac,sizeof(ac)); zmem(ns,sizeof(ns)); zmem(nu,sizeof(nu)); ID3D11DeviceContext_CSSetShaderResources(ctx,0,8,ns); ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx,0,8,nu,0); ID3D11DeviceContext_CSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_CSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_CSSetConstantBuffers(ctx,3,1,&audio_cb); ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx,0,1,&audio_uav,0); ID3D11DeviceContext_CSSetShader(ctx,sh[LT_AUDIO_SHADER].cs,0,0); ID3D11DeviceContext_Dispatch(ctx,(n+255)/256,1,1); ID3D11DeviceContext_CSSetShader(ctx,0,0,0); ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx,0,8,nu,0); ID3D11DeviceContext_CopyResource(ctx,(ID3D11Resource*)audio_stage,(ID3D11Resource*)audio_out); if(SUCCEEDED(ID3D11DeviceContext_Map(ctx,(ID3D11Resource*)audio_stage,0,D3D11_MAP_READ,0,&m))){ cpy(dst,m.pData,n*4); ID3D11DeviceContext_Unmap(ctx,(ID3D11Resource*)audio_stage,0); } audio_sample+=n; if(LT_AUDIO_LOOP&&audio_sample>=total)audio_sample%=total; return n; }
 static void audio_tick(float sec){ (void)sec; if(!awo)return; if(!audio_started){ audio_sample=0; audio_started=1; } for(int i=0;i<LT_AUDIO_Q;i++){ if((awh[i].dwFlags&WHDR_INQUEUE)&&!(awh[i].dwFlags&WHDR_DONE))continue; if(audio_gen(awb[i]))waveOutWrite(awo,&awh[i],sizeof(WAVEHDR)); } }
 )LT64K", f);
     }
+    fputs("static ID3D11ShaderResourceView* srvof(int s){", f);
     if (uses_structured_buffers)
-        fputs("static ID3D11ShaderResourceView* srvof(int s){ if(s>=1000&&s<1000+SBN)return sb_srv[s-1000]; if(s>=0&&s<RTN)return rt_srv[s]; if(s==-2)return depth_srv; if(s==-3)return shadow_srv; return 0; }\n", f);
-    else
-        fputs("static ID3D11ShaderResourceView* srvof(int s){ if(s>=0&&s<RTN)return rt_srv[s]; if(s==-2)return depth_srv; if(s==-3)return shadow_srv; return 0; }\n", f);
+        fputs(" if(s>=1000&&s<1000+SBN)return sb_srv[s-1000];", f);
+    fputs(" if(s>=0&&s<RTN)return rt_srv[s]; if(s==-2)return depth_srv; if(s==-3)return shadow_srv;", f);
+    if (uses_scene_color_surface)
+        fputs(" if(s==-4)return scene_srv;", f);
+    fputs(" return 0; }\n", f);
     if (uses_compute) {
-        if (uses_structured_buffers && uses_rt_uavs)
-            fputs("static ID3D11UnorderedAccessView* uavof(int s){ if(s>=1000&&s<1000+SBN)return sb_uav[s-1000]; if(s>=0&&s<RTN)return rt_uav[s]; return 0; }\n", f);
-        else if (uses_structured_buffers)
-            fputs("static ID3D11UnorderedAccessView* uavof(int s){ if(s>=1000&&s<1000+SBN)return sb_uav[s-1000]; return 0; }\n", f);
-        else if (uses_rt_uavs)
-            fputs("static ID3D11UnorderedAccessView* uavof(int s){ if(s>=0&&s<RTN)return rt_uav[s]; return 0; }\n", f);
-        else
-            fputs("static ID3D11UnorderedAccessView* uavof(int s){ return 0; }\n", f);
+        fputs("static ID3D11UnorderedAccessView* uavof(int s){", f);
+        if (uses_structured_buffers)
+            fputs(" if(s>=1000&&s<1000+SBN)return sb_uav[s-1000];", f);
+        if (uses_rt_uavs)
+            fputs(" if(s>=0&&s<RTN)return rt_uav[s];", f);
+        if (uses_scene_color_surface)
+            fputs(" if(s==-4)return scene_uav;", f);
+        fputs(" return 0; }\n", f);
     }
-    fputs(R"LT64K(static ID3D11RenderTargetView* rtvof(int t){ if(t==-2)return rtv; if(t>=0&&t<RTN)return rt_rtv[t]; return 0; }
-)LT64K", f);
+    if (uses_scene_color_surface)
+        fputs("static ID3D11RenderTargetView* rtvof(int t){ if(t==-2)return scene_rtv; if(t>=0&&t<RTN)return rt_rtv[t]; return 0; }\n", f);
+    else
+        fputs("static ID3D11RenderTargetView* rtvof(int t){ if(t==-2)return rtv; if(t>=0&&t<RTN)return rt_rtv[t]; return 0; }\n", f);
     if (uses_compute) {
         fputs(R"LT64K(static void set_target(Cmd* c){ ID3D11ShaderResourceView* nulls[16]; ID3D11UnorderedAccessView* nuavs[8]; zmem(nulls,sizeof(nulls)); zmem(nuavs,sizeof(nuavs)); ID3D11DeviceContext_PSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_VSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_CSSetShaderResources(ctx,0,16,nulls); ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx,0,8,nuavs,0); ID3D11RenderTargetView* rv=rtvof(c->rt); ID3D11DepthStencilView* dv=(c->dep==-2)?dsv:0; ID3D11DeviceContext_OMSetRenderTargets(ctx,rv?1:0,rv?&rv:0,dv); D3D11_VIEWPORT vp; zmem(&vp,sizeof(vp)); if(c->rt>=0&&c->rt<RTN){ vp.Width=(float)rtw(c->rt); vp.Height=(float)rth(c->rt); } else if(c->rt==-2){ vp.Width=(float)W; vp.Height=(float)H; } else { vp.Width=(float)RW; vp.Height=(float)RH; } vp.MinDepth=0;vp.MaxDepth=1; ID3D11DeviceContext_RSSetViewports(ctx,1,&vp); }
 )LT64K", f);
@@ -2359,12 +2483,40 @@ static void run_compute(Cmd* c){ if(c->shader<0||c->shader>=SHN||!sh[c->shader].
     } else {
         fputs("static void run_compute(Cmd* c){ (void)c; }\n", f);
     }
+    if (uses_swap) {
+        fputs("static void run_swap(Cmd* c){ int a=c->sa,b=c->sb;\n", f);
+        if (!rt_res_indices.empty()) {
+            fprintf(f, " if(a>=0&&a<%u&&b>=0&&b<%u){ ID3D11Texture2D* tx=rt_tex[a]; rt_tex[a]=rt_tex[b]; rt_tex[b]=tx; ID3D11RenderTargetView* rv=rt_rtv[a]; rt_rtv[a]=rt_rtv[b]; rt_rtv[b]=rv; ID3D11ShaderResourceView* sv=rt_srv[a]; rt_srv[a]=rt_srv[b]; rt_srv[b]=sv;",
+                    (unsigned)rt_res_indices.size(), (unsigned)rt_res_indices.size());
+            if (uses_rt_uavs)
+                fputs(" ID3D11UnorderedAccessView* uv=rt_uav[a]; rt_uav[a]=rt_uav[b]; rt_uav[b]=uv;", f);
+            if (uses_rt_dsvs)
+                fputs(" ID3D11DepthStencilView* dv=rt_dsv[a]; rt_dsv[a]=rt_dsv[b]; rt_dsv[b]=dv;", f);
+            fputs(" return; }\n", f);
+        }
+        if (uses_scene_color_surface && !rt_res_indices.empty()) {
+            fprintf(f, " if((a==-4&&b>=0&&b<%u)||(b==-4&&a>=0&&a<%u)){ int i=a==-4?b:a; ID3D11Texture2D* tx=scene_tex; scene_tex=rt_tex[i]; rt_tex[i]=tx; ID3D11RenderTargetView* rv=scene_rtv; scene_rtv=rt_rtv[i]; rt_rtv[i]=rv; ID3D11ShaderResourceView* sv=scene_srv; scene_srv=rt_srv[i]; rt_srv[i]=sv;",
+                    (unsigned)rt_res_indices.size(), (unsigned)rt_res_indices.size());
+            if (uses_rt_uavs)
+                fputs(" ID3D11UnorderedAccessView* uv=scene_uav; scene_uav=rt_uav[i]; rt_uav[i]=uv;", f);
+            fputs(" return; }\n", f);
+        }
+        if (uses_scene_depth_swap && uses_rt_dsvs && !rt_res_indices.empty()) {
+            fprintf(f, " if((a==-2&&b>=0&&b<%u)||(b==-2&&a>=0&&a<%u)){ int i=a==-2?b:a; ID3D11Texture2D* tx=depth_tex; depth_tex=rt_tex[i]; rt_tex[i]=tx; ID3D11DepthStencilView* dv=dsv; dsv=rt_dsv[i]; rt_dsv[i]=dv; ID3D11ShaderResourceView* sv=depth_srv; depth_srv=rt_srv[i]; rt_srv[i]=sv; return; }\n",
+                    (unsigned)rt_res_indices.size(), (unsigned)rt_res_indices.size());
+        }
+        if (uses_structured_buffers) {
+            fprintf(f, " if(a>=1000&&a<1000+%u&&b>=1000&&b<1000+%u){ a-=1000;b-=1000; ID3D11Buffer* bf=sb_buf[a]; sb_buf[a]=sb_buf[b]; sb_buf[b]=bf; ID3D11ShaderResourceView* sv=sb_srv[a]; sb_srv[a]=sb_srv[b]; sb_srv[b]=sv; ID3D11UnorderedAccessView* uv=sb_uav[a]; sb_uav[a]=sb_uav[b]; sb_uav[b]=uv; }\n",
+                    (unsigned)buffer_res_indices.size(), (unsigned)buffer_res_indices.size());
+        }
+        fputs("}\n", f);
+    }
     fputs(R"LT64K(
 static int reset_compute_done=0; static float prev_render_sec=0;
 static void render(float sec){ float dt=sec-prev_render_sec; if(dt<0)dt=0; if(dt>0.10f)dt=0.10f; prev_render_sec=sec; cpy(cam,cam0,sizeof(cam));cpy(dl,dl0,sizeof(dl));
 )LT64K", f);
     if (uses_timeline) fputs(" timeline(sec);", f);
-    std::string render_body = R"LT64K( float clr[4]={0,0,0,1},bf[4]={0,0,0,0}; SceneCB sc; ObjectCB oc; M4 vp,ivp; zmem(&sc,sizeof(sc)); viewproj(&vp,sec); invm(&vp,&ivp); cpy(sc.view_proj,vp.m,64); cpy(sc.prev_view_proj,vp.m,64); cpy(sc.inv_view_proj,ivp.m,64); cpy(sc.prev_inv_view_proj,ivp.m,64); shadowvp(&sc); sc.time_vec[0]=sec; sc.time_vec[1]=dt; sc.time_vec[2]=sec*60.0f; sc.cam_pos[0]=cam[0];sc.cam_pos[1]=cam[1];sc.cam_pos[2]=cam[2]; float cp=cs(cam[4]); sc.cam_dir[0]=sn(cam[3])*cp;sc.cam_dir[1]=sn(cam[4]);sc.cam_dir[2]=cs(cam[3])*cp; sc.camera_params[0]=cam[9]>=0.5f?1.0f:0.0f;sc.camera_params[1]=cam[10];sc.camera_params[2]=cam[6];sc.camera_params[3]=cam[7]; float ldx=dl[3]-dl[0],ldy=dl[4]-dl[1],ldz=dl[5]-dl[2],li=rsq(ldx*ldx+ldy*ldy+ldz*ldz); sc.light_dir[0]=ldx*li;sc.light_dir[1]=ldy*li;sc.light_dir[2]=ldz*li;sc.light_dir[3]=dl[9]; sc.light_color[0]=dl[6];sc.light_color[1]=dl[7];sc.light_color[2]=dl[8]; shadowpass(&sc); cb_up(scene_cb,&sc,sizeof(sc)); audio_tick(sec); ID3D11DeviceContext_ClearRenderTargetView(ctx,rtv,clr); if(dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,1,0); for(int i=0;i<CMDN;i++){ Cmd* c=cmd+i; if(!c->enabled)continue; set_target(c); if(c->type==1){ ID3D11RenderTargetView* rv=rtvof(c->rt); float cc[4],dc; clear_vals(c,cc,&dc); if(c->ccen&&rv)ID3D11DeviceContext_ClearRenderTargetView(ctx,rv,cc); if(c->cden&&c->dep==-2&&dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,dc,0); } else if(c->type==3){ if(!c->reset||!reset_compute_done)run_compute(c); } else if(c->type==2 && c->shader>=0&&c->shader<SHN&&sh[c->shader].vs&&sh[c->shader].ps){ UserCB uc; M4 w; world(c,&w); cpy(oc.world,w.m,64); fill_user_cmd(&uc,c); cb_up(object_cb,&oc,sizeof(oc)); cb_up(user_cb,&uc,sizeof(uc)); ID3D11DeviceContext_OMSetDepthStencilState(ctx,ds[(c->dt?1:0)|(c->dw?2:0)],0); ID3D11DeviceContext_RSSetState(ctx,rs[c->cb?1:0]); ID3D11DeviceContext_OMSetBlendState(ctx,bs[(c->ab?1:0)|(c->cw?2:0)],bf,0xffffffff); ID3D11DeviceContext_VSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetSamplers(ctx,0,1,&smp_lin); ID3D11DeviceContext_PSSetSamplers(ctx,1,1,&smp_cmp); for(int t=0;t<c->tc;t++){ ID3D11ShaderResourceView* sv=srvof(c->tex[t]); ID3D11DeviceContext_PSSetShaderResources(ctx,c->tsl[t],1,&sv); } if(c->srecv){ ID3D11ShaderResourceView* sv=shadow_srv; ID3D11DeviceContext_PSSetShaderResources(ctx,7,1,&sv); } for(int t=0;t<c->sc;t++){ ID3D11ShaderResourceView* sv=srvof(c->srv[t]); ID3D11DeviceContext_VSSetShaderResources(ctx,c->ssl[t],1,&sv); ID3D11DeviceContext_PSSetShaderResources(ctx,c->ssl[t],1,&sv); } if(c->mk>0&&c->mk<6&&prim_vb[c->mk]){ unsigned int st=32,off=0; ID3D11DeviceContext_IASetInputLayout(ctx,sh[c->shader].il); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,1,&prim_vb[c->mk],&st,&off); } else { ID3D11DeviceContext_IASetInputLayout(ctx,0); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,0,0,0,0); } ID3D11DeviceContext_IASetIndexBuffer(ctx,0,DXGI_FORMAT_R32_UINT,0); ID3D11DeviceContext_IASetPrimitiveTopology(ctx,c->topology?D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST:D3D11_PRIMITIVE_TOPOLOGY_POINTLIST); ID3D11DeviceContext_VSSetShader(ctx,sh[c->shader].vs,0,0); ID3D11DeviceContext_PSSetShader(ctx,sh[c->shader].ps,0,0); ID3D11DeviceContext_DrawInstanced(ctx,c->vc,c->ic,0,0); } } reset_compute_done=1; IDXGISwapChain_Present(swp,LT_VSYNC?1:0,0); fps_title(); }
+    std::string render_body = R"LT64K( float clr[4]={0,0,0,1},bf[4]={0,0,0,0}; SceneCB sc; ObjectCB oc; M4 vp,ivp; zmem(&sc,sizeof(sc)); viewproj(&vp,sec); invm(&vp,&ivp); cpy(sc.view_proj,vp.m,64); cpy(sc.prev_view_proj,vp.m,64); cpy(sc.inv_view_proj,ivp.m,64); cpy(sc.prev_inv_view_proj,ivp.m,64); shadowvp(&sc); sc.time_vec[0]=sec; sc.time_vec[1]=dt; sc.time_vec[2]=sec*60.0f; sc.cam_pos[0]=cam[0];sc.cam_pos[1]=cam[1];sc.cam_pos[2]=cam[2]; float cp=cs(cam[4]); sc.cam_dir[0]=sn(cam[3])*cp;sc.cam_dir[1]=sn(cam[4]);sc.cam_dir[2]=cs(cam[3])*cp; sc.camera_params[0]=cam[9]>=0.5f?1.0f:0.0f;sc.camera_params[1]=cam[10];sc.camera_params[2]=cam[6];sc.camera_params[3]=cam[7]; float ldx=dl[3]-dl[0],ldy=dl[4]-dl[1],ldz=dl[5]-dl[2],li=rsq(ldx*ldx+ldy*ldy+ldz*ldz); sc.light_dir[0]=ldx*li;sc.light_dir[1]=ldy*li;sc.light_dir[2]=ldz*li;sc.light_dir[3]=dl[9]; sc.light_color[0]=dl[6];sc.light_color[1]=dl[7];sc.light_color[2]=dl[8]; shadowpass(&sc); cb_up(scene_cb,&sc,sizeof(sc)); audio_tick(sec); ID3D11DeviceContext_ClearRenderTargetView(ctx,rtvof(-2),clr); if(dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,1,0); for(int i=0;i<CMDN;i++){ Cmd* c=cmd+i; if(!c->enabled)continue; set_target(c); if(c->type==1){ ID3D11RenderTargetView* rv=rtvof(c->rt); float cc[4],dc; clear_vals(c,cc,&dc); if(c->ccen&&rv)ID3D11DeviceContext_ClearRenderTargetView(ctx,rv,cc); if(c->cden&&c->dep==-2&&dsv)ID3D11DeviceContext_ClearDepthStencilView(ctx,dsv,D3D11_CLEAR_DEPTH,dc,0); } else if(c->type==3){ if(!c->reset||!reset_compute_done)run_compute(c); } /*LT_SWAP_BRANCH*/ else if(c->type==2 && c->shader>=0&&c->shader<SHN&&sh[c->shader].vs&&sh[c->shader].ps){ UserCB uc; M4 w; world(c,&w); cpy(oc.world,w.m,64); fill_user_cmd(&uc,c); cb_up(object_cb,&oc,sizeof(oc)); cb_up(user_cb,&uc,sizeof(uc)); ID3D11DeviceContext_OMSetDepthStencilState(ctx,ds[(c->dt?1:0)|(c->dw?2:0)],0); ID3D11DeviceContext_RSSetState(ctx,rs[c->cb?1:0]); ID3D11DeviceContext_OMSetBlendState(ctx,bs[(c->ab?1:0)|(c->cw?2:0)],bf,0xffffffff); ID3D11DeviceContext_VSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,0,1,&scene_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,1,1,&object_cb); ID3D11DeviceContext_VSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetConstantBuffers(ctx,2,1,&user_cb); ID3D11DeviceContext_PSSetSamplers(ctx,0,1,&smp_lin); ID3D11DeviceContext_PSSetSamplers(ctx,1,1,&smp_cmp); for(int t=0;t<c->tc;t++){ ID3D11ShaderResourceView* sv=srvof(c->tex[t]); ID3D11DeviceContext_PSSetShaderResources(ctx,c->tsl[t],1,&sv); } if(c->srecv){ ID3D11ShaderResourceView* sv=shadow_srv; ID3D11DeviceContext_PSSetShaderResources(ctx,7,1,&sv); } for(int t=0;t<c->sc;t++){ ID3D11ShaderResourceView* sv=srvof(c->srv[t]); ID3D11DeviceContext_VSSetShaderResources(ctx,c->ssl[t],1,&sv); ID3D11DeviceContext_PSSetShaderResources(ctx,c->ssl[t],1,&sv); } if(c->mk>0&&c->mk<6&&prim_vb[c->mk]){ unsigned int st=32,off=0; ID3D11DeviceContext_IASetInputLayout(ctx,sh[c->shader].il); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,1,&prim_vb[c->mk],&st,&off); } else { ID3D11DeviceContext_IASetInputLayout(ctx,0); ID3D11DeviceContext_IASetVertexBuffers(ctx,0,0,0,0,0); } ID3D11DeviceContext_IASetIndexBuffer(ctx,0,DXGI_FORMAT_R32_UINT,0); ID3D11DeviceContext_IASetPrimitiveTopology(ctx,c->topology?D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST:D3D11_PRIMITIVE_TOPOLOGY_POINTLIST); ID3D11DeviceContext_VSSetShader(ctx,sh[c->shader].vs,0,0); ID3D11DeviceContext_PSSetShader(ctx,sh[c->shader].ps,0,0); ID3D11DeviceContext_DrawInstanced(ctx,c->vc,c->ic,0,0); } } reset_compute_done=1; /*LT_PRESENT_SCENE*/ IDXGISwapChain_Present(swp,LT_VSYNC?1:0,0); fps_title(); }
 static LRESULT CALLBACK wp(HWND h,UINT m,WPARAM w,LPARAM l){
     if(LT_ESC_CLOSE&&m==WM_KEYDOWN&&w==VK_ESCAPE)PostQuitMessage(0);
     if(m==WM_CLOSE||m==WM_DESTROY){PostQuitMessage(0);return 0;}
@@ -2378,12 +2530,18 @@ static LRESULT CALLBACK wp(HWND h,UINT m,WPARAM w,LPARAM l){
 static float qpcdt(LARGE_INTEGER* now,LARGE_INTEGER* prev,LARGE_INTEGER* freq){ unsigned int dt=(unsigned int)now->LowPart-(unsigned int)prev->LowPart; unsigned int fq=(unsigned int)freq->LowPart? (unsigned int)freq->LowPart:1; float s=(float)dt/(float)fq; if(s>0.10f)s=0.10f; return s; }
 void WINAPI WinMainCRTStartup(void){ WNDCLASSA wc; zmem(&wc,sizeof(wc)); wc.lpfnWndProc=wp; wc.hInstance=GetModuleHandleA(0); wc.hCursor=LoadCursorA(0,(LPCSTR)32512); wc.lpszClassName=LT_WNDCLS; RegisterClassA(&wc); // FPS-in-title builds use a maximized overlapped window so the title bar is visible.
 // Otherwise the tiny player uses borderless desktop fullscreen.
-W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); DWORD st=LT_SHOW_FPS_TITLE?WS_OVERLAPPEDWINDOW:(WS_POPUP|WS_VISIBLE); DWORD ex=LT_SHOW_FPS_TITLE?0:WS_EX_TOPMOST; HWND hw=CreateWindowExA(ex,LT_WNDCLS,"lt64k",st,0,0,W,H,0,0,wc.hInstance,0); wh=hw; if(LT_SHOW_FPS_TITLE){ShowWindow(hw,SW_SHOWMAXIMIZED); RECT rc; GetClientRect(hw,&rc); W=rc.right-rc.left; H=rc.bottom-rc.top;}else{SetWindowPos(hw,HWND_TOPMOST,0,0,W,H,SWP_SHOWWINDOW); while(ShowCursor(FALSE)>=0);} RW=W; RH=H; DXGI_SWAP_CHAIN_DESC sd; zmem(&sd,sizeof(sd)); sd.BufferCount=1; sd.BufferDesc.Width=W; sd.BufferDesc.Height=H; sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow=hw; sd.SampleDesc.Count=1; sd.Windowed=TRUE; if(FAILED(D3D11CreateDeviceAndSwapChain(0,D3D_DRIVER_TYPE_HARDWARE,0,0,0,0,D3D11_SDK_VERSION,&sd,&swp,&dev,0,&ctx)))ExitProcess(1); ID3D11Texture2D* bb=0; IDXGISwapChain_GetBuffer(swp,0,&IID_ID3D11Texture2D,(void**)&bb); ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)bb,0,&rtv); ID3D11Texture2D_Release(bb); init_depth_shadow(); init_rts(); init_sbs(); init_states(); cb_make(&scene_cb,sizeof(SceneCB)); cb_make(&object_cb,sizeof(ObjectCB)); cb_make(&user_cb,sizeof(UserCB)); init_shaders(); init_audio(); init_prims(); LARGE_INTEGER fq,t0,tn; QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0); float sec=0; MSG msg; for(;;){ while(PeekMessageA(&msg,0,0,0,PM_REMOVE)){ if(msg.message==WM_QUIT)ExitProcess(0); TranslateMessage(&msg); DispatchMessageA(&msg);} QueryPerformanceCounter(&tn); sec+=qpcdt(&tn,&t0,&fq); t0=tn; render(sec);
+W=GetSystemMetrics(SM_CXSCREEN); H=GetSystemMetrics(SM_CYSCREEN); DWORD st=LT_SHOW_FPS_TITLE?WS_OVERLAPPEDWINDOW:(WS_POPUP|WS_VISIBLE); DWORD ex=LT_SHOW_FPS_TITLE?0:WS_EX_TOPMOST; HWND hw=CreateWindowExA(ex,LT_WNDCLS,"lt64k",st,0,0,W,H,0,0,wc.hInstance,0); wh=hw; if(LT_SHOW_FPS_TITLE){ShowWindow(hw,SW_SHOWMAXIMIZED); RECT rc; GetClientRect(hw,&rc); W=rc.right-rc.left; H=rc.bottom-rc.top;}else{SetWindowPos(hw,HWND_TOPMOST,0,0,W,H,SWP_SHOWWINDOW); while(ShowCursor(FALSE)>=0);} RW=W; RH=H; DXGI_SWAP_CHAIN_DESC sd; zmem(&sd,sizeof(sd)); sd.BufferCount=1; sd.BufferDesc.Width=W; sd.BufferDesc.Height=H; sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow=hw; sd.SampleDesc.Count=1; sd.Windowed=TRUE; if(FAILED(D3D11CreateDeviceAndSwapChain(0,D3D_DRIVER_TYPE_HARDWARE,0,0,0,0,D3D11_SDK_VERSION,&sd,&swp,&dev,0,&ctx)))ExitProcess(1); ID3D11Texture2D* bb=0; IDXGISwapChain_GetBuffer(swp,0,&IID_ID3D11Texture2D,(void**)&bb); ID3D11Device_CreateRenderTargetView(dev,(ID3D11Resource*)bb,0,&rtv); ID3D11Texture2D_Release(bb); /*LT_INIT_SCENE*/ init_depth_shadow(); init_rts(); init_sbs(); init_states(); cb_make(&scene_cb,sizeof(SceneCB)); cb_make(&object_cb,sizeof(ObjectCB)); cb_make(&user_cb,sizeof(UserCB)); init_shaders(); init_audio(); init_prims(); LARGE_INTEGER fq,t0,tn; QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0); float sec=0; MSG msg; for(;;){ while(PeekMessageA(&msg,0,0,0,PM_REMOVE)){ if(msg.message==WM_QUIT)ExitProcess(0); TranslateMessage(&msg); DispatchMessageA(&msg);} QueryPerformanceCounter(&tn); sec+=qpcdt(&tn,&t0,&fq); t0=tn; render(sec);
 )LT64K";
     if (!uses_audio) {
         replace_all_inplace(render_body, " audio_tick(sec);", "");
         replace_all_inplace(render_body, " init_audio();", "");
     }
+    replace_all_inplace(render_body, " /*LT_SWAP_BRANCH*/",
+                        uses_swap ? " else if(c->type==4)run_swap(c);" : "");
+    replace_all_inplace(render_body, " /*LT_INIT_SCENE*/",
+                        uses_scene_color_surface ? " init_scene_color();" : "");
+    replace_all_inplace(render_body, " /*LT_PRESENT_SCENE*/",
+                        uses_scene_color_surface ? " present_scene();" : "");
     fputs(render_body.c_str(), f);
     if (uses_timeline) fputs(" if(LT_EXIT_AFTER_TIMELINE&&TL_ON){float tt=tltotal(); if(tt>0&&sec>=tt)PostQuitMessage(0);}", f);
     fputs(R"LT64K( } }

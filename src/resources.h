@@ -63,6 +63,7 @@ ResHandle res_create_audio_shader(const char* name, const char* path, const char
 ResHandle res_load_texture(const char* name, const char* path);
 bool      res_reload_texture(Resource* r, const char* path);
 ResHandle res_load_mesh(const char* name, const char* path);
+ResHandle res_load_skinned_mesh(const char* name, const char* path);
 ResHandle res_load_gaussian_splat(const char* name, const char* path);
 bool      res_reload_gaussian_splat(Resource* r, const char* path);
 ResHandle res_load_nanovdb(const char* name, const char* path);
@@ -74,6 +75,8 @@ void      res_sync_size_resource(ResHandle h);
 void      res_release_gpu(Resource* r);
 void      res_reset_transient_gpu_resources();
 void      res_sync_scene_dependent_render_textures();
+bool      res_can_swap_backing(ResHandle a, ResHandle b, char* reason = nullptr, int reason_sz = 0);
+bool      res_swap_backing(ResHandle a, ResHandle b);
 void      res_rename(ResHandle h, const char* new_name);
 void      res_make_unique_name(const char* base, char* out, int out_sz);
 const char* res_type_str(ResType t);

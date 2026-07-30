@@ -1,0 +1,41 @@
+lazyTool_project 1
+export_settings 0 1 1 0 0 0
+
+resource render_texture ping_a 64 64 28 1 1 1 0 0
+resource render_texture ping_b 64 64 28 1 1 1 0 0
+resource render_texture scene_ping 1 1 28 1 1 1 0 1
+resource render_texture depth_ping 1 1 44 0 1 0 1 1
+resource structured_buffer buffer_a 16 64 1 1 0
+resource structured_buffer buffer_b 16 64 1 1 0
+
+audio_settings 0 - 48000 60 0.35 0
+
+commands
+command clear clear_ping_a 1
+  targets ping_a|render_texture2d -
+  clear 1 1 0 0 1 0 1
+  clear_sources - -
+end_command
+command clear clear_ping_b 1
+  targets ping_b|render_texture2d -
+  clear 1 0 0 1 1 0 1
+  clear_sources - -
+end_command
+command swap swap_targets 1
+  swap ping_a|render_texture2d ping_b|render_texture2d
+end_command
+command swap swap_scene_color 1
+  swap scene_color|builtin_scene_color scene_ping|render_texture2d
+end_command
+command swap swap_scene_depth 1
+  swap scene_depth|builtin_scene_depth depth_ping|render_texture2d
+end_command
+command swap swap_buffers 1
+  swap buffer_a|structured_buffer buffer_b|structured_buffer
+end_command
+
+timeline
+timeline_global 0 0 0
+timeline_clip Timeline_1 24 2 0 1
+end_timeline_clip
+end_timeline

@@ -219,6 +219,7 @@ Resources are one-based handles stored in a fixed table. This keeps serializatio
 | `render_texture3d` | Internal 3D texture with SRV/UAV support and slice preview. |
 | `structured_buffer` | GPU buffer with SRV/UAV flags and optional indirect-argument layout. |
 | `mesh` | Imported glTF/GLB mesh data with parts, material slots, bounds, and material texture references. |
+| `skinned_mesh` | Imported glTF/GLB geometry plus `JOINTS_0`, `WEIGHTS_0`, rest transforms, parent indices, and inverse-bind matrices. |
 | `mesh_primitive` | Built-in cube, quad, tetrahedron, sphere, and fullscreen triangle meshes. |
 | `gaussian_splat` | PLY splat buffer uploaded as a structured SRV with bounds and SH metadata. |
 | `shader` | VS/PS or CS HLSL program with compile status, fallback state, reflection data, and source editor support. |
@@ -235,6 +236,32 @@ Built-ins are available as resources too:
 
 Some resources generate helper resources. For example, resources with dimensions/counts can expose implicit size values that may be linked into UserCB variables.
 
+### GPU skinned meshes
+
+The project syntax is:
+
+```text
+resource skinned_gltf character assets/models/character.glb
+```
+
+A skinned mesh is one logical resource with several internal GPU objects:
+
+- normal vertex/index buffers;
+- an internal `StructuredBuffer<LT_SkinInfluence>` bound automatically to
+  vertex-shader slot `t5`;
+- a static `StructuredBuffer<LT_SkinRigBone>` exposed through the resource's
+  normal SRV, so a `Dispatch` can bind the skinned mesh directly.
+
+`shaders/skinning.hlsl` defines the matching HLSL ABI. Dynamic poses remain normal
+`structured_buffer` resources. Compute commands may read the rig, write any chosen
+pose/state layout, and a draw binds that pose explicitly as a vertex SRV. The
+included `projects/skinned_tree_gpu.lt` example uses `t6` for a state containing
+global matrices, final skin matrices, bend angles, and angular velocities.
+
+Skinned shadow casters require an explicit shadow shader using the same pose SRV.
+The built-in static-mesh shadow vertex shader cannot infer a user-defined dynamic
+bone-buffer layout.
+
 ---
 
 ## Commands
@@ -246,6 +273,7 @@ The command list is the frame pipeline. Enabled commands are validated and execu
 | `Clear` | Clear a color target and/or depth target. Clear color/depth may come from hardcoded values, value resources, or UserCB entries. |
 | `Group` | Editor/runtime container for organizing child commands. |
 | `Repeat` | Execute child commands multiple times; primarily useful for iterative compute workflows. |
+| `Swap` | Exchange the GPU backing objects and views of two compatible render targets, scene color/depth targets, or structured buffers in O(1), while keeping their names, handles, and descriptors fixed. |
 | `DrawMesh` | Draw a mesh, primitive, or procedural vertex source with a VS/PS shader. |
 | `DrawInstanced` | Draw mesh/procedural geometry with an instance count. |
 | `IndirectDraw` | Draw through a D3D11 indirect argument buffer. |
@@ -275,6 +303,16 @@ Dispatch commands can use:
 - group counts derived from a resource size;
 - optional indirect dispatch;
 - reset-only execution for setup passes.
+
+`Swap` requires two distinct resources with compatible physical descriptors and
+matching resize policy. Before exchanging their backing objects, the runtime
+unbinds active render targets, SRVs, and UAVs to avoid D3D11 binding hazards. It
+supports 2D and 3D render targets plus structured buffers in the normal runtime.
+The built-in `scene_color` can swap with a full-resolution RGBA8 RT that has
+RTV/SRV/UAV views; `scene_depth` can swap with a full-resolution R24G8 depth RT
+that has DSV/SRV views. The 64k exporter supports 2D RTs, both scene built-ins,
+and structured buffers. It emits an intermediate scene surface only when the
+project actually requires swappable or shader-readable scene color.
 
 ---
 

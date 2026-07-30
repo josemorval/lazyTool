@@ -2,6 +2,7 @@
 #include "build_config.h"
 #include "log.h"
 #include "project.h"
+#include "resources.h"
 #include <d3d11sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_5.h>
@@ -200,26 +201,22 @@ float4 PSMain(PSIn i) : SV_Target
 #endif
 
 static void safe_release_scene_rt() {
-    if (g_dx.scene_rtv) { g_dx.scene_rtv->Release(); g_dx.scene_rtv = nullptr; }
-    if (g_dx.scene_srv) { g_dx.scene_srv->Release(); g_dx.scene_srv = nullptr; }
-    if (g_dx.scene_uav) { g_dx.scene_uav->Release(); g_dx.scene_uav = nullptr; }
-    if (g_dx.scene_tex) { g_dx.scene_tex->Release(); g_dx.scene_tex = nullptr; }
-    if (g_dx.depth_dsv) { g_dx.depth_dsv->Release(); g_dx.depth_dsv = nullptr; }
-    if (g_dx.depth_srv) { g_dx.depth_srv->Release(); g_dx.depth_srv = nullptr; }
-    if (g_dx.depth_tex) { g_dx.depth_tex->Release(); g_dx.depth_tex = nullptr; }
+    Resource* scene = res_get(g_builtin_scene_color);
+    Resource* depth = res_get(g_builtin_scene_depth);
+    if (scene && scene->owns_gpu_backing) res_release_gpu(scene);
+    if (depth && depth->owns_gpu_backing) res_release_gpu(depth);
 }
 
 static void safe_release_shadow_map() {
     if (g_dx.shadow_preview_srv) { g_dx.shadow_preview_srv->Release(); g_dx.shadow_preview_srv = nullptr; }
-    if (g_dx.shadow_srv) { g_dx.shadow_srv->Release(); g_dx.shadow_srv = nullptr; }
-    if (g_dx.shadow_dsv) { g_dx.shadow_dsv->Release(); g_dx.shadow_dsv = nullptr; }
     for (int i = 0; i < MAX_SHADOW_CASCADES; i++) {
         if (g_dx.shadow_slice_dsv[i]) {
             g_dx.shadow_slice_dsv[i]->Release();
             g_dx.shadow_slice_dsv[i] = nullptr;
         }
     }
-    if (g_dx.shadow_tex) { g_dx.shadow_tex->Release(); g_dx.shadow_tex = nullptr; }
+    Resource* shadow = res_get(g_builtin_shadow_map);
+    if (shadow && shadow->owns_gpu_backing) res_release_gpu(shadow);
     g_dx.shadow_layers = 0;
 }
 
@@ -630,6 +627,37 @@ void dx_create_scene_rt(int w, int h) {
     }
     safe_release_scene_rt();
 
+    Resource* scene = res_get(g_builtin_scene_color);
+    Resource* depth = res_get(g_builtin_scene_depth);
+    if (!scene || !depth || !g_dx.dev) {
+        log_error("Cannot create scene targets before built-in resources and D3D are initialized.");
+        return;
+    }
+
+    scene->width = w;
+    scene->height = h;
+    scene->depth = 1;
+    scene->tex_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    scene->has_rtv = true;
+    scene->has_srv = true;
+    scene->has_uav = true;
+    scene->has_dsv = false;
+    scene->scene_scale_divisor = 1;
+    scene->owns_gpu_backing = true;
+    scene->runtime_managed = true;
+
+    depth->width = w;
+    depth->height = h;
+    depth->depth = 1;
+    depth->tex_fmt = DXGI_FORMAT_R24G8_TYPELESS;
+    depth->has_rtv = false;
+    depth->has_srv = true;
+    depth->has_uav = false;
+    depth->has_dsv = true;
+    depth->scene_scale_divisor = 1;
+    depth->owns_gpu_backing = true;
+    depth->runtime_managed = true;
+
     D3D11_TEXTURE2D_DESC td = {};
     td.Width     = w; td.Height = h;
     td.MipLevels = 1; td.ArraySize = 1;
@@ -637,28 +665,34 @@ void dx_create_scene_rt(int w, int h) {
     td.SampleDesc.Count = 1;
     td.Usage     = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-    g_dx.dev->CreateTexture2D(&td, nullptr, &g_dx.scene_tex);
-    g_dx.dev->CreateRenderTargetView(g_dx.scene_tex, nullptr, &g_dx.scene_rtv);
-    g_dx.dev->CreateShaderResourceView(g_dx.scene_tex, nullptr, &g_dx.scene_srv);
-    g_dx.dev->CreateUnorderedAccessView(g_dx.scene_tex, nullptr, &g_dx.scene_uav);
+    g_dx.dev->CreateTexture2D(&td, nullptr, &scene->tex);
+    if (scene->tex) {
+        g_dx.dev->CreateRenderTargetView(scene->tex, nullptr, &scene->rtv);
+        g_dx.dev->CreateShaderResourceView(scene->tex, nullptr, &scene->srv);
+        g_dx.dev->CreateUnorderedAccessView(scene->tex, nullptr, &scene->uav);
+    }
 
     D3D11_TEXTURE2D_DESC dd = td;
     dd.Format    = DXGI_FORMAT_R24G8_TYPELESS;
     dd.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
-    g_dx.dev->CreateTexture2D(&dd, nullptr, &g_dx.depth_tex);
+    g_dx.dev->CreateTexture2D(&dd, nullptr, &depth->tex);
 
     D3D11_DEPTH_STENCIL_VIEW_DESC dsvd = {};
     dsvd.Format        = DXGI_FORMAT_D24_UNORM_S8_UINT;
     dsvd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
-    g_dx.dev->CreateDepthStencilView(g_dx.depth_tex, &dsvd, &g_dx.depth_dsv);
+    if (depth->tex)
+        g_dx.dev->CreateDepthStencilView(depth->tex, &dsvd, &depth->dsv);
 
     D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
     srvd.Format                    = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
     srvd.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
     srvd.Texture2D.MipLevels       = 1;
-    g_dx.dev->CreateShaderResourceView(g_dx.depth_tex, &srvd, &g_dx.depth_srv);
+    if (depth->tex)
+        g_dx.dev->CreateShaderResourceView(depth->tex, &srvd, &depth->srv);
     g_dx.scene_width  = w;
     g_dx.scene_height = h;
+    res_sync_size_resource(g_builtin_scene_color);
+    res_sync_size_resource(g_builtin_scene_depth);
     dx_invalidate_scene_history();
 }
 
@@ -670,6 +704,21 @@ void dx_create_shadow_map(int w, int h, int layers) {
     if (layers < 1) layers = 1;
     if (layers > MAX_SHADOW_CASCADES) layers = MAX_SHADOW_CASCADES;
     safe_release_shadow_map();
+    Resource* shadow = res_get(g_builtin_shadow_map);
+    if (!shadow || !g_dx.dev) {
+        log_error("Cannot create shadow map before its built-in resource and D3D are initialized.");
+        return;
+    }
+    shadow->width = w;
+    shadow->height = h;
+    shadow->depth = layers;
+    shadow->tex_fmt = DXGI_FORMAT_R24G8_TYPELESS;
+    shadow->has_rtv = false;
+    shadow->has_srv = true;
+    shadow->has_uav = false;
+    shadow->has_dsv = true;
+    shadow->owns_gpu_backing = true;
+    shadow->runtime_managed = true;
 
     D3D11_TEXTURE2D_DESC td = {};
     td.Width     = (UINT)w;
@@ -680,8 +729,8 @@ void dx_create_shadow_map(int w, int h, int layers) {
     td.SampleDesc.Count = 1;
     td.Usage     = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
-    HRESULT hr = g_dx.dev->CreateTexture2D(&td, nullptr, &g_dx.shadow_tex);
-    if (FAILED(hr) || !g_dx.shadow_tex) {
+    HRESULT hr = g_dx.dev->CreateTexture2D(&td, nullptr, &shadow->tex);
+    if (FAILED(hr) || !shadow->tex) {
         log_error("Shadow map texture create failed: 0x%08X", hr);
         return;
     }
@@ -692,7 +741,7 @@ void dx_create_shadow_map(int w, int h, int layers) {
     dsvd.Texture2DArray.FirstArraySlice = 0;
     dsvd.Texture2DArray.ArraySize = (UINT)layers;
     dsvd.Texture2DArray.MipSlice = 0;
-    hr = g_dx.dev->CreateDepthStencilView(g_dx.shadow_tex, &dsvd, &g_dx.shadow_dsv);
+    hr = g_dx.dev->CreateDepthStencilView(shadow->tex, &dsvd, &shadow->dsv);
     if (FAILED(hr)) log_error("Shadow map DSV create failed: 0x%08X", hr);
 
     for (int i = 0; i < layers; i++) {
@@ -702,7 +751,7 @@ void dx_create_shadow_map(int w, int h, int layers) {
         slice_dsvd.Texture2DArray.MipSlice = 0;
         slice_dsvd.Texture2DArray.FirstArraySlice = (UINT)i;
         slice_dsvd.Texture2DArray.ArraySize = 1;
-        hr = g_dx.dev->CreateDepthStencilView(g_dx.shadow_tex, &slice_dsvd, &g_dx.shadow_slice_dsv[i]);
+        hr = g_dx.dev->CreateDepthStencilView(shadow->tex, &slice_dsvd, &g_dx.shadow_slice_dsv[i]);
         if (FAILED(hr)) log_error("Shadow map slice DSV create failed: 0x%08X", hr);
     }
 
@@ -713,7 +762,7 @@ void dx_create_shadow_map(int w, int h, int layers) {
     srvd.Texture2DArray.MipLevels = 1;
     srvd.Texture2DArray.FirstArraySlice = 0;
     srvd.Texture2DArray.ArraySize = (UINT)layers;
-    hr = g_dx.dev->CreateShaderResourceView(g_dx.shadow_tex, &srvd, &g_dx.shadow_srv);
+    hr = g_dx.dev->CreateShaderResourceView(shadow->tex, &srvd, &shadow->srv);
     if (FAILED(hr)) log_error("Shadow map SRV create failed: 0x%08X", hr);
 
     if (layers == 1) {
@@ -721,13 +770,14 @@ void dx_create_shadow_map(int w, int h, int layers) {
         preview_srvd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
         preview_srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         preview_srvd.Texture2D.MipLevels = 1;
-        hr = g_dx.dev->CreateShaderResourceView(g_dx.shadow_tex, &preview_srvd, &g_dx.shadow_preview_srv);
+        hr = g_dx.dev->CreateShaderResourceView(shadow->tex, &preview_srvd, &g_dx.shadow_preview_srv);
         if (FAILED(hr)) g_dx.shadow_preview_srv = nullptr;
     }
 
     g_dx.shadow_width = w;
     g_dx.shadow_height = h;
     g_dx.shadow_layers = layers;
+    res_sync_size_resource(g_builtin_shadow_map);
 }
 
 void dx_resize(int w, int h) {
@@ -799,13 +849,17 @@ void dx_update_object_cb(const ObjectCBData& d) {
 // Bind the off-screen scene surface and shared render state so command
 // execution can render a complete frame for the editor viewport.
 void dx_begin_scene() {
+    Resource* scene = res_get(g_builtin_scene_color);
+    Resource* depth = res_get(g_builtin_scene_depth);
+    if (!scene || !depth || !scene->rtv || !depth->dsv)
+        return;
     float clear[4] = { 0.05f, 0.05f, 0.08f, 1.0f };
     ID3D11ShaderResourceView* null_srvs[8] = {};
     g_dx.ctx->PSSetShaderResources(0, 8, null_srvs);
     g_dx.ctx->CSSetShaderResources(0, 8, null_srvs);
-    g_dx.ctx->OMSetRenderTargets(1, &g_dx.scene_rtv, g_dx.depth_dsv);
-    g_dx.ctx->ClearRenderTargetView(g_dx.scene_rtv, clear);
-    g_dx.ctx->ClearDepthStencilView(g_dx.depth_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+    g_dx.ctx->OMSetRenderTargets(1, &scene->rtv, depth->dsv);
+    g_dx.ctx->ClearRenderTargetView(scene->rtv, clear);
+    g_dx.ctx->ClearDepthStencilView(depth->dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
     D3D11_VIEWPORT vp = { 0, 0, (float)g_dx.scene_width, (float)g_dx.scene_height, 0, 1 };
     g_dx.ctx->RSSetViewports(1, &vp);
     g_dx.ctx->RSSetState(g_dx.rs_solid);
@@ -953,7 +1007,8 @@ void dx_render_scene_grid_overlay() {
 #ifdef LAZYTOOL_PLAYER_ONLY
     return;
 #else
-    if (!g_dx.scene_grid_enabled || !g_dx.ctx || !g_dx.scene_rtv ||
+    Resource* scene = res_get(g_builtin_scene_color);
+    if (!g_dx.scene_grid_enabled || !g_dx.ctx || !scene || !scene->rtv ||
         !g_dx.scene_cb || !s_editor_grid_vs || !s_editor_grid_ps || !s_editor_grid_il ||
         !s_editor_grid_cb || !s_editor_grid_vb ||
         g_dx.scene_width <= 0 || g_dx.scene_height <= 0)
@@ -992,7 +1047,7 @@ void dx_render_scene_grid_overlay() {
 
     D3D11_VIEWPORT vp = { 0, 0, (float)g_dx.scene_width, (float)g_dx.scene_height, 0, 1 };
     float blend_factor[4] = {};
-    ID3D11RenderTargetView* scene_rtv = g_dx.scene_rtv;
+    ID3D11RenderTargetView* scene_rtv = scene->rtv;
     ID3D11Buffer* ps_cbs[] = { g_dx.scene_cb, s_editor_grid_cb };
     UINT stride = sizeof(EditorGridVertex);
     UINT offset = 0;
@@ -1029,7 +1084,8 @@ void dx_begin_ui() {
 }
 
 void dx_present_scene_to_backbuffer() {
-    if (!g_dx.sc || !g_dx.ctx || !g_dx.scene_tex)
+    Resource* scene = res_get(g_builtin_scene_color);
+    if (!g_dx.sc || !g_dx.ctx || !scene || !scene->tex)
         return;
 
     ID3D11RenderTargetView* null_rtv = nullptr;
@@ -1045,7 +1101,7 @@ void dx_present_scene_to_backbuffer() {
 
     ID3D11Texture2D* bb = nullptr;
     if (SUCCEEDED(g_dx.sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb)) && bb) {
-        g_dx.ctx->CopyResource(bb, g_dx.scene_tex);
+        g_dx.ctx->CopyResource(bb, scene->tex);
         bb->Release();
     }
 }

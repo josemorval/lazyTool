@@ -1,0 +1,73 @@
+lazyTool_project 1
+export_settings 1 1 0 1 1 1
+
+resource skinned_gltf tree assets/models/skinned_tree.gltf
+resource structured_buffer bones_prev 144 4 1 1 0
+resource structured_buffer bones_curr 144 4 1 1 0
+resource shader_cs tree_init shaders/skinned_tree_init.hlsl
+resource shader_cs tree_simulate shaders/skinned_tree_simulate.hlsl
+resource shader_vsps tree_draw shaders/skinned_tree_draw.hlsl
+resource shader_vsps tree_shadow shaders/skinned_tree_shadow.hlsl
+
+audio_settings 0 - 48000 60 0.35 0
+
+user_cb
+end_user_cb
+
+commands
+command clear clear_scene 1
+  targets scene_color|builtin_scene_color scene_depth|builtin_scene_depth
+  clear 1 0.018 0.026 0.038 1 1 1
+  clear_sources - -
+end_command
+
+command dispatch initialize_tree_bones 1
+  mesh_shader - tree_init|shader
+  threads 1 1 1
+  compute_on_reset 1
+  srvs 1 tree|skinned_mesh 0
+  uavs 2 bones_prev|structured_buffer 0 bones_curr|structured_buffer 1
+  params 2
+  param JointCount int 1 - 4 0 0 0 0 0 0 0
+  param InstanceCount int 1 - 1 0 0 0 0 0 0 0
+end_command
+
+command dispatch simulate_tree_bones 1
+  mesh_shader - tree_simulate|shader
+  threads 1 1 1
+  compute_on_reset 0
+  srvs 2 tree|skinned_mesh 0 bones_prev|structured_buffer 1
+  uavs 1 bones_curr|structured_buffer 0
+  params 8
+  param JointCount int 1 - 4 0 0 0 0 0 0 0
+  param InstanceCount int 1 - 1 0 0 0 0 0 0 0
+  param Stiffness float 1 - 0 0 0 0 18 0 0 0
+  param Damping float 1 - 0 0 0 0 5.5 0 0 0
+  param WindStrength float 1 - 0 0 0 0 0.32 0 0 0
+  param WindFrequency float 1 - 0 0 0 0 1.7 0 0 0
+  param MaxBend float 1 - 0 0 0 0 0.55 0 0 0
+  param DeltaTimeScale float 1 - 0 0 0 0 1 0 0 0
+end_command
+
+command swap advance_tree_state 1
+  swap bones_prev|structured_buffer bones_curr|structured_buffer
+end_command
+
+command draw_mesh draw_tree 1
+  targets scene_color|builtin_scene_color scene_depth|builtin_scene_depth
+  mesh_shader tree|skinned_mesh tree_draw|shader
+  shadow_shader tree_shadow|shader
+  render_state 1 1 1 0 0 1 1
+  transformq 0 -2 0 0 0 0 1 1 1 1
+  instance 1
+  srvs 1 bones_prev|structured_buffer 6
+  params 2
+  param JointCount int 1 - 4 0 0 0 0 0 0 0
+  param PaletteInstanceOffset int 1 - 0 0 0 0 0 0 0 0
+end_command
+
+timeline
+timeline_global 0 0 0
+timeline_clip Tree_Loop 24 240 0 1
+end_timeline_clip
+end_timeline

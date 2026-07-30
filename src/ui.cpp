@@ -1692,6 +1692,65 @@ static float ui_labeled_item_compact_width(const char* label, float max_w, float
     return width;
 }
 
+static bool ui_reload_skinned_mesh_resource(Resource* r, const char* path) {
+    if (!r || r->type != RES_SKINNED_MESH || !path || !path[0])
+        return false;
+
+    ResHandle owner_h = ui_resource_handle_from_ptr(r);
+    if (owner_h == INVALID_HANDLE)
+        return false;
+
+    char local_path[MAX_PATH_LEN] = {};
+    strncpy(local_path, path, MAX_PATH_LEN - 1);
+    local_path[MAX_PATH_LEN - 1] = '\0';
+    ResHandle tmp = res_load_skinned_mesh(r->name, local_path);
+    Resource* src = res_get(tmp);
+    if (!src || !src->compiled_ok) {
+        if (tmp != INVALID_HANDLE)
+            res_free(tmp);
+        return false;
+    }
+
+    res_free_generated_children(owner_h);
+    res_reassign_generated_children(tmp, owner_h);
+    res_release_gpu(r);
+
+    strncpy(r->path, src->path, MAX_PATH_LEN - 1);
+    r->path[MAX_PATH_LEN - 1] = '\0';
+    r->vb = src->vb; src->vb = nullptr;
+    r->ib = src->ib; src->ib = nullptr;
+    r->buf = src->buf; src->buf = nullptr;
+    r->srv = src->srv; src->srv = nullptr;
+    r->skin_influence_buf = src->skin_influence_buf; src->skin_influence_buf = nullptr;
+    r->skin_influence_srv = src->skin_influence_srv; src->skin_influence_srv = nullptr;
+    r->vert_count = src->vert_count;
+    r->idx_count = src->idx_count;
+    r->vert_stride = src->vert_stride;
+    r->elem_size = src->elem_size;
+    r->elem_count = src->elem_count;
+    r->has_srv = src->has_srv;
+    r->has_uav = src->has_uav;
+    r->mesh_part_count = src->mesh_part_count;
+    r->mesh_material_count = src->mesh_material_count;
+    memcpy(r->mesh_parts, src->mesh_parts, sizeof(r->mesh_parts));
+    memcpy(r->mesh_materials, src->mesh_materials, sizeof(r->mesh_materials));
+    r->mesh_bounds_valid = src->mesh_bounds_valid;
+    memcpy(r->mesh_bounds_min, src->mesh_bounds_min, sizeof(r->mesh_bounds_min));
+    memcpy(r->mesh_bounds_max, src->mesh_bounds_max, sizeof(r->mesh_bounds_max));
+    r->mesh_primitive_type = -1;
+    r->compiled_ok = src->compiled_ok;
+    r->using_fallback = false;
+    strncpy(r->compile_err, src->compile_err, sizeof(r->compile_err) - 1);
+    r->compile_err[sizeof(r->compile_err) - 1] = '\0';
+    r->size_handle = src->size_handle;
+    src->size_handle = INVALID_HANDLE;
+    src->mesh_part_count = 0;
+    src->mesh_material_count = 0;
+    res_free(tmp);
+    res_sync_size_resource(owner_h);
+    return true;
+}
+
 static float ui_button_width(const char* label) {
     ImGuiStyle& style = ImGui::GetStyle();
     return ImGui::CalcTextSize(label, nullptr, true).x + style.FramePadding.x * 2.0f;
@@ -1711,7 +1770,8 @@ static bool ui_same_line_if_fits(float next_item_w, float spacing = -1.0f) {
 }
 
 static void res_combo(const char* label, ResHandle* h, ResType filter, bool allow_invalid = true,
-                      ResType filter2 = RES_NONE, ResType filter3 = RES_NONE) {
+                      ResType filter2 = RES_NONE, ResType filter3 = RES_NONE,
+                      ResType filter4 = RES_NONE, ResType filter5 = RES_NONE) {
     Resource* cur     = res_get(*h);
     const char* prev  = cur ? ui_resource_display_name(*cur) : "(none)";
     ImGui::SetNextItemWidth(ui_labeled_item_compact_width(label));
@@ -1723,7 +1783,9 @@ static void res_combo(const char* label, ResHandle* h, ResType filter, bool allo
             if (!r.active) continue;
             bool match = filter == RES_NONE || r.type == filter ||
                          (filter2 != RES_NONE && r.type == filter2) ||
-                         (filter3 != RES_NONE && r.type == filter3);
+                         (filter3 != RES_NONE && r.type == filter3) ||
+                         (filter4 != RES_NONE && r.type == filter4) ||
+                         (filter5 != RES_NONE && r.type == filter5);
             if (!match) continue;
             bool sel = (*h == (ResHandle)(i + 1));
             ImGui::PushID(i);
@@ -2350,7 +2412,8 @@ static ID3D11ShaderResourceView* ui_render_texture3d_preview_slice(Resource* r, 
 }
 
 static ID3D11ShaderResourceView* ui_render_shadow_depth_preview(int width, int height, int layer) {
-    if (!g_dx.shadow_srv || width <= 0 || height <= 0)
+    Resource* shadow = res_get(g_builtin_shadow_map);
+    if (!shadow || !shadow->srv || width <= 0 || height <= 0)
         return nullptr;
     if (!ui_init_shadow_depth_preview_pipeline())
         return nullptr;
@@ -2420,7 +2483,7 @@ static ID3D11ShaderResourceView* ui_render_shadow_depth_preview(int width, int h
     g_dx.ctx->DSSetShader(nullptr, nullptr, 0);
     g_dx.ctx->PSSetShader(s_shadow_depth_preview_ps, nullptr, 0);
     g_dx.ctx->PSSetConstantBuffers(0, 1, &s_shadow_depth_preview_cb);
-    ID3D11ShaderResourceView* src_srv = g_dx.shadow_srv;
+    ID3D11ShaderResourceView* src_srv = shadow->srv;
     g_dx.ctx->PSSetShaderResources(0, 1, &src_srv);
     g_dx.ctx->Draw(3, 0);
 
@@ -6177,6 +6240,7 @@ static ImVec4 ui_type_color(ResType type) {
     switch (type) {
     case RES_SHADER:              return ImVec4(0.64f, 0.50f, 0.72f, 1.0f);
     case RES_MESH:                return ImVec4(0.55f, 0.66f, 0.72f, 1.0f);
+    case RES_SKINNED_MESH:        return ImVec4(0.48f, 0.73f, 0.60f, 1.0f);
     case RES_TEXTURE2D:
     case RES_RENDER_TEXTURE2D:
     case RES_RENDER_TEXTURE3D:
@@ -6237,13 +6301,14 @@ static bool ui_rt_scene_scale_combo(const char* label, int* divisor) {
 static bool ui_resource_has_warning(const Resource& r) {
     return (r.type == RES_SHADER && !r.compiled_ok) ||
            (r.type == RES_MESH && r.using_fallback) ||
+           (r.type == RES_SKINNED_MESH && !r.compiled_ok) ||
            (r.type == RES_GAUSSIAN_SPLAT && r.path[0] && !r.compiled_ok) ||
            (r.type == RES_NANOVDB && r.path[0] && !r.compiled_ok);
 }
 
 static bool ui_resource_filter_match(const Resource& r, int filter) {
     switch (filter) {
-    case 1: return r.type == RES_MESH;
+    case 1: return r.type == RES_MESH || r.type == RES_SKINNED_MESH;
     case 2: return r.type == RES_SHADER;
     case 3: return r.type == RES_TEXTURE2D || r.type == RES_RENDER_TEXTURE2D ||
                    r.type == RES_RENDER_TEXTURE3D ||
@@ -6298,6 +6363,7 @@ static ImVec4 ui_command_type_color(CmdType type) {
     case CMD_INDIRECT_DRAW:     return ImVec4(0.92f, 0.70f, 0.38f, 1.0f);
     case CMD_INDIRECT_DISPATCH: return ImVec4(0.84f, 0.58f, 0.86f, 1.0f);
     case CMD_REPEAT:            return ImVec4(0.93f, 0.62f, 0.36f, 1.0f);
+    case CMD_SWAP:              return ImVec4(0.34f, 0.74f, 0.82f, 1.0f);
     case CMD_GROUP:             return ImVec4(0.66f, 0.68f, 0.74f, 1.0f);
     default:                    return ImVec4(0.60f, 0.62f, 0.66f, 1.0f);
     }
@@ -6483,6 +6549,9 @@ static bool ui_command_has_warning(const Command& c) {
                                                ui_indirect_dispatch_args_required_bytes())) return true;
         return false;
     }
+
+    case CMD_SWAP:
+        return !res_can_swap_backing(c.swap_a, c.swap_b);
 
     case CMD_REPEAT: {
         if (c.repeat_count < 1) return true;
@@ -7306,6 +7375,11 @@ static void ui_panel_resources(bool embedded = false) {
                 g_sel_res = res_alloc(uname, RES_MESH);
                 g_sel_cmd = INVALID_HANDLE;
             }
+            if (ImGui::MenuItem("Load Skinned Mesh glTF... (set path in Inspector)")) {
+                res_make_unique_name("skinned_0", uname, MAX_NAME);
+                g_sel_res = res_alloc(uname, RES_SKINNED_MESH);
+                g_sel_cmd = INVALID_HANDLE;
+            }
             if (ImGui::MenuItem("Load Gaussian Splat PLY... (set path in Inspector)")) {
                 res_make_unique_name("splat_0", uname, MAX_NAME);
                 g_sel_res = res_load_gaussian_splat(uname, "");
@@ -7774,6 +7848,12 @@ static void ui_panel_commands(bool embedded = false) {
         if (ImGui::MenuItem("Clear")) {
             cmd_make_unique_name("clear_0", uname, MAX_NAME);
             g_sel_cmd = cmd_alloc(uname, CMD_CLEAR); g_sel_res = INVALID_HANDLE;
+            s_cmd_nav = g_sel_cmd;
+            app_request_scene_render();
+        }
+        if (ImGui::MenuItem("Swap")) {
+            cmd_make_unique_name("swap_0", uname, MAX_NAME);
+            g_sel_cmd = cmd_alloc(uname, CMD_SWAP); g_sel_res = INVALID_HANDLE;
             s_cmd_nav = g_sel_cmd;
             app_request_scene_render();
         }
@@ -8343,10 +8423,19 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         break;
     }
 
-    case RES_MESH: {
+    case RES_MESH:
+    case RES_SKINNED_MESH: {
+        bool skinned = r->type == RES_SKINNED_MESH;
         ImGui::Text("Vertices: %d", r->vert_count);
         ImGui::Text("Indices:  %d", r->idx_count);
         ImGui::Text("Stride:   %d bytes", r->vert_stride);
+        if (skinned) {
+            ImGui::Text("Joints:   %d", r->elem_count);
+            ImGui::Text("Rig stride: %d bytes", r->elem_size);
+            ui_inspector_text_disabled_wrapped(
+                "Bind this resource as a compute SRV to read the static rig. "
+                "Draw commands bind vertex influences automatically at VS t5.");
+        }
         ImGui::Text("Parts:    %d", r->mesh_part_count);
         ImGui::Text("Materials:%d", r->mesh_material_count);
         ImGui::TextWrapped("Path: %s", r->path);
@@ -8368,8 +8457,11 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
                 ImGui::TextWrapped("%s", r->compile_err);
                 ImGui::PopStyleColor();
             }
-        } else if (r->vb) {
+        } else if (r->vb && r->compiled_ok) {
             ImGui::TextColored({0.35f, 1, 0.45f, 1}, "Status: OK");
+        } else if (skinned && r->compile_err[0]) {
+            ImGui::TextColored({1, 0.35f, 0.3f, 1}, "Status: LOAD FAILED");
+            ImGui::TextWrapped("%s", r->compile_err);
         }
         if (r->mesh_part_count > 0) {
             ImGui::Separator();
@@ -8421,30 +8513,30 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
             }
         }
         ImGui::Separator();
-        if (ImGui::Button("Use Cube")) {
+        if (!skinned && ImGui::Button("Use Cube")) {
             res_set_mesh_primitive(r, MESH_PRIM_CUBE);
             r->path[0] = '\0';
             mesh_path[0] = '\0';
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Use Quad")) {
+        if (!skinned) ImGui::SameLine();
+        if (!skinned && ImGui::Button("Use Quad")) {
             res_set_mesh_primitive(r, MESH_PRIM_QUAD);
             r->path[0] = '\0';
             mesh_path[0] = '\0';
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Use Tetrahedron")) {
+        if (!skinned) ImGui::SameLine();
+        if (!skinned && ImGui::Button("Use Tetrahedron")) {
             res_set_mesh_primitive(r, MESH_PRIM_TETRAHEDRON);
             r->path[0] = '\0';
             mesh_path[0] = '\0';
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Use Sphere")) {
+        if (!skinned) ImGui::SameLine();
+        if (!skinned && ImGui::Button("Use Sphere")) {
             res_set_mesh_primitive(r, MESH_PRIM_SPHERE);
             r->path[0] = '\0';
             mesh_path[0] = '\0';
         }
-        if (ImGui::Button("Use Fullscreen Triangle")) {
+        if (!skinned && ImGui::Button("Use Fullscreen Triangle")) {
             res_set_mesh_primitive(r, MESH_PRIM_FULLSCREEN_TRIANGLE);
             r->path[0] = '\0';
             mesh_path[0] = '\0';
@@ -8453,10 +8545,13 @@ static void ui_inspector_resource(Resource* r, ResHandle h) {
         PathInputResult mesh_path_result =
             ui_path_input_ex("Path##mesh", mesh_path, MAX_PATH_LEN, ".gltf;.glb", 0, "assets/models");
         if (r->using_fallback) ImGui::PopStyleColor();
-        if (mesh_path_result.file_selected)
-            ui_reload_mesh_resource(r, mesh_path);
+        if (mesh_path_result.file_selected) {
+            if (skinned) ui_reload_skinned_mesh_resource(r, mesh_path);
+            else ui_reload_mesh_resource(r, mesh_path);
+        }
         if (ImGui::Button("Load glTF")) {
-            ui_reload_mesh_resource(r, mesh_path);
+            if (skinned) ui_reload_skinned_mesh_resource(r, mesh_path);
+            else ui_reload_mesh_resource(r, mesh_path);
         }
         break;
     }
@@ -9104,7 +9199,7 @@ static void ui_inspector_command(Command* c) {
                 if (c->vertex_count < 0) c->vertex_count = 0;
                 ui_hint_text_disabled_wrapped("No mesh is bound. The VS should use SV_VertexID / VS SRVs.");
             } else {
-                res_combo("Mesh##dm", &c->mesh, RES_MESH, false);
+                res_combo("Mesh##dm", &c->mesh, RES_MESH, false, RES_SKINNED_MESH);
             }
             res_combo_shader_kind("Shader##dm", &c->shader, SHADER_PROGRAM_VSPS, false);
             if (c->type == CMD_DRAW_INSTANCED) {
@@ -9160,6 +9255,8 @@ static void ui_inspector_command(Command* c) {
 
         if (ui_inspector_section("SRV BINDINGS")) {
             ui_hint_text_disabled_wrapped("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
+            if (Resource* mesh = res_get(c->mesh); mesh && mesh->type == RES_SKINNED_MESH)
+                ui_hint_text_disabled_wrapped("Skinned vertex influences are bound automatically to VS t5. Bind the simulated bone buffer to the slot expected by your skinning shader (the examples use VS t6).");
             ui_hint_text_disabled_wrapped("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
             if (s_show_interface_hints) {
                 if (ImGui::TreeNodeEx("Slot Reference##draw_slots", ImGuiTreeNodeFlags_None)) {
@@ -9242,7 +9339,7 @@ static void ui_inspector_command(Command* c) {
                 ui_draw_topology_combo("Topology##id", &c->draw_topology);
                 ui_hint_text_disabled_wrapped("Uses DrawInstancedIndirect args.");
             } else {
-                res_combo("Mesh##id", &c->mesh, RES_MESH, false);
+                res_combo("Mesh##id", &c->mesh, RES_MESH, false, RES_SKINNED_MESH);
                 ui_hint_text_disabled_wrapped("%s",
                     (mesh && mesh->ib) ? "Uses DrawIndexedInstancedIndirect args."
                                        : "Uses DrawInstancedIndirect args.");
@@ -9288,6 +9385,8 @@ static void ui_inspector_command(Command* c) {
 
         if (ui_inspector_section("SRV BINDINGS")) {
             ui_hint_text_disabled_wrapped("SRVs are bound to t# in both VS and PS. Mesh material textures still bind PS slots first; manual SRVs override them.");
+            if (Resource* mesh = res_get(c->mesh); mesh && mesh->type == RES_SKINNED_MESH)
+                ui_hint_text_disabled_wrapped("Skinned vertex influences are bound automatically to VS t5. Bind the simulated bone buffer to the slot expected by your skinning shader.");
             ui_hint_text_disabled_wrapped("Reserved PS material slots: t0 base, t1 metal-rough, t2 normal, t3 emissive, t4 occlusion, t5 env, t7 shadow.");
             if (s_show_interface_hints) {
                 if (ImGui::TreeNodeEx("Slot Reference##indirect_draw_slots", ImGuiTreeNodeFlags_None)) {
@@ -9356,6 +9455,26 @@ static void ui_inspector_command(Command* c) {
         if (ui_inspector_section("INDIRECT BUFFER")) {
             res_combo("Indirect Buffer##id", &c->indirect_buf, RES_STRUCTURED_BUFFER, false);
             ImGui::InputScalar("Byte Offset", ImGuiDataType_U32, &c->indirect_offset);
+        }
+        break;
+    }
+
+    case CMD_SWAP: {
+        if (ui_inspector_section("SWAP")) {
+            res_combo("Resource A##swap", &c->swap_a, RES_RENDER_TEXTURE2D, true,
+                      RES_RENDER_TEXTURE3D, RES_STRUCTURED_BUFFER,
+                      RES_BUILTIN_SCENE_COLOR, RES_BUILTIN_SCENE_DEPTH);
+            res_combo("Resource B##swap", &c->swap_b, RES_RENDER_TEXTURE2D, true,
+                      RES_RENDER_TEXTURE3D, RES_STRUCTURED_BUFFER,
+                      RES_BUILTIN_SCENE_COLOR, RES_BUILTIN_SCENE_DEPTH);
+            ui_hint_text_disabled_wrapped(
+                "Swaps GPU backing objects in O(1). Resource names, handles and descriptors stay fixed.");
+
+            char reason[192] = {};
+            if (res_can_swap_backing(c->swap_a, c->swap_b, reason, sizeof(reason)))
+                ui_hint_text_disabled_wrapped("Ready: descriptors match.");
+            else if (reason[0])
+                ui_inspector_text_disabled_wrapped("%s", reason);
         }
         break;
     }
@@ -9511,8 +9630,8 @@ static ID3D11ShaderResourceView* ui_runtime_preview_srv(const Resource* r) {
     if (!r)
         return nullptr;
     switch (r->type) {
-    case RES_BUILTIN_SCENE_COLOR: return g_dx.scene_srv;
-    case RES_BUILTIN_SCENE_DEPTH: return g_dx.depth_srv;
+    case RES_BUILTIN_SCENE_COLOR:
+    case RES_BUILTIN_SCENE_DEPTH: return r->srv;
     case RES_BUILTIN_SHADOW_MAP:  return ui_render_shadow_depth_preview(g_dx.shadow_width, g_dx.shadow_height, 0);
     case RES_RENDER_TEXTURE2D:    return r->srv;
     default:                      return nullptr;
@@ -9839,6 +9958,12 @@ static void ui_panel_bindings(bool embedded = false) {
                 if (ui_inspector_section("ARGUMENTS"))
                     ui_binding_row("Indirect Buffer", "ARG", -1, c->indirect_buf);
                 break;
+            case CMD_SWAP:
+                if (ui_inspector_section("RESOURCES")) {
+                    ui_binding_row("Resource A", "SWAP", -1, c->swap_a);
+                    ui_binding_row("Resource B", "SWAP", -1, c->swap_b);
+                }
+                break;
             default:
                 break;
             }
@@ -9865,7 +9990,8 @@ static void ui_panel_bindings(bool embedded = false) {
                 ImGui::PopStyleColor();
                 ImGui::PopID();
             }
-        } else if (r->type == RES_MESH && (r->mesh_part_count > 0 || r->mesh_material_count > 0)) {
+        } else if ((r->type == RES_MESH || r->type == RES_SKINNED_MESH) &&
+                   (r->mesh_part_count > 0 || r->mesh_material_count > 0)) {
             if (r->mesh_part_count > 0) {
                 if (ui_inspector_section("MESH PARTS")) {
                     for (int i = 0; i < r->mesh_part_count; i++) {
@@ -9949,7 +10075,8 @@ static void ui_panel_selection_state(bool embedded = false) {
                 ImGui::Text("Warning: %s", ui_resource_has_warning(*r) ? "yes" : "no");
                 if (r->path[0])
                     ImGui::TextWrapped("Path: %s", r->path);
-                if (r->type == RES_SHADER || r->type == RES_MESH) {
+                if (r->type == RES_SHADER || r->type == RES_MESH ||
+                    r->type == RES_SKINNED_MESH) {
                     ImGui::Text("Compiled OK: %s", r->compiled_ok ? "yes" : "no");
                     ImGui::Text("Fallback: %s", r->using_fallback ? "yes" : "no");
                 }
@@ -12063,6 +12190,8 @@ static void ui_panel_scene(bool embedded = false) {
     s_scene_view_screen_rect_valid = false;
     s_scene_view_overlay_screen_rect_valid = false;
     ImVec2 avail = ImGui::GetContentRegionAvail();
+    Resource* scene_color = res_get(g_builtin_scene_color);
+    ID3D11ShaderResourceView* scene_srv = scene_color ? scene_color->srv : nullptr;
     if (avail.x > 4 && avail.y > 4) {
         int new_w = (int)avail.x;
         int new_h = (int)avail.y;
@@ -12070,8 +12199,8 @@ static void ui_panel_scene(bool embedded = false) {
             app_request_scene_surface_resize(new_w, new_h);
             s_scene_surface_resize_armed = false;
         }
-        if (g_dx.scene_srv) {
-            ImGui::Image((ImTextureID)g_dx.scene_srv, avail);
+        if (scene_srv) {
+            ImGui::Image((ImTextureID)scene_srv, avail);
             hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
             image_min = ImGui::GetItemRectMin();
             image_max = ImGui::GetItemRectMax();
@@ -12083,7 +12212,7 @@ static void ui_panel_scene(bool embedded = false) {
         }
     }
     bool overlay_hovered = false;
-    if (g_dx.scene_srv && image_max.x > image_min.x && image_max.y > image_min.y)
+    if (scene_srv && image_max.x > image_min.x && image_max.y > image_min.y)
         overlay_hovered = ui_viewport_toolbar_hit_test(image_min, image_max);
     bool panel_focused = ui_current_panel_focused();
     bool pointer_over_viewport = hovered && !overlay_hovered;
@@ -12092,7 +12221,7 @@ static void ui_panel_scene(bool embedded = false) {
     g_scene_view_hovered = viewport_hovered;
     g_scene_view_focused = panel_focused;
     g_scene_view_pointer_over = pointer_over_viewport;
-    if (g_dx.scene_srv && image_max.x > image_min.x && image_max.y > image_min.y) {
+    if (scene_srv && image_max.x > image_min.x && image_max.y > image_min.y) {
         ui_draw_viewport_bounds_debug(image_min, image_max);
         ui_draw_viewport_light_debug(image_min, image_max);
         ui_draw_viewport_timeline_paths(image_min, image_max);
@@ -14902,6 +15031,7 @@ static bool ui_render_graph_resource_is_traceable(const Resource& r) {
     case RES_STRUCTURED_BUFFER:
     case RES_GAUSSIAN_SPLAT:
     case RES_MESH:
+    case RES_SKINNED_MESH:
     case RES_BUILTIN_SCENE_COLOR:
     case RES_BUILTIN_SCENE_DEPTH:
     case RES_BUILTIN_SHADOW_MAP:
@@ -15028,6 +15158,13 @@ static void ui_render_graph_add_command_usages(UiRenderGraphBuild* graph, int cm
         break;
     }
 
+    case CMD_SWAP:
+        ui_render_graph_add_usage(graph, cmd_index, c.swap_a,
+                                  UI_RENDER_GRAPH_READ | UI_RENDER_GRAPH_WRITE);
+        ui_render_graph_add_usage(graph, cmd_index, c.swap_b,
+                                  UI_RENDER_GRAPH_READ | UI_RENDER_GRAPH_WRITE);
+        break;
+
     case CMD_GROUP:
     case CMD_REPEAT:
     default:
@@ -15093,6 +15230,7 @@ static ImVec4 ui_render_graph_resource_color(const Resource& r) {
     case RES_TEXTURE2D:
         return ImVec4(0.76f, 0.58f, 0.24f, 1.0f);
     case RES_MESH:
+    case RES_SKINNED_MESH:
     case RES_GAUSSIAN_SPLAT:
         return ImVec4(0.74f, 0.50f, 0.32f, 1.0f);
     default:
